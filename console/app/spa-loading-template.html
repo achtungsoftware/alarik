@@ -1,0 +1,22 @@
+<div class="loader"></div>
+
+<style>
+    .loader {
+        display: block;
+        position: fixed;
+        z-index: 1;
+        top: calc(50% - 24px);
+        left: calc(50% - 24px);
+        width: 48px;
+        height: 48px;
+        border: 8px solid var(--ui-bg-muted);
+        border-top: 8px solid var(--ui-color-primary-500);
+        border-radius: 50%;
+        animation: spin 1.4s linear infinite;
+    }
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+</style>

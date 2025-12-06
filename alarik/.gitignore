@@ -1,0 +1,15 @@
+Packages
+.build
+xcuserdata
+*.xcodeproj
+DerivedData/
+.DS_Store
+db.sqlite
+.swiftpm
+.env
+.env.*
+!.env.example
+default.profraw
+
+Storage/buckets/*
+!Storage/buckets/.gitkeep

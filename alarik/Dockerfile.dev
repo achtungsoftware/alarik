@@ -1,0 +1,30 @@
+# ================================
+# Development image for Alarik
+# ================================
+FROM swift:6.2-noble
+
+# Install OS updates and development dependencies
+RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    && apt-get -q update \
+    && apt-get -q dist-upgrade -y \
+    && apt-get install -y libjemalloc-dev
+
+# Set up working directory
+WORKDIR /app
+
+# Copy package files first for dependency resolution
+COPY ./Package.* ./
+
+# Resolve dependencies
+RUN swift package resolve \
+    $([ -f ./Package.resolved ] && echo "--force-resolved-versions" || true)
+
+# Copy the entire application
+COPY . .
+
+# Expose the port
+EXPOSE 8080
+
+# For development, use swift run which compiles and runs
+# This works with volume mounts for live development
+CMD ["swift", "run", "Alarik", "serve", "--env", "development", "--hostname", "0.0.0.0", "--port", "8080"]

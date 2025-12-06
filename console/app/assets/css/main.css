@@ -1,0 +1,202 @@
+/*
+Copyright 2025-present Julian Gerhards
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@theme {
+    --color-primary-500: #171717;
+    --font-sans: 'Geist', sans-serif;
+}
+
+:root {
+    --ui-radius: 0.3rem;
+
+    /* Least prominent text */
+    --ui-text-dimmed: var(--ui-color-neutral-400);
+    /* Slightly muted text */
+    --ui-text-muted: var(--ui-color-neutral-500);
+    /* Moderately prominent text */
+    --ui-text-toned: var(--ui-color-neutral-600);
+
+
+    /* Main background color */
+    --ui-bg: var(--color-white);
+    /* Subtle background */
+    --ui-bg-muted: var(--ui-color-neutral-50);
+    /* Slightly elevated background */
+    --ui-bg-elevated: var(--ui-color-neutral-100);
+    /* More prominent background */
+    --ui-bg-accented: var(--ui-color-neutral-200);
+    /* Inverted background color */
+    --ui-bg-inverted: var(--ui-color-neutral-900);
+
+    /* Default border color */
+    --ui-border: var(--ui-color-neutral-200);
+    /* Subtle border */
+    --ui-border-muted: var(--ui-color-neutral-200);
+    /* More prominent border */
+    --ui-border-accented: var(--ui-color-neutral-300);
+    /* Inverted border color */
+    --ui-border-inverted: var(--ui-color-neutral-900);
+
+    --ui-primary: var(--color-primary-500);
+}
+
+.dark {
+    --color-primary-500: #ededed;
+
+    /* Least prominent text */
+    --ui-text-dimmed: var(--ui-color-neutral-500);
+    /* Slightly muted text */
+    --ui-text-muted: var(--ui-color-neutral-400);
+    /* Moderately prominent text */
+    --ui-text-toned: var(--ui-color-neutral-300);
+    /* Default text color */
+    --ui-text: #ededed;
+    /* Most prominent text */
+    --ui-text-highlighted: #ededed;
+
+    /* Main background color */
+    --ui-bg: #000;
+    /* Subtle background */
+    --ui-bg-muted: var(--ui-color-neutral-950);
+    /* Slightly elevated background */
+    --ui-bg-elevated: var(--ui-color-neutral-800);
+    /* More prominent background */
+    --ui-bg-accented: var(--ui-color-neutral-700);
+    /* Inverted background color */
+    --ui-bg-inverted: var(--color-white);
+
+    /* Default border color */
+    --ui-border: var(--ui-color-neutral-800);
+    /* Subtle border */
+    --ui-border-muted: var(--ui-color-neutral-700);
+    /* More prominent border */
+    --ui-border-accented: var(--ui-color-neutral-700);
+    /* Inverted border color */
+    --ui-border-inverted: var(--color-white);
+    --ui-primary: var(--color-primary-500);
+}
+
+* {
+    @apply selection:bg-(--ui-text) selection:text-(--ui-bg);
+}
+
+.article>h1 {
+    @apply text-2xl sm:text-3xl font-medium pb-4 sm:pb-6;
+}
+
+.article>h2 {
+    @apply text-2xl sm:text-3xl font-medium pb-1 pt-6 sm:pt-12;
+}
+
+.article>h3 {
+    @apply text-xl sm:text-2xl font-medium pb-1 pt-4 sm:pt-6;
+}
+
+.article>h4 {
+    @apply text-lg sm:text-xl font-medium pb-1 pt-4 sm:pt-6;
+}
+
+.article>h5 {
+    @apply text-lg font-medium pb-1 pt-4 sm:pt-6;
+}
+
+.article>h2>a {
+    @apply hover:no-underline hover:opacity-80;
+}
+
+.article>h3>a {
+    @apply hover:no-underline hover:opacity-80;
+}
+
+.article>h4>a {
+    @apply hover:no-underline hover:opacity-80;
+}
+
+.article>ul {
+    @apply leading-7 list-disc pl-5;
+}
+
+.article>ol {
+    @apply list-decimal pl-6;
+}
+
+.article>ol {
+    @apply py-2;
+}
+
+.article>p {
+    @apply my-2 hyphens-none;
+}
+
+.article>pre {
+    @apply bg-[var(--ui-bg-elevated)] rounded-md p-4 text-sm my-4 border-[var(--ui-border-accented)] border-dashed border overflow-x-auto block;
+}
+
+.article>table>tbody>tr>td {
+    @apply border border-[var(--ui-border)] p-2;
+}
+
+.article>table>thead>tr>th {
+    @apply border border-[var(--ui-border)] p-2 text-left bg-[var(--ui-bg-elevated)] break-normal hyphens-none;
+}
+
+.article>table {
+    @apply text-sm w-full my-6 inline-block overflow-auto sm:table sm:overflow-hidden;
+}
+
+.article>p>img {
+    @apply my-6 w-full;
+}
+
+.article>p>em {
+    @apply text-[var(--ui-text-muted)] text-sm;
+}
+
+.article>p>code,
+.article>ul>li>code,
+.article>ul>li>strong>code,
+.article>table>tbody>tr>td>code,
+.article>div>div>p>code {
+    @apply bg-[var(--ui-bg-elevated)] rounded p-1 text-sm my-4 border-[var(--ui-border-accented)] border border-dashed leading-7 overflow-x-auto break-words;
+}
+
+.article>p>a,
+.article>ul>li>a,
+.article>ol>li>a,
+.article>table>tbody>tr>td>a {
+    @apply font-semibold text-[var(--ui-secondary)];
+}
+
+.grid-background {
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(to right, rgba(255, 255, 255, 0.05) 1px, transparent 1px), linear-gradient(to bottom, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 40%, transparent 100%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 40%, transparent 100%);
+}
+
+.grid-background::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px), linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 20px 20px;
+    opacity: 0.6;
+}

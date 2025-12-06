@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  alarik:
+    build:
+      context: ./alarik
+      dockerfile: Dockerfile.dev
+    container_name: alarik-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
+      - CONSOLE_BASE_URL=${CONSOLE_BASE_URL:-http://localhost:3000}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
+      # Providing default keys is optional but necessary for testing
+      - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+      - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    volumes:
+      - ./alarik:/app
+      - ./alarik/Storage:/app/Storage
+      - alarik-build:/app/.build
+    networks:
+      - alarik-network
+
+  console:
+    build:
+      context: ./console
+      dockerfile: Dockerfile.dev
+    container_name: console-dev
+    ports:
+      - "3000:3000"
+      - "24678:24678" # Nuxt dev server HMR
+    environment:
+      - NODE_ENV=development
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
+      - CONSOLE_BASE_URL=${CONSOLE_BASE_URL:-http://localhost:3000}
+    volumes:
+      - ./console:/app
+      - /app/node_modules
+      - /app/.nuxt
+    depends_on:
+      - alarik
+    networks:
+      - alarik-network
+
+networks:
+  alarik-network:
+    driver: bridge
+
+volumes:
+  alarik-build:

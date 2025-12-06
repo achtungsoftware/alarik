@@ -1,0 +1,16 @@
+node_modules
+.nuxt
+.output
+dist
+.env
+.env.*
+!.env.example
+.DS_Store
+.git
+.gitignore
+*.md
+docker-compose*.yml
+Dockerfile*
+coverage
+.vscode
+.idea

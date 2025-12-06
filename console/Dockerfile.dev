@@ -1,0 +1,23 @@
+# Development Dockerfile for Nuxt
+FROM node:20-alpine
+
+# Install dependencies for better compatibility
+RUN apk add --no-cache git
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application
+COPY . .
+
+# Expose ports (3000 for Nuxt, 24678 for HMR)
+EXPOSE 3000 24678
+
+# Start development server
+CMD ["npm", "run", "dev"]

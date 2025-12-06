@@ -1,0 +1,28 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:alarik}/alarik",
+            "name": "Debug Alarik (alarik)",
+            "target": "Alarik",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Alarik (alarik)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:alarik}/alarik",
+            "name": "Release Alarik (alarik)",
+            "target": "Alarik",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Alarik (alarik)",
+            "env": {
+                "DEFAULT_ACCESS_KEY": "AKIAIOSFODNN7EXAMPLE",
+                "DEFAULT_SECRET_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            }
+        }
+    ]
+}
