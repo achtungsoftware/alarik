@@ -93,7 +93,7 @@ async function submitForm(event: FormSubmitEvent<any>) {
                     <UInput autocomplete="off" :autocorrect="false" placeholder="Password" type="password" v-model="state.password" class="w-full" size="lg" variant="subtle" />
                 </UFormField>
 
-                <USwitch v-model="state.isAdmin" label="Admin" description="Do you want to create an Admin User?" />
+                <USwitch v-model="state.isAdmin" size="lg" label="Admin" description="Do you want to create an Admin User?" />
             </UForm>
         </template>
 
