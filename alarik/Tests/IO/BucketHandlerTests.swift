@@ -60,6 +60,91 @@ struct BucketHandlerTests {
         }
     }
 
+    @Test("Force delete bucket with contents")
+    func testForceDelete() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Create bucket with files
+            try BucketHandler.create(name: "testbucket")
+            let bucketURL = BucketHandler.bucketURL(for: "testbucket")
+
+            // Add root file
+            let file1 = bucketURL.appendingPathComponent("test.txt")
+            try "content".write(to: file1, atomically: true, encoding: .utf8)
+
+            // Add nested file
+            let subDir = bucketURL.appendingPathComponent("mykey/sub")
+            try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+            let file2 = subDir.appendingPathComponent("test.txt")
+            try "content".write(to: file2, atomically: true, encoding: .utf8)
+
+            // Verify files exist
+            #expect(FileManager.default.fileExists(atPath: file1.path))
+            #expect(FileManager.default.fileExists(atPath: file2.path))
+            #expect(try BucketHandler.countKeys(name: "testbucket") == 2)
+
+            // Force delete should succeed even with contents
+            try BucketHandler.forceDelete(name: "testbucket")
+
+            // Verify bucket is deleted
+            #expect(!FileManager.default.fileExists(atPath: bucketURL.path))
+            #expect(try BucketHandler.list().isEmpty)
+        }
+    }
+
+    @Test("Force delete empty bucket")
+    func testForceDeleteEmptyBucket() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Create empty bucket
+            try BucketHandler.create(name: "emptybucket")
+            let bucketURL = BucketHandler.bucketURL(for: "emptybucket")
+            #expect(FileManager.default.fileExists(atPath: bucketURL.path))
+
+            // Force delete should work on empty bucket
+            try BucketHandler.forceDelete(name: "emptybucket")
+
+            // Verify bucket is deleted
+            #expect(!FileManager.default.fileExists(atPath: bucketURL.path))
+        }
+    }
+
+    @Test("Force delete non-existent bucket")
+    func testForceDeleteNonExistentBucket() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Force delete on non-existent bucket should not throw
+            try BucketHandler.forceDelete(name: "nonexistent")
+        }
+    }
+
+    @Test("Regular delete fails on non-empty bucket")
+    func testDeleteFailsOnNonEmptyBucket() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Create bucket with file
+            try BucketHandler.create(name: "testbucket")
+            let bucketURL = BucketHandler.bucketURL(for: "testbucket")
+            let file = bucketURL.appendingPathComponent("test.txt")
+            try "content".write(to: file, atomically: true, encoding: .utf8)
+
+            // Regular delete should fail
+            #expect(throws: S3Error.self) {
+                try BucketHandler.delete(name: "testbucket")
+            }
+
+            // Bucket should still exist
+            #expect(FileManager.default.fileExists(atPath: bucketURL.path))
+
+            // Clean up with force delete
+            try BucketHandler.forceDelete(name: "testbucket")
+        }
+    }
+
     @Test("Bucket count keys")
     func testCountKeys() async throws {
         try await withApp { _ in
