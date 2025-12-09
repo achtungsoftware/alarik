@@ -24,6 +24,8 @@ struct InternalAdminController: RouteCollection {
             .get(use: listUsers)
         routes.grouped("admin").grouped("users")
             .post(use: createUser)
+        routes.grouped("admin").grouped("users")
+            .put(use: editUser)
     }
 
     @Sendable
@@ -81,5 +83,41 @@ struct InternalAdminController: RouteCollection {
         }
 
         return user.toResponseDTO()
+    }
+
+    @Sendable
+    func editUser(req: Request) async throws -> User.ResponseDTO {
+        try User.Edit.validate(content: req)
+
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let fetchedAdminUser: User = try await User.find(sessionToken.userId, on: req.db)
+        else {
+            throw Abort(.unauthorized, reason: "User not found")
+        }
+
+        guard fetchedAdminUser.isAdmin else {
+            throw Abort(.unauthorized, reason: "User not admin")
+        }
+
+        let editUser: User.Edit = try req.content.decode(User.Edit.self)
+
+        do {
+            try await User.query(on: req.db)
+                .filter(\.$id == editUser.id)
+                .set(\.$name, to: editUser.name)
+                .set(\.$username, to: editUser.username)
+                .set(\.$isAdmin, to: editUser.isAdmin)
+                .update()
+        } catch {
+            if let dbError = error as? any DatabaseError,
+                dbError.isConstraintFailure
+            {
+                throw Abort(.conflict, reason: "Username already exists.")
+            }
+            throw error
+        }
+
+        return editUser.toUserResponseDTO()
     }
 }

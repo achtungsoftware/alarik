@@ -16,7 +16,7 @@ limitations under the License.
 */
 
 import { h, resolveComponent } from "vue";
-import type { TableColumn, TableRow } from "@nuxt/ui";
+import type { DropdownMenuItem, TableColumn, TableRow } from "@nuxt/ui";
 
 definePageMeta({
     layout: "dashboard",
@@ -36,6 +36,11 @@ const jwtCookie = useJWTCookie();
 const openUserCreateModal = ref(false);
 const isDeleting = ref(false);
 const toast = useToast();
+const UDropdownMenu = resolveComponent("UDropdownMenu");
+const UButton = resolveComponent("UButton");
+
+const selectedUserForEdit = ref<User | null>(null);
+const openUserEditModal = ref(false);
 
 const {
     data: fetchResponse,
@@ -89,6 +94,42 @@ const columns: TableColumn<User>[] = [
             return row.original.isAdmin ? "yes" : "no";
         },
     },
+    {
+        id: "actions",
+        cell: ({ row }) => {
+            return h(
+                "div",
+                { class: "text-right" },
+                h(
+                    UDropdownMenu,
+                    {
+                        content: {
+                            align: "end",
+                        },
+                        items: [
+                            {
+                                label: "Edit User",
+                                icon: "i-lucide-square-pen",
+                                onSelect() {
+                                    selectedUserForEdit.value = row.original;
+                                    openUserEditModal.value = true;
+                                },
+                            },
+                        ] as DropdownMenuItem,
+                        "aria-label": "Action Menu",
+                    },
+                    () =>
+                        h(UButton, {
+                            icon: "i-lucide-ellipsis-vertical",
+                            color: "neutral",
+                            variant: "ghost",
+                            class: "ml-auto",
+                            "aria-label": "Action Menu",
+                        })
+                )
+            );
+        },
+    },
 ];
 
 const selectedItems = computed(() => {
@@ -98,8 +139,7 @@ const selectedItems = computed(() => {
         .filter((item): item is User => item !== undefined);
 });
 
-function onSelect(e: Event, row: TableRow<User>) {
-}
+function onSelect(e: Event, row: TableRow<User>) {}
 
 async function deleteMany() {
     const items = selectedItems.value;
@@ -112,7 +152,8 @@ async function deleteMany() {
 </script>
 <template>
     <ConfirmationDialog confirmLabel="Delete" v-model:isShowing="openDeletionModal" :title="`Delete ${selectedItems.length} User${selectedItems.length !== 1 ? 's' : ''}`" :onConfirm="deleteMany" :message="`Do you really want to delete ${selectedItems.length} user${selectedItems.length !== 1 ? 's' : ''}? All data from the user will be deleted. This action cannot be undone.`" />
-
+    <EditUserModal v-if="selectedUserForEdit && openUserEditModal" v-model:open="openUserEditModal" :user="selectedUserForEdit" />
+    
     <UDashboardPanel
         :ui="{
             body: '!p-0',
