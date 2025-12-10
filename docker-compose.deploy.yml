@@ -34,12 +34,6 @@ services:
     read_only: false
     tmpfs:
       - /tmp
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
 
   console:
     build:
@@ -47,36 +41,19 @@ services:
       dockerfile: Dockerfile
     container_name: console-prod
     restart: unless-stopped
-    expose:
-      - "3000"
+    ports:
+      - "3000:3000"
     environment:
       - NODE_ENV=production
       - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
       - CONSOLE_BASE_URL=${CONSOLE_BASE_URL:-http://localhost:3000}
       - ALLOW_ACCOUNT_CREATION=${ALLOW_ACCOUNT_CREATION}
-    depends_on:
-      alarik:
-        condition: service_healthy
     networks:
       - alarik-network
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    security_opt:
-      - no-new-privileges:true
     read_only: true
     tmpfs:
       - /tmp
       - /app/.nuxt
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 256M
 
 networks:
   alarik-network:
