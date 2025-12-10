@@ -41,7 +41,7 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/buckets`, {
+} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets`, {
     params: {
         page: page,
         per: itemsPerPage,
@@ -109,7 +109,7 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/buckets/${item.name}`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets/${item.name}`, {
                     method: "DELETE",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,

@@ -19,7 +19,7 @@ useHead({
     title: `Log In - Alarik`,
 });
 
-const allowAccountCreation = useRuntimeConfig().public.ALLOW_ACCOUNT_CREATION;
+const allowAccountCreation = useRuntimeConfig().public.allowAccountCreation;
 const jwtCookie = useJWTCookie();
 const loginError = ref("");
 const isLoadingLogin = ref(false);
@@ -35,7 +35,7 @@ async function login(e: Event) {
         isLoadingLogin.value = true;
         loginError.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users/login`, {
+        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/login`, {
             method: "POST",
             body: JSON.stringify(loginState),
             headers: {

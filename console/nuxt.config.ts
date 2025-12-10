@@ -31,9 +31,9 @@ export default defineNuxtConfig({
     },
     runtimeConfig: {
         public: {
-            API_BASE_URL: import.meta.env.API_BASE_URL ?? "http://localhost:8080",
-            CONSOLE_BASE_URL: import.meta.env.CONSOLE_BASE_URL ?? "http://localhost:3000",
-            ALLOW_ACCOUNT_CREATION: import.meta.env.NODE_ENV !== "production" ? true : import.meta.env.ALLOW_ACCOUNT_CREATION === undefined ? false : import.meta.env.ALLOW_ACCOUNT_CREATION === "true",
+            apiBaseUrl: "http://localhost:8080",
+            consoleBaseUrl: "http://localhost:3000",
+            allowAccountCreation: false,
         },
     },
 });

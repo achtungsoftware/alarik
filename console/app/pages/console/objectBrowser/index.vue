@@ -123,7 +123,7 @@ const {
     data: bucketsResponse,
     status: bucketsStatus,
     refresh: refreshBuckets,
-} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/buckets`, {
+} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets`, {
     params: { page: page, per: itemsPerPage },
     headers: { Authorization: `Bearer ${jwtCookie.value}` },
     watch: [page],
@@ -135,7 +135,7 @@ const {
     data: objectsResponse,
     status: objectsStatus,
     refresh,
-} = await useFetch<Page<BrowserItem>>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/objects`, {
+} = await useFetch<Page<BrowserItem>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
     params: {
         bucket: currentBucket,
         prefix: currentPrefix,
@@ -284,7 +284,7 @@ async function deleteMany() {
             }
 
             try {
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/objects`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
                     method: "DELETE",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,
@@ -353,7 +353,7 @@ async function downloadSelected() {
     try {
         const keys = items.map((item) => item.key);
 
-        const response = await fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/objects/download`, {
+        const response = await fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/download`, {
             method: "POST",
             headers: {
                 Authorization: `Bearer ${jwtCookie.value}`,
@@ -437,7 +437,7 @@ async function handleFileUpload(event: Event) {
                 const formData = new FormData();
                 formData.append("data", file, file.name);
 
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/objects`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
                     method: "POST",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,
@@ -511,7 +511,7 @@ async function handleFolderUpload(event: Event) {
                 // Combine current prefix with the file's relative path
                 const fullPrefix = currentPrefix.value + relativePath.substring(0, relativePath.lastIndexOf("/") + 1);
 
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/objects`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
                     method: "POST",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,

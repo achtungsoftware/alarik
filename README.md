@@ -27,6 +27,10 @@ Developers and organizations need an S3-compatible store that is fast, simple to
 
 The goal: a self-hosted, high-speed S3 system built for today’s workloads, without the enterprise upsell.
 
+## Installation
+
+Please see [Documentation](https://alarik.io/docs/installation)
+
 ## Why Swift?
 
 Swift brings a rare combination of **performance**, **safety**, and **developer ergonomics**:
@@ -86,57 +90,6 @@ We welcome contributions of any size. Please:
 -   Keep pull requests focused and incremental
 
 More detailed contributing guidelines will be added soon.
-
-## Running Alarik
-
-You can run Alarik in **development** or **production** mode.
-All modes are available via Docker Compose, and development mode can also run natively via Swift.
-
-### Development Mode
-
-Development mode is optimized for local iteration. It starts the backend, the console UI, and any supporting services.
-
-#### Option 1 - Run via Docker Compose
-
-```bash
-docker compose -f docker-compose.dev.yml up --build -d
-```
-
-This starts the full development environment, including the API server and the web console.
-
-#### Option 2 - Run the Swift server locally
-
-```bash
-cd alarik
-swift run
-```
-
-> **Note:** Native builds are **not supported on Windows**.
-> On Windows, please use Docker (Option 1).
-
-#### Running the Console UI (local dev - Nuxt)
-
-```bash
-cd console
-npm install
-npm run dev
-```
-
-This starts the development UI with hot reloading.
-
-### Testing
-
-Testing with `swift test` will fail. Please use `test.sh`. All tests need to pass before committing.
-
-### Production Mode
-
-For production deployments, use the hardened Compose configuration:
-
-```bash
-docker compose -f docker-compose.deploy.yml up --build -d
-```
-
-This launches a production-ready instance with optimized settings and persistent data volumes.
 
 ---
 

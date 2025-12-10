@@ -1,3 +1,5 @@
+# Alarik Console
+
 # Build stage
 FROM node:22-slim AS build
 
@@ -13,6 +15,10 @@ RUN npm run build
 
 # Production stage
 FROM node:22-slim
+
+LABEL org.opencontainers.image.source=https://github.com/achtungsoftware/alarik
+LABEL org.opencontainers.image.description="Alarik Console - Web UI for Alarik S3 storage"
+LABEL org.opencontainers.image.licenses=Apache-2.0
 
 WORKDIR /app
 

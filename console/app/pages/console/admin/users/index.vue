@@ -48,7 +48,7 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<User>>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/admin/users`, {
+} = await useFetch<Page<User>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users`, {
     params: {
         page: page,
         per: itemsPerPage,
@@ -169,7 +169,7 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/admin/users/${item.id}`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users/${item.id}`, {
                     method: "DELETE",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,
@@ -225,7 +225,7 @@ async function deleteSingleUser() {
     isDeleting.value = true;
 
     try {
-        await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/admin/users/${user.id}`, {
+        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users/${user.id}`, {
             method: "DELETE",
             headers: {
                 Authorization: `Bearer ${jwtCookie.value}`,

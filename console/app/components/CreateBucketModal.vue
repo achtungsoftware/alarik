@@ -54,7 +54,7 @@ async function submitForm(event: FormSubmitEvent<any>) {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/buckets`, {
+        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets`, {
             method: "POST",
             body: JSON.stringify(state),
             headers: {

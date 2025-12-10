@@ -41,7 +41,7 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<AccessKey>>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users/accessKeys`, {
+} = await useFetch<Page<AccessKey>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys`, {
     params: {
         page: page,
         per: itemsPerPage,
@@ -115,7 +115,7 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users/accessKeys/${item.id}`, {
+                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys/${item.id}`, {
                     method: "DELETE",
                     headers: {
                         Authorization: `Bearer ${jwtCookie.value}`,

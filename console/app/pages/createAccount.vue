@@ -36,7 +36,7 @@ async function createAccount(e: Event) {
         isLoadingCreateAccount.value = true;
         createAccountError.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users`, {
+        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users`, {
             method: "POST",
             body: JSON.stringify(createAccountState),
             headers: {

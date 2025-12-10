@@ -20,7 +20,7 @@ export default defineNuxtRouteMiddleware(async (to, from) => {
 
     if (jwtCookie.value != null) {
         if (jwtCookie.value !== "" && !user.value.isLoggedIn) {
-            await $fetch(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users/auth`, {
+            await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/auth`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

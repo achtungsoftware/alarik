@@ -33,6 +33,10 @@ RUN swift build -c release \
 # Runtime stage
 FROM ubuntu:noble
 
+LABEL org.opencontainers.image.source=https://github.com/achtungsoftware/alarik
+LABEL org.opencontainers.image.description="Alarik - S3-compatible object storage"
+LABEL org.opencontainers.image.licenses=Apache-2.0
+
 # Install runtime dependencies
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \

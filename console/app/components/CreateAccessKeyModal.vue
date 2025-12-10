@@ -41,7 +41,7 @@ const {
     data: accessKeyGeneratorResponse,
     status: accessKeyGeneratorStatus,
     refresh,
-} = await useFetch<{ accessKeyId: string; secretAccessKey: string }>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/accessKeyGenerator`, {
+} = await useFetch<{ accessKeyId: string; secretAccessKey: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/accessKeyGenerator`, {
     default: () => ({ accessKeyId: "", secretAccessKey: "" }),
 });
 
@@ -67,7 +67,7 @@ async function submitForm(event: FormSubmitEvent<any>) {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.API_BASE_URL}/api/v1/users/accessKeys`, {
+        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys`, {
             method: "POST",
             body: JSON.stringify({
                 ...state,

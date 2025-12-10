@@ -1,0 +1,29 @@
+services:
+  alarik:
+    image: ghcr.io/achtungsoftware/alarik:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - API_BASE_URL=http://localhost:8080
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=alarik
+      - ADMIN_PASSWORD=alarik
+      - ALLOW_ACCOUNT_CREATION=false
+    volumes:
+      - alarik-storage:/app/Storage
+
+  console:
+    image: ghcr.io/achtungsoftware/alarik-console:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NUXT_PUBLIC_API_BASE_URL=http://localhost:8080
+      - NUXT_PUBLIC_CONSOLE_BASE_URL=http://localhost:3000
+      - NUXT_PUBLIC_ALLOW_ACCOUNT_CREATION=false
+    depends_on:
+      - alarik
+
+volumes:
+  alarik-storage:
