@@ -16,6 +16,7 @@ limitations under the License.
 
 import Fluent
 import FluentSQLiteDriver
+import JWTKit
 import NIOSSL
 import Vapor
 
@@ -65,7 +66,14 @@ public func configure(_ app: Application) async throws {
     app.middleware.use(cors)
     app.middleware.use(S3ErrorMiddleware())
 
-    await app.jwt.keys.add(hmac: "super-secret-key", digestAlgorithm: .sha256)
+    if let jwt = Environment.get("JWT") {
+        await app.jwt.keys.add(hmac: HMACKey(from: jwt), digestAlgorithm: .sha256)
+    } else {
+        app.logger.error(
+            "No JWT key provided in environment variable 'JWT'. Falling back to an insecure default key. Please set a secure JWT key before deploying to production."
+        )
+        await app.jwt.keys.add(hmac: "super-secret-key", digestAlgorithm: .sha256)
+    }
 
     app.lifecycle.use(LoadCacheLifecycle())
 

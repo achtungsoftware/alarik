@@ -9,6 +9,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=alarik
       - ADMIN_PASSWORD=alarik
+      - JWT=YOUR_SECURE_JWT_KEY
       - ALLOW_ACCOUNT_CREATION=false
     volumes:
       - alarik-storage:/app/Storage
