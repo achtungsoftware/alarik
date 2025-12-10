@@ -47,8 +47,8 @@ services:
       dockerfile: Dockerfile
     container_name: console-prod
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       - NODE_ENV=production
       - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
