@@ -1,59 +1,33 @@
-# ================================
-# Production image for Console
-# ================================
-
 # Build stage
-FROM node:20-alpine AS build
+FROM node:22-slim AS build
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files
+# Copy package files and install all dependencies
 COPY package*.json ./
+RUN npm install
 
-# Install dependencies
-RUN npm ci --only=production=false
-
-# Copy the rest of the application
+# Copy the entire project and build it
 COPY . .
-
-# Build the application
 RUN npm run build
 
 # Production stage
-FROM node:20-alpine
+FROM node:22-slim
 
-# Install dumb-init for proper signal handling
-RUN apk add --no-cache dumb-init
-
-# Create a non-root user
-RUN addgroup -g 1001 -S nodejs && adduser -S nuxt -u 1001
-
-# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY --chown=nuxt:nodejs package*.json ./
+# Set environment variable for production
+ENV NODE_ENV=production
 
-# Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Copy package files and install only production dependencies
+COPY --from=build /app/package*.json ./
+RUN npm install --production
 
-# Copy built application from build stage
-COPY --from=build --chown=nuxt:nodejs /app/.output /app/.output
+# Copy the built Nuxt 3 output
+COPY --from=build /app/.output ./.output
 
-# Switch to non-root user
-USER nuxt
-
-# Expose port
+# Expose the default Nuxt port
 EXPOSE 3000
 
-# Set NODE_ENV to production
-ENV NODE_ENV=production \
-    HOST=0.0.0.0 \
-    PORT=3000
-
-# Use dumb-init to handle signals properly
-ENTRYPOINT ["dumb-init", "--"]
-
-# Start the application
+# Start the application directly with Node
 CMD ["node", ".output/server/index.mjs"]
