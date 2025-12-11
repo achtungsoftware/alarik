@@ -130,8 +130,18 @@ struct InternalUserController: RouteCollection {
             accessKey: create.accessKey,
             userId: sessionToken.userId
         )
-        // Note: AccessKeyBucketMapCache is updated when buckets are created,
-        // not when access keys are created (new access keys have no buckets yet)
+
+        // Map the new access key to all existing buckets for this user
+        let userBuckets = try await Bucket.query(on: req.db)
+            .filter(\.$user.$id == sessionToken.userId)
+            .all()
+
+        for bucket in userBuckets {
+            await AccessKeyBucketMapCache.shared.add(
+                accessKey: create.accessKey,
+                bucketName: bucket.name
+            )
+        }
 
         return accessKey.toResponseDTO()
     }
