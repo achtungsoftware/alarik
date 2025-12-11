@@ -46,6 +46,7 @@ watch(open, (val) => {
 
 const state = reactive({
     name: "",
+    versioningEnabled: false
 });
 
 async function submitForm(event: FormSubmitEvent<any>) {
@@ -82,6 +83,8 @@ async function submitForm(event: FormSubmitEvent<any>) {
                 <UFormField required label="Name" name="name">
                     <UInput placeholder="Name your bucket" v-model="state.name" class="w-full" size="lg" variant="subtle" />
                 </UFormField>
+
+                <USwitch v-model="state.versioningEnabled" size="lg" label="Versioning" description="Do you want to enable versioning for this Bucket?" />
             </UForm>
         </template>
 

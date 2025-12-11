@@ -34,37 +34,64 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "creation_date")
     var creationDate: Date?
 
-    init() {}
+    @Field(key: "versioning_status")
+    var versioningStatus: String
+
+    init() {
+        self.versioningStatus = VersioningStatus.disabled.rawValue
+    }
 
     init(name: String, userId: UUID) {
         self.name = name
         self.creationDate = Date()
         self.$user.id = userId
+        self.versioningStatus = VersioningStatus.disabled.rawValue
     }
 
     init(name: String, userId: UUID, creationDate: Date) {
         self.name = name
         self.creationDate = creationDate
         self.$user.id = userId
+        self.versioningStatus = VersioningStatus.disabled.rawValue
+    }
+
+    init(name: String, userId: UUID, versioningStatus: VersioningStatus) {
+        self.name = name
+        self.creationDate = Date()
+        self.$user.id = userId
+        self.versioningStatus = versioningStatus.rawValue
     }
 
     func toResponseDTO() -> Bucket.ResponseDTO {
         .init(
             id: self.id,
             name: self.$name.value,
+            versioningStatus: self.versioningStatus
         )
+    }
+
+    /// Returns true if versioning is enabled for this bucket
+    var isVersioningEnabled: Bool {
+        versioningStatus == VersioningStatus.enabled.rawValue
+    }
+
+    /// Returns true if versioning is suspended (was enabled, now paused)
+    var isVersioningSuspended: Bool {
+        versioningStatus == VersioningStatus.suspended.rawValue
     }
 }
 
 extension Bucket {
     struct Create: Content {
         var name: String
+        var versioningEnabled: Bool
     }
 
     struct ResponseDTO: Content {
         var id: UUID?
         var name: String?
         var creationDate: Date?
+        var versioningStatus: String?
 
         func toModel() -> Bucket {
             let model = Bucket()
@@ -73,11 +100,11 @@ extension Bucket {
             if let name = self.name {
                 model.name = name
             }
-            if let name = self.name {
-                model.name = name
-            }
             if let creationDate = self.creationDate {
                 model.creationDate = creationDate
+            }
+            if let versioningStatus = self.versioningStatus {
+                model.versioningStatus = versioningStatus
             }
             return model
         }
@@ -87,6 +114,7 @@ extension Bucket {
 extension Bucket.Create: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: .bucketName)
+        validations.add("versioningEnabled", as: Bool.self, is: .valid)
     }
 }
 

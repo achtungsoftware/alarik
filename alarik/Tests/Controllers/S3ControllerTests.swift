@@ -212,8 +212,6 @@ struct S3ControllerTests {
             })
     }
 
-    // MARK: - ListObjects V1 Tests
-
     @Test("List Objects V1 - Empty bucket")
     func testListObjectsV1Empty() async throws {
         let bucketName = "test-list-empty"
@@ -418,8 +416,6 @@ struct S3ControllerTests {
         }
     }
 
-    // MARK: - ListObjectsV2 Tests
-
     @Test("List Objects V2 - Empty bucket")
     func testListObjectsV2Empty() async throws {
         let bucketName = "test-list-v2-empty"
@@ -600,8 +596,6 @@ struct S3ControllerTests {
         }
     }
 
-    // MARK: - Error Cases
-
     @Test("List Objects - Non-existent bucket returns 404")
     func testListObjectsNonExistentBucket() async throws {
         let bucketName = "non-existent-bucket"
@@ -637,8 +631,6 @@ struct S3ControllerTests {
                 })
         }
     }
-
-    // MARK: - Bucket Delete Tests
 
     @Test("Delete Empty Bucket - Should succeed")
     func testDeleteEmptyBucket() async throws {
@@ -678,8 +670,6 @@ struct S3ControllerTests {
                 })
         }
     }
-
-    // MARK: - Range Request Tests
 
     @Test("GET Object with Range - Complete range (bytes=0-9)")
     func testGetObjectWithCompleteRange() async throws {
@@ -811,8 +801,6 @@ struct S3ControllerTests {
                 })
         }
     }
-
-    // MARK: - Conditional Request Tests (ETag validation)
 
     @Test("GET Object with If-Match - Matching ETag should succeed")
     func testGetObjectWithIfMatchSuccess() async throws {
@@ -972,8 +960,6 @@ struct S3ControllerTests {
         }
     }
 
-    // MARK: - Content-MD5 Validation Tests
-
     @Test("PUT Object with correct Content-MD5 should succeed")
     func testPutObjectWithCorrectContentMD5() async throws {
         let bucketName = "test-md5-correct"
@@ -1055,8 +1041,6 @@ struct S3ControllerTests {
                 })
         }
     }
-
-    // MARK: - Copy Object Tests
 
     @Test("Copy Object - Basic copy within same bucket")
     func testCopyObjectWithinBucket() async throws {

@@ -65,12 +65,24 @@ final class LoadCacheLifecycle: LifecycleHandler {
             await AccessKeyUserMapCache.shared.load(initialData: userMappingData)
             await AccessKeyBucketMapCache.shared.load(initialData: bucketData)
 
+            // Load bucket versioning status cache
+            let allBuckets = try await Bucket.query(on: app.db).all()
+            let versioningData = allBuckets.map {
+                (bucketName: $0.name, versioningStatus: $0.versioningStatus)
+            }
+            await BucketVersioningCache.shared.load(initialData: versioningData)
+
         } catch {
-            app.logger.error("Failed to load access key cache: \(error)")
+            app.logger.error("Failed to load cache: \(error)")
         }
 
-        /*print(await AccessKeyUserMapCache.shared.getMap())
-        print(await AccessKeyBucketMapCache.shared.getMap())
-        print(await AccessKeySecretKeyMapCache.shared.getMap())*/
+        #if DEBUG  // Print all caches in debug
+            if app.environment != .testing {
+                dump(await AccessKeyUserMapCache.shared.getMap())
+                dump(await AccessKeyBucketMapCache.shared.getMap())
+                dump(await AccessKeySecretKeyMapCache.shared.getMap())
+                dump(await BucketVersioningCache.shared.getMap())
+            }
+        #endif
     }
 }

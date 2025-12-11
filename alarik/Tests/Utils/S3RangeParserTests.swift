@@ -20,8 +20,6 @@ import Testing
 @Suite("S3RangeParser tests")
 struct S3RangeParserTests {
 
-    // MARK: - Complete Range Tests (bytes=start-end)
-
     @Test("Parse complete range - bytes=0-9")
     func testParseCompleteRange() {
         let range = S3RangeParser.parseRangeHeader("bytes=0-9", fileSize: 100)
@@ -52,8 +50,6 @@ struct S3RangeParserTests {
         #expect(range?.length == 100)
     }
 
-    // MARK: - Open-Ended Range Tests (bytes=start-)
-
     @Test("Parse open-ended range - bytes=50-")
     func testParseOpenEndedRange() {
         let range = S3RangeParser.parseRangeHeader("bytes=50-", fileSize: 100)
@@ -73,8 +69,6 @@ struct S3RangeParserTests {
         #expect(range?.end == 99)
         #expect(range?.length == 100)
     }
-
-    // MARK: - Suffix Range Tests (bytes=-length)
 
     @Test("Parse suffix range - bytes=-10")
     func testParseSuffixRange() {
@@ -106,8 +100,6 @@ struct S3RangeParserTests {
         #expect(range?.length == 100)
     }
 
-    // MARK: - Content-Range Header Tests
-
     @Test("Content-Range header format")
     func testContentRangeFormat() {
         let range = ByteRange(start: 0, end: 9)
@@ -123,8 +115,6 @@ struct S3RangeParserTests {
 
         #expect(header == "bytes 90-99/100")
     }
-
-    // MARK: - Invalid Range Tests
 
     @Test("Invalid range - missing bytes= prefix")
     func testInvalidRangeMissingPrefix() {
@@ -162,8 +152,6 @@ struct S3RangeParserTests {
         #expect(range == nil)
     }
 
-    // MARK: - Edge Cases
-
     @Test("Edge case - single byte range")
     func testEdgeCaseSingleByte() {
         let range = S3RangeParser.parseRangeHeader("bytes=0-0", fileSize: 100)
@@ -199,8 +187,6 @@ struct S3RangeParserTests {
         let range = S3RangeParser.parseRangeHeader("bytes=0-0", fileSize: 0)
         #expect(range == nil)
     }
-
-    // MARK: - Validation Tests
 
     @Test("Validate range within file bounds")
     func testValidateRangeValid() {

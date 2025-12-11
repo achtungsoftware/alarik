@@ -20,4 +20,5 @@ import Vapor
 struct DownloadRequestDTO: Content {
     var bucket: String
     var keys: [String]
+    var versionId: String?
 }

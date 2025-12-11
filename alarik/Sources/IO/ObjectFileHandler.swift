@@ -174,7 +174,7 @@ struct ObjectFileHandler {
         return true
     }
 
-    /// Checks if a bucket contains any objects.
+    /// Checks if a bucket contains any objects (including versioned objects).
     static func hasBucketObjects(bucketName: String) -> Bool {
         let bucketURL = BucketHandler.bucketURL(for: bucketName)
 
@@ -192,7 +192,7 @@ struct ObjectFileHandler {
             return false
         }
 
-        // Check if there's at least one .obj file
+        // Check if there's at least one .obj file (either versioned or non-versioned)
         for case let fileURL as URL in enumerator {
             if fileURL.pathExtension == "obj" {
                 return true
@@ -280,6 +280,7 @@ struct ObjectFileHandler {
     }
 
     /// Lists all objects in a bucket with optional prefix filtering
+    /// This method returns the LATEST version of each object (or the non-versioned object)
     static func listObjects(
         bucketName: String,
         prefix: String = "",
@@ -305,10 +306,12 @@ struct ObjectFileHandler {
             return ([], [], false, nil)
         }
 
-        var allObjects: [(key: String, meta: ObjectMeta)] = []
+        // Track unique keys - we'll need to look up the latest version for each
+        var versionedKeys: Set<String> = []
+        var nonVersionedKeys: Set<String> = []
         var commonPrefixesSet: Set<String> = []
 
-        // Collect all objects
+        // First pass: collect all unique keys and common prefixes
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "obj" else { continue }
 
@@ -318,8 +321,21 @@ struct ObjectFileHandler {
                 with: ""
             )
 
-            // Remove .obj extension to get the key
-            let key = String(relativePath.dropLast(4))
+            // Parse the path to determine the object key
+            let key: String
+            let isVersioned: Bool
+
+            if relativePath.contains(".versions/") {
+                // Versioned path: key.versions/versionId.obj
+                // Extract the key by removing .versions/... suffix
+                let parts = relativePath.components(separatedBy: ".versions/")
+                key = parts[0]
+                isVersioned = true
+            } else {
+                // Non-versioned path: key.obj
+                key = String(relativePath.dropLast(4))
+                isVersioned = false
+            }
 
             // Apply prefix filter
             if !prefix.isEmpty && !key.hasPrefix(prefix) {
@@ -333,9 +349,8 @@ struct ObjectFileHandler {
 
             // Handle delimiter (for directory-like listing)
             if let delimiter = delimiter, !delimiter.isEmpty {
-                // Only support single-character delimiters (like S3: usually "/")
                 guard delimiter.count == 1, let delimChar = delimiter.first else {
-                    continue  // or throw – invalid delimiter
+                    continue
                 }
 
                 let keyAfterPrefix = String(key.dropFirst(prefix.count))
@@ -347,24 +362,69 @@ struct ObjectFileHandler {
                 }
             }
 
-            // Read metadata
+            // Track this key
+            if isVersioned {
+                versionedKeys.insert(key)
+            } else {
+                nonVersionedKeys.insert(key)
+            }
+        }
+
+        // Second pass: read the latest version for each key
+        var latestByKey: [String: ObjectMeta] = [:]
+
+        // Process versioned keys - use the .latest pointer to find the latest version
+        for key in versionedKeys {
             do {
-                let (meta, _) = try read(from: fileURL.path, loadData: false)
-                allObjects.append((key: key, meta: meta))
+                // Try to read the latest version using the .latest pointer
+                let (meta, _) = try readVersion(
+                    bucketName: bucketName,
+                    key: key,
+                    versionId: nil,  // nil means "get latest"
+                    loadData: false
+                )
+
+                // Skip delete markers
+                if meta.isDeleteMarker {
+                    continue
+                }
+
+                latestByKey[key] = meta
             } catch {
-                // Skip objects with read errors
+                // If we can't read the latest, skip this key
                 continue
             }
         }
 
-        // Sort objects by key
+        // Process non-versioned keys (only if not already covered by versioned)
+        for key in nonVersionedKeys {
+            if latestByKey[key] != nil {
+                continue  // Already have a versioned latest
+            }
+
+            let path = storagePath(for: bucketName, key: key)
+            do {
+                let (meta, _) = try read(from: path, loadData: false)
+
+                // Skip delete markers
+                if meta.isDeleteMarker {
+                    continue
+                }
+
+                latestByKey[key] = meta
+            } catch {
+                continue
+            }
+        }
+
+        // Convert to array and sort
+        var allObjects: [(key: String, meta: ObjectMeta)] = latestByKey.map { ($0.key, $0.value) }
         allObjects.sort { $0.key < $1.key }
 
         // Sort common prefixes
         let sortedCommonPrefixes = commonPrefixesSet.sorted()
 
         // S3 behavior: maxKeys limits the TOTAL number of keys + common prefixes returned
-        // We need to interleave objects and common prefixes in sorted order, then limit
         var finalObjects: [ObjectMeta] = []
         var finalCommonPrefixes: [String] = []
         var isTruncated = false
@@ -413,5 +473,511 @@ struct ObjectFileHandler {
         }
 
         return (finalObjects, finalCommonPrefixes, isTruncated, nextMarker)
+    }
+
+    /// Returns the base directory path for versioned objects
+    /// Structure: Storage/buckets/{bucket}/{key}/.versions/
+    static func versionedBasePath(for bucketName: String, key: String) -> String {
+        let encodedBucket =
+            bucketName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bucketName
+
+        let sanitizedKey: String
+        if key.contains("..") {
+            let components = key.components(separatedBy: "/")
+            sanitizedKey = components.map { $0.replacingOccurrences(of: "..", with: "") }.joined(
+                separator: "/")
+        } else {
+            sanitizedKey = key
+        }
+
+        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey).versions/"
+    }
+
+    /// Returns the path for a specific version of an object
+    static func versionedPath(for bucketName: String, key: String, versionId: String) -> String {
+        return "\(versionedBasePath(for: bucketName, key: key))\(versionId).obj"
+    }
+
+    /// Returns the path to the .latest file that tracks the current version
+    static func latestPointerPath(for bucketName: String, key: String) -> String {
+        return "\(versionedBasePath(for: bucketName, key: key)).latest"
+    }
+
+    /// Checks if an object has any versions (is versioned)
+    static func isVersioned(bucketName: String, key: String) -> Bool {
+        let basePath = versionedBasePath(for: bucketName, key: key)
+        return FileManager.default.fileExists(atPath: basePath)
+    }
+
+    /// Writes a versioned object. Returns the new version ID.
+    static func writeVersioned(
+        metadata: ObjectMeta,
+        data: Data,
+        bucketName: String,
+        key: String,
+        versioningStatus: VersioningStatus
+    ) throws -> String {
+        let versionId: String
+        let path: String
+
+        switch versioningStatus {
+        case .enabled:
+            // Generate a new version ID and store in versioned directory
+            versionId = ObjectMeta.generateVersionId()
+            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+            // Mark all existing versions as not latest
+            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+
+        case .suspended:
+            // Use "null" as version ID, overwrite any existing null version
+            versionId = "null"
+            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+            // Mark all existing versions as not latest
+            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+
+        case .disabled:
+            // No versioning - use the old single-file path
+            // If there are existing versions, this is an error state
+            // For simplicity, we just write to the non-versioned path
+            versionId = "null"
+            path = storagePath(for: bucketName, key: key)
+        }
+
+        // Create metadata with version info
+        var versionedMeta = metadata
+        versionedMeta.versionId = versionId
+        versionedMeta.isLatest = true
+        versionedMeta.isDeleteMarker = false
+
+        // Write the object
+        try write(metadata: versionedMeta, data: data, to: path)
+
+        // Update the .latest pointer (only for versioned objects)
+        if versioningStatus != .disabled {
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+        }
+
+        return versionId
+    }
+
+    /// Reads a specific version of an object, or the latest if versionId is nil
+    static func readVersion(
+        bucketName: String,
+        key: String,
+        versionId: String?,
+        loadData: Bool = true,
+        range: (start: Int, end: Int)? = nil
+    ) throws -> (ObjectMeta, Data?) {
+        let path: String
+
+        if let versionId = versionId {
+            // Read specific version
+            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+        } else if isVersioned(bucketName: bucketName, key: key) {
+            // Read latest version from versioned storage
+            guard let latestVersionId = try getLatestVersionId(bucketName: bucketName, key: key) else {
+                throw NSError(
+                    domain: "ObjectNotFound", code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "No versions found for object"])
+            }
+            path = versionedPath(for: bucketName, key: key, versionId: latestVersionId)
+        } else {
+            // Non-versioned object - use old path
+            path = storagePath(for: bucketName, key: key)
+        }
+
+        return try read(from: path, loadData: loadData, range: range)
+    }
+
+    /// Gets the latest version ID for a key
+    static func getLatestVersionId(bucketName: String, key: String) throws -> String? {
+        let pointerPath = latestPointerPath(for: bucketName, key: key)
+
+        guard FileManager.default.fileExists(atPath: pointerPath) else {
+            return nil
+        }
+
+        let versionId = try String(contentsOfFile: pointerPath, encoding: .utf8).trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        return versionId.isEmpty ? nil : versionId
+    }
+
+    /// Updates the .latest pointer file
+    static func updateLatestPointer(bucketName: String, key: String, versionId: String) throws {
+        let pointerPath = latestPointerPath(for: bucketName, key: key)
+        let pointerURL = URL(fileURLWithPath: pointerPath)
+
+        // Ensure directory exists
+        let dirURL = pointerURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: dirURL.path) {
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        }
+
+        try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
+    }
+
+    /// Marks all versions of an object as not latest
+    static func markAllVersionsNotLatest(bucketName: String, key: String) throws {
+        let basePath = versionedBasePath(for: bucketName, key: key)
+        let baseURL = URL(fileURLWithPath: basePath)
+
+        guard FileManager.default.fileExists(atPath: basePath) else {
+            return
+        }
+
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: baseURL, includingPropertiesForKeys: nil)
+
+        for fileURL in contents where fileURL.pathExtension == "obj" {
+            do {
+                let (meta, data) = try read(from: fileURL.path, loadData: true)
+                if meta.isLatest {
+                    var updatedMeta = meta
+                    updatedMeta.isLatest = false
+                    try write(metadata: updatedMeta, data: data ?? Data(), to: fileURL.path)
+                }
+            } catch {
+                // Skip files we can't read
+                continue
+            }
+        }
+    }
+
+    /// Lists all versions of an object
+    static func listVersions(
+        bucketName: String,
+        key: String
+    ) throws -> [ObjectMeta] {
+        var versions: [ObjectMeta] = []
+
+        // Check versioned storage first
+        let basePath = versionedBasePath(for: bucketName, key: key)
+        if FileManager.default.fileExists(atPath: basePath) {
+            let baseURL = URL(fileURLWithPath: basePath)
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: baseURL, includingPropertiesForKeys: nil)
+
+            for fileURL in contents where fileURL.pathExtension == "obj" {
+                do {
+                    let (meta, _) = try read(from: fileURL.path, loadData: false)
+                    versions.append(meta)
+                } catch {
+                    continue
+                }
+            }
+        }
+
+        // Also check non-versioned path (for objects created before versioning was enabled)
+        let nonVersionedPath = storagePath(for: bucketName, key: key)
+        if FileManager.default.fileExists(atPath: nonVersionedPath) {
+            do {
+                let (meta, _) = try read(from: nonVersionedPath, loadData: false)
+                // Only add if not already in versions (by versionId)
+                if !versions.contains(where: { $0.versionId == meta.versionId }) {
+                    versions.append(meta)
+                }
+            } catch {
+                // Ignore errors
+            }
+        }
+
+        // Sort by updatedAt descending (newest first)
+        versions.sort { $0.updatedAt > $1.updatedAt }
+
+        return versions
+    }
+
+    /// Lists all versions across all keys in a bucket
+    static func listAllVersions(
+        bucketName: String,
+        prefix: String = "",
+        delimiter: String? = nil,
+        keyMarker: String? = nil,
+        versionIdMarker: String? = nil,
+        maxKeys: Int = 1000
+    ) throws -> (
+        versions: [ObjectMeta],
+        deleteMarkers: [ObjectMeta],
+        commonPrefixes: [String],
+        isTruncated: Bool,
+        nextKeyMarker: String?,
+        nextVersionIdMarker: String?
+    ) {
+        let bucketURL = BucketHandler.bucketURL(for: bucketName)
+
+        guard FileManager.default.fileExists(atPath: bucketURL.path) else {
+            return ([], [], [], false, nil, nil)
+        }
+
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: bucketURL,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return ([], [], [], false, nil, nil)
+        }
+
+        var allVersions: [ObjectMeta] = []
+        var allDeleteMarkers: [ObjectMeta] = []
+        var commonPrefixSet: Set<String> = []
+
+        // Collect all .obj files (both versioned and non-versioned)
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension == "obj" else { continue }
+
+            // Parse the path to get key and version info
+            let relativePath = fileURL.path.replacingOccurrences(
+                of: bucketURL.path + "/",
+                with: ""
+            )
+
+            // Determine if this is a versioned path
+            var objectKey: String
+            if relativePath.contains(".versions/") {
+                // Versioned path: key.versions/versionId.obj
+                let parts = relativePath.components(separatedBy: ".versions/")
+                objectKey = parts[0]
+            } else {
+                // Non-versioned path: key.obj
+                objectKey = String(relativePath.dropLast(4))
+            }
+
+            // Apply prefix filter
+            if !prefix.isEmpty && !objectKey.hasPrefix(prefix) {
+                continue
+            }
+
+            // Handle delimiter for folder-like navigation
+            if let delimiter = delimiter, !delimiter.isEmpty, let delimiterChar = delimiter.first {
+                // Get the part after prefix
+                let afterPrefix = String(objectKey.dropFirst(prefix.count))
+
+                // Check if there's a delimiter in the remaining path
+                if let delimiterIndex = afterPrefix.firstIndex(of: delimiterChar) {
+                    // This is a "folder" - extract the common prefix
+                    let folderPrefix = prefix + String(afterPrefix[..<afterPrefix.index(after: delimiterIndex)])
+                    commonPrefixSet.insert(folderPrefix)
+                    continue  // Don't include this as a version entry
+                }
+            }
+
+            // Read metadata
+            do {
+                let (meta, _) = try read(from: fileURL.path, loadData: false)
+
+                // Apply marker filtering
+                if let keyMarker = keyMarker {
+                    if meta.key < keyMarker {
+                        continue
+                    }
+                    if meta.key == keyMarker, let versionIdMarker = versionIdMarker {
+                        if let versionId = meta.versionId, versionId <= versionIdMarker {
+                            continue
+                        }
+                    }
+                }
+
+                if meta.isDeleteMarker {
+                    allDeleteMarkers.append(meta)
+                } else {
+                    allVersions.append(meta)
+                }
+            } catch {
+                continue
+            }
+        }
+
+        // Sort by key, then by updatedAt descending
+        allVersions.sort {
+            if $0.key != $1.key {
+                return $0.key < $1.key
+            }
+            return $0.updatedAt > $1.updatedAt
+        }
+
+        allDeleteMarkers.sort {
+            if $0.key != $1.key {
+                return $0.key < $1.key
+            }
+            return $0.updatedAt > $1.updatedAt
+        }
+
+        // Sort common prefixes
+        let sortedCommonPrefixes = commonPrefixSet.sorted()
+
+        // Apply maxKeys limit
+        let totalCount = allVersions.count + allDeleteMarkers.count
+        let isTruncated = totalCount > maxKeys
+
+        var limitedVersions = allVersions
+        var limitedDeleteMarkers = allDeleteMarkers
+
+        if isTruncated {
+            // Merge and limit
+            var combined: [(meta: ObjectMeta, isDeleteMarker: Bool)] = []
+            combined.append(contentsOf: allVersions.map { ($0, false) })
+            combined.append(contentsOf: allDeleteMarkers.map { ($0, true) })
+
+            combined.sort {
+                if $0.meta.key != $1.meta.key {
+                    return $0.meta.key < $1.meta.key
+                }
+                return $0.meta.updatedAt > $1.meta.updatedAt
+            }
+
+            let limited = Array(combined.prefix(maxKeys))
+            limitedVersions = limited.filter { !$0.isDeleteMarker }.map { $0.meta }
+            limitedDeleteMarkers = limited.filter { $0.isDeleteMarker }.map { $0.meta }
+        }
+
+        // Get next markers
+        var nextKeyMarker: String? = nil
+        var nextVersionIdMarker: String? = nil
+
+        if isTruncated {
+            // Find the last item to get next markers
+            let lastVersion = limitedVersions.last
+            let lastDeleteMarker = limitedDeleteMarkers.last
+
+            if let lv = lastVersion, let ldm = lastDeleteMarker {
+                if lv.key > ldm.key || (lv.key == ldm.key && lv.updatedAt < ldm.updatedAt) {
+                    nextKeyMarker = lv.key
+                    nextVersionIdMarker = lv.versionId
+                } else {
+                    nextKeyMarker = ldm.key
+                    nextVersionIdMarker = ldm.versionId
+                }
+            } else if let lv = lastVersion {
+                nextKeyMarker = lv.key
+                nextVersionIdMarker = lv.versionId
+            } else if let ldm = lastDeleteMarker {
+                nextKeyMarker = ldm.key
+                nextVersionIdMarker = ldm.versionId
+            }
+        }
+
+        return (limitedVersions, limitedDeleteMarkers, sortedCommonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker)
+    }
+
+    /// Deletes a specific version of an object
+    static func deleteVersion(bucketName: String, key: String, versionId: String) throws {
+        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw NSError(
+                domain: "ObjectNotFound", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "Version does not exist"])
+        }
+
+        // Check if this is the latest version
+        let isLatest = try getLatestVersionId(bucketName: bucketName, key: key) == versionId
+
+        // Delete the version file
+        try FileManager.default.removeItem(atPath: path)
+
+        // If we deleted the latest version, update the pointer to the next most recent
+        if isLatest {
+            try updateLatestToMostRecent(bucketName: bucketName, key: key)
+        }
+
+        // Clean up empty directories
+        try cleanupEmptyVersionsDirectory(bucketName: bucketName, key: key)
+    }
+
+    /// Creates a delete marker (soft delete for versioned buckets)
+    static func createDeleteMarker(bucketName: String, key: String) throws -> ObjectMeta {
+        let versionId = ObjectMeta.generateVersionId()
+        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+        // Mark all existing versions as not latest
+        try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+
+        // Create delete marker metadata
+        let meta = ObjectMeta(
+            bucketName: bucketName,
+            key: key,
+            size: 0,
+            contentType: "",
+            etag: "",
+            updatedAt: Date(),
+            versionId: versionId,
+            isLatest: true,
+            isDeleteMarker: true
+        )
+
+        // Write empty data with delete marker metadata
+        try write(metadata: meta, data: Data(), to: path)
+
+        // Update latest pointer
+        try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+
+        return meta
+    }
+
+    /// Updates the .latest pointer to the most recent non-deleted version
+    private static func updateLatestToMostRecent(bucketName: String, key: String) throws {
+        let versions = try listVersions(bucketName: bucketName, key: key)
+
+        // Find the most recent version (already sorted by updatedAt descending)
+        if let mostRecent = versions.first {
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
+
+            // Update the metadata to mark it as latest
+            let path = versionedPath(for: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
+            if FileManager.default.fileExists(atPath: path) {
+                let (meta, data) = try read(from: path, loadData: true)
+                var updatedMeta = meta
+                updatedMeta.isLatest = true
+                try write(metadata: updatedMeta, data: data ?? Data(), to: path)
+            }
+        } else {
+            // No versions left, remove the .latest pointer
+            let pointerPath = latestPointerPath(for: bucketName, key: key)
+            try? FileManager.default.removeItem(atPath: pointerPath)
+        }
+    }
+
+    /// Cleans up empty .versions directories
+    private static func cleanupEmptyVersionsDirectory(bucketName: String, key: String) throws {
+        let basePath = versionedBasePath(for: bucketName, key: key)
+        let baseURL = URL(fileURLWithPath: basePath)
+
+        guard FileManager.default.fileExists(atPath: basePath) else {
+            return
+        }
+
+        let contents = try FileManager.default.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: nil)
+
+        // Check if only .latest file remains or directory is empty
+        let objFiles = contents.filter { $0.pathExtension == "obj" }
+        if objFiles.isEmpty {
+            // Remove the entire .versions directory
+            try? FileManager.default.removeItem(at: baseURL)
+        }
+    }
+
+    /// Checks if a versioned object exists (has any versions or a non-versioned file)
+    static func versionedKeyExists(bucketName: String, key: String, versionId: String? = nil) -> Bool {
+        if let versionId = versionId {
+            // Check specific version
+            let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+            return FileManager.default.fileExists(atPath: path)
+        }
+
+        // Check for any version
+        if isVersioned(bucketName: bucketName, key: key) {
+            // Has versioned storage - check if there's a latest version
+            if let _ = try? getLatestVersionId(bucketName: bucketName, key: key) {
+                return true
+            }
+        }
+
+        // Check non-versioned path
+        let nonVersionedPath = storagePath(for: bucketName, key: key)
+        return FileManager.default.fileExists(atPath: nonVersionedPath)
     }
 }

@@ -547,8 +547,6 @@ struct ObjectFileHandlerTests {
         try ObjectFileHandler.write(metadata: metadata, data: data, to: path)
     }
 
-    // MARK: - Basic Tests
-
     @Test("List objects in empty bucket returns empty list")
     func listObjectsEmptyBucket() throws {
         let bucketName = try createTestBucket()
@@ -615,8 +613,6 @@ struct ObjectFileHandlerTests {
         #expect(objects[2].key == "zebra.txt")
     }
 
-    // MARK: - Prefix Filter Tests
-
     @Test("List objects with prefix returns only matching objects")
     func listObjectsWithPrefix() throws {
         let bucketName = try createTestBucket()
@@ -667,8 +663,6 @@ struct ObjectFileHandlerTests {
 
         #expect(objects.count == 2)
     }
-
-    // MARK: - Delimiter Tests
 
     @Test("List objects with delimiter groups directories")
     func listObjectsWithDelimiter() throws {
@@ -755,8 +749,6 @@ struct ObjectFileHandlerTests {
         #expect(commonPrefixes[1] == "beta/")
         #expect(commonPrefixes[2] == "zebra/")
     }
-
-    // MARK: - MaxKeys and Pagination Tests
 
     @Test("List objects respects maxKeys limit")
     func listObjectsMaxKeys() throws {
@@ -849,8 +841,6 @@ struct ObjectFileHandlerTests {
         #expect(isTruncated == false)
         #expect(nextMarker == nil)
     }
-
-    // MARK: - Edge Cases
 
     @Test("List objects with special characters in keys")
     func listObjectsWithSpecialCharacters() throws {
@@ -991,8 +981,6 @@ struct ObjectFileHandlerTests {
         #expect(objects[0].key == longKey)
     }
 
-    // MARK: - Performance Tests
-
     @Test("List objects with large number of objects")
     func listObjectsLargeNumberOfObjects() throws {
         let bucketName = try createTestBucket()
@@ -1016,8 +1004,6 @@ struct ObjectFileHandlerTests {
         #expect(objects.count == 100)
         #expect(duration < 1.0)  // Should complete within 1 second
     }
-
-    // MARK: - Combined Filter Tests
 
     @Test("List objects with prefix, delimiter, and maxKeys - prefixes first")
     func listObjectsCombinedFilters() throws {

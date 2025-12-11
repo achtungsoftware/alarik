@@ -564,7 +564,7 @@ async function handleFolderUpload(event: Event) {
 }
 </script>
 <template>
-    <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" />
+    <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
 
     <ConfirmationDialog confirmLabel="Delete" v-model:isShowing="openDeletionModal" :title="`Delete ${deletionCounts.total} Item${deletionCounts.total !== 1 ? 's' : ''}`" :onConfirm="deleteMany" :message="deletionCounts.fileCount > 0 && deletionCounts.folderCount > 0 ? `Do you really want to delete ${deletionCounts.fileCount} file${deletionCounts.fileCount !== 1 ? 's' : ''} and ${deletionCounts.folderCount} folder${deletionCounts.folderCount !== 1 ? 's' : ''}? This action cannot be undone.` : deletionCounts.folderCount > 0 ? `Do you really want to delete ${deletionCounts.folderCount} folder${deletionCounts.folderCount !== 1 ? 's' : ''} and all files within? This action cannot be undone.` : `Do you really want to delete ${deletionCounts.fileCount} file${deletionCounts.fileCount !== 1 ? 's' : ''}? This action cannot be undone.`" />
 

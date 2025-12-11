@@ -47,7 +47,9 @@ struct S3Service {
     }
 
     static func extractObjectKey(from req: Request) -> String {
-        req.parameters.getCatchall().joined(separator: "/")
+        let key = req.parameters.getCatchall().joined(separator: "/")
+        // URL-decode the key in case the client sent encoded characters
+        return key.removingPercentEncoding ?? key
     }
 
     static func verifyBucketExists(_ bucketName: String, requestId: String) async throws {
@@ -111,6 +113,10 @@ struct S3Service {
         response.headers.add(name: "ETag", value: "\"\(meta.etag)\"")
         response.headers.add(name: "Last-Modified", value: meta.updatedAt.rfc1123String)
         response.headers.add(name: "Accept-Ranges", value: "bytes")
+
+        for (key, value) in meta.metadata {
+            response.headers.add(name: "x-amz-meta-\(key)", value: value)
+        }
 
         if let range = range {
             response.headers.add(
@@ -436,19 +442,129 @@ struct S3Service {
     }
 
     static func shouldHandleSubresource(query: String) -> Bool {
-        query.lowercased().contains("location") || query.contains("policy")
+        let lowerQuery = query.lowercased()
+        return lowerQuery.contains("location")
+            || lowerQuery.contains("policy")
+            || lowerQuery.contains("versioning")
+            || lowerQuery.contains("versions")
     }
 
-    static func handleSubresourceQuery(query: String, req: Request) throws -> Response? {
-        if query.lowercased().contains("location") {
+    static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
+        -> Response?
+    {
+        let lowerQuery = query.lowercased()
+
+        if lowerQuery.contains("location") {
             return handleLocationQuery(req: req)
         }
 
-        if query.contains("policy") {
+        if lowerQuery.contains("policy") {
             return try handlePolicyQuery(req: req)
         }
 
+        // Handle versioning configuration (GET only - PUT handled in controller)
+        if lowerQuery.contains("versioning") && !lowerQuery.contains("versions") {
+            return handleVersioningGet(bucket: bucket)
+        }
+
+        // Note: ?versions is handled in the controller for list versions
+
         return nil
+    }
+
+    /// Handles GET ?versioning - returns bucket versioning configuration
+    static func handleVersioningGet(bucket: Bucket?) -> Response {
+        let status = bucket?.versioningStatus ?? VersioningStatus.disabled.rawValue
+
+        print(
+            "[handleVersioningGet] bucket=\(bucket?.name ?? "nil") versioningStatus='\(bucket?.versioningStatus ?? "nil")' status='\(status)'"
+        )
+
+        // S3 returns empty VersioningConfiguration for buckets that have never had versioning enabled
+        let statusElement: String
+        if status == VersioningStatus.disabled.rawValue {
+            statusElement = ""
+        } else {
+            statusElement = "<Status>\(status)</Status>"
+        }
+
+        let xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\(statusElement)</VersioningConfiguration>"
+        print("[handleVersioningGet] xml='\(xml)'")
+        return buildXMLResponse(data: Data(xml.utf8))
+    }
+
+    /// Builds the ListVersionsResult XML response
+    static func buildListVersionsResponse(
+        bucketName: String,
+        prefix: String,
+        delimiter: String?,
+        keyMarker: String?,
+        versionIdMarker: String?,
+        maxKeys: Int,
+        versions: [ObjectMeta],
+        deleteMarkers: [ObjectMeta],
+        commonPrefixes: [String],
+        isTruncated: Bool,
+        nextKeyMarker: String?,
+        nextVersionIdMarker: String?
+    ) throws -> Data {
+        let encoder = XMLEncoder()
+        encoder.outputFormatting = .prettyPrinted
+
+        let versionEntries = versions.map { VersionEntry(from: $0) }
+        let deleteMarkerEntries = deleteMarkers.map { DeleteMarkerEntry(from: $0) }
+        let commonPrefixEntries = commonPrefixes.map { CommonPrefix(prefix: $0) }
+
+        let result = ListVersionsResult(
+            name: bucketName,
+            prefix: prefix,
+            delimiter: delimiter,
+            keyMarker: keyMarker,
+            versionIdMarker: versionIdMarker,
+            nextKeyMarker: isTruncated ? nextKeyMarker : nil,
+            nextVersionIdMarker: isTruncated ? nextVersionIdMarker : nil,
+            maxKeys: maxKeys,
+            isTruncated: isTruncated,
+            versions: versionEntries,
+            deleteMarkers: deleteMarkerEntries,
+            commonPrefixes: commonPrefixEntries
+        )
+
+        return try encoder.encode(
+            result, withRootKey: "ListVersionsResult",
+            rootAttributes: ["xmlns": "http://s3.amazonaws.com/doc/2006-03-01/"])
+    }
+
+    /// Adds version headers to a response
+    static func addVersionHeaders(to response: Response, meta: ObjectMeta) {
+        if let versionId = meta.versionId {
+            response.headers.add(name: "x-amz-version-id", value: versionId)
+        }
+        if meta.isDeleteMarker {
+            response.headers.add(name: "x-amz-delete-marker", value: "true")
+        }
+    }
+
+    /// Builds object metadata response with version headers
+    static func buildVersionedObjectMetadataResponse(
+        meta: ObjectMeta,
+        status: HTTPStatus = .ok,
+        includeBody: Bool = false,
+        data: Data? = nil,
+        range: ByteRange? = nil
+    ) -> Response {
+        let response = buildObjectMetadataResponse(
+            meta: meta,
+            status: status,
+            includeBody: includeBody,
+            data: data,
+            range: range
+        )
+
+        addVersionHeaders(to: response, meta: meta)
+
+        return response
     }
 
     static func authenticateWithCache(

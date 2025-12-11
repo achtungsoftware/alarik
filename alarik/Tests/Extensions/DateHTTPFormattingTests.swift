@@ -22,8 +22,6 @@ import Testing
 @Suite("Date HTTP Formatting Tests", .serialized)
 struct DateHTTPFormattingTests {
 
-    // MARK: - RFC 1123 Formatting Tests
-
     @Test("RFC 1123 formatting produces correct format")
     func rfc1123Formatting() {
         var components = DateComponents()
@@ -78,8 +76,6 @@ struct DateHTTPFormattingTests {
         #expect(formatted == "Wed, 31 Dec 2025 00:00:00 GMT")
     }
 
-    // MARK: - ISO8601 Formatting Tests
-
     @Test("ISO8601 formatting produces correct format")
     func iso8601Formatting() {
         var components = DateComponents()
@@ -118,8 +114,6 @@ struct DateHTTPFormattingTests {
         #expect(formatted == "2025-01-15T12:30:45.000Z")
     }
 
-    // MARK: - RFC 1123 Parsing Tests
-
     @Test("RFC 1123 parsing works correctly")
     func rfc1123Parsing() {
         let date = Date.fromHTTPDateString("Sun, 06 Nov 1994 08:49:37 GMT")
@@ -154,8 +148,6 @@ struct DateHTTPFormattingTests {
         #expect(Date.fromHTTPDateString("Sun, 06 Nov 1994 08:49:37") == nil)  // Missing GMT
         #expect(Date.fromHTTPDateString("Sun, 32 Nov 1994 08:49:37 GMT") == nil)  // Invalid day
     }
-
-    // MARK: - RFC 850 Parsing Tests
 
     @Test("RFC 850 parsing works correctly")
     func rfc850Parsing() {
@@ -196,8 +188,6 @@ struct DateHTTPFormattingTests {
         #expect(Date.fromHTTPDateString("Sunday, 32-Nov-94 08:49:37 GMT") == nil)  // Invalid day
     }
 
-    // MARK: - ANSI C Parsing Tests
-
     @Test("ANSI C parsing works correctly")
     func ansiCParsing() {
         let date = Date.fromHTTPDateString("Sun Nov  6 08:49:37 1994")
@@ -230,8 +220,6 @@ struct DateHTTPFormattingTests {
         #expect(Date.fromHTTPDateString("Sun Nov 6 08:49:37") == nil)  // Missing year
         #expect(Date.fromHTTPDateString("Sun Xyz  6 08:49:37 1994") == nil)  // Invalid month
     }
-
-    // MARK: - Round-trip Tests
 
     @Test("RFC 1123 format round-trip")
     func rfc1123RoundTrip() {
@@ -278,8 +266,6 @@ struct DateHTTPFormattingTests {
         #expect(formatted.contains(".500Z"))
         #expect(formatted.hasPrefix("2025-06-15T14:30:45"))
     }
-
-    // MARK: - Edge Cases
 
     @Test("Whitespace trimming in parsing")
     func whitespaceTrimming() {

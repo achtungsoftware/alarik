@@ -18,8 +18,10 @@ declare global {
     export interface Bucket {
         name: string;
         creationDate: string;
+        versioningStatus: string;
     }
 
+    // ObjectMeta.ResponseDTO
     export interface BrowserItem {
         key: string;
         size: number;
@@ -28,6 +30,9 @@ declare global {
         lastModified: string;
         isFolder: boolean;
         isBucket?: boolean;
+        versionId?: string;
+        isLatest?: boolean;
+        isDeleteMarker?: boolean;
     }
 
     export interface AccessKey {

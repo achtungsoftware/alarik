@@ -21,14 +21,28 @@ import XMLCoder
 import ZIPFoundation
 
 struct InternalBucketController: RouteCollection {
+    struct UploadInput: Content {
+        let data: File
+    }
+
+    struct VersioningStatusDTO: Content {
+        let status: String
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
         routes.grouped("buckets").grouped(":bucketName").delete(use: self.deleteBucket)
+        routes.grouped("buckets").grouped(":bucketName").grouped("versioning").get(
+            use: self.getVersioning)
+        routes.grouped("buckets").grouped(":bucketName").grouped("versioning").put(
+            use: self.setVersioning)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects").post(use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
+        routes.grouped("objects", "versions").get(use: self.listObjectVersions)
+        routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
     }
 
     @Sendable
@@ -49,7 +63,8 @@ struct InternalBucketController: RouteCollection {
         let create: Bucket.Create = try req.content.decode(Bucket.Create.self)
 
         try await BucketService.create(
-            on: req.db, bucketName: create.name, userId: sessionToken.userId)
+            on: req.db, bucketName: create.name, userId: sessionToken.userId,
+            versioningEnabled: create.versioningEnabled)
 
         // Fetch the created bucket from the database to get the ID
         guard
@@ -160,10 +175,6 @@ struct InternalBucketController: RouteCollection {
         )
     }
 
-    struct UploadInput: Content {
-        var data: File
-    }
-
     @Sendable
     func uploadObject(req: Request) async throws -> ObjectMeta.ResponseDTO {
         let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
@@ -202,7 +213,7 @@ struct InternalBucketController: RouteCollection {
         let etag = Insecure.MD5.hash(data: fileData).hex
 
         // Create object metadata
-        let meta = ObjectMeta(
+        var meta = ObjectMeta(
             bucketName: bucketName,
             key: keyPath,
             size: fileData.count,
@@ -211,9 +222,24 @@ struct InternalBucketController: RouteCollection {
             updatedAt: Date()
         )
 
-        // Write object to storage
-        let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-        try ObjectFileHandler.write(metadata: meta, data: fileData, to: path)
+        // Get bucket versioning status from cache
+        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+
+        // Write object with versioning support
+        if versioningStatus != .disabled {
+            let versionId = try ObjectFileHandler.writeVersioned(
+                metadata: meta,
+                data: fileData,
+                bucketName: bucketName,
+                key: keyPath,
+                versioningStatus: versioningStatus
+            )
+            meta.versionId = versionId
+            meta.isLatest = true
+        } else {
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+            try ObjectFileHandler.write(metadata: meta, data: fileData, to: path)
+        }
 
         return ObjectMeta.ResponseDTO(from: meta)
     }
@@ -240,12 +266,30 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
+        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+
         // Check if this is a folder (prefix) deletion
         if key.hasSuffix("/") {
             // Delete all objects with this prefix
             _ = try ObjectFileHandler.deletePrefix(bucketName: bucketName, prefix: key)
+        } else if versioningStatus == .enabled {
+            // Versioning enabled - create delete marker instead of permanent delete
+            _ = try ObjectFileHandler.createDeleteMarker(bucketName: bucketName, key: key)
         } else {
-            // Delete single object
+            // Versioning disabled or suspended - permanent delete
+            // Check versioned storage first
+            if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
+                // Delete all versions
+                let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+                for version in versions {
+                    if let vid = version.versionId {
+                        try? ObjectFileHandler.deleteVersion(
+                            bucketName: bucketName, key: key, versionId: vid)
+                    }
+                }
+            }
+
+            // Also delete non-versioned path if exists
             let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
             if FileManager.default.fileExists(atPath: path) {
                 try FileManager.default.removeItem(atPath: path)
@@ -277,26 +321,59 @@ struct InternalBucketController: RouteCollection {
         // If single file, download directly
         if input.keys.count == 1 && !input.keys[0].hasSuffix("/") {
             return try await downloadSingleFile(
-                req: req, bucketName: input.bucket, key: input.keys[0])
+                req: req, bucketName: input.bucket, key: input.keys[0], versionId: input.versionId)
         }
 
         // Multiple files or folders - create ZIP
         return try await downloadAsZip(req: req, bucketName: input.bucket, keys: input.keys)
     }
 
-    private func downloadSingleFile(req: Request, bucketName: String, key: String) async throws
+    private func downloadSingleFile(
+        req: Request, bucketName: String, key: String, versionId: String? = nil
+    ) async throws
         -> Response
     {
-        let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+        // Try versioned storage first, then fall back to non-versioned
+        let meta: ObjectMeta
+        let fileData: Data
 
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw Abort(.notFound, reason: "Object not found")
-        }
+        do {
+            let (m, data) = try ObjectFileHandler.readVersion(
+                bucketName: bucketName,
+                key: key,
+                versionId: versionId,
+                loadData: true
+            )
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+            // Check if latest version is a delete marker
+            if m.isDeleteMarker {
+                throw Abort(.notFound, reason: "Object not found")
+            }
 
-        guard let fileData = data else {
-            throw Abort(.internalServerError, reason: "Failed to read object data")
+            guard let d = data else {
+                throw Abort(.internalServerError, reason: "Failed to read object data")
+            }
+
+            meta = m
+            fileData = d
+        } catch let error as Abort {
+            throw error
+        } catch {
+            // Fall back to non-versioned path
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+
+            guard FileManager.default.fileExists(atPath: path) else {
+                throw Abort(.notFound, reason: "Object not found")
+            }
+
+            let (m, data) = try ObjectFileHandler.read(from: path, loadData: true)
+
+            guard let d = data else {
+                throw Abort(.internalServerError, reason: "Failed to read object data")
+            }
+
+            meta = m
+            fileData = d
         }
 
         let response = Response(status: .ok, body: .init(data: fileData))
@@ -335,6 +412,30 @@ struct InternalBucketController: RouteCollection {
 
         var addedFiles = 0
 
+        // Helper function to read object data (versioned or non-versioned)
+        func readObjectData(bucketName: String, key: String) -> Data? {
+            // Try versioned storage first
+            if let (meta, data) = try? ObjectFileHandler.readVersion(
+                bucketName: bucketName,
+                key: key,
+                versionId: nil,
+                loadData: true
+            ), !meta.isDeleteMarker, let fileData = data {
+                return fileData
+            }
+
+            // Fall back to non-versioned path
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            if FileManager.default.fileExists(atPath: path),
+                let (_, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                let fileData = data
+            {
+                return fileData
+            }
+
+            return nil
+        }
+
         for key in keys {
             if key.hasSuffix("/") {
                 // It's a folder - add all files with this prefix
@@ -346,38 +447,17 @@ struct InternalBucketController: RouteCollection {
                 )
 
                 for object in objects {
-                    let path = ObjectFileHandler.storagePath(for: bucketName, key: object.key)
-                    if FileManager.default.fileExists(atPath: path) {
-                        let (_, data) = try ObjectFileHandler.read(from: path, loadData: true)
-                        if let fileData = data {
-                            // Use relative path from the folder prefix
-                            let relativePath = String(object.key.dropFirst(key.count))
-                            let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
+                    // Skip delete markers
+                    if object.isDeleteMarker { continue }
 
-                            try archive.addEntry(
-                                with: zipEntryPath, type: .file,
-                                uncompressedSize: Int64(fileData.count),
-                                bufferSize: 4096,
-                                provider: { position, size in
-                                    let start = Int(position)
-                                    let end = min(start + size, fileData.count)
-                                    return fileData[start..<end]
-                                })
-                            addedFiles += 1
-                        }
-                    }
-                }
-            } else {
-                // Single file - use just the filename without path
-                let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-                if FileManager.default.fileExists(atPath: path) {
-                    let (_, data) = try ObjectFileHandler.read(from: path, loadData: true)
-                    if let fileData = data {
-                        // Extract just the filename from the full key path
-                        let filename = key.split(separator: "/").last.map(String.init) ?? key
+                    if let fileData = readObjectData(bucketName: bucketName, key: object.key) {
+                        // Use relative path from the folder prefix
+                        let relativePath = String(object.key.dropFirst(key.count))
+                        let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
 
                         try archive.addEntry(
-                            with: filename, type: .file, uncompressedSize: Int64(fileData.count),
+                            with: zipEntryPath, type: .file,
+                            uncompressedSize: Int64(fileData.count),
                             bufferSize: 4096,
                             provider: { position, size in
                                 let start = Int(position)
@@ -386,6 +466,22 @@ struct InternalBucketController: RouteCollection {
                             })
                         addedFiles += 1
                     }
+                }
+            } else {
+                // Single file - use just the filename without path
+                if let fileData = readObjectData(bucketName: bucketName, key: key) {
+                    // Extract just the filename from the full key path
+                    let filename = key.split(separator: "/").last.map(String.init) ?? key
+
+                    try archive.addEntry(
+                        with: filename, type: .file, uncompressedSize: Int64(fileData.count),
+                        bufferSize: 4096,
+                        provider: { position, size in
+                            let start = Int(position)
+                            let end = min(start + size, fileData.count)
+                            return fileData[start..<end]
+                        })
+                    addedFiles += 1
                 }
             }
         }
@@ -413,5 +509,115 @@ struct InternalBucketController: RouteCollection {
         )
 
         return response
+    }
+
+    @Sendable
+    func getVersioning(req: Request) async throws -> VersioningStatusDTO {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        // Verify bucket exists and belongs to user
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == sessionToken.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        return VersioningStatusDTO(status: bucket.versioningStatus)
+    }
+
+    @Sendable
+    func setVersioning(req: Request) async throws -> VersioningStatusDTO {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(VersioningStatusDTO.self)
+
+        guard let newStatus = VersioningStatus(rawValue: input.status) else {
+            throw Abort(
+                .badRequest,
+                reason: "Invalid versioning status. Use 'Enabled', 'Suspended', or 'Disabled'")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == sessionToken.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        bucket.versioningStatus = newStatus.rawValue
+        try await bucket.save(on: req.db)
+
+        await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
+
+        return VersioningStatusDTO(status: newStatus.rawValue)
+    }
+
+    @Sendable
+    func listObjectVersions(req: Request) async throws -> [ObjectMeta.ResponseDTO] {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"] else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' query parameter")
+        }
+
+        guard let key = req.query[String.self, at: "key"] else {
+            throw Abort(.badRequest, reason: "Missing 'key' query parameter")
+        }
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == sessionToken.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+
+        return versions.map { ObjectMeta.ResponseDTO(from: $0) }
+    }
+
+    @Sendable
+    func deleteObjectVersion(req: Request) async throws -> HTTPStatus {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"] else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' query parameter")
+        }
+
+        guard let key = req.query[String.self, at: "key"] else {
+            throw Abort(.badRequest, reason: "Missing 'key' query parameter")
+        }
+
+        guard let versionId = req.query[String.self, at: "versionId"] else {
+            throw Abort(.badRequest, reason: "Missing 'versionId' query parameter")
+        }
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == sessionToken.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        try ObjectFileHandler.deleteVersion(bucketName: bucketName, key: key, versionId: versionId)
+
+        return .noContent
     }
 }

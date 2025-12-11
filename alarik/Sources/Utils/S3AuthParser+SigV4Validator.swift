@@ -21,7 +21,7 @@ import Vapor
 
 /// Collapse consecutive whitespace to single space (replaces expensive regex)
 @inline(__always)
-fileprivate func collapseWhitespace(_ s: String) -> String {
+private func collapseWhitespace(_ s: String) -> String {
     var result = ""
     result.reserveCapacity(s.count)
     var lastWasWhitespace = false
@@ -39,7 +39,7 @@ fileprivate func collapseWhitespace(_ s: String) -> String {
     return result
 }
 
-fileprivate func getRequestValue(for header: String, request: Request) throws -> String {
+private func getRequestValue(for header: String, request: Request) throws -> String {
     if let h = request.headers.first(name: header) {
         return h
     } else if let q = request.query[String.self, at: header] {
@@ -50,7 +50,7 @@ fileprivate func getRequestValue(for header: String, request: Request) throws ->
         message: "Missing value for signed header: \(header)")
 }
 
-fileprivate func getRequestValues(for header: String, request: Request) -> [String] {
+private func getRequestValues(for header: String, request: Request) -> [String] {
     let hs = request.headers[header]
     if !hs.isEmpty {
         return hs
@@ -324,21 +324,23 @@ struct SigV4Validator {
             }
         }
 
-        // Derive signing key once (4 HMAC operations) - reused for both validation attempts
+        // Derive signing key once (4 HMAC operations) - reused for all validation attempts
         let kSigning = try deriveSigningKey(authInfo: authInfo)
 
-        // Try validation with sorted query params (AWS spec compliant clients like Cyberduck)
-        if try validateWithQuerySort(
-            request: request, authInfo: authInfo, sorted: true, signingKey: kSigning
-        ) {
-            return true
-        }
-
-        // Try validation with unsorted query params (Soto-AWS bug compatibility)
-        if try validateWithQuerySort(
-            request: request, authInfo: authInfo, sorted: false, signingKey: kSigning
-        ) {
-            return true
+        // Try multiple combinations to handle different client implementations:
+        // - sorted=true: AWS spec compliant query param sorting
+        // - sorted=false: Soto-AWS compatibility (preserves original order)
+        // - emptyValueEquals=true: AWS CLI style (?versioning=)
+        // - emptyValueEquals=false: Soto style (?versioning)
+        for sorted in [true, false] {
+            for emptyValueEquals in [true, false] {
+                if try validateWithQuerySort(
+                    request: request, authInfo: authInfo, sorted: sorted,
+                    emptyValueEquals: emptyValueEquals, signingKey: kSigning
+                ) {
+                    return true
+                }
+            }
         }
 
         return false
@@ -360,6 +362,7 @@ struct SigV4Validator {
         request: Request,
         authInfo: S3AuthInfo,
         sorted: Bool,
+        emptyValueEquals: Bool,
         signingKey: Data
     ) throws -> Bool {
         // Create canonical request
@@ -367,7 +370,8 @@ struct SigV4Validator {
             request: request,
             signedHeaders: authInfo.signedHeaders,
             isQueryAuth: authInfo.expires != nil,
-            sortQueryParams: sorted
+            sortQueryParams: sorted,
+            emptyValueEquals: emptyValueEquals
         )
 
         let stringToSign = createStringToSign(
@@ -404,7 +408,8 @@ struct SigV4Validator {
         request: Request,
         signedHeaders: [String],
         isQueryAuth: Bool,
-        sortQueryParams: Bool
+        sortQueryParams: Bool,
+        emptyValueEquals: Bool
     ) throws -> String {
         let method = request.method.rawValue
         // Canonical URI
@@ -459,15 +464,15 @@ struct SigV4Validator {
             }
 
             // Build canonical query string
-            // CRITICAL: Parameters with = but empty value need to keep the =
-            // e.g., "prefix=" not "prefix"
+            // Handle different client implementations:
+            // - AWS CLI sends ?versioning= (with equals)
+            // - Soto sends ?versioning (without equals)
             queryString = queryItems.map { item in
-                if item.hadEquals {
-                    // Had an = sign, so keep it even if value is empty
-                    return item.value.isEmpty ? "\(item.key)=" : "\(item.key)=\(item.value)"
+                if item.value.isEmpty {
+                    // Empty value - use emptyValueEquals flag to determine format
+                    return emptyValueEquals ? "\(item.key)=" : item.key
                 } else {
-                    // No = sign in original (e.g., ?versioning)
-                    return item.key
+                    return "\(item.key)=\(item.value)"
                 }
             }.joined(separator: "&")
         }
@@ -491,12 +496,14 @@ struct SigV4Validator {
 
         for header in sortedHeaders {
             // O(1) lookup instead of O(n) case-insensitive scan
-            let values = headerLookup[header] ?? {
-                if let q = request.query[String.self, at: header] {
-                    return [q]
-                }
-                return []
-            }()
+            let values =
+                headerLookup[header]
+                ?? {
+                    if let q = request.query[String.self, at: header] {
+                        return [q]
+                    }
+                    return []
+                }()
             let processed = values.map { value -> String in
                 let trimmed = value.trimmingCharacters(in: .whitespaces)
                 return collapseWhitespace(trimmed)

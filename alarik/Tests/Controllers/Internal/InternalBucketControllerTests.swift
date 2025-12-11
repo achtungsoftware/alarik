@@ -43,7 +43,7 @@ struct InternalBucketControllerTests {
     }
 
     private func createBucket(_ app: Application, token: String, name: String) async throws {
-        let createDTO = Bucket.Create(name: name)
+        let createDTO = Bucket.Create(name: name, versioningEnabled: false)
 
         try await app.test(
             .POST, "/api/v1/buckets",
@@ -175,13 +175,11 @@ struct InternalBucketControllerTests {
         }
     }
 
-    // MARK: - Create Bucket Tests
-
     @Test("Create bucket - Success")
     func testCreateBucketSuccess() async throws {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
-            let createDTO = Bucket.Create(name: "my-new-bucket")
+            let createDTO = Bucket.Create(name: "my-new-bucket", versioningEnabled: false)
 
             try await app.test(
                 .POST, "/api/v1/buckets",
@@ -202,7 +200,7 @@ struct InternalBucketControllerTests {
     @Test("Create bucket - Without auth fails")
     func testCreateBucketUnauthorized() async throws {
         try await withApp { app in
-            let createDTO = Bucket.Create(name: "test-bucket")
+            let createDTO = Bucket.Create(name: "test-bucket", versioningEnabled: false)
 
             try await app.test(
                 .POST, "/api/v1/buckets",
@@ -219,7 +217,7 @@ struct InternalBucketControllerTests {
     func testCreateBucketInvalidName() async throws {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
-            let createDTO = Bucket.Create(name: "Invalid_Bucket_Name!")
+            let createDTO = Bucket.Create(name: "Invalid_Bucket_Name!", versioningEnabled: false)
 
             try await app.test(
                 .POST, "/api/v1/buckets",
@@ -232,8 +230,6 @@ struct InternalBucketControllerTests {
                 })
         }
     }
-
-    // MARK: - Delete Bucket Tests
 
     @Test("Delete bucket - Success")
     func testDeleteBucketSuccess() async throws {
@@ -507,8 +503,6 @@ struct InternalBucketControllerTests {
                 })
         }
     }
-
-    // MARK: - List Objects Tests
 
     @Test("List objects - Without bucket param fails")
     func testListObjectsMissingBucket() async throws {
@@ -819,8 +813,6 @@ struct InternalBucketControllerTests {
         }
     }
 
-    // MARK: - Upload Object Tests
-
     @Test("Upload object - Success")
     func testUploadObjectSuccess() async throws {
         try await withApp { app in
@@ -1105,8 +1097,6 @@ struct InternalBucketControllerTests {
                 })
         }
     }
-
-    // MARK: - Delete Object Tests
 
     @Test("Delete object - Success")
     func testDeleteObjectSuccess() async throws {
@@ -1595,8 +1585,6 @@ struct InternalBucketControllerTests {
         }
     }
 
-    // MARK: - Download Object Tests
-
     @Test("Download single file - Success")
     func testDownloadSingleFileSuccess() async throws {
         try await withApp { app in
@@ -1897,6 +1885,744 @@ struct InternalBucketControllerTests {
 
                     let data = Data(buffer: res.body)
                     #expect(data.count > 0)
+                })
+        }
+    }
+
+    // MARK: - Versioning Tests
+
+    private func createVersionedBucket(_ app: Application, token: String, name: String)
+        async throws
+    {
+        let createDTO = Bucket.Create(name: name, versioningEnabled: true)
+
+        try await app.test(
+            .POST, "/api/v1/buckets",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                try req.content.encode(createDTO)
+            },
+            afterResponse: { res in
+                #expect(res.status == .ok)
+            })
+
+        // Load caches to ensure versioning is active
+        let loadCacheLifecycle = LoadCacheLifecycle()
+        try await loadCacheLifecycle.didBootAsync(app)
+    }
+
+    private func uploadFileViaAPI(
+        _ app: Application, token: String, bucketName: String, fileName: String, content: String
+    ) async throws -> ObjectMeta.ResponseDTO? {
+        var result: ObjectMeta.ResponseDTO?
+
+        try await app.test(
+            .POST, "/api/v1/objects?bucket=\(bucketName)&prefix=",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+
+                let boundary = "----WebKitFormBoundary\(UUID().uuidString)"
+                req.headers.replaceOrAdd(
+                    name: .contentType, value: "multipart/form-data; boundary=\(boundary)")
+
+                var body = ""
+                body += "--\(boundary)\r\n"
+                body +=
+                    "Content-Disposition: form-data; name=\"data\"; filename=\"\(fileName)\"\r\n"
+                body += "Content-Type: text/plain\r\n\r\n"
+                body += content
+                body += "\r\n--\(boundary)--\r\n"
+
+                req.body = ByteBuffer(string: body)
+            },
+            afterResponse: { res async throws in
+                #expect(res.status == .ok)
+                result = try res.content.decode(ObjectMeta.ResponseDTO.self)
+            })
+
+        return result
+    }
+
+    @Test("Get versioning - Disabled by default")
+    func testGetVersioningDisabledByDefault() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-versioning-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-versioning-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let status = try res.content.decode(
+                        InternalBucketController.VersioningStatusDTO.self)
+                    #expect(status.status == "Disabled")
+                })
+        }
+    }
+
+    @Test("Get versioning - Enabled when created with versioning")
+    func testGetVersioningEnabled() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/versioned-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let status = try res.content.decode(
+                        InternalBucketController.VersioningStatusDTO.self)
+                    #expect(status.status == "Enabled")
+                })
+        }
+    }
+
+    @Test("Get versioning - Non-existent bucket fails")
+    func testGetVersioningNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/buckets/nonexistent-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Get versioning - Without auth fails")
+    func testGetVersioningUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/buckets/test-bucket/versioning",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Set versioning - Enable versioning")
+    func testSetVersioningEnable() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-versioning")
+
+            // Enable versioning
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-versioning/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.VersioningStatusDTO(status: "Enabled"))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let status = try res.content.decode(
+                        InternalBucketController.VersioningStatusDTO.self)
+                    #expect(status.status == "Enabled")
+                })
+
+            // Verify it's enabled
+            try await app.test(
+                .GET, "/api/v1/buckets/test-versioning/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let status = try res.content.decode(
+                        InternalBucketController.VersioningStatusDTO.self)
+                    #expect(status.status == "Enabled")
+                })
+        }
+    }
+
+    @Test("Set versioning - Suspend versioning")
+    func testSetVersioningSuspend() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "test-versioning")
+
+            // Suspend versioning
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-versioning/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.VersioningStatusDTO(status: "Suspended"))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let status = try res.content.decode(
+                        InternalBucketController.VersioningStatusDTO.self)
+                    #expect(status.status == "Suspended")
+                })
+        }
+    }
+
+    @Test("Set versioning - Invalid status fails")
+    func testSetVersioningInvalidStatus() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-versioning")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-versioning/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.VersioningStatusDTO(status: "Invalid"))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Set versioning - Non-existent bucket fails")
+    func testSetVersioningNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/nonexistent/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.VersioningStatusDTO(status: "Enabled"))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Set versioning - Without auth fails")
+    func testSetVersioningUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/versioning",
+                beforeRequest: { req in
+                    try req.content.encode(
+                        InternalBucketController.VersioningStatusDTO(status: "Enabled"))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Upload to versioned bucket - Returns version ID")
+    func testUploadVersionedReturnsVersionId() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            let result = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 1")
+
+            #expect(result != nil)
+            #expect(result?.versionId != nil)
+            #expect(result?.versionId != "null")
+            #expect(result?.versionId?.count == 32)
+            #expect(result?.isLatest == true)
+        }
+    }
+
+    @Test("Upload to non-versioned bucket - No version ID")
+    func testUploadNonVersionedNoVersionId() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "non-versioned-bucket")
+
+            let result = try await uploadFileViaAPI(
+                app, token: token, bucketName: "non-versioned-bucket",
+                fileName: "test.txt", content: "Content")
+
+            #expect(result != nil)
+            #expect(result?.versionId == nil)
+        }
+    }
+
+    @Test("Upload multiple versions - Creates unique version IDs")
+    func testUploadMultipleVersions() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            let result1 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 1")
+
+            let result2 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 2")
+
+            let result3 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 3")
+
+            #expect(result1?.versionId != nil)
+            #expect(result2?.versionId != nil)
+            #expect(result3?.versionId != nil)
+            #expect(result1?.versionId != result2?.versionId)
+            #expect(result2?.versionId != result3?.versionId)
+            #expect(result1?.versionId != result3?.versionId)
+        }
+    }
+
+    @Test("List object versions - Returns all versions")
+    func testListObjectVersions() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload multiple versions
+            let v1 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 1")
+
+            let v2 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 2")
+
+            let v3 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 3")
+
+            // List versions
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=versioned-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.count == 3)
+
+                    let versionIds = versions.compactMap { $0.versionId }
+                    #expect(versionIds.contains(v1?.versionId ?? ""))
+                    #expect(versionIds.contains(v2?.versionId ?? ""))
+                    #expect(versionIds.contains(v3?.versionId ?? ""))
+
+                    // Only one should be latest
+                    let latestCount = versions.filter { $0.isLatest == true }.count
+                    #expect(latestCount == 1)
+                })
+        }
+    }
+
+    @Test("List object versions - Empty for non-existent key")
+    func testListObjectVersionsEmpty() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-bucket-empty")
+
+            // Don't upload any object - query for a key that doesn't exist
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=test-bucket-empty&key=non-existent.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.count == 0)
+                })
+        }
+    }
+
+    @Test("List object versions - Non-versioned bucket returns single version")
+    func testListObjectVersionsNonVersionedBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "non-versioned-bucket")
+
+            // Upload object to non-versioned bucket
+            try await putObject(
+                app, bucketName: "non-versioned-bucket", key: "test.txt", content: "content")
+
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=non-versioned-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    // Non-versioned bucket still returns the current object as a single "version"
+                    #expect(versions.count == 1)
+                    #expect(versions[0].key == "test.txt")
+                })
+        }
+    }
+
+    @Test("List object versions - Missing bucket param fails")
+    func testListObjectVersionsMissingBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/objects/versions?key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("List object versions - Missing key param fails")
+    func testListObjectVersionsMissingKey() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=test-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("List object versions - Without auth fails")
+    func testListObjectVersionsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=test&key=test.txt",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete object version - Success")
+    func testDeleteObjectVersionSuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload two versions
+            let v1 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 1")
+
+            let v2 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Version 2")
+
+            // Delete first version
+            try await app.test(
+                .DELETE,
+                "/api/v1/objects/version?bucket=versioned-bucket&key=test.txt&versionId=\(v1!.versionId!)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            // Verify only one version remains
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=versioned-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.count == 1)
+                    #expect(versions.first?.versionId == v2?.versionId)
+                })
+        }
+    }
+
+    @Test("Delete object version - Missing params fails")
+    func testDeleteObjectVersionMissingParams() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-bucket")
+
+            // Missing bucket
+            try await app.test(
+                .DELETE, "/api/v1/objects/version?key=test.txt&versionId=abc",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+
+            // Missing key
+            try await app.test(
+                .DELETE, "/api/v1/objects/version?bucket=test-bucket&versionId=abc",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+
+            // Missing versionId
+            try await app.test(
+                .DELETE, "/api/v1/objects/version?bucket=test-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Delete object version - Without auth fails")
+    func testDeleteObjectVersionUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .DELETE, "/api/v1/objects/version?bucket=test&key=test.txt&versionId=abc",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete object version - User isolation")
+    func testDeleteObjectVersionUserIsolation() async throws {
+        try await withApp { app in
+            // Create first user with versioned bucket
+            let token1 = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token1, name: "user1-versioned")
+
+            let v1 = try await uploadFileViaAPI(
+                app, token: token1, bucketName: "user1-versioned",
+                fileName: "test.txt", content: "Secret content")
+
+            // Create second user
+            let createDTO2 = User.Create(
+                name: "User 2",
+                username: "user2@example.com",
+                password: "Pass123!",
+                isAdmin: false
+            )
+
+            try await app.test(
+                .POST, "/api/v1/users",
+                beforeRequest: { req in
+                    try req.content.encode(createDTO2)
+                })
+
+            let loginDTO2 = ["username": "user2@example.com", "password": "Pass123!"]
+            var token2 = ""
+
+            try await app.test(
+                .POST, "/api/v1/users/login",
+                beforeRequest: { req in
+                    try req.content.encode(loginDTO2)
+                },
+                afterResponse: { res async throws in
+                    let tokenResponse = try res.content.decode(ClientTokenResponse.self)
+                    token2 = tokenResponse.token
+                })
+
+            // User 2 tries to delete User 1's version
+            try await app.test(
+                .DELETE,
+                "/api/v1/objects/version?bucket=user1-versioned&key=test.txt&versionId=\(v1!.versionId!)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            // Verify version still exists for user 1
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=user1-versioned&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token1)
+                },
+                afterResponse: { res async throws in
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.count == 1)
+                    #expect(versions.first?.versionId == v1?.versionId)
+                })
+        }
+    }
+
+    @Test("Download specific version - Success")
+    func testDownloadSpecificVersion() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload two versions with different content
+            let v1 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "First version content")
+
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Second version content")
+
+            // Download first version
+            try await app.test(
+                .POST, "/api/v1/objects/download",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        DownloadRequestDTO(
+                            bucket: "versioned-bucket",
+                            keys: ["test.txt"],
+                            versionId: v1?.versionId
+                        ))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let data = Data(buffer: res.body)
+                    let content = String(data: data, encoding: .utf8)
+                    #expect(content == "First version content")
+                })
+        }
+    }
+
+    @Test("Download latest version - Returns latest content")
+    func testDownloadLatestVersion() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload multiple versions
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "First version")
+
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Second version")
+
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Latest version")
+
+            // Download without specifying version (should get latest)
+            try await app.test(
+                .POST, "/api/v1/objects/download",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        DownloadRequestDTO(bucket: "versioned-bucket", keys: ["test.txt"]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let data = Data(buffer: res.body)
+                    let content = String(data: data, encoding: .utf8)
+                    #expect(content == "Latest version")
+                })
+        }
+    }
+
+    @Test("Delete versioned object - Creates delete marker")
+    func testDeleteVersionedObjectCreatesMarker() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload object
+            let v1 = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "test.txt", content: "Content to delete")
+
+            // Delete object (without specifying version)
+            try await app.test(
+                .DELETE, "/api/v1/objects?bucket=versioned-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            // List versions - should show both original and delete marker
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=versioned-bucket&key=test.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.count == 2)
+
+                    // One should be delete marker (latest)
+                    let deleteMarkers = versions.filter { $0.isDeleteMarker == true }
+                    #expect(deleteMarkers.count == 1)
+                    #expect(deleteMarkers.first?.isLatest == true)
+
+                    // Original version should still exist
+                    let originalVersions = versions.filter { $0.isDeleteMarker != true }
+                    #expect(originalVersions.count == 1)
+                    #expect(originalVersions.first?.versionId == v1?.versionId)
+                })
+        }
+    }
+
+    @Test("List objects - Deleted versioned object not shown")
+    func testListObjectsDeletedVersionedNotShown() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createVersionedBucket(app, token: token, name: "versioned-bucket")
+
+            // Upload objects
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "keep.txt", content: "Keep this")
+
+            _ = try await uploadFileViaAPI(
+                app, token: token, bucketName: "versioned-bucket",
+                fileName: "delete.txt", content: "Delete this")
+
+            // Delete one object
+            try await app.test(
+                .DELETE, "/api/v1/objects?bucket=versioned-bucket&key=delete.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            // List objects - should only show keep.txt
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=versioned-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.count == 1)
+                    #expect(page.items.first?.key == "keep.txt")
                 })
         }
     }

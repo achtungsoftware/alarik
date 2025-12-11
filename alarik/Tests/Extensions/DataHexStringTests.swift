@@ -23,8 +23,6 @@ import Testing
 @Suite("Data and Digest HexString Extension Tests", .serialized)
 struct DataHexStringTests {
 
-    // MARK: - Data.hexString() Tests
-
     @Test("Empty Data returns empty string")
     func emptyData() {
         let data = Data()
@@ -89,8 +87,6 @@ struct DataHexStringTests {
         #expect(hexString.allSatisfy({ $0.isHexDigit }))
     }
 
-    // MARK: - Digest.hexString() Tests
-
     @Test("SHA256 Digest converts correctly")
     func sha256DigestConversion() {
         let data = Data("Hello, World!".utf8)
@@ -139,8 +135,6 @@ struct DataHexStringTests {
 
         #expect(digestHex == dataHex)
     }
-
-    // MARK: - Data.constantTimeCompare() Tests
 
     @Test("Identical strings compare as equal")
     func identicalStrings() {
@@ -243,8 +237,6 @@ struct DataHexStringTests {
         tamperedHex.replaceSubrange(midIndex...midIndex, with: "x")
         #expect(data.constantTimeCompare(to: tamperedHex) == false)
     }
-
-    // MARK: - Performance Characteristics Tests
 
     @Test("Constant time comparison always processes full string")
     func constantTimeCharacteristic() {

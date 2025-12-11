@@ -56,10 +56,10 @@ public func loginDefaultAdminUser(_ app: Application) async throws -> String {
     return token
 }
 
-public func createUserAndLogin(_ app: Application) async throws -> String {
+public func createUserAndLogin(_ app: Application, username: String = "test@example.com") async throws -> String {
     let createDTO = User.Create(
         name: "Test User",
-        username: "test@example.com",
+        username: username,
         password: "TestPass123!",
         isAdmin: false
     )
@@ -70,7 +70,7 @@ public func createUserAndLogin(_ app: Application) async throws -> String {
             try req.content.encode(createDTO)
         })
 
-    let loginDTO = ["username": "test@example.com", "password": "TestPass123!"]
+    let loginDTO = ["username": username, "password": "TestPass123!"]
     var token = ""
 
     try await app.test(

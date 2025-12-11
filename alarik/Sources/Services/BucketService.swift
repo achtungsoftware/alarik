@@ -22,11 +22,14 @@ struct BucketService {
     static func create(
         on database: any Database,
         bucketName: String,
-        userId: UUID
+        userId: UUID,
+        versioningEnabled: Bool = false
     )
         async throws
     {
-        let bucket: Bucket = Bucket(name: bucketName, userId: userId)
+        let bucket: Bucket = Bucket(
+            name: bucketName, userId: userId,
+            versioningStatus: versioningEnabled ? .enabled : .disabled)
 
         do {
             try await bucket.save(on: database)
@@ -42,6 +45,9 @@ struct BucketService {
                     bucketName: bucketName
                 )
             }
+
+            await BucketVersioningCache.shared.addBucket(
+                bucketName, versioningStatus: versioningEnabled ? .enabled : .disabled)
         } catch {
             try await bucket.delete(on: database)
             try BucketHandler.delete(name: bucketName)
@@ -62,6 +68,7 @@ struct BucketService {
             .delete()
 
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
+        await BucketVersioningCache.shared.removeBucket(bucketName)
         try BucketHandler.delete(name: bucketName)
     }
 }

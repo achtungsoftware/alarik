@@ -23,6 +23,7 @@ struct CreateBucket: AsyncMigration {
             .field("user_id", .uuid, .required, .references("users", "id", onDelete: .cascade))
             .field("name", .string, .required)
             .field("creation_date", .datetime, .required)
+            .field("versioning_status", .string, .required, .sql(.default("Disabled")))
             .unique(on: "name")
             .create()
     }

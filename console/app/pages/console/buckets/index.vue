@@ -76,6 +76,15 @@ const columns: TableColumn<Bucket>[] = [
         },
     },
     {
+        accessorKey: "versioning",
+        header: "Versioning",
+        cell: ({ row }) =>
+            h(UBadge, {
+                label: row.original.versioningStatus,
+                variant: row.original.versioningStatus == "Enabled" ? "solid" : "subtle"
+            }),
+    },
+    {
         accessorKey: "creationDate",
         header: "Created at",
         cell: ({ row }) => {
