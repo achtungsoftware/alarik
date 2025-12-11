@@ -44,6 +44,10 @@ struct InternalUserController: RouteCollection {
         routes.grouped("users").grouped("accessKeys").grouped(":accessKeyId")
             .grouped(SessionToken.authenticator())
             .delete(use: deleteAccessKey)
+
+        routes.grouped("users")
+            .grouped(SessionToken.authenticator())
+            .delete(use: deleteUser)
     }
 
     @Sendable
@@ -52,12 +56,29 @@ struct InternalUserController: RouteCollection {
 
         let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
 
-        guard (try await User.find(sessionToken.userId, on: req.db)) != nil
+        guard let user = try await User.find(sessionToken.userId, on: req.db)
         else {
             throw Abort(.notFound, reason: "User not found")
         }
 
         let editUser: User.Edit = try req.content.decode(User.Edit.self)
+
+        // Handle password change if requested
+        if let currentPassword = editUser.currentPassword,
+            let newPassword = editUser.newPassword,
+            !currentPassword.isEmpty,
+            !newPassword.isEmpty
+        {
+            guard try user.verify(password: currentPassword) else {
+                throw Abort(.unauthorized, reason: "Current password is incorrect")
+            }
+
+            let newPasswordHash = try Bcrypt.hash(newPassword)
+            try await User.query(on: req.db)
+                .filter(\.$id == sessionToken.userId)
+                .set(\.$passwordHash, to: newPasswordHash)
+                .update()
+        }
 
         do {
             try await User.query(on: req.db)
@@ -165,6 +186,39 @@ struct InternalUserController: RouteCollection {
         let user: User = try req.auth.require(User.self)
         let payload: SessionToken = try SessionToken(with: user)
         return ClientTokenResponse(token: try await req.jwt.sign(payload))
+    }
+
+    @Sendable
+    func deleteUser(req: Request) async throws -> HTTPStatus {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let userToDelete = try await User.find(sessionToken.userId, on: req.db) else {
+            throw Abort(.notFound, reason: "User not found")
+        }
+
+        // Delete all bucket folders from disk
+        let buckets = try await Bucket.query(on: req.db)
+            .filter(\.$user.$id == sessionToken.userId)
+            .all()
+
+        for bucket in buckets {
+            try BucketHandler.forceDelete(name: bucket.name)
+        }
+
+        // Remove from all caches
+        let accessKeys = try await AccessKey.query(on: req.db)
+            .filter(\.$user.$id == sessionToken.userId)
+            .all()
+
+        for accessKey in accessKeys {
+            await AccessKeyUserMapCache.shared.remove(accessKey: accessKey.accessKey)
+            await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey.accessKey)
+        }
+
+        // Delete the user (buckets and access keys cascade delete in DB)
+        try await userToDelete.delete(on: req.db)
+
+        return .noContent
     }
 
     @Sendable

@@ -61,6 +61,8 @@ extension User {
     struct Edit: Content {
         var name: String
         var username: String
+        var currentPassword: String?
+        var newPassword: String?
 
         func toUserResponseDTO() -> User.ResponseDTO {
             .init(

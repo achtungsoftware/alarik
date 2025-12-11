@@ -161,7 +161,7 @@ struct InternalAdminControllerTests {
                 })
 
             // Edit the user
-            let editDTO = User.Edit(
+            let editDTO = User.EditAdmin(
                 id: userId!,
                 name: "Updated Name",
                 username: "updated@example.com",
@@ -189,7 +189,7 @@ struct InternalAdminControllerTests {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
 
-            let editDTO = User.Edit(
+            let editDTO = User.EditAdmin(
                 id: UUID(),
                 name: "Updated Name",
                 username: "updated@example.com",
@@ -249,7 +249,7 @@ struct InternalAdminControllerTests {
                 })
 
             // Try to edit user1 to have user2's username
-            let editDTO = User.Edit(
+            let editDTO = User.EditAdmin(
                 id: user1Id!,
                 name: "User One",
                 username: "user2@example.com",

@@ -23,9 +23,11 @@ const props = withDefaults(
         badge?: String;
         breadCrumbItems?: BreadcrumbItem[];
         size?: "sm" | "md" | "lg";
+        color?: "default" | "error";
     }>(),
     {
         size: "md",
+        color: "default"
     }
 );
 
@@ -41,6 +43,8 @@ const slots = useSlots();
                     'text-sm': props.size == 'sm',
                     'text-lg': props.size == 'md',
                     'text-xl': props.size == 'lg',
+                    'text-default': props.color == 'default',
+                    'text-error': props.color == 'error',
                 }"
             >
                 {{ props.title }}<UBadge v-if="props.badge" size="sm" color="neutral" variant="subtle">{{ props.badge }}</UBadge>
