@@ -34,6 +34,8 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const folderInput = ref<HTMLInputElement | null>(null);
 const openDetailModal = ref(false);
 const selectedObject = ref<BrowserItem | null>(null);
+const openPreviewModal = ref(false);
+const previewObject = ref<BrowserItem | null>(null);
 
 const { isDeleting, isDownloading, isUploading, deleteObjects, downloadObjects, downloadSingleObject, uploadFiles, uploadFolder } = useObjectService();
 const { confirm } = useConfirmDialog();
@@ -253,6 +255,17 @@ const columns: TableColumn<BrowserItem>[] = [
 
             return h("div", { class: "flex flex-row items-center gap-2" }, [
                 h(resolveComponent("UButton"), {
+                    label: "Preview",
+                    variant: "subtle",
+                    color: "neutral",
+                    icon: "i-lucide-eye",
+                    onClick: (e: Event) => {
+                        e.stopPropagation();
+                        previewObject.value = item;
+                        openPreviewModal.value = true;
+                    },
+                }),
+                h(resolveComponent("UButton"), {
                     label: "Download",
                     variant: "subtle",
                     color: "neutral",
@@ -371,6 +384,7 @@ async function handleSingleDelete(item: BrowserItem) {
 </script>
 <template>
     <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
+    <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :object-key="previewObject?.key ?? ''" :content-type="previewObject?.contentType" />
 
     <UDashboardPanel
         :ui="{
