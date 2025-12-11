@@ -499,4 +499,150 @@ struct InternalAdminControllerTests {
             #expect(remainingKeys.isEmpty)
         }
     }
+
+    @Test("Get storage stats as admin - should pass")
+    func testGetStorageStats() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    #expect(stats.totalBytes > 0)
+                    #expect(stats.availableBytes > 0)
+                    #expect(stats.usedBytes >= 0)
+                    #expect(stats.alarikUsedBytes >= 0)
+                    #expect(stats.bucketCount >= 0)
+                    #expect(stats.userCount >= 1)  // At least the admin user
+                })
+        }
+    }
+
+    @Test("Get storage stats as non admin - should fail")
+    func testGetStorageStatsAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Get storage stats without auth - should fail")
+    func testGetStorageStatsWithoutAuth() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                afterResponse: { res async throws in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Storage stats reflects bucket and user counts")
+    func testStorageStatsReflectsCounts() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            // Get initial stats
+            var initialBucketCount = 0
+            var initialUserCount = 0
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    initialBucketCount = stats.bucketCount
+                    initialUserCount = stats.userCount
+                })
+
+            // Create users
+            try await createRandomUser(app)
+            try await createRandomUser(app)
+
+            // Create buckets for admin user
+            let adminUser = try await User.query(on: app.db)
+                .filter(\.$username == "alarik")
+                .first()
+            let bucket1 = Bucket(name: "stats-test-bucket-1", userId: adminUser!.id!)
+            let bucket2 = Bucket(name: "stats-test-bucket-2", userId: adminUser!.id!)
+            try await bucket1.save(on: app.db)
+            try await bucket2.save(on: app.db)
+            try BucketHandler.create(name: "stats-test-bucket-1")
+            try BucketHandler.create(name: "stats-test-bucket-2")
+
+            // Get updated stats
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    #expect(stats.bucketCount == initialBucketCount + 2)
+                    #expect(stats.userCount == initialUserCount + 2)
+                })
+        }
+    }
+
+    @Test("Storage stats reflects alarik storage usage")
+    func testStorageStatsReflectsAlarikUsage() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            // Get initial alarik usage
+            var initialAlarikUsedBytes: Int64 = 0
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    initialAlarikUsedBytes = stats.alarikUsedBytes
+                })
+
+            // Create a bucket and add a file
+            let adminUser = try await User.query(on: app.db)
+                .filter(\.$username == "alarik")
+                .first()
+            let bucket = Bucket(name: "storage-usage-test-bucket", userId: adminUser!.id!)
+            try await bucket.save(on: app.db)
+            try BucketHandler.create(name: "storage-usage-test-bucket")
+
+            // Write a file with known size
+            let testData = String(repeating: "x", count: 1024)  // 1KB of data
+            let bucketURL = BucketHandler.bucketURL(for: "storage-usage-test-bucket")
+            try testData.write(
+                to: bucketURL.appendingPathComponent("testfile.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            // Get updated stats
+            try await app.test(
+                .GET, "/api/v1/admin/storageStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    #expect(stats.alarikUsedBytes > initialAlarikUsedBytes)
+                    #expect(stats.alarikUsedBytes >= initialAlarikUsedBytes + 1024)
+                })
+        }
+    }
 }

@@ -47,6 +47,13 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 type: "label",
             },
             {
+                label: "Dashboard",
+                icon: "i-lucide-layout-dashboard",
+                to: "/console/admin/dashboard",
+                active: route.path.startsWith("/console/admin/dashboard"),
+                disabled: !user.value.isAdmin,
+            },
+            {
                 label: "Users",
                 icon: "i-lucide-users",
                 to: "/console/admin/users",

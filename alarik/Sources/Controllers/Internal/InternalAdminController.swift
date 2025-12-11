@@ -19,6 +19,16 @@ import Vapor
 import XMLCoder
 
 struct InternalAdminController: RouteCollection {
+
+    struct StorageStats: Content {
+        let totalBytes: Int64
+        let availableBytes: Int64
+        let usedBytes: Int64
+        let alarikUsedBytes: Int64
+        let bucketCount: Int
+        let userCount: Int
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("admin").grouped("users")
             .get(use: listUsers)
@@ -28,6 +38,8 @@ struct InternalAdminController: RouteCollection {
             .put(use: editUser)
         routes.grouped("admin").grouped("users")
             .delete(":userId", use: deleteUser)
+        routes.grouped("admin")
+            .get("storageStats", use: getStorageStats)
     }
 
     @Sendable
@@ -175,5 +187,87 @@ struct InternalAdminController: RouteCollection {
         try await userToDelete.delete(on: req.db)
 
         return .noContent
+    }
+
+    @Sendable
+    func getStorageStats(req: Request) async throws -> StorageStats {
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard let fetchedAdminUser: User = try await User.find(sessionToken.userId, on: req.db)
+        else {
+            throw Abort(.unauthorized, reason: "User not found")
+        }
+
+        guard fetchedAdminUser.isAdmin else {
+            throw Abort(.unauthorized, reason: "User not admin")
+        }
+
+        let storageURL = URL(fileURLWithPath: BucketHandler.rootPath)
+
+        let availableBytes: Int64
+        let totalBytes: Int64
+
+        do {
+            let values = try storageURL.resourceValues(forKeys: [
+                .volumeAvailableCapacityForImportantUsageKey,
+                .volumeTotalCapacityKey,
+            ])
+            availableBytes = Int64(values.volumeAvailableCapacityForImportantUsage ?? 0)
+            totalBytes = Int64(values.volumeTotalCapacity ?? 0)
+        } catch {
+            // Fallback: try the parent directory if storage path doesn't exist yet
+            let parentURL = storageURL.deletingLastPathComponent()
+            let values = try parentURL.resourceValues(forKeys: [
+                .volumeAvailableCapacityForImportantUsageKey,
+                .volumeTotalCapacityKey,
+            ])
+            availableBytes = Int64(values.volumeAvailableCapacityForImportantUsage ?? 0)
+            totalBytes = Int64(values.volumeTotalCapacity ?? 0)
+        }
+
+        let usedBytes = totalBytes - availableBytes
+
+        // Calculate storage used by alarik (size of Storage/buckets directory)
+        let alarikUsedBytes = Self.calculateDirectorySize(at: storageURL)
+
+        // Count buckets and objects
+        let bucketCount = try await Bucket.query(on: req.db).count()
+        let userCount = try await User.query(on: req.db).count()
+
+        return StorageStats(
+            totalBytes: totalBytes,
+            availableBytes: availableBytes,
+            usedBytes: usedBytes,
+            alarikUsedBytes: alarikUsedBytes,
+            bucketCount: bucketCount,
+            userCount: userCount
+        )
+    }
+
+    private static func calculateDirectorySize(at url: URL) -> Int64 {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else {
+            return 0
+        }
+
+        guard
+            let enumerator = fileManager.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return 0
+        }
+
+        var totalSize: Int64 = 0
+        while let fileURL = enumerator.nextObject() as? URL {
+            if let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey]),
+                let fileSize = resourceValues.fileSize
+            {
+                totalSize += Int64(fileSize)
+            }
+        }
+        return totalSize
     }
 }

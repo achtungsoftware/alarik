@@ -15,6 +15,15 @@ limitations under the License.
 */
 
 declare global {
+    export interface StorageStats {
+        totalBytes: number;
+        availableBytes: number;
+        usedBytes: number;
+        alarikUsedBytes: number;
+        bucketCount: number;
+        userCount: number;
+    }
+
     export interface Bucket {
         name: string;
         creationDate: string;
