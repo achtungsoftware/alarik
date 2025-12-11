@@ -203,6 +203,7 @@ struct InternalUserController: RouteCollection {
 
         for bucket in buckets {
             try BucketHandler.forceDelete(name: bucket.name)
+            await BucketVersioningCache.shared.removeBucket(bucket.name)
         }
 
         // Remove from all caches
