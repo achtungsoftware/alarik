@@ -59,6 +59,18 @@ final class User: Model, @unchecked Sendable {
 
 extension User {
     struct Edit: Content {
+        var name: String
+        var username: String
+
+        func toUserResponseDTO() -> User.ResponseDTO {
+            .init(
+                name: self.name,
+                username: self.username,
+            )
+        }
+    }
+
+    struct EditAdmin: Content {
         var id: UUID
         var name: String
         var username: String
@@ -127,12 +139,19 @@ extension User.FormCreate: Validatable {
     }
 }
 
-extension User.Edit: Validatable {
+extension User.EditAdmin: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("id", as: UUID.self)
         validations.add("name", as: String.self, is: !.empty)
         validations.add("username", as: String.self, is: !.empty)
         validations.add("isAdmin", as: Bool.self)
+    }
+}
+
+extension User.Edit: Validatable {
+    static func validations(_ validations: inout Validations) {
+        validations.add("name", as: String.self, is: !.empty)
+        validations.add("username", as: String.self, is: !.empty)
     }
 }
 

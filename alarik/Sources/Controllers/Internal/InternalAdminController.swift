@@ -89,7 +89,7 @@ struct InternalAdminController: RouteCollection {
 
     @Sendable
     func editUser(req: Request) async throws -> User.ResponseDTO {
-        try User.Edit.validate(content: req)
+        try User.EditAdmin.validate(content: req)
 
         let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
 
@@ -102,7 +102,7 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.unauthorized, reason: "User not admin")
         }
 
-        let editUser: User.Edit = try req.content.decode(User.Edit.self)
+        let editUser: User.EditAdmin = try req.content.decode(User.EditAdmin.self)
 
         do {
             try await User.query(on: req.db)

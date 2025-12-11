@@ -73,13 +73,18 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 label: "Configuration",
                 type: "label",
             },
-
             {
                 label: "Settings",
                 icon: "i-lucide-cog",
-                to: "/console",
-                active: route.path.startsWith("/console/settings"),
-                disabled: true,
+                open: route.path.startsWith("/console/settings"),
+                children: [
+                    {
+                        label: "Account",
+                        to: "/console/settings/account",
+                        icon: "i-lucide-user",
+                        active: route.path.startsWith("/console/settings/account"),
+                    },
+                ],
             },
         ],
     ];

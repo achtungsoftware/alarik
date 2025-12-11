@@ -33,6 +33,10 @@ struct InternalUserController: RouteCollection {
             .grouped(SessionToken.authenticator())
             .get(use: listAccessKeys)
 
+        routes.grouped("users")
+            .grouped(SessionToken.authenticator())
+            .put(use: editUser)
+
         routes.grouped("users").grouped("accessKeys")
             .grouped(SessionToken.authenticator())
             .post(use: createAccessKey)
@@ -40,6 +44,37 @@ struct InternalUserController: RouteCollection {
         routes.grouped("users").grouped("accessKeys").grouped(":accessKeyId")
             .grouped(SessionToken.authenticator())
             .delete(use: deleteAccessKey)
+    }
+
+    @Sendable
+    func editUser(req: Request) async throws -> User.ResponseDTO {
+        try User.Edit.validate(content: req)
+
+        let sessionToken: SessionToken = try req.auth.require(SessionToken.self)
+
+        guard (try await User.find(sessionToken.userId, on: req.db)) != nil
+        else {
+            throw Abort(.notFound, reason: "User not found")
+        }
+
+        let editUser: User.Edit = try req.content.decode(User.Edit.self)
+
+        do {
+            try await User.query(on: req.db)
+                .filter(\.$id == sessionToken.userId)
+                .set(\.$name, to: editUser.name)
+                .set(\.$username, to: editUser.username)
+                .update()
+        } catch {
+            if let dbError = error as? any DatabaseError,
+                dbError.isConstraintFailure
+            {
+                throw Abort(.conflict, reason: "Username already exists.")
+            }
+            throw error
+        }
+
+        return editUser.toUserResponseDTO()
     }
 
     @Sendable
