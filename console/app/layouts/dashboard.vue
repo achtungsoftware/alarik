@@ -19,6 +19,7 @@ import type { DropdownMenuItem, NavigationMenuItem } from "@nuxt/ui";
 
 const route = useRoute();
 const openSidebar = ref(false);
+const openServerInformationModal = ref(false);
 const user = useUser();
 const jwtCookie = useJWTCookie();
 const colorMode = useColorMode();
@@ -147,6 +148,13 @@ const userMenuItems = computed<DropdownMenuItem[][]>(() => [
             type: "separator",
         },
         {
+            label: "Server Information",
+            icon: "i-lucide-info",
+            onClick: async () => {
+                openServerInformationModal.value = !openServerInformationModal.value;
+            },
+        },
+        {
             label: "Log Out",
             icon: "i-lucide-log-out",
             color: "error",
@@ -159,6 +167,14 @@ const userMenuItems = computed<DropdownMenuItem[][]>(() => [
 ]);
 </script>
 <template>
+    <UModal v-model:open="openServerInformationModal" title="Server Information" :ui="{ body: '!p-0' }">
+        <template #body>
+            <div>
+                <NameValueLabel name="API Endpoint Url" :value="useRuntimeConfig().public.apiBaseUrl" />
+            </div>
+        </template>
+    </UModal>
+
     <UDashboardGroup unit="rem">
         <UDashboardSidebar v-model:open="openSidebar" :resizable="false" :ui="{ footer: 'border-t border-default' }">
             <template #header>
