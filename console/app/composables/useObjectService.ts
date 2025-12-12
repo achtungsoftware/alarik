@@ -84,7 +84,7 @@ export function useObjectService() {
         if (result.skippedBuckets > 0) {
             toast.add({
                 title: "Buckets Cannot Be Deleted Here",
-                description: `${result.skippedBuckets} bucket${result.skippedBuckets !== 1 ? "s" : ""} skipped. Use bucket management to delete buckets.`,
+                description: `${result.skippedBuckets} bucket${result.skippedBuckets !== 1 ? "s" : ""} skipped. Use the delete button in the Actions column to delete buckets.`,
                 icon: "i-lucide-alert-triangle",
                 color: "warning",
             });

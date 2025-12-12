@@ -39,6 +39,7 @@ const previewObject = ref<BrowserItem | null>(null);
 
 const { isDeleting, isDownloading, isUploading, deleteObjects, downloadObjects, downloadSingleObject, uploadFiles, uploadFolder } = useObjectService();
 const { confirm } = useConfirmDialog();
+const toast = useToast();
 
 // Navigation state
 const currentBucket = ref<string>("");
@@ -55,12 +56,14 @@ const selectedItems = computed(() => {
     return displayItems.value.filter((_, index) => rowSelection.value[index]);
 });
 
-// Count files and folders for deletion dialog
+// Count files, folders, and buckets for deletion dialog
 const deletionCounts = computed(() => {
-    const items = selectedItems.value.filter((item) => !item.isBucket);
-    const fileCount = items.filter((item) => !item.isFolder).length;
-    const folderCount = items.filter((item) => item.isFolder).length;
-    return { fileCount, folderCount, total: items.length };
+    const items = selectedItems.value;
+    const bucketCount = items.filter((item) => item.isBucket).length;
+    const nonBucketItems = items.filter((item) => !item.isBucket);
+    const fileCount = nonBucketItems.filter((item) => !item.isFolder).length;
+    const folderCount = nonBucketItems.filter((item) => item.isFolder).length;
+    return { fileCount, folderCount, bucketCount, total: items.length };
 });
 
 // Breadcrumb data structure for navigation
@@ -316,8 +319,17 @@ async function deleteMany() {
     const items = selectedItems.value;
     if (items.length === 0) return;
 
-    const { fileCount, folderCount, total } = deletionCounts.value;
-    const message = fileCount > 0 && folderCount > 0 ? `Do you really want to delete ${fileCount} file${fileCount !== 1 ? "s" : ""} and ${folderCount} folder${folderCount !== 1 ? "s" : ""}? This action cannot be undone.` : folderCount > 0 ? `Do you really want to delete ${folderCount} folder${folderCount !== 1 ? "s" : ""} and all files within? This action cannot be undone.` : `Do you really want to delete ${fileCount} file${fileCount !== 1 ? "s" : ""}? This action cannot be undone.`;
+    const { fileCount, folderCount, bucketCount, total } = deletionCounts.value;
+
+    // Build message based on what's being deleted
+    const parts: string[] = [];
+    if (bucketCount > 0) parts.push(`${bucketCount} bucket${bucketCount !== 1 ? "s" : ""}`);
+    if (folderCount > 0) parts.push(`${folderCount} folder${folderCount !== 1 ? "s" : ""}`);
+    if (fileCount > 0) parts.push(`${fileCount} file${fileCount !== 1 ? "s" : ""}`);
+
+    let message = `Do you really want to delete ${parts.join(" and ")}?`;
+    if (bucketCount > 0) message += " Buckets must be empty to be deleted.";
+    message += " This action cannot be undone.";
 
     const confirmed = await confirm({
         title: `Delete ${total} Item${total !== 1 ? "s" : ""}`,
@@ -327,8 +339,22 @@ async function deleteMany() {
 
     if (!confirmed) return;
 
-    await deleteObjects(currentBucket.value, items);
-    await refresh();
+    // Delete buckets
+    if (bucketCount > 0) {
+        const buckets = items.filter((item) => item.isBucket);
+        for (const bucket of buckets) {
+            await deleteBucket(bucket.key);
+        }
+        await refreshBuckets();
+    }
+
+    // Delete files/folders
+    const nonBucketItems = items.filter((item) => !item.isBucket);
+    if (nonBucketItems.length > 0) {
+        await deleteObjects(currentBucket.value, nonBucketItems);
+        await refresh();
+    }
+
     rowSelection.value = {};
 }
 
@@ -383,6 +409,25 @@ async function handleSingleDelete(item: BrowserItem) {
 
     await deleteObjects(currentBucket.value, [item]);
     await refresh();
+}
+
+async function deleteBucket(bucketName: string): Promise<boolean> {
+    try {
+        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets/${bucketName}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        });
+        return true;
+    } catch (error: any) {
+        const message = error?.data?.reason || error?.message || "Failed to delete bucket";
+        toast.add({
+            title: "Failed to Delete Bucket",
+            description: message,
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+        return false;
+    }
 }
 </script>
 <template>
