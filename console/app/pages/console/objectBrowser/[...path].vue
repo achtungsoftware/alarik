@@ -225,7 +225,7 @@ const columns: TableColumn<BrowserItem>[] = [
                     item.key
                         .split("/")
                         .filter((p: any) => p)
-                        .pop() + "/";
+                        .pop();
             } else {
                 displayName = item.key.split("/").pop() || item.key;
             }
