@@ -25,6 +25,8 @@ useHead({
     title: `Object Browser`,
 });
 
+const route = useRoute();
+
 const openBucketCreateModal = ref(false);
 const page = ref(1);
 const itemsPerPage = ref(100);
@@ -41,9 +43,17 @@ const { isDeleting, isDownloading, isUploading, deleteObjects, downloadObjects, 
 const { confirm } = useConfirmDialog();
 const toast = useToast();
 
-// Navigation state
-const currentBucket = ref<string>("");
-const currentPrefix = ref<string>("");
+// Navigation derived from route
+const currentBucket = computed(() => {
+    const pathSegments = route.params.path as string[] | undefined;
+    return pathSegments?.[0] ?? "";
+});
+
+const currentPrefix = computed(() => {
+    const pathSegments = route.params.path as string[] | undefined;
+    if (!pathSegments || pathSegments.length <= 1) return "";
+    return pathSegments.slice(1).join("/") + "/";
+});
 
 // Reset page when navigation changes
 watch([currentBucket, currentPrefix], () => {
@@ -51,7 +61,6 @@ watch([currentBucket, currentPrefix], () => {
     rowSelection.value = {};
 });
 
-// Get selected items for deletion
 const selectedItems = computed(() => {
     return displayItems.value.filter((_, index) => rowSelection.value[index]);
 });
@@ -66,11 +75,10 @@ const deletionCounts = computed(() => {
     return { fileCount, folderCount, bucketCount, total: items.length };
 });
 
-// Breadcrumb data structure for navigation
 interface BreadcrumbNav {
     label: string;
     icon: string;
-    onClick: () => void;
+    to: string;
 }
 
 // Computed breadcrumb navigation items
@@ -79,10 +87,7 @@ const breadcrumbNavItems = computed<BreadcrumbNav[]>(() => {
         {
             label: "Buckets",
             icon: "i-lucide-home",
-            onClick: () => {
-                currentBucket.value = "";
-                currentPrefix.value = "";
-            },
+            to: "/console/objectBrowser",
         },
     ];
 
@@ -90,21 +95,17 @@ const breadcrumbNavItems = computed<BreadcrumbNav[]>(() => {
         items.push({
             label: currentBucket.value,
             icon: "i-lucide-cylinder",
-            onClick: () => {
-                currentPrefix.value = "";
-            },
+            to: `/console/objectBrowser/${currentBucket.value}`,
         });
 
         if (currentPrefix.value) {
             const folderParts = currentPrefix.value.split("/").filter((p) => p.length > 0);
             folderParts.forEach((part, index) => {
+                const folders = folderParts.slice(0, index + 1);
                 items.push({
                     label: part,
                     icon: "i-lucide-folder",
-                    onClick: () => {
-                        const folders = folderParts.slice(0, index + 1);
-                        currentPrefix.value = folders.join("/") + "/";
-                    },
+                    to: `/console/objectBrowser/${currentBucket.value}/${folders.join("/")}`,
                 });
             });
         }
@@ -113,11 +114,12 @@ const breadcrumbNavItems = computed<BreadcrumbNav[]>(() => {
     return items;
 });
 
-// Convert to BreadcrumbItem format (without click handlers, we'll use slots)
+// Convert to BreadcrumbItem format
 const breadcrumbItems = computed<BreadcrumbItem[]>(() => {
     return breadcrumbNavItems.value.map((item) => ({
         label: item.label,
         icon: item.icon,
+        to: item.to,
     }));
 });
 
@@ -148,10 +150,16 @@ const {
     headers: {
         Authorization: `Bearer ${jwtCookie.value}`,
     },
-    watch: [currentBucket, currentPrefix, page],
     immediate: false,
     default: () => ({ items: [], metadata: { page: 1, per: 100, total: 0 } }),
 });
+
+// Fetch objects when navigating into a bucket
+watch([currentBucket, currentPrefix, page], () => {
+    if (currentBucket.value) {
+        refresh();
+    }
+}, { immediate: true });
 
 // Combined data: show buckets at root, or objects when inside a bucket
 const displayItems = computed<BrowserItem[]>(() => {
@@ -300,13 +308,11 @@ function onSelect(e: Event, row: TableRow<BrowserItem>) {
     const item = row.original;
 
     if (item.isBucket) {
-        // Navigate into bucket
-        currentBucket.value = item.key;
-        currentPrefix.value = "";
+        navigateTo(`/console/objectBrowser/${item.key}`);
         return;
     } else if (item.isFolder) {
-        // Navigate into folder
-        currentPrefix.value = item.key;
+        const folderPath = item.key.endsWith("/") ? item.key.slice(0, -1) : item.key;
+        navigateTo(`/console/objectBrowser/${currentBucket.value}/${folderPath}`);
         return;
     }
 
@@ -501,14 +507,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 
             <UDashboardToolbar v-if="breadcrumbItems.length > 1">
                 <template #left>
-                    <UBreadcrumb :items="breadcrumbItems">
-                        <template #item="{ item, index }">
-                            <button @click="breadcrumbNavItems[index]?.onClick()" class="flex items-center gap-1.5 hover:text-primary transition-colors">
-                                <UIcon v-if="item.icon" :name="item.icon" class="w-4 h-4" />
-                                <span>{{ item.label }}</span>
-                            </button>
-                        </template>
-                    </UBreadcrumb>
+                    <UBreadcrumb :items="breadcrumbItems" />
                 </template>
             </UDashboardToolbar>
         </template>
