@@ -158,7 +158,46 @@ export function useObjectService() {
     }
 
     async function downloadSingleObject(bucket: string, key: string): Promise<boolean> {
-        return downloadObjects(bucket, [key]);
+        isDownloading.value = true;
+
+        try {
+            const response = await fetch(`${apiBaseUrl}/api/v1/objects/download`, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${jwtCookie.value}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ bucket, keys: [key] }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Download failed: ${response.statusText}`);
+            }
+
+            const blob = await response.blob();
+            const filename = extractFilename(response) || key.split("/").pop() || "download";
+
+            triggerBrowserDownload(blob, filename);
+
+            toast.add({
+                title: "Download Started",
+                description: `Downloading ${filename}`,
+                icon: "i-lucide-download",
+                color: "success",
+            });
+
+            return true;
+        } catch (err: any) {
+            toast.add({
+                title: "Download Failed",
+                description: err.data?.reason ?? err.message ?? "Unknown error",
+                icon: "i-lucide-circle-x",
+                color: "error",
+            });
+            return false;
+        } finally {
+            isDownloading.value = false;
+        }
     }
 
     function extractFilename(response: Response): string | null {
