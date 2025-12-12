@@ -386,8 +386,12 @@ export default defineAppConfig({
             },
         },
         modal: {
-            slots: {
-                overlay: "fixed inset-0 bg-black/50 backdrop-blur-sm",
+            variants: {
+                overlay: {
+                    true: {
+                        overlay: "bg-black/50 backdrop-blur-sm",
+                    },
+                },
             },
         },
         drawer: {
