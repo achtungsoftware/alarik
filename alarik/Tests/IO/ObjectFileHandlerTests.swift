@@ -522,7 +522,7 @@ struct ObjectFileHandlerTests {
     }
 
     private func cleanupBucket(name: String) {
-        try? BucketHandler.delete(name: name)
+        try? BucketHandler.delete(name: name, force: false)
     }
 
     private func createTestObject(

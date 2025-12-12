@@ -50,7 +50,7 @@ struct BucketService {
                 bucketName, versioningStatus: versioningEnabled ? .enabled : .disabled)
         } catch {
             try await bucket.delete(on: database)
-            try BucketHandler.delete(name: bucketName)
+            try BucketHandler.delete(name: bucketName, force: true)
             await BucketVersioningCache.shared.removeBucket(bucketName)
             throw error
         }
@@ -59,7 +59,8 @@ struct BucketService {
     static func delete(
         on database: any Database,
         bucketName: String,
-        userId: UUID
+        userId: UUID,
+        force: Bool = false
     )
         async throws
     {
@@ -70,6 +71,6 @@ struct BucketService {
 
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
         await BucketVersioningCache.shared.removeBucket(bucketName)
-        try BucketHandler.delete(name: bucketName)
+        try BucketHandler.delete(name: bucketName, force: force)
     }
 }

@@ -52,9 +52,9 @@ struct BucketHandlerTests {
             try BucketHandler.create(name: "bucketC")
             buckets = try BucketHandler.list()
             #expect(buckets.sorted() == ["bucketA", "bucketB", "bucketC"])
-            try BucketHandler.delete(name: "bucketA")
-            try BucketHandler.delete(name: "bucketB")
-            try BucketHandler.delete(name: "bucketC")
+            try BucketHandler.delete(name: "bucketA", force: false)
+            try BucketHandler.delete(name: "bucketB", force: false)
+            try BucketHandler.delete(name: "bucketC", force: false)
             buckets = try BucketHandler.list()
             #expect(buckets.isEmpty)
         }
@@ -134,7 +134,7 @@ struct BucketHandlerTests {
 
             // Regular delete should fail
             #expect(throws: S3Error.self) {
-                try BucketHandler.delete(name: "testbucket")
+                try BucketHandler.delete(name: "testbucket", force: false)
             }
 
             // Bucket should still exist
@@ -178,7 +178,7 @@ struct BucketHandlerTests {
             try FileManager.default.removeItem(at: subDir)
             try FileManager.default.removeItem(at: bucketURL.appendingPathComponent("mykey"))
             // Delete bucket
-            try BucketHandler.delete(name: "testbucket")
+            try BucketHandler.delete(name: "testbucket", force: false)
             #expect(try BucketHandler.countKeys(name: "testbucket") == 0)
         }
     }

@@ -328,7 +328,7 @@ async function deleteMany() {
     if (fileCount > 0) parts.push(`${fileCount} file${fileCount !== 1 ? "s" : ""}`);
 
     let message = `Do you really want to delete ${parts.join(" and ")}?`;
-    if (bucketCount > 0) message += " Buckets must be empty to be deleted.";
+    if (bucketCount > 0) message += " All Objects inside the Bucket will be deleted.";
     message += " This action cannot be undone.";
 
     const confirmed = await confirm({

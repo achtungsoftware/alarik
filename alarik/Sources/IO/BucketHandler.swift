@@ -32,14 +32,12 @@ struct BucketHandler {
         try fm.createDirectory(at: bucketURL(for: name), withIntermediateDirectories: true)
     }
 
-    /// Deletes a bucket directory if empty (only meta.json allowed).
-    static func delete(name: String) throws {
+    /// Deletes a bucket directory
+    static func delete(name: String, force: Bool) throws {
         let fm = FileManager.default
         let dataURL = bucketURL(for: name)
-        // Get contents of the bucket directory
         let contents = try fm.contentsOfDirectory(atPath: dataURL.path)
-        // Since meta.json is now separate, the data directory should be completely empty
-        if !contents.isEmpty {
+        if !contents.isEmpty && !force {
             throw S3Error(
                 status: .conflict,
                 code: "BucketNotEmpty",

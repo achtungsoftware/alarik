@@ -97,13 +97,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
-        // Check if bucket is empty
-        if ObjectFileHandler.hasBucketObjects(bucketName: bucketName) {
-            throw Abort(.conflict, reason: "The bucket is not empty")
-        }
-
-        try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: sessionToken.userId)
+        try await BucketService.delete(on: req.db, bucketName: bucketName, userId: sessionToken.userId, force: true)
 
         return .noContent
     }

@@ -312,40 +312,6 @@ struct InternalBucketControllerTests {
         }
     }
 
-    @Test("Delete bucket - Not empty fails")
-    func testDeleteBucketNotEmpty() async throws {
-        try await withApp { app in
-            let token = try await createUserAndLogin(app)
-            try await createBucket(app, token: token, name: "nonempty-bucket")
-
-            // Add an object to the bucket
-            try await putObject(
-                app, bucketName: "nonempty-bucket", key: "file.txt", content: "content")
-
-            // Try to delete bucket - should fail
-            try await app.test(
-                .DELETE, "/api/v1/buckets/nonempty-bucket",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .conflict)
-                })
-
-            // Verify bucket still exists
-            try await app.test(
-                .GET, "/api/v1/buckets",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
-                    #expect(page.items.count == 1)
-                    #expect(page.items.first?.name == "nonempty-bucket")
-                })
-        }
-    }
-
     @Test("Delete bucket - User cannot delete other user's bucket")
     func testDeleteBucketUserIsolation() async throws {
         try await withApp { app in
@@ -400,70 +366,6 @@ struct InternalBucketControllerTests {
                     let page = try res.content.decode(Page<Bucket>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.name == "user1-bucket")
-                })
-        }
-    }
-
-    @Test("Delete bucket - After deleting objects succeeds")
-    func testDeleteBucketAfterDeletingObjects() async throws {
-        try await withApp { app in
-            let token = try await createUserAndLogin(app)
-            try await createBucket(app, token: token, name: "cleanup-bucket")
-
-            // Add objects to the bucket
-            try await putObject(
-                app, bucketName: "cleanup-bucket", key: "file1.txt", content: "content1")
-            try await putObject(
-                app, bucketName: "cleanup-bucket", key: "file2.txt", content: "content2")
-
-            // First delete attempt should fail
-            try await app.test(
-                .DELETE, "/api/v1/buckets/cleanup-bucket",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .conflict)
-                })
-
-            // Delete the objects
-            try await app.test(
-                .DELETE, "/api/v1/objects?bucket=cleanup-bucket&key=file1.txt",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .noContent)
-                })
-
-            try await app.test(
-                .DELETE, "/api/v1/objects?bucket=cleanup-bucket&key=file2.txt",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .noContent)
-                })
-
-            // Now delete bucket should succeed
-            try await app.test(
-                .DELETE, "/api/v1/buckets/cleanup-bucket",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .noContent)
-                })
-
-            // Verify bucket is deleted
-            try await app.test(
-                .GET, "/api/v1/buckets",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
-                    #expect(page.items.count == 0)
                 })
         }
     }
