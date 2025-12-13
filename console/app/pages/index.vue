@@ -88,8 +88,9 @@ async function login(e: Event) {
                             <UButton v-if="allowAccountCreation" to="/createAccount" label="Create Account" block size="xl" color="neutral" variant="subtle" />
                         </div>
                     </UForm>
-                    <div class="flex flex-row gap-4 items-center justify-center pt-4">
-                        <UButton icon="grommet-icons:github" to="https://github.com/achtungsoftware/alarik" target="_blank" color="primary" variant="ghost" />
+                    <div class="flex flex-row gap-2 items-center justify-center pt-4">
+                        <UButton label="Website" icon="i-lucide-external-link" to="https://alarik.io" target="_blank" color="primary" variant="ghost" />
+                        <UButton label="Github" icon="grommet-icons:github" to="https://github.com/achtungsoftware/alarik" target="_blank" color="primary" variant="ghost" />
                     </div>
                 </div>
             </div>
