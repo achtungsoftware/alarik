@@ -185,7 +185,7 @@ function getVersionStatusBadge(version: BrowserItem) {
 }
 </script>
 <template>
-    <FilePreviewModal :key="previewObject?.key" v-model:open="openPreviewModal" :bucket="props.bucketName" :object-key="previewObject?.key ?? ''" :content-type="previewObject?.contentType" :version-id="previewObject?.versionId" />
+    <FilePreviewModal v-if="open" v-model:open="openPreviewModal" :bucket="props.bucketName" :item="previewObject" @saved="fetchVersions" />
     
     <USlideover v-model:open="open" :title="props.item?.key">
         <slot />

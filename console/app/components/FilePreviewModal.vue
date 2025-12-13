@@ -19,27 +19,29 @@ const props = withDefaults(
     defineProps<{
         open: boolean;
         bucket: string;
-        objectKey: string;
-        contentType?: string;
-        versionId?: string;
+        item: BrowserItem | null;
     }>(),
     {
         open: false,
     }
 );
 
-const emit = defineEmits(["update:open"]);
+const emit = defineEmits(["update:open", "saved"]);
 const open = ref(props.open);
 const jwtCookie = useJWTCookie();
+const toast = useToast();
 const loading = ref(false);
+const saving = ref(false);
 const error = ref<string | null>(null);
 const previewUrl = ref<string | null>(null);
 const textContent = ref<string | null>(null);
+const editedContent = ref<string | null>(null);
+const isEditing = ref(false);
 
-const fileName = computed(() => props.objectKey.split("/").pop() || props.objectKey);
+const fileName = computed(() => props.item?.key.split("/").pop() || props.item?.key || "");
 
 const previewType = computed(() => {
-    const type = props.contentType?.toLowerCase() || "";
+    const type = props.item?.contentType?.toLowerCase() || "";
     const ext = fileName.value.split(".").pop()?.toLowerCase() || "";
 
     // Images
@@ -71,12 +73,14 @@ const previewType = computed(() => {
 });
 
 const canPreview = computed(() => previewType.value !== "unsupported");
+const canEdit = computed(() => previewType.value === "text" && (props.item?.isLatest !== false));
+const hasChanges = computed(() => isEditing.value && editedContent.value !== textContent.value);
 
 watch(
     () => props.open,
     (val) => {
         open.value = val;
-        if (val && props.bucket && props.objectKey) {
+        if (val && props.bucket && props.item?.key) {
             loadPreview();
         }
     }
@@ -95,11 +99,75 @@ function cleanup() {
         previewUrl.value = null;
     }
     textContent.value = null;
+    editedContent.value = null;
+    isEditing.value = false;
     error.value = null;
 }
 
+function startEditing() {
+    editedContent.value = textContent.value;
+    isEditing.value = true;
+}
+
+function cancelEditing() {
+    editedContent.value = null;
+    isEditing.value = false;
+}
+
+async function saveChanges() {
+    if (!props.bucket || !props.item?.key || editedContent.value === null) return;
+
+    saving.value = true;
+    try {
+        // Get the prefix (everything except the filename)
+        const lastSlashIndex = props.item.key.lastIndexOf("/");
+        const prefix = lastSlashIndex >= 0 ? props.item.key.substring(0, lastSlashIndex + 1) : "";
+
+        // Create a File from the edited content
+        const contentType = props.item.contentType || "text/plain";
+        const blob = new Blob([editedContent.value], { type: contentType });
+        const file = new File([blob], fileName.value, { type: contentType });
+
+        const formData = new FormData();
+        formData.append("data", file, file.name);
+
+        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+            params: {
+                bucket: props.bucket,
+                ...(prefix.length > 0 && { prefix }),
+            },
+            body: formData,
+        });
+
+        // Update the original content to match saved content
+        textContent.value = editedContent.value;
+        isEditing.value = false;
+        editedContent.value = null;
+
+        toast.add({
+            title: "File Saved",
+            description: "Changes have been saved successfully",
+            icon: "i-lucide-circle-check",
+            color: "success",
+        });
+
+        emit("saved");
+    } catch (err: any) {
+        toast.add({
+            title: "Save Failed",
+            description: err.message || "Failed to save changes",
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+    } finally {
+        saving.value = false;
+    }
+}
+
 async function loadPreview() {
-    if (!props.bucket || !props.objectKey) return;
+    if (!props.bucket || !props.item?.key) return;
 
     cleanup();
     loading.value = true;
@@ -114,8 +182,8 @@ async function loadPreview() {
             },
             body: JSON.stringify({
                 bucket: props.bucket,
-                keys: [props.objectKey],
-                ...(props.versionId && { versionId: props.versionId }),
+                keys: [props.item.key],
+                ...(props.item.versionId && { versionId: props.item.versionId }),
             }),
         });
 
@@ -140,10 +208,17 @@ async function loadPreview() {
 onUnmounted(() => {
     cleanup();
 });
+
+const title = computed(() => {
+    if (props.item && props.item.versionId) {
+        return `${fileName.value} (${props.item.versionId.substring(0, 12)}...)`
+    }
+    return fileName.value
+});
 </script>
 
 <template>
-    <UModal v-model:open="open" :title="fileName" :ui="{ content: 'max-w-5xl' }">
+    <UModal v-model:open="open" :title="title" :ui="{ content: 'max-w-5xl', footer: 'justify-end' }">
         <template #body>
             <!-- Loading State -->
             <div v-if="loading" class="flex items-center justify-center bg-elevated/50 rounded-lg min-h-64">
@@ -164,7 +239,7 @@ onUnmounted(() => {
 
             <!-- Unsupported Type -->
             <div v-else-if="!canPreview" class="flex items-center justify-center bg-elevated/50 rounded-lg min-h-64">
-                <UEmpty title="Preview not available" :description="`This file type cannot be previewed. Content-Type: ${contentType || 'unknown'}`" icon="i-lucide-file-question" size="lg" variant="naked" />
+                <UEmpty title="Preview not available" :description="`This file type cannot be previewed. Content-Type: ${item?.contentType || 'unknown'}`" icon="i-lucide-file-question" size="lg" variant="naked" />
             </div>
 
             <!-- Image Preview -->
@@ -189,9 +264,25 @@ onUnmounted(() => {
                 <iframe :src="previewUrl" class="w-full h-[70vh] border-0" :title="fileName" />
             </div>
 
-            <!-- Text Preview -->
+            <!-- Text Preview / Edit -->
             <div v-else-if="previewType === 'text' && textContent !== null" class="bg-elevated/50 rounded-lg max-h-[70vh] overflow-y-auto overflow-x-hidden">
-                <pre class="p-4 text-sm font-mono whitespace-pre-wrap break-words leading-relaxed">{{ textContent }}</pre>
+                <textarea
+                    v-if="isEditing"
+                    v-model="editedContent"
+                    class="w-full h-[60vh] p-4 text-sm font-mono bg-transparent border-0 leading-relaxed resize-none focus:outline-none focus:ring-0"
+                    spellcheck="false"
+                />
+                <pre v-else class="p-4 text-sm font-mono whitespace-pre-wrap break-words leading-relaxed">{{ textContent }}</pre>
+            </div>
+        </template>
+
+        <template v-if="canEdit && textContent !== null" #footer>
+            <div class="flex justify-end gap-2">
+                <template v-if="isEditing">
+                    <UButton label="Cancel" variant="ghost" color="neutral" :disabled="saving" @click="cancelEditing" />
+                    <UButton label="Save" icon="i-lucide-save" :loading="saving" :disabled="!hasChanges" @click="saveChanges" />
+                </template>
+                <UButton v-else label="Edit File" icon="i-lucide-square-pen" color="neutral" variant="subtle" @click="startEditing" />
             </div>
         </template>
     </UModal>

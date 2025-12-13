@@ -438,7 +438,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 </script>
 <template>
     <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
-    <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :object-key="previewObject?.key ?? ''" :content-type="previewObject?.contentType" />
+    <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
 
     <UDashboardPanel
         :ui="{
