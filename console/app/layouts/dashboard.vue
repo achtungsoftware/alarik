@@ -187,8 +187,8 @@ const userMenuItems = computed<DropdownMenuItem[][]>(() => [
             </template>
 
             <template #default>
-                <UNavigationMenu :items="items[0]" orientation="vertical" />
-                <UNavigationMenu :items="items[1]" orientation="vertical" class="mt-auto" />
+                <UNavigationMenu :items="items[0]" orientation="vertical" color="secondary" />
+                <UNavigationMenu :items="items[1]" orientation="vertical" color="secondary" class="mt-auto" />
             </template>
 
             <template #footer>

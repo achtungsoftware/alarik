@@ -79,7 +79,16 @@ export default defineAppConfig({
         },
         dashboardSidebar: {
             slots: {
-                root: "relative hidden lg:flex flex-col min-h-svh min-w-16 w-[16rem] shrink-0 bg-elevated/40",
+                root: "shadow-sm my-2 ml-2 border border-default rounded-xl relative hidden lg:flex flex-col min-h-[100svh-8] min-w-16 w-[17rem] shrink-0 bg-elevated/50",
+            },
+            variants: {
+                menu: {
+                    true: {
+                        header: "sm:p-6",
+                        body: "sm:p-6",
+                        footer: "sm:p-6",
+                    },
+                },
             },
         },
         avatar: {
