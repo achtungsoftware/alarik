@@ -155,11 +155,15 @@ const {
 });
 
 // Fetch objects when navigating into a bucket
-watch([currentBucket, currentPrefix, page], () => {
-    if (currentBucket.value) {
-        refresh();
-    }
-}, { immediate: true });
+watch(
+    [currentBucket, currentPrefix, page],
+    () => {
+        if (currentBucket.value) {
+            refresh();
+        }
+    },
+    { immediate: true }
+);
 
 // Combined data: show buckets at root, or objects when inside a bucket
 const displayItems = computed<BrowserItem[]>(() => {
@@ -221,18 +225,19 @@ const columns: TableColumn<BrowserItem>[] = [
             if (item.isBucket) {
                 displayName = item.key;
             } else if (item.isFolder) {
-                displayName =
-                    item.key
-                        .split("/")
-                        .filter((p: any) => p)
-                        .pop();
+                displayName = item.key
+                    .split("/")
+                    .filter((p: any) => p)
+                    .pop();
             } else {
                 displayName = item.key.split("/").pop() || item.key;
             }
 
             const icon = getFileIcon(item.key, item.isFolder || false, item.isBucket || false);
+            const iconColorClass = item.isBucket ? "text-primary" : item.isFolder ? "text-green-500" : "text-secondary-500";
+            const bgColorClass = item.isBucket ? "bg-primary/20" : item.isFolder ? "bg-green-500/20" : "bg-secondary-500/20";
 
-            return h("div", { class: "flex items-center gap-2" }, [h(resolveComponent("UIcon"), { name: icon, class: "w-6 h-6" }), h("span", displayName)]);
+            return h("div", { class: "flex items-center gap-3" }, [h("div", { class: `flex items-center justify-center w-9 h-9 rounded-lg ${bgColorClass}` }, [h(resolveComponent("UIcon"), { name: icon, class: `w-5 h-5 ${iconColorClass}` })]), h("div", { class: "flex flex-col" }, [h("span", { class: "font-medium text-highlighted" }, displayName), item.isBucket ? h("span", { class: "text-xs text-muted" }, "Bucket") : item.isFolder ? h("span", { class: "text-xs text-muted" }, "Folder") : h("span", { class: "text-xs text-muted" }, item.contentType || "File")])]);
         },
     },
     {
@@ -507,7 +512,11 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 
             <UDashboardToolbar v-if="breadcrumbItems.length > 1">
                 <template #left>
-                    <UBreadcrumb :items="breadcrumbItems" />
+                    <UBreadcrumb :items="breadcrumbItems">
+                        <template #separator>
+                            <span class="mx-2 text-muted">/</span>
+                        </template>
+                    </UBreadcrumb>
                 </template>
             </UDashboardToolbar>
         </template>
