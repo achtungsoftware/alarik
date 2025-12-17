@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 /// Alarik version string (updated by publish.sh)
-public let alarikVersion = "1.0.0-alpha-11"
+public let alarikVersion = "1.0.0-alpha-12"
 
 /// Global hex lookup table for optimal performance
 public let hexLookupTable: InlineArray<16, UInt8> = [
