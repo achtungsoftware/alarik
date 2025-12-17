@@ -20,11 +20,6 @@ export interface DeleteResult {
     skippedBuckets: number;
 }
 
-export interface UploadResult {
-    successCount: number;
-    errorCount: number;
-}
-
 export function useObjectService() {
     const config = useRuntimeConfig();
     const jwtCookie = useJWTCookie();
@@ -32,7 +27,6 @@ export function useObjectService() {
 
     const isDeleting = ref(false);
     const isDownloading = ref(false);
-    const isUploading = ref(false);
 
     const apiBaseUrl = config.public.apiBaseUrl;
 
@@ -222,110 +216,10 @@ export function useObjectService() {
         document.body.removeChild(a);
     }
 
-    async function uploadFile(bucket: string, prefix: string, file: File): Promise<boolean> {
-        try {
-            const formData = new FormData();
-            formData.append("data", file, file.name);
-
-            await $fetch(`${apiBaseUrl}/api/v1/objects`, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${jwtCookie.value}` },
-                params: {
-                    bucket,
-                    ...(prefix.length > 0 && { prefix }),
-                },
-                body: formData,
-            });
-            return true;
-        } catch (error) {
-            console.error(`Failed to upload ${file.name}:`, error);
-            return false;
-        }
-    }
-
-    async function uploadFiles(bucket: string, prefix: string, files: FileList | File[]): Promise<UploadResult> {
-        const result: UploadResult = { successCount: 0, errorCount: 0 };
-
-        if (!files || files.length === 0) return result;
-
-        isUploading.value = true;
-
-        try {
-            for (const file of Array.from(files)) {
-                const success = await uploadFile(bucket, prefix, file);
-                if (success) {
-                    result.successCount++;
-                } else {
-                    result.errorCount++;
-                }
-            }
-
-            showUploadResultToast(result);
-        } finally {
-            isUploading.value = false;
-        }
-
-        return result;
-    }
-
-    async function uploadFolder(bucket: string, currentPrefix: string, files: FileList | File[]): Promise<UploadResult> {
-        const result: UploadResult = { successCount: 0, errorCount: 0 };
-
-        if (!files || files.length === 0) return result;
-
-        isUploading.value = true;
-
-        try {
-            for (const file of Array.from(files)) {
-                const relativePath = (file as any).webkitRelativePath || file.name;
-                const fullPrefix = currentPrefix + relativePath.substring(0, relativePath.lastIndexOf("/") + 1);
-
-                const success = await uploadFile(bucket, fullPrefix, file);
-                if (success) {
-                    result.successCount++;
-                } else {
-                    result.errorCount++;
-                }
-            }
-
-            showUploadResultToast(result);
-        } finally {
-            isUploading.value = false;
-        }
-
-        return result;
-    }
-
-    function showUploadResultToast(result: UploadResult) {
-        if (result.errorCount === 0) {
-            toast.add({
-                title: "Upload Successful",
-                description: `${result.successCount} file${result.successCount !== 1 ? "s" : ""} uploaded successfully`,
-                icon: "i-lucide-circle-check",
-                color: "success",
-            });
-        } else if (result.successCount === 0) {
-            toast.add({
-                title: "Upload Failed",
-                description: `All ${result.errorCount} file${result.errorCount !== 1 ? "s" : ""} failed to upload`,
-                icon: "i-lucide-circle-x",
-                color: "error",
-            });
-        } else {
-            toast.add({
-                title: "Upload Partially Successful",
-                description: `${result.successCount} succeeded, ${result.errorCount} failed`,
-                icon: "i-lucide-alert-triangle",
-                color: "warning",
-            });
-        }
-    }
-
     return {
         // State
         isDeleting: readonly(isDeleting),
         isDownloading: readonly(isDownloading),
-        isUploading: readonly(isUploading),
 
         // Delete operations
         deleteObject,
@@ -334,10 +228,5 @@ export function useObjectService() {
         // Download operations
         downloadObjects,
         downloadSingleObject,
-
-        // Upload operations
-        uploadFile,
-        uploadFiles,
-        uploadFolder,
     };
 }

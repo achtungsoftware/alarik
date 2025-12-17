@@ -39,7 +39,13 @@ const selectedObject = ref<BrowserItem | null>(null);
 const openPreviewModal = ref(false);
 const previewObject = ref<BrowserItem | null>(null);
 
-const { isDeleting, isDownloading, isUploading, deleteObjects, downloadObjects, downloadSingleObject, uploadFiles, uploadFolder } = useObjectService();
+const { isDeleting, isDownloading, deleteObjects, downloadObjects, downloadSingleObject } = useObjectService();
+const { addToQueue, addFolderToQueue, isUploading, openSlideover, onBatchComplete } = useUploadQueue();
+
+// Refresh the list when uploads complete
+onBatchComplete(() => {
+    refresh();
+});
 const { confirm } = useConfirmDialog();
 const toast = useToast();
 
@@ -388,23 +394,21 @@ function triggerFolderUpload() {
     folderInput.value?.click();
 }
 
-async function handleFileUpload(event: Event) {
+function handleFileUpload(event: Event) {
     const input = event.target as HTMLInputElement;
     const files = input.files;
     if (!files || files.length === 0) return;
 
-    await uploadFiles(currentBucket.value, currentPrefix.value, files);
-    await refresh();
+    addToQueue(currentBucket.value, currentPrefix.value, files);
     if (input) input.value = "";
 }
 
-async function handleFolderUpload(event: Event) {
+function handleFolderUpload(event: Event) {
     const input = event.target as HTMLInputElement;
     const files = input.files;
     if (!files || files.length === 0) return;
 
-    await uploadFolder(currentBucket.value, currentPrefix.value, files);
-    await refresh();
+    addFolderToQueue(currentBucket.value, currentPrefix.value, files);
     if (input) input.value = "";
 }
 
@@ -444,6 +448,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 <template>
     <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
+    <UploadProgressSlideover />
 
     <UDashboardPanel
         :ui="{
@@ -481,7 +486,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
                     />
 
                     <UDropdownMenu
-                        v-if="currentBucket != ''"
+                        v-if="currentBucket != '' && !isUploading"
                         :items="[
                             {
                                 label: 'File',
@@ -497,6 +502,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
                     >
                         <UButton label="Upload" icon="i-lucide-upload" color="neutral" variant="subtle" :loading="isUploading" />
                     </UDropdownMenu>
+                    <UButton v-else-if="isUploading" icon="i-lucide-list" color="neutral" variant="subtle" label="Upload Progress" @click="openSlideover" />
 
                     <!-- Hidden file input -->
                     <input ref="fileInput" type="file" multiple style="display: none" @change="handleFileUpload" />

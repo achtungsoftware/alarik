@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+export const MAX_CONCURRENT_UPLOADS = 3;
+
 export function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 Bytes";
     const k = 1024;
