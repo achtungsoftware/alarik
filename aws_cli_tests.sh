@@ -276,4 +276,125 @@ echo ""
 echo "=== Multipart Upload Tests Complete ==="
 echo ""
 
+echo "=== Multi-Object Delete Tests ==="
+
+# Create a bucket for multi-object delete tests
+echo "Creating bucket for multi-object delete tests..."
+aws_s3 s3 mb s3://delete-objects-test-bucket
+
+# Upload a few objects to delete in bulk
+echo "Uploading objects to delete..."
+echo "content a" | aws_s3 s3 cp - s3://delete-objects-test-bucket/a.txt
+echo "content b" | aws_s3 s3 cp - s3://delete-objects-test-bucket/b.txt
+echo "content c" | aws_s3 s3 cp - s3://delete-objects-test-bucket/c.txt
+
+# Basic multi-object delete (verbose mode - returns Deleted entries)
+echo "Testing basic Multi-Object Delete..."
+DELETE_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-test-bucket \
+    --delete '{"Objects":[{"Key":"a.txt"},{"Key":"b.txt"}]}')
+DELETED_COUNT=$(echo "$DELETE_RESPONSE" | jq '.Deleted | length')
+
+if [ "$DELETED_COUNT" -eq 2 ]; then
+    echo "PASS: DeleteObjects reported 2 deleted keys."
+else
+    echo "FAIL: DeleteObjects reported $DELETED_COUNT deleted keys (expected 2)."
+    echo "  Response: $DELETE_RESPONSE"
+fi
+
+# Verify both objects are actually gone
+A_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key a.txt 2>&1)
+B_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key b.txt 2>&1)
+if echo "$A_EXISTS" | grep -qi "not found\|404" && echo "$B_EXISTS" | grep -qi "not found\|404"; then
+    echo "PASS: Both deleted objects are gone (HeadObject 404)."
+else
+    echo "FAIL: A deleted object still exists."
+    echo "  a.txt HeadObject: $A_EXISTS"
+    echo "  b.txt HeadObject: $B_EXISTS"
+fi
+
+# c.txt should be untouched
+C_CONTENT=$(aws_s3 s3 cp s3://delete-objects-test-bucket/c.txt -)
+if [ "$C_CONTENT" == "content c" ]; then
+    echo "PASS: Untouched object c.txt still has its original content."
+else
+    echo "FAIL: c.txt content changed unexpectedly: $C_CONTENT"
+fi
+
+# Deleting an already-deleted / non-existent key should still succeed (idempotent)
+echo "Testing Multi-Object Delete with a non-existent key..."
+NONEXISTENT_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-test-bucket \
+    --delete '{"Objects":[{"Key":"does-not-exist.txt"}]}')
+NONEXISTENT_DELETED=$(echo "$NONEXISTENT_RESPONSE" | jq '.Deleted | length')
+NONEXISTENT_ERRORS=$(echo "$NONEXISTENT_RESPONSE" | jq '.Errors | length // 0')
+
+if [ "$NONEXISTENT_DELETED" -eq 1 ] && [ "$NONEXISTENT_ERRORS" -eq 0 ]; then
+    echo "PASS: Deleting a non-existent key is treated as a successful delete."
+else
+    echo "FAIL: Deleting a non-existent key did not behave idempotently."
+    echo "  Response: $NONEXISTENT_RESPONSE"
+fi
+
+# Quiet mode - should suppress Deleted entries
+echo "Testing Multi-Object Delete in Quiet mode..."
+echo "content d" | aws_s3 s3 cp - s3://delete-objects-test-bucket/d.txt
+QUIET_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-test-bucket \
+    --delete '{"Objects":[{"Key":"d.txt"}],"Quiet":true}')
+# AWS CLI prints nothing at all when the result has no fields (no Deleted, no Errors),
+# which is the expected response for a Quiet-mode delete with no errors.
+if [ -z "$QUIET_RESPONSE" ]; then
+    QUIET_DELETED=0
+else
+    QUIET_DELETED=$(echo "$QUIET_RESPONSE" | jq '.Deleted | length // 0')
+fi
+
+if [ "$QUIET_DELETED" -eq 0 ]; then
+    echo "PASS: Quiet mode suppressed Deleted entries in the response."
+else
+    echo "FAIL: Quiet mode still returned Deleted entries."
+    echo "  Response: $QUIET_RESPONSE"
+fi
+
+D_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key d.txt 2>&1)
+if echo "$D_EXISTS" | grep -qi "not found\|404"; then
+    echo "PASS: d.txt was actually deleted despite Quiet mode."
+else
+    echo "FAIL: d.txt still exists after a Quiet-mode delete."
+fi
+
+# Multi-Object Delete against a versioned bucket - should create delete markers
+echo "Testing Multi-Object Delete with versioning enabled..."
+aws_s3 s3 mb s3://delete-objects-versioned-bucket
+aws_s3 s3api put-bucket-versioning --bucket delete-objects-versioned-bucket --versioning-configuration Status=Enabled
+echo "versioned content" | aws_s3 s3 cp - s3://delete-objects-versioned-bucket/v.txt
+
+VERSIONED_DELETE_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-versioned-bucket \
+    --delete '{"Objects":[{"Key":"v.txt"}]}')
+DELETE_MARKER=$(echo "$VERSIONED_DELETE_RESPONSE" | jq -r '.Deleted[0].DeleteMarker // false')
+
+if [ "$DELETE_MARKER" == "true" ]; then
+    echo "PASS: DeleteObjects created a delete marker in a versioned bucket."
+else
+    echo "FAIL: DeleteObjects did not create a delete marker."
+    echo "  Response: $VERSIONED_DELETE_RESPONSE"
+fi
+
+# Object should appear gone via normal GET, but still listed via list-object-versions
+V_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-versioned-bucket --key v.txt 2>&1)
+if echo "$V_EXISTS" | grep -qi "not found\|404"; then
+    echo "PASS: Object behind a delete marker is no longer visible via HeadObject."
+else
+    echo "FAIL: Object is still visible after a delete-marker delete."
+fi
+
+V_VERSIONS=$(aws_s3 s3api list-object-versions --bucket delete-objects-versioned-bucket --prefix v.txt | jq '.DeleteMarkers | length // 0')
+if [ "$V_VERSIONS" -ge 1 ]; then
+    echo "PASS: list-object-versions shows the delete marker."
+else
+    echo "FAIL: list-object-versions does not show a delete marker."
+fi
+
+echo ""
+echo "=== Multi-Object Delete Tests Complete ==="
+echo ""
+
 echo "Test complete."

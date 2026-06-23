@@ -212,6 +212,28 @@ struct S3ControllerTests {
             })
     }
 
+    private func enableVersioning(_ app: Application, bucketName: String) async throws {
+        let body = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <Status>Enabled</Status>
+            </VersioningConfiguration>
+            """
+        let bodyData = Data(body.utf8)
+        let signed = signedHeaders(
+            for: .PUT, path: "/\(bucketName)", query: "versioning", body: bodyData)
+
+        try await app.test(
+            .PUT, "/\(bucketName)?versioning",
+            beforeRequest: { req in
+                req.headers.add(contentsOf: signed)
+                req.body = ByteBuffer(data: bodyData)
+            },
+            afterResponse: { res in
+                #expect(res.status == .ok)
+            })
+    }
+
     @Test("List Objects V1 - Empty bucket")
     func testListObjectsV1Empty() async throws {
         let bucketName = "test-list-empty"
@@ -1963,6 +1985,423 @@ struct S3ControllerTests {
                     #expect(bodyString.contains("<ETag>"))
                     // ETag should end with -2 (2 parts)
                     #expect(bodyString.contains("-2"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Multi-object delete removes all listed keys")
+    func testDeleteObjectsBasic() async throws {
+        let bucketName = "test-delete-objects-basic"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "a.txt", content: "A")
+            try await putObject(app, bucketName: bucketName, key: "b.txt", content: "B")
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>a.txt</Key></Object>
+                    <Object><Key>b.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.contentType == .xml)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<DeleteResult"))
+                    #expect(bodyString.contains("<Key>a.txt</Key>"))
+                    #expect(bodyString.contains("<Key>b.txt</Key>"))
+                    #expect(!bodyString.contains("<Error>"))
+                })
+
+            for key in ["a.txt", "b.txt"] {
+                let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/\(key)")
+                try await app.test(
+                    .GET, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: getSigned)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .notFound)
+                    })
+            }
+        }
+    }
+
+    @Test("DeleteObjects - Quiet mode omits Deleted entries")
+    func testDeleteObjectsQuietMode() async throws {
+        let bucketName = "test-delete-objects-quiet"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "a.txt", content: "A")
+
+            let deleteBody = """
+                <Delete>
+                    <Quiet>true</Quiet>
+                    <Object><Key>a.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(!bodyString.contains("<Deleted>"))
+                    #expect(!bodyString.contains("a.txt"))
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/a.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Non-existent keys are treated as successfully deleted")
+    func testDeleteObjectsNonExistentKeysSucceed() async throws {
+        let bucketName = "test-delete-objects-nonexistent"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>does-not-exist.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<Key>does-not-exist.txt</Key>"))
+                    #expect(!bodyString.contains("<Error>"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Creates delete markers when versioning enabled")
+    func testDeleteObjectsCreatesDeleteMarkers() async throws {
+        let bucketName = "test-delete-objects-versioning"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await enableVersioning(app, bucketName: bucketName)
+
+            try await putObject(app, bucketName: bucketName, key: "a.txt", content: "A")
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>a.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<Key>a.txt</Key>"))
+                    #expect(bodyString.contains("<DeleteMarker>true</DeleteMarker>"))
+                    #expect(bodyString.contains("<DeleteMarkerVersionId>"))
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/a.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Permanent delete of a specific version via VersionId")
+    func testDeleteObjectsPermanentVersionDelete() async throws {
+        let bucketName = "test-delete-objects-version-id"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await enableVersioning(app, bucketName: bucketName)
+
+            var versionId1: String = ""
+            let put1Data = Data("Version 1".utf8)
+            let put1Signed = signedHeaders(for: .PUT, path: "/\(bucketName)/a.txt", body: put1Data)
+            try await app.test(
+                .PUT, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: put1Signed)
+                    req.body = ByteBuffer(data: put1Data)
+                },
+                afterResponse: { res in
+                    versionId1 = res.headers.first(name: "x-amz-version-id") ?? ""
+                })
+            #expect(!versionId1.isEmpty)
+
+            let put2Data = Data("Version 2".utf8)
+            let put2Signed = signedHeaders(for: .PUT, path: "/\(bucketName)/a.txt", body: put2Data)
+            try await app.test(
+                .PUT, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: put2Signed)
+                    req.body = ByteBuffer(data: put2Data)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>a.txt</Key><VersionId>\(versionId1)</VersionId></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<VersionId>\(versionId1)</VersionId>"))
+                    #expect(!bodyString.contains("<DeleteMarker>true</DeleteMarker>"))
+                })
+
+            let getV1Signed = signedHeaders(
+                for: .GET, path: "/\(bucketName)/a.txt", query: "versionId=\(versionId1)")
+            try await app.test(
+                .GET, "/\(bucketName)/a.txt?versionId=\(versionId1)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getV1Signed)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/a.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Version 2")
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Malformed body without Object entries fails")
+    func testDeleteObjectsMalformedBody() async throws {
+        let bucketName = "test-delete-objects-malformed"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let deleteBody = "<Delete></Delete>"
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("<Code>MalformedXML</Code>"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Empty Key element produces an Error entry, not a request failure")
+    func testDeleteObjectsEmptyKeyProducesError() async throws {
+        let bucketName = "test-delete-objects-empty-key"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key></Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<Error>"))
+                    #expect(bodyString.contains("<Code>InvalidArgument</Code>"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - More than 1000 keys is rejected")
+    func testDeleteObjectsExceedsMaxKeys() async throws {
+        let bucketName = "test-delete-objects-too-many"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            var deleteBody = "<Delete>"
+            for i in 0..<1001 {
+                deleteBody += "<Object><Key>key-\(i).txt</Key></Object>"
+            }
+            deleteBody += "</Delete>"
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("<Code>MalformedXML</Code>"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Quiet mode still reports Error entries")
+    func testDeleteObjectsQuietModeStillReportsErrors() async throws {
+        let bucketName = "test-delete-objects-quiet-errors"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let deleteBody = """
+                <Delete>
+                    <Quiet>true</Quiet>
+                    <Object><Key></Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Error>"))
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Non-existent bucket fails")
+    func testDeleteObjectsNonExistentBucket() async throws {
+        let bucketName = "test-delete-objects-no-bucket"
+        try await withApp { app in
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>a.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: bodyData)
+
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("DeleteObjects - Unauthorized request without a signature is rejected")
+    func testDeleteObjectsUnauthorized() async throws {
+        let bucketName = "test-delete-objects-unauth"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "a.txt", content: "A")
+
+            let deleteBody = """
+                <Delete>
+                    <Object><Key>a.txt</Key></Object>
+                </Delete>
+                """
+            let bodyData = Data(deleteBody.utf8)
+
+            // No Authorization header/signature attached
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .forbidden || res.status == .badRequest)
+                })
+
+            // Object must still exist - the delete must not have gone through
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/a.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/a.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "A")
                 })
         }
     }

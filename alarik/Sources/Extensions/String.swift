@@ -93,4 +93,16 @@ extension String {
         result = result.replacingOccurrences(of: "'", with: "&apos;")
         return result
     }
+
+    /// Reverses `xmlEscaped` - unescapes XML entities found in parsed request bodies.
+    /// Must unescape `&amp;` last to avoid turning `&amp;lt;` into `<`.
+    var xmlUnescaped: String {
+        var result = self
+        result = result.replacingOccurrences(of: "&lt;", with: "<")
+        result = result.replacingOccurrences(of: "&gt;", with: ">")
+        result = result.replacingOccurrences(of: "&quot;", with: "\"")
+        result = result.replacingOccurrences(of: "&apos;", with: "'")
+        result = result.replacingOccurrences(of: "&amp;", with: "&")
+        return result
+    }
 }

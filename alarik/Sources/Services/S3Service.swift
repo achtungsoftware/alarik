@@ -611,4 +611,68 @@ struct S3Service {
         let authInfo = try S3AuthParser.parse(request: req)
         return try await authenticateWithDB(req: req, authInfo: authInfo)
     }
+
+    /// Outcome of deleting a single object, used to build both the single-object
+    /// DELETE response headers and the multi-object DeleteResult XML entries.
+    struct ObjectDeleteOutcome {
+        let versionId: String?
+        let isDeleteMarker: Bool
+    }
+
+    /// Deletes a single object, honoring versionId (permanent delete of a specific version)
+    /// and bucket versioning status (delete marker vs. permanent delete), matching S3 semantics.
+    /// Deleting a key that doesn't exist is treated as success, like real S3.
+    static func deleteObject(
+        bucketName: String,
+        key: String,
+        versionId: String?,
+        versioningStatus: VersioningStatus
+    ) throws -> ObjectDeleteOutcome {
+        if let versionId = versionId {
+            do {
+                try ObjectFileHandler.deleteVersion(
+                    bucketName: bucketName, key: key, versionId: versionId)
+            } catch {
+                // Version might not exist - S3 returns success anyway
+            }
+            return ObjectDeleteOutcome(versionId: versionId, isDeleteMarker: false)
+        }
+
+        if versioningStatus == .enabled {
+            let deleteMarker = try ObjectFileHandler.createDeleteMarker(
+                bucketName: bucketName, key: key)
+            return ObjectDeleteOutcome(versionId: deleteMarker.versionId, isDeleteMarker: true)
+        }
+
+        // Versioning disabled or suspended - permanent delete
+        if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
+            let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+            for version in versions {
+                if let vid = version.versionId {
+                    try? ObjectFileHandler.deleteVersion(
+                        bucketName: bucketName, key: key, versionId: vid)
+                }
+            }
+        }
+
+        let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+        if FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.removeItem(atPath: path)
+        }
+        return ObjectDeleteOutcome(versionId: nil, isDeleteMarker: false)
+    }
+
+    /// Builds the DeleteResult XML response for a Multi-Object Delete request
+    static func buildDeleteObjectsResponse(
+        deleted: [DeletedEntry],
+        errors: [DeleteErrorEntry]
+    ) throws -> Data {
+        let encoder = XMLEncoder()
+        encoder.outputFormatting = .prettyPrinted
+
+        let result = DeleteObjectsResult(deleted: deleted, errors: errors)
+        return try encoder.encode(
+            result, withRootKey: "DeleteResult",
+            rootAttributes: ["xmlns": "http://s3.amazonaws.com/doc/2006-03-01/"])
+    }
 }

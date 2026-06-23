@@ -30,6 +30,7 @@ struct S3Controller: RouteCollection {
         bucketRoute.delete(use: self.handleBucketDelete)
         bucketRoute.on(.HEAD, use: self.handleBucketHead)
         bucketRoute.get(use: self.handleBucketGet)
+        bucketRoute.post(use: self.handleBucketPost)
 
         bucketRoute.on(.HEAD, "**", use: self.handleObjectHead)
         bucketRoute.get("**", use: self.handleObjectGet)
@@ -693,52 +694,160 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        // Check for versionId query parameter
         let versionId = req.query[String.self, at: "versionId"]
-
-        // Get bucket versioning status from cache
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
+        let outcome = try S3Service.deleteObject(
+            bucketName: bucketName,
+            key: keyPath,
+            versionId: versionId,
+            versioningStatus: versioningStatus
+        )
+
         var headers = HTTPHeaders()
-
-        if let versionId = versionId {
-            // Delete specific version (permanent delete)
-            do {
-                try ObjectFileHandler.deleteVersion(
-                    bucketName: bucketName, key: keyPath, versionId: versionId)
-                headers.add(name: "x-amz-version-id", value: versionId)
-            } catch {
-                // Version might not exist - S3 returns success anyway
-            }
-        } else if versioningStatus == .enabled {
-            // Versioning enabled, no versionId - create delete marker
-            let deleteMarker = try ObjectFileHandler.createDeleteMarker(
-                bucketName: bucketName, key: keyPath)
-            headers.add(name: "x-amz-version-id", value: deleteMarker.versionId ?? "null")
+        if let resultVersionId = outcome.versionId {
+            headers.add(name: "x-amz-version-id", value: resultVersionId)
+        }
+        if outcome.isDeleteMarker {
             headers.add(name: "x-amz-delete-marker", value: "true")
-        } else {
-            // Versioning disabled or suspended - permanent delete
-            // Check versioned storage first
-            if ObjectFileHandler.isVersioned(bucketName: bucketName, key: keyPath) {
-                // Delete all versions
-                let versions = try ObjectFileHandler.listVersions(
-                    bucketName: bucketName, key: keyPath)
-                for version in versions {
-                    if let vid = version.versionId {
-                        try? ObjectFileHandler.deleteVersion(
-                            bucketName: bucketName, key: keyPath, versionId: vid)
-                    }
-                }
-            }
-
-            // Also delete non-versioned path if exists
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            if FileManager.default.fileExists(atPath: path) {
-                try FileManager.default.removeItem(atPath: path)
-            }
         }
 
         return Response(status: .noContent, headers: headers)
+    }
+
+    // POST /:bucketName (no key) - currently only used for ?delete (Multi-Object Delete)
+    @Sendable
+    func handleBucketPost(req: Request) async throws -> Response {
+        let bucketName = try S3Service.extractBucketName(from: req)
+        let query = req.url.query ?? ""
+
+        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        if query.lowercased().contains("delete") {
+            return try await handleDeleteObjects(req: req, bucketName: bucketName)
+        }
+
+        throw S3Error(
+            status: .badRequest, code: "InvalidRequest",
+            message: "Invalid POST request", requestId: req.id)
+    }
+
+    /// Multi-Object Delete - POST /:bucket?delete
+    @Sendable
+    private func handleDeleteObjects(req: Request, bucketName: String) async throws -> Response {
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let bodyString = String(buffer: bodyData)
+
+        let (objects, quiet) = try parseDeleteObjectsBody(bodyString, requestId: req.id)
+
+        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+
+        var deleted: [DeletedEntry] = []
+        var errors: [DeleteErrorEntry] = []
+
+        for object in objects {
+            guard !object.key.isEmpty else {
+                errors.append(
+                    DeleteErrorEntry(
+                        key: object.key, code: "InvalidArgument",
+                        message: "The Key element of an Object cannot be empty."))
+                continue
+            }
+
+            do {
+                let outcome = try S3Service.deleteObject(
+                    bucketName: bucketName,
+                    key: object.key,
+                    versionId: object.versionId,
+                    versioningStatus: versioningStatus
+                )
+
+                deleted.append(
+                    DeletedEntry(
+                        key: object.key,
+                        versionId: outcome.isDeleteMarker ? nil : outcome.versionId,
+                        deleteMarker: outcome.isDeleteMarker ? true : nil,
+                        deleteMarkerVersionId: outcome.isDeleteMarker ? outcome.versionId : nil
+                    ))
+            } catch {
+                errors.append(
+                    DeleteErrorEntry(
+                        key: object.key, code: "InternalError",
+                        message: "We encountered an internal error. Please try again."))
+            }
+        }
+
+        let xmlData = try S3Service.buildDeleteObjectsResponse(
+            deleted: quiet ? [] : deleted, errors: errors)
+        return S3Service.buildXMLResponse(data: xmlData)
+    }
+
+    /// Parses the Multi-Object Delete request XML body:
+    /// `<Delete><Quiet>true</Quiet><Object><Key>k</Key><VersionId>v</VersionId></Object>...</Delete>`
+    private func parseDeleteObjectsBody(
+        _ body: String,
+        requestId: String
+    ) throws -> (objects: [DeleteObjectRequestEntry], quiet: Bool) {
+        let quiet = body.contains("<Quiet>true</Quiet>")
+
+        let objectBlockPattern = #"<Object>(.*?)</Object>"#
+        let objectBlockRegex = try NSRegularExpression(
+            pattern: objectBlockPattern, options: [.dotMatchesLineSeparators])
+        let range = NSRange(body.startIndex..., in: body)
+
+        let objectBlocks = objectBlockRegex.matches(in: body, options: [], range: range)
+
+        guard !objectBlocks.isEmpty else {
+            throw S3Error(
+                status: .badRequest, code: "MalformedXML",
+                message: "The XML you provided was not well-formed.", requestId: requestId)
+        }
+
+        guard objectBlocks.count <= 1000 else {
+            throw S3Error(
+                status: .badRequest, code: "MalformedXML",
+                message: "The request contains more keys than are permitted in a single request.",
+                requestId: requestId)
+        }
+
+        let keyPattern = #"<Key>(.*?)</Key>"#
+        let versionIdPattern = #"<VersionId>(.*?)</VersionId>"#
+        let keyRegex = try NSRegularExpression(
+            pattern: keyPattern, options: [.dotMatchesLineSeparators])
+        let versionIdRegex = try NSRegularExpression(
+            pattern: versionIdPattern, options: [.dotMatchesLineSeparators])
+
+        var objects: [DeleteObjectRequestEntry] = []
+
+        for objectBlock in objectBlocks {
+            guard let blockRange = Range(objectBlock.range(at: 1), in: body) else {
+                continue
+            }
+            let blockContent = String(body[blockRange])
+            let blockNSRange = NSRange(blockContent.startIndex..., in: blockContent)
+
+            guard
+                let keyMatch = keyRegex.firstMatch(
+                    in: blockContent, options: [], range: blockNSRange),
+                let keyRange = Range(keyMatch.range(at: 1), in: blockContent)
+            else {
+                continue
+            }
+            let key = String(blockContent[keyRange]).xmlUnescaped
+
+            var versionId: String? = nil
+            if let versionIdMatch = versionIdRegex.firstMatch(
+                in: blockContent, options: [], range: blockNSRange),
+                let versionIdRange = Range(versionIdMatch.range(at: 1), in: blockContent)
+            {
+                versionId = String(blockContent[versionIdRange]).xmlUnescaped
+            }
+
+            objects.append(DeleteObjectRequestEntry(key: key, versionId: versionId))
+        }
+
+        return (objects, quiet)
     }
 
     /// Handles POST /:bucketName/*key
