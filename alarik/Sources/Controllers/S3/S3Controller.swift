@@ -339,6 +339,17 @@ struct S3Controller: RouteCollection {
             let partNumber = Int(partNumberStr),
             let uploadId = req.query[String.self, at: "uploadId"]
         {
+            // UploadPartCopy - same query params, but copies the part from another object
+            if let copySource = try S3Service.parseCopySource(from: req) {
+                return try await handleUploadPartCopy(
+                    req: req,
+                    destinationBucket: bucketName,
+                    uploadId: uploadId,
+                    partNumber: partNumber,
+                    copySource: copySource
+                )
+            }
+
             return try await handleUploadPart(
                 req: req,
                 bucketName: bucketName,
@@ -433,18 +444,15 @@ struct S3Controller: RouteCollection {
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Get source object path and verify it exists
-        let sourcePath = ObjectFileHandler.storagePath(
-            for: copySource.bucketName, key: copySource.key)
-        try S3Service.verifyObjectExists(
+        // Read source object metadata and data, resolving the requested version (or the
+        // latest one) and falling back to the legacy non-versioned path where applicable
+        let (sourceMeta, sourceData) = try S3Service.readVersionedObjectForCopy(
             bucketName: copySource.bucketName,
             key: copySource.key,
-            path: sourcePath,
+            versionId: copySource.versionId,
+            loadData: true,
             requestId: req.id
         )
-
-        // Read source object metadata and data
-        let (sourceMeta, sourceData) = try ObjectFileHandler.read(from: sourcePath, loadData: true)
         guard let data = sourceData else {
             throw S3Error(
                 status: .internalServerError,
@@ -1096,6 +1104,109 @@ struct S3Controller: RouteCollection {
         headers.add(name: "ETag", value: "\"\(etag)\"")
 
         return Response(status: .ok, headers: headers)
+    }
+
+    /// UploadPartCopy - PUT /:bucket/:key?partNumber=X&uploadId=Y with an x-amz-copy-source header.
+    /// Copies (a range of) another object's data into a part of an in-progress multipart upload.
+    @Sendable
+    private func handleUploadPartCopy(
+        req: Request,
+        destinationBucket: String,
+        uploadId: String,
+        partNumber: Int,
+        copySource: CopySource
+    ) async throws -> Response {
+        guard MultipartFileHandler.uploadExists(bucketName: destinationBucket, uploadId: uploadId)
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchUpload",
+                message: "The specified upload does not exist.", requestId: req.id)
+        }
+
+        guard partNumber >= 1 && partNumber <= 10000 else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument",
+                message: "Part number must be between 1 and 10000.", requestId: req.id)
+        }
+
+        try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
+
+        // Authenticate access to the source bucket
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
+
+        // Resolve source metadata first, preferring the requested/latest version and
+        // falling back to the legacy non-versioned path where applicable
+        let (sourceMeta, _) = try S3Service.readVersionedObjectForCopy(
+            bucketName: copySource.bucketName,
+            key: copySource.key,
+            versionId: copySource.versionId,
+            loadData: false,
+            requestId: req.id
+        )
+
+        // Validate copy conditions (x-amz-copy-source-if-match, etc.)
+        try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
+
+        // Optional partial copy via x-amz-copy-source-range: "bytes=start-end"
+        let partData: Data
+        if let rangeHeader = req.headers.first(name: "x-amz-copy-source-range") {
+            guard
+                let range = S3RangeParser.parseRangeHeader(rangeHeader, fileSize: sourceMeta.size)
+            else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidArgument",
+                    message: "The x-amz-copy-source-range value is invalid.", requestId: req.id)
+            }
+            let (_, rangeData) = try S3Service.readVersionedObjectForCopy(
+                bucketName: copySource.bucketName,
+                key: copySource.key,
+                versionId: copySource.versionId,
+                loadData: true,
+                range: (range.start, range.end),
+                requestId: req.id
+            )
+            guard let data = rangeData else {
+                throw S3Error(
+                    status: .internalServerError, code: "InternalError",
+                    message: "Could not read source object", requestId: req.id)
+            }
+            partData = data
+        } else {
+            let (_, fullData) = try S3Service.readVersionedObjectForCopy(
+                bucketName: copySource.bucketName,
+                key: copySource.key,
+                versionId: copySource.versionId,
+                loadData: true,
+                requestId: req.id
+            )
+            guard let data = fullData else {
+                throw S3Error(
+                    status: .internalServerError, code: "InternalError",
+                    message: "Could not read source object", requestId: req.id)
+            }
+            partData = data
+        }
+
+        let etag = try MultipartFileHandler.writePart(
+            bucketName: destinationBucket,
+            uploadId: uploadId,
+            partNumber: partNumber,
+            data: partData
+        )
+
+        let xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <CopyPartResult>
+                <LastModified>\(sourceMeta.updatedAt.iso8601String)</LastModified>
+                <ETag>"\(etag)"</ETag>
+            </CopyPartResult>
+            """
+
+        let response = S3Service.buildXMLResponse(data: Data(xml.utf8))
+        if let sourceVersionId = sourceMeta.versionId {
+            response.headers.add(name: "x-amz-copy-source-version-id", value: sourceVersionId)
+        }
+        return response
     }
 
     /// AbortMultipartUpload - DELETE /:bucket/:key?uploadId=X

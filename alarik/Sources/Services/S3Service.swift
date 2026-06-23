@@ -23,6 +23,7 @@ import XMLCoder
 struct CopySource {
     let bucketName: String
     let key: String
+    let versionId: String?
 }
 
 struct ListObjectsParams {
@@ -57,19 +58,6 @@ struct S3Service {
             throw S3Error(
                 status: .notFound, code: "NoSuchBucket",
                 message: "The specified bucket does not exist.", requestId: requestId)
-        }
-    }
-
-    static func verifyObjectExists(
-        bucketName: String,
-        key: String,
-        path: String,
-        requestId: String
-    ) throws {
-        guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchKey",
-                message: "The specified key does not exist.", requestId: requestId)
         }
     }
 
@@ -214,14 +202,28 @@ struct S3Service {
     }
 
     /// Parses the x-amz-copy-source header
-    /// Format: /source-bucket/source-key or source-bucket/source-key
+    /// Format: /source-bucket/source-key or source-bucket/source-key, optionally
+    /// suffixed with ?versionId=xxx to copy from a specific source object version.
     static func parseCopySource(from req: Request) throws -> CopySource? {
         guard let copySourceHeader = req.headers.first(name: "x-amz-copy-source") else {
             return nil
         }
 
+        // Split off the query string before percent-decoding: a literal "?" only ever
+        // appears as the query separator, since a "?" that's part of the key itself
+        // would already be percent-encoded as %3F by a well-behaved client.
+        let rawPath: Substring
+        let rawQuery: Substring?
+        if let queryIndex = copySourceHeader.firstIndex(of: "?") {
+            rawPath = copySourceHeader[..<queryIndex]
+            rawQuery = copySourceHeader[copySourceHeader.index(after: queryIndex)...]
+        } else {
+            rawPath = Substring(copySourceHeader)
+            rawQuery = nil
+        }
+
         // URL decode the header value
-        guard let decoded = copySourceHeader.removingPercentEncoding else {
+        guard let decoded = String(rawPath).removingPercentEncoding else {
             throw S3Error(
                 status: .badRequest,
                 code: "InvalidArgument",
@@ -255,7 +257,18 @@ struct S3Service {
             )
         }
 
-        return CopySource(bucketName: bucketName, key: key)
+        var versionId: String? = nil
+        if let rawQuery = rawQuery {
+            for param in rawQuery.split(separator: "&") {
+                guard let eqIndex = param.firstIndex(of: "=") else { continue }
+                let paramKey = param[..<eqIndex]
+                guard paramKey == "versionId" else { continue }
+                let rawValue = String(param[param.index(after: eqIndex)...])
+                versionId = rawValue.removingPercentEncoding ?? rawValue
+            }
+        }
+
+        return CopySource(bucketName: bucketName, key: key, versionId: versionId)
     }
 
     /// Validates conditional copy headers against source object metadata
@@ -674,5 +687,45 @@ struct S3Service {
         return try encoder.encode(
             result, withRootKey: "DeleteResult",
             rootAttributes: ["xmlns": "http://s3.amazonaws.com/doc/2006-03-01/"])
+    }
+
+    /// Resolves and reads a copy-source object (CopyObject / UploadPartCopy), preferring
+    /// versioned storage - either a specific versionId or the current latest version - and
+    /// falling back to the legacy non-versioned path for objects written before the source
+    /// bucket ever had versioning enabled.
+    /// Throws NoSuchKey if the object doesn't exist, or if its latest version is a delete
+    /// marker and no explicit versionId was requested (matching GetObject semantics).
+    static func readVersionedObjectForCopy(
+        bucketName: String,
+        key: String,
+        versionId: String?,
+        loadData: Bool,
+        range: (start: Int, end: Int)? = nil,
+        requestId: String
+    ) throws -> (meta: ObjectMeta, data: Data?) {
+        let meta: ObjectMeta
+        let data: Data?
+        do {
+            (meta, data) = try ObjectFileHandler.readVersion(
+                bucketName: bucketName, key: key, versionId: versionId,
+                loadData: loadData, range: range)
+        } catch {
+            // Fallback to non-versioned path for backwards compatibility
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
+                throw S3Error(
+                    status: .notFound, code: "NoSuchKey",
+                    message: "The specified key does not exist.", requestId: requestId)
+            }
+            (meta, data) = try ObjectFileHandler.read(from: path, loadData: loadData, range: range)
+        }
+
+        if meta.isDeleteMarker && versionId == nil {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: requestId)
+        }
+
+        return (meta, data)
     }
 }

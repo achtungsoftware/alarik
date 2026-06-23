@@ -397,4 +397,140 @@ echo ""
 echo "=== Multi-Object Delete Tests Complete ==="
 echo ""
 
+echo "=== UploadPartCopy Tests ==="
+
+# Create buckets for UploadPartCopy tests
+echo "Creating buckets for UploadPartCopy tests..."
+aws_s3 s3 mb s3://upload-part-copy-source-bucket
+aws_s3 s3 mb s3://upload-part-copy-dest-bucket
+
+# Upload a source object larger than a single part for a meaningful range-copy test
+echo "Uploading source object..."
+echo -n "0123456789ABCDEFGHIJ" | aws_s3 s3 cp - s3://upload-part-copy-source-bucket/source.txt
+
+# Create a multipart upload on the destination
+echo "Creating multipart upload on destination..."
+CREATE_RESPONSE=$(aws_s3 s3api create-multipart-upload --bucket upload-part-copy-dest-bucket --key dest.txt)
+UPLOAD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.UploadId')
+
+if [ -n "$UPLOAD_ID" ] && [ "$UPLOAD_ID" != "null" ]; then
+    echo "PASS: CreateMultipartUpload returned UploadId: $UPLOAD_ID"
+else
+    echo "FAIL: CreateMultipartUpload did not return UploadId"
+fi
+
+# UploadPartCopy - copy the whole source object as part 1
+echo "Testing UploadPartCopy (whole object)..."
+COPY_PART1_RESPONSE=$(aws_s3 s3api upload-part-copy \
+    --bucket upload-part-copy-dest-bucket --key dest.txt \
+    --part-number 1 --upload-id "$UPLOAD_ID" \
+    --copy-source upload-part-copy-source-bucket/source.txt)
+ETAG1=$(echo "$COPY_PART1_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
+
+if [ -n "$ETAG1" ]; then
+    echo "PASS: UploadPartCopy returned ETag for part 1: $ETAG1"
+else
+    echo "FAIL: UploadPartCopy did not return an ETag for part 1."
+    echo "  Response: $COPY_PART1_RESPONSE"
+fi
+
+# UploadPartCopy with a byte range - copy only the first 10 bytes as part 2
+echo "Testing UploadPartCopy with x-amz-copy-source-range..."
+COPY_PART2_RESPONSE=$(aws_s3 s3api upload-part-copy \
+    --bucket upload-part-copy-dest-bucket --key dest.txt \
+    --part-number 2 --upload-id "$UPLOAD_ID" \
+    --copy-source upload-part-copy-source-bucket/source.txt \
+    --copy-source-range "bytes=0-9")
+ETAG2=$(echo "$COPY_PART2_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
+
+if [ -n "$ETAG2" ]; then
+    echo "PASS: UploadPartCopy with a byte range returned ETag for part 2: $ETAG2"
+else
+    echo "FAIL: UploadPartCopy with a byte range did not return an ETag."
+    echo "  Response: $COPY_PART2_RESPONSE"
+fi
+
+# Complete the multipart upload using both copied parts
+echo "Completing multipart upload assembled from copied parts..."
+COMPLETE_RESPONSE=$(aws_s3 s3api complete-multipart-upload \
+    --bucket upload-part-copy-dest-bucket --key dest.txt --upload-id "$UPLOAD_ID" \
+    --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$ETAG1},{\"PartNumber\":2,\"ETag\":$ETAG2}]}")
+FINAL_ETAG=$(echo "$COMPLETE_RESPONSE" | jq -r '.ETag // empty')
+
+if [ -n "$FINAL_ETAG" ]; then
+    echo "PASS: CompleteMultipartUpload (from copied parts) returned ETag: $FINAL_ETAG"
+else
+    echo "FAIL: CompleteMultipartUpload (from copied parts) did not return an ETag."
+    echo "  Response: $COMPLETE_RESPONSE"
+fi
+
+# Verify final content: full source (20 bytes) + first 10 bytes of source again
+DEST_CONTENT=$(aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest.txt -)
+EXPECTED_CONTENT="0123456789ABCDEFGHIJ0123456789"
+if [ "$DEST_CONTENT" == "$EXPECTED_CONTENT" ]; then
+    echo "PASS: Assembled object has the expected content from both copied parts."
+else
+    echo "FAIL: Assembled object content mismatch."
+    echo "  Expected: $EXPECTED_CONTENT"
+    echo "  Got:      $DEST_CONTENT"
+fi
+
+# UploadPartCopy from a non-existent source key should fail
+echo "Testing UploadPartCopy with a non-existent source key..."
+CREATE_RESPONSE2=$(aws_s3 s3api create-multipart-upload --bucket upload-part-copy-dest-bucket --key dest2.txt)
+UPLOAD_ID2=$(echo "$CREATE_RESPONSE2" | jq -r '.UploadId')
+BAD_COPY_OUTPUT=$(aws_s3 s3api upload-part-copy \
+    --bucket upload-part-copy-dest-bucket --key dest2.txt \
+    --part-number 1 --upload-id "$UPLOAD_ID2" \
+    --copy-source upload-part-copy-source-bucket/does-not-exist.txt 2>&1)
+
+if echo "$BAD_COPY_OUTPUT" | grep -qi "NoSuchKey\|not found\|404"; then
+    echo "PASS: UploadPartCopy from a non-existent source key failed as expected."
+else
+    echo "FAIL: UploadPartCopy from a non-existent source key did not fail as expected."
+    echo "  Output: $BAD_COPY_OUTPUT"
+fi
+aws_s3 s3api abort-multipart-upload --bucket upload-part-copy-dest-bucket --key dest2.txt --upload-id "$UPLOAD_ID2" >/dev/null 2>&1
+
+# UploadPartCopy from a specific source version in a versioned bucket
+echo "Testing UploadPartCopy from a specific source version..."
+aws_s3 s3api put-bucket-versioning --bucket upload-part-copy-source-bucket --versioning-configuration Status=Enabled
+echo -n "version one content" | aws_s3 s3 cp - s3://upload-part-copy-source-bucket/versioned.txt
+V1_RESPONSE=$(aws_s3 s3api list-object-versions --bucket upload-part-copy-source-bucket --prefix versioned.txt)
+VERSION_ID_1=$(echo "$V1_RESPONSE" | jq -r '.Versions[0].VersionId')
+echo -n "version two content" | aws_s3 s3 cp - s3://upload-part-copy-source-bucket/versioned.txt
+
+CREATE_RESPONSE3=$(aws_s3 s3api create-multipart-upload --bucket upload-part-copy-dest-bucket --key dest3.txt)
+UPLOAD_ID3=$(echo "$CREATE_RESPONSE3" | jq -r '.UploadId')
+COPY_VERSIONED_RESPONSE=$(aws_s3 s3api upload-part-copy \
+    --bucket upload-part-copy-dest-bucket --key dest3.txt \
+    --part-number 1 --upload-id "$UPLOAD_ID3" \
+    --copy-source "upload-part-copy-source-bucket/versioned.txt?versionId=$VERSION_ID_1")
+ETAG3=$(echo "$COPY_VERSIONED_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
+SOURCE_VERSION_ID=$(echo "$COPY_VERSIONED_RESPONSE" | jq -r '.CopySourceVersionId // empty')
+
+if [ "$SOURCE_VERSION_ID" == "$VERSION_ID_1" ]; then
+    echo "PASS: UploadPartCopy reported the correct source version ID."
+else
+    echo "FAIL: UploadPartCopy did not report the expected source version ID."
+    echo "  Expected: $VERSION_ID_1"
+    echo "  Got:      $SOURCE_VERSION_ID"
+fi
+
+aws_s3 s3api complete-multipart-upload \
+    --bucket upload-part-copy-dest-bucket --key dest3.txt --upload-id "$UPLOAD_ID3" \
+    --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$ETAG3}]}" >/dev/null
+
+DEST3_CONTENT=$(aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest3.txt -)
+if [ "$DEST3_CONTENT" == "version one content" ]; then
+    echo "PASS: UploadPartCopy correctly copied the older source version's content."
+else
+    echo "FAIL: UploadPartCopy did not copy the requested source version's content."
+    echo "  Got: $DEST3_CONTENT"
+fi
+
+echo ""
+echo "=== UploadPartCopy Tests Complete ==="
+echo ""
+
 echo "Test complete."

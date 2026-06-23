@@ -1065,4 +1065,301 @@ struct S3VersioningTests {
                 })
         }
     }
+
+    @Test("CopyObject - Copies the latest version from a versioned source bucket")
+    func testCopyObjectFromLatestVersionInVersionedSourceBucket() async throws {
+        let sourceBucket = "test-copy-latest-version-source"
+        let destBucket = "test-copy-latest-version-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await enableVersioning(app, bucketName: sourceBucket)
+
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 1")
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 2")
+
+            // Copy without an explicit versionId - must resolve to the latest version.
+            // Before the version-aware fix, this read the (stale/non-existent) plain
+            // non-versioned path and failed with 404 once versioning was enabled.
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                additionalHeaders: ["x-amz-copy-source": "/\(sourceBucket)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(destBucket)/dest.txt")
+            try await app.test(
+                .GET, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Version 2")
+                })
+        }
+    }
+
+    @Test("CopyObject - Copies a specific source version via ?versionId")
+    func testCopyObjectFromSpecificSourceVersion() async throws {
+        let sourceBucket = "test-copy-specific-version-source"
+        let destBucket = "test-copy-specific-version-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await enableVersioning(app, bucketName: sourceBucket)
+
+            let versionId1 = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 1")
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 2")
+
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(sourceBucket)/source.txt?versionId=\(versionId1!)"
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(
+                        res.headers.first(name: "x-amz-copy-source-version-id") == versionId1)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(destBucket)/dest.txt")
+            try await app.test(
+                .GET, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Version 1")
+                })
+        }
+    }
+
+    @Test("CopyObject - Source behind a delete marker fails with NoSuchKey")
+    func testCopyObjectFromDeleteMarkerSourceFails() async throws {
+        let sourceBucket = "test-copy-delete-marker-source"
+        let destBucket = "test-copy-delete-marker-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await enableVersioning(app, bucketName: sourceBucket)
+
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Content")
+
+            let deleteSigned = signedHeaders(for: .DELETE, path: "/\(sourceBucket)/source.txt")
+            try await app.test(
+                .DELETE, "/\(sourceBucket)/source.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: deleteSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .noContent)
+                })
+
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                additionalHeaders: ["x-amz-copy-source": "/\(sourceBucket)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("<Code>NoSuchKey</Code>"))
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Copies the latest version from a versioned source bucket")
+    func testUploadPartCopyFromLatestVersionInVersionedSourceBucket() async throws {
+        let sourceBucket = "test-uploadpartcopy-latest-version-source"
+        let destBucket = "test-uploadpartcopy-latest-version-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await enableVersioning(app, bucketName: sourceBucket)
+
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 1")
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 2")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            var etag1: String = ""
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: ["x-amz-copy-source": "/\(sourceBucket)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<ETag>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</ETag>")
+                    {
+                        etag1 = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            let completeBody = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etag1)</ETag></Part>
+                </CompleteMultipartUpload>
+                """
+            let completeData = Data(completeBody.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploadId=\(uploadId)",
+                body: completeData)
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(destBucket)/dest.txt")
+            try await app.test(
+                .GET, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Version 2")
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Copies a specific source version and reports it in the response")
+    func testUploadPartCopyFromSpecificSourceVersion() async throws {
+        let sourceBucket = "test-uploadpartcopy-specific-version-source"
+        let destBucket = "test-uploadpartcopy-specific-version-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await enableVersioning(app, bucketName: sourceBucket)
+
+            let versionId1 = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 1")
+            _ = try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "Version 2")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            var etag1: String = ""
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(sourceBucket)/source.txt?versionId=\(versionId1!)"
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(
+                        res.headers.first(name: "x-amz-copy-source-version-id") == versionId1)
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<ETag>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</ETag>")
+                    {
+                        etag1 = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            let completeBody = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etag1)</ETag></Part>
+                </CompleteMultipartUpload>
+                """
+            let completeData = Data(completeBody.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploadId=\(uploadId)",
+                body: completeData)
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(destBucket)/dest.txt")
+            try await app.test(
+                .GET, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Version 1")
+                })
+        }
+    }
 }

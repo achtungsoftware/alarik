@@ -1815,6 +1815,413 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("UploadPartCopy - Copies a whole source object into a part")
+    func testUploadPartCopyBasic() async throws {
+        let bucketName = "test-upload-part-copy-basic"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(
+                app, bucketName: bucketName, key: "source.txt", content: "Hello, ")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+            #expect(!uploadId.isEmpty)
+
+            // Part 1: copied from source.txt
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: ["x-amz-copy-source": "/\(bucketName)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    #expect(bodyString.contains("<CopyPartResult"))
+                    #expect(bodyString.contains("<ETag>"))
+                    #expect(bodyString.contains("<LastModified>"))
+                })
+
+            // Part 2: regular uploaded data
+            let part2Data = Data("World!".utf8)
+            let part2Signed = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=2&uploadId=\(uploadId)", body: part2Data)
+            var etag1: String = ""
+            var etag2: String = ""
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=2&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: part2Signed)
+                    req.body = ByteBuffer(data: part2Data)
+                },
+                afterResponse: { res in
+                    etag2 = res.headers.first(name: "ETag") ?? ""
+                })
+
+            // Need part 1's ETag for completion - fetch via ListParts
+            let listSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/dest.txt", query: "uploadId=\(uploadId)")
+            try await app.test(
+                .GET, "/\(bucketName)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<ETag>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</ETag>")
+                    {
+                        etag1 = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+            #expect(!etag1.isEmpty)
+
+            let completeBody = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etag1)</ETag></Part>
+                    <Part><PartNumber>2</PartNumber><ETag>\(etag2)</ETag></Part>
+                </CompleteMultipartUpload>
+                """
+            let completeData = Data(completeBody.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploadId=\(uploadId)",
+                body: completeData)
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/dest.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "Hello, World!")
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Copies a byte range via x-amz-copy-source-range")
+    func testUploadPartCopyWithRange() async throws {
+        let bucketName = "test-upload-part-copy-range"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(
+                app, bucketName: bucketName, key: "source.txt", content: "0123456789ABCDEF")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            // Copy only bytes 0-9 ("0123456789") as part 1
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(bucketName)/source.txt",
+                    "x-amz-copy-source-range": "bytes=0-9",
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            var etag1: String = ""
+            let listSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/dest.txt", query: "uploadId=\(uploadId)")
+            try await app.test(
+                .GET, "/\(bucketName)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<ETag>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</ETag>")
+                    {
+                        etag1 = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                    // The copied part should only be 10 bytes
+                    #expect(bodyString.contains("<Size>10</Size>"))
+                })
+
+            let completeBody = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etag1)</ETag></Part>
+                </CompleteMultipartUpload>
+                """
+            let completeData = Data(completeBody.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploadId=\(uploadId)",
+                body: completeData)
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/dest.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "0123456789")
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Non-existent source key fails with NoSuchKey")
+    func testUploadPartCopyNonExistentSource() async throws {
+        let bucketName = "test-upload-part-copy-no-source"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: ["x-amz-copy-source": "/\(bucketName)/does-not-exist.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("<Code>NoSuchKey</Code>"))
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Non-existent upload fails with NoSuchUpload")
+    func testUploadPartCopyNonExistentUpload() async throws {
+        let bucketName = "test-upload-part-copy-no-upload"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "source.txt", content: "data")
+
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=1&uploadId=nonexistent",
+                additionalHeaders: ["x-amz-copy-source": "/\(bucketName)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=1&uploadId=nonexistent",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("<Code>NoSuchUpload</Code>"))
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Failing If-Match condition rejects the copy")
+    func testUploadPartCopyIfMatchFailure() async throws {
+        let bucketName = "test-upload-part-copy-if-match"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "source.txt", content: "data")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(bucketName)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(bucketName)/source.txt",
+                    "x-amz-copy-source-if-match": "\"wrongetag\"",
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .preconditionFailed)
+                })
+
+            // ListParts should show no parts since the copy never wrote one
+            let listSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/dest.txt", query: "uploadId=\(uploadId)")
+            try await app.test(
+                .GET, "/\(bucketName)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.body.string.contains("<IsTruncated>false</IsTruncated>"))
+                    #expect(!res.body.string.contains("<Part>"))
+                })
+        }
+    }
+
+    @Test("UploadPartCopy - Copies a part from a different bucket")
+    func testUploadPartCopyAcrossBuckets() async throws {
+        let sourceBucket = "test-upload-part-copy-cross-source"
+        let destBucket = "test-upload-part-copy-cross-dest"
+        try await withApp { app in
+            try await createBucket(app, bucketName: sourceBucket)
+            try await createBucket(app, bucketName: destBucket)
+            try await putObject(
+                app, bucketName: sourceBucket, key: "source.txt", content: "cross-bucket data")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            var etag1: String = ""
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(destBucket)/dest.txt",
+                query: "partNumber=1&uploadId=\(uploadId)",
+                additionalHeaders: ["x-amz-copy-source": "/\(sourceBucket)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(destBucket)/dest.txt?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    if let range = res.body.string.range(of: "<ETag>"),
+                        let endRange = res.body.string[range.upperBound...].range(
+                            of: "</ETag>")
+                    {
+                        etag1 = String(res.body.string[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+
+            let completeBody = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etag1)</ETag></Part>
+                </CompleteMultipartUpload>
+                """
+            let completeData = Data(completeBody.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(destBucket)/dest.txt", query: "uploadId=\(uploadId)",
+                body: completeData)
+            try await app.test(
+                .POST, "/\(destBucket)/dest.txt?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let getSigned = signedHeaders(for: .GET, path: "/\(destBucket)/dest.txt")
+            try await app.test(
+                .GET, "/\(destBucket)/dest.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "cross-bucket data")
+                })
+        }
+    }
+
     @Test("CompleteMultipartUpload fails with duplicate part numbers")
     func testCompleteMultipartUploadDuplicateParts() async throws {
         let bucketName = "test-multipart-duplicate-parts"
