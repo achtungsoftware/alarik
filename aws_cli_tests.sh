@@ -658,4 +658,70 @@ echo ""
 echo "=== Bucket Policy Tests Complete ==="
 echo ""
 
+echo "=== Share File Tests ==="
+
+# Create a bucket and object to share. The internal API accepts the same
+# Access Key/Secret Key headers as the S3 API (InternalAuthenticator supports both).
+echo "Creating bucket and object for share tests..."
+aws_s3 s3 mb s3://share-test-bucket
+echo -n "share me" | aws_s3 s3 cp - s3://share-test-bucket/shared-file.txt
+
+echo "Generating a share link (opaque token) via the internal API..."
+SHARE_RESPONSE=$(curl -s -X POST "$ENDPOINT/api/v1/objects/share" \
+    -H "X-Access-Key: $AWS_ACCESS_KEY_ID" \
+    -H "X-Secret-Key: $AWS_SECRET_ACCESS_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"bucket":"share-test-bucket","key":"shared-file.txt","expiresInSeconds":3600}')
+SHARE_URL=$(echo "$SHARE_RESPONSE" | jq -r '.url // empty')
+
+if [ -n "$SHARE_URL" ]; then
+    echo "PASS: Share endpoint returned a URL."
+else
+    echo "FAIL: Share endpoint did not return a URL."
+    echo "  Response: $SHARE_RESPONSE"
+fi
+
+# The link must work with zero credentials - no access key, no signature, just the token
+echo "Testing the generated link with no credentials at all..."
+SHARE_CONTENT=$(curl -s "$SHARE_URL")
+SHARE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$SHARE_URL")
+
+if [ "$SHARE_CODE" == "200" ] && [ "$SHARE_CONTENT" == "share me" ]; then
+    echo "PASS: Anonymous curl on the share link succeeded with the expected content."
+else
+    echo "FAIL: Anonymous curl on the share link did not succeed as expected."
+    echo "  Status: $SHARE_CODE, Content: $SHARE_CONTENT"
+fi
+
+# A request for more than the 7-day SigV4 maximum must be rejected
+echo "Testing that expiresInSeconds beyond 7 days is rejected..."
+TOO_LONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ENDPOINT/api/v1/objects/share" \
+    -H "X-Access-Key: $AWS_ACCESS_KEY_ID" \
+    -H "X-Secret-Key: $AWS_SECRET_ACCESS_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"bucket":"share-test-bucket","key":"shared-file.txt","expiresInSeconds":604801}')
+
+if [ "$TOO_LONG_CODE" == "400" ]; then
+    echo "PASS: A 7-day+ expiry was rejected."
+else
+    echo "FAIL: Expected 400 for an over-long expiry, got $TOO_LONG_CODE."
+fi
+
+# Sharing a non-existent object must fail
+NON_EXISTENT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ENDPOINT/api/v1/objects/share" \
+    -H "X-Access-Key: $AWS_ACCESS_KEY_ID" \
+    -H "X-Secret-Key: $AWS_SECRET_ACCESS_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"bucket":"share-test-bucket","key":"does-not-exist.txt","expiresInSeconds":3600}')
+
+if [ "$NON_EXISTENT_CODE" == "404" ]; then
+    echo "PASS: Sharing a non-existent object was rejected."
+else
+    echo "FAIL: Expected 404 for a non-existent object, got $NON_EXISTENT_CODE."
+fi
+
+echo ""
+echo "=== Share File Tests Complete ==="
+echo ""
+
 echo "Test complete."

@@ -2904,4 +2904,142 @@ struct InternalBucketControllerTests {
                 })
         }
     }
+
+    /// Extracts just the path + query from a generated absolute share URL, since `app.test`
+    /// dispatches on the path. No Host-header workaround is needed here (unlike a presigned
+    /// URL) - this route doesn't use SigV4 at all.
+    private func pathAndQuery(fromShareURL url: String) -> String {
+        guard let components = URLComponents(string: url) else { return url }
+        var result = components.path
+        if let query = components.query {
+            result += "?\(query)"
+        }
+        return result
+    }
+
+    @Test("Share object - Success generates a token link that actually works, unauthenticated")
+    func testShareObjectSuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-success@example.com")
+            try await createBucket(app, token: token, name: "share-bucket")
+            try await putObject(
+                app, bucketName: "share-bucket", key: "file.txt", content: "shared content")
+
+            var shareURL = ""
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-bucket", key: "file.txt", expiresInSeconds: 3600))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(
+                        InternalBucketController.ShareResponseDTO.self)
+                    #expect(dto.url.contains("/api/v1/shared/"))
+                    // No credential of any kind should appear in the link
+                    #expect(!dto.url.contains("share-bucket"))
+                    #expect(!dto.url.contains("file.txt"))
+                    shareURL = dto.url
+                })
+
+            #expect(!shareURL.isEmpty)
+
+            // The generated link must actually work, with zero credentials at all
+            try await app.test(
+                .GET, pathAndQuery(fromShareURL: shareURL),
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "shared content")
+                })
+        }
+    }
+
+    @Test("Share object - expiresInSeconds beyond 7 days is rejected")
+    func testShareObjectExpiresInSecondsTooLarge() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-too-long@example.com")
+            try await createBucket(app, token: token, name: "share-bucket")
+            try await putObject(
+                app, bucketName: "share-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-bucket", key: "file.txt", expiresInSeconds: 604_801))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Share object - Non-existent object fails")
+    func testShareObjectNonExistentObject() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-no-obj@example.com")
+            try await createBucket(app, token: token, name: "share-bucket")
+
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-bucket", key: "does-not-exist.txt",
+                            expiresInSeconds: 3600))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Share object - Non-owned bucket fails")
+    func testShareObjectNonOwnedBucket() async throws {
+        try await withApp { app in
+            let ownerToken = try await createUserAndLogin(
+                app, username: "share-owner@example.com")
+            try await createBucket(app, token: ownerToken, name: "share-owner-bucket")
+            try await putObject(
+                app, bucketName: "share-owner-bucket", key: "file.txt", content: "data")
+
+            let otherToken = try await createUserAndLogin(
+                app, username: "share-other@example.com")
+
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-owner-bucket", key: "file.txt", expiresInSeconds: 3600)
+                    )
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Share object - Without auth fails")
+    func testShareObjectUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-bucket", key: "file.txt", expiresInSeconds: 3600))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
 }

@@ -52,6 +52,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateAccessKey())
     app.migrations.add(CreateBucket())
     app.migrations.add(AddBucketPolicy())
+    app.migrations.add(CreateSharedLink())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -106,6 +107,18 @@ public func configure(_ app: Application) async throws {
                     }
                 } catch {
                     app.logger.error("Failed to invalidate expired access keys: \(error)")
+                }
+
+                do {
+                    let expiredSharedLinks = try await SharedLink.query(on: app.db)
+                        .filter(\.$expiresAt <= Date.now)
+                        .all()
+
+                    for link in expiredSharedLinks {
+                        try await link.delete(on: app.db)
+                    }
+                } catch {
+                    app.logger.error("Failed to clean up expired shared links: \(error)")
                 }
             }
         }

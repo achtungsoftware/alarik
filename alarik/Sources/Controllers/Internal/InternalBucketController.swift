@@ -33,6 +33,17 @@ struct InternalBucketController: RouteCollection {
         let policy: String?
     }
 
+    struct ShareRequestDTO: Content {
+        let bucket: String
+        let key: String
+        let expiresInSeconds: Int
+    }
+
+    struct ShareResponseDTO: Content {
+        let url: String
+        let expiresAt: Date
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
@@ -53,6 +64,7 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
+        routes.grouped("objects", "share").post(use: self.shareObject)
     }
 
     @Sendable
@@ -182,6 +194,54 @@ struct InternalBucketController: RouteCollection {
                 total: items.count
             )
         )
+    }
+
+    /// Cap on how long a shared link can stay valid. Kept at the same 7 days as a real S3
+    /// presigned URL would allow, for familiarity - but this is an Alarik-specific limit, not
+    /// a SigV4 constraint, since shared links don't use SigV4 at all.
+    static let maxShareExpirySeconds = 604_800
+
+    /// Creates a time-limited public link to an object you own. Nothing about your account or
+    /// credentials is exposed - the link is just an opaque, unguessable token (the new row's own
+    /// id) that `SharedLinkController` looks up. Revoking access just means deleting the row,
+    /// which happens automatically once it expires (see the cleanup task in configure.swift).
+    @Sendable
+    func shareObject(req: Request) async throws -> ShareResponseDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        let input = try req.content.decode(ShareRequestDTO.self)
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == input.bucket)
+                .filter(\.$user.$id == auth.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        let path = ObjectFileHandler.storagePath(for: input.bucket, key: input.key)
+        guard ObjectFileHandler.keyExists(for: input.bucket, key: input.key, path: path) else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        guard input.expiresInSeconds > 0,
+            input.expiresInSeconds <= Self.maxShareExpirySeconds
+        else {
+            throw Abort(
+                .badRequest,
+                reason:
+                    "expiresInSeconds must be between 1 and \(Self.maxShareExpirySeconds) (7 days)"
+            )
+        }
+
+        let expiresAt = Date().addingTimeInterval(TimeInterval(input.expiresInSeconds))
+        let link = SharedLink(
+            userId: auth.userId, bucketName: input.bucket, key: input.key, expiresAt: expiresAt)
+        try await link.save(on: req.db)
+
+        let url = "\(apiBaseURL)/api/v1/shared/\(link.id!.uuidString)"
+        return ShareResponseDTO(url: url, expiresAt: expiresAt)
     }
 
     @Sendable

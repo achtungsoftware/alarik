@@ -26,6 +26,12 @@ func routes(_ app: Application) throws {
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalAdminController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBucketController())
 
+    // Public, unauthenticated shared-file links - kept under /api/v1 (ungrouped, so no
+    // InternalAuthenticator applies) rather than top-level, so it can never collide with
+    // path-style S3 bucket routing (a bucket literally named "shared" would otherwise shadow
+    // or be shadowed by this route).
+    try apiV1.register(collection: SharedLinkController())
+
     // S3
     try app.register(collection: S3Controller())
 }

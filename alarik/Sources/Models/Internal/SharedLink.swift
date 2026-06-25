@@ -1,0 +1,61 @@
+/*
+Copyright 2025-present Julian Gerhards
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Fluent
+import Foundation
+
+/// A time-limited public link to a single object. The row's own id is used directly as the
+/// opaque, unguessable public token - no credential of any kind is exposed, and revoking a
+/// link is just deleting (or letting expire) this row.
+final class SharedLink: Model, @unchecked Sendable {
+    static let schema = "shared_links"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Parent(key: "user_id")
+    var user: User
+
+    @Field(key: "bucket_name")
+    var bucketName: String
+
+    @Field(key: "key")
+    var key: String
+
+    @Field(key: "expires_at")
+    var expiresAt: Date
+
+    @Field(key: "created_at")
+    var createdAt: Date
+
+    init() {}
+
+    init(
+        id: UUID? = nil,
+        userId: UUID,
+        bucketName: String,
+        key: String,
+        expiresAt: Date,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.$user.id = userId
+        self.bucketName = bucketName
+        self.key = key
+        self.expiresAt = expiresAt
+        self.createdAt = createdAt
+    }
+}

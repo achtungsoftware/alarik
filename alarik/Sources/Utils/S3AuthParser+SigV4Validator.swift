@@ -325,7 +325,8 @@ struct SigV4Validator {
         }
 
         // Derive signing key once (4 HMAC operations) - reused for all validation attempts
-        let kSigning = try deriveSigningKey(authInfo: authInfo)
+        let kSigning = try deriveSigningKey(
+            date: authInfo.date, region: authInfo.region, service: authInfo.service)
 
         // Try multiple combinations to handle different client implementations:
         // - sorted=true: AWS spec compliant query param sorting
@@ -346,15 +347,15 @@ struct SigV4Validator {
         return false
     }
 
-    private func deriveSigningKey(authInfo: S3AuthInfo) throws -> Data {
+    private func deriveSigningKey(date: String, region: String, service: String) throws -> Data {
         let kSecret = Data(secretKey.utf8)
         var kSecretWithPrefix = Data(capacity: kSecret.count + 4)
         kSecretWithPrefix.append(contentsOf: "AWS4".utf8)
         kSecretWithPrefix.append(kSecret)
 
-        let kDate = try hmacSHA256(key: kSecretWithPrefix, data: Data(authInfo.date.utf8))
-        let kRegion = try hmacSHA256(key: kDate, data: Data(authInfo.region.utf8))
-        let kService = try hmacSHA256(key: kRegion, data: Data(authInfo.service.utf8))
+        let kDate = try hmacSHA256(key: kSecretWithPrefix, data: Data(date.utf8))
+        let kRegion = try hmacSHA256(key: kDate, data: Data(region.utf8))
+        let kService = try hmacSHA256(key: kRegion, data: Data(service.utf8))
         return try hmacSHA256(key: kService, data: Data("aws4_request".utf8))
     }
 
@@ -494,16 +495,25 @@ struct SigV4Validator {
             }
         }
 
+        // Build a case-insensitive query param lookup too, for headers that are only signed
+        // via the query string (e.g. presigned URLs signing "x-amz-date", which exists only as
+        // ?X-Amz-Date=... - AWS query param names keep their spec casing, unlike header names).
+        var queryLookup: [String: String] = [:]
+        if let rawQuery = rawQueryString {
+            for param in rawQuery.split(separator: "&") where !param.isEmpty {
+                guard let eqIndex = param.firstIndex(of: "=") else { continue }
+                let key = String(param[..<eqIndex]).lowercased()
+                let value = String(param[param.index(after: eqIndex)...])
+                queryLookup[key] = value.removingPercentEncoding ?? value
+            }
+        }
+
         for header in sortedHeaders {
-            // O(1) lookup instead of O(n) case-insensitive scan
+            // O(1) lookups instead of O(n) case-insensitive scans
             let values =
                 headerLookup[header]
-                ?? {
-                    if let q = request.query[String.self, at: header] {
-                        return [q]
-                    }
-                    return []
-                }()
+                ?? queryLookup[header].map { [$0] }
+                ?? []
             let processed = values.map { value -> String in
                 let trimmed = value.trimmingCharacters(in: .whitespaces)
                 return collapseWhitespace(trimmed)
@@ -673,3 +683,4 @@ struct SigV4Validator {
         return Data(HMAC<SHA256>.authenticationCode(for: data, using: symmetricKey))
     }
 }
+

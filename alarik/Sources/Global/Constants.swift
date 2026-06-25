@@ -14,8 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import Vapor
+
 /// Alarik version string (updated by publish.sh)
-public let alarikVersion = "1.0.0-alpha-15"
+public let alarikVersion = "1.0.0-alpha-16"
+
+/// The externally-reachable base URL of this instance's S3 API (no trailing slash), used to
+/// build absolute URLs such as presigned share links. The incoming request's Host header isn't
+/// used for this since Alarik may sit behind a reverse proxy with a different public hostname.
+public let apiBaseURL: String = Environment.get("API_BASE_URL") ?? "http://localhost:8080"
 
 /// Global hex lookup table for optimal performance
 public let hexLookupTable: InlineArray<16, UInt8> = [
