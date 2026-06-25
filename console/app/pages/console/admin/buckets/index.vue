@@ -16,7 +16,7 @@ limitations under the License.
 */
 
 import { h, resolveComponent } from "vue";
-import type { TableColumn, TableRow } from "@nuxt/ui";
+import type { DropdownMenuItem, TableColumn, TableRow } from "@nuxt/ui";
 
 definePageMeta({
     layout: "dashboard",
@@ -30,12 +30,16 @@ const page = ref(1);
 const itemsPerPage = ref(10);
 const UCheckbox = resolveComponent("UCheckbox");
 const UBadge = resolveComponent("UBadge");
+const UDropdownMenu = resolveComponent("UDropdownMenu");
+const UButton = resolveComponent("UButton");
 const rowSelection = ref<Record<string, boolean>>({});
 const jwtCookie = useJWTCookie();
 const openBucketCreateModal = ref(false);
 const isDeleting = ref(false);
 const toast = useToast();
 const { confirm } = useConfirmDialog();
+const selectedBucketForPolicy = ref<Bucket | null>(null);
+const openBucketPolicyModal = ref(false);
 
 const {
     data: fetchResponse,
@@ -96,6 +100,54 @@ const columns: TableColumn<Bucket>[] = [
         header: "Created at",
         cell: ({ row }) => {
             return new Date(row.original.creationDate).toLocaleString();
+        },
+    },
+    {
+        accessorKey: "policy",
+        header: "Access",
+        cell: ({ row }) =>
+            h(UBadge, {
+                label: row.original.policy ? "Public (policy)" : "Private",
+                color: row.original.policy ? "warning" : "neutral",
+                variant: row.original.policy ? "solid" : "subtle",
+            }),
+    },
+    {
+        id: "actions",
+        cell: ({ row }) => {
+            return h(
+                "div",
+                { class: "text-right" },
+                h(
+                    UDropdownMenu,
+                    {
+                        content: {
+                            align: "end",
+                        },
+                        items: [
+                            [
+                                {
+                                    label: "Manage Policy",
+                                    icon: "i-lucide-shield",
+                                    onSelect() {
+                                        selectedBucketForPolicy.value = row.original;
+                                        openBucketPolicyModal.value = true;
+                                    },
+                                },
+                            ],
+                        ] as DropdownMenuItem[][],
+                        "aria-label": "Action Menu",
+                    },
+                    () =>
+                        h(UButton, {
+                            icon: "i-lucide-ellipsis-vertical",
+                            color: "neutral",
+                            variant: "ghost",
+                            class: "ml-auto",
+                            "aria-label": "Action Menu",
+                        })
+                )
+            );
         },
     },
 ];
@@ -239,4 +291,12 @@ async function deleteMany() {
             </div>
         </template>
     </UDashboardPanel>
+
+    <BucketPolicyModal
+        v-if="selectedBucketForPolicy && openBucketPolicyModal"
+        v-model:open="openBucketPolicyModal"
+        :bucket="selectedBucketForPolicy"
+        admin
+        @saved="refresh"
+    />
 </template>

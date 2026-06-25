@@ -33,6 +33,10 @@ struct InternalAdminController: RouteCollection {
         let userCount: Int
     }
 
+    struct PolicyDTO: Content {
+        let policy: String?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
 
         routes.grouped("admin").grouped("users")
@@ -55,6 +59,13 @@ struct InternalAdminController: RouteCollection {
 
         routes.grouped("admin").grouped("buckets").grouped(":bucketName").delete(
             use: self.deleteBucket)
+
+        routes.grouped("admin").grouped("buckets").grouped(":bucketName").grouped("policy").get(
+            use: self.getBucketPolicy)
+        routes.grouped("admin").grouped("buckets").grouped(":bucketName").grouped("policy").put(
+            use: self.setBucketPolicy)
+        routes.grouped("admin").grouped("buckets").grouped(":bucketName").grouped("policy").delete(
+            use: self.deleteBucketPolicy)
     }
 
     @Sendable
@@ -78,6 +89,90 @@ struct InternalAdminController: RouteCollection {
 
         try await BucketService.delete(
             on: req.db, bucketName: bucketName, userId: bucket.user.id!, force: true)
+
+        return .noContent
+    }
+
+    @Sendable
+    func getBucketPolicy(req: Request) async throws -> PolicyDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        return PolicyDTO(policy: bucket.policy)
+    }
+
+    @Sendable
+    func setBucketPolicy(req: Request) async throws -> PolicyDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(PolicyDTO.self)
+
+        guard let rawJSON = input.policy else {
+            throw Abort(.badRequest, reason: "Missing policy")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        let policy: BucketPolicy
+        do {
+            policy = try BucketPolicy.parseAndValidate(
+                rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
+        } catch let error as S3Error {
+            throw Abort(.badRequest, reason: error.message)
+        }
+
+        bucket.policy = rawJSON
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+
+        return PolicyDTO(policy: rawJSON)
+    }
+
+    @Sendable
+    func deleteBucketPolicy(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        bucket.policy = nil
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.removePolicy(for: bucketName)
 
         return .noContent
     }

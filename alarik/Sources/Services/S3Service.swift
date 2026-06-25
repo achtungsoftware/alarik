@@ -448,10 +448,19 @@ struct S3Service {
         return buildXMLResponse(data: Data(xml.utf8))
     }
 
-    static func handlePolicyQuery(req: Request) throws -> Response {
-        throw S3Error(
-            status: .notFound, code: "NoSuchBucketPolicy",
-            message: "The specified bucket does not have a bucket policy.", requestId: req.id)
+    /// Handles GET ?policy - returns the bucket's policy as raw JSON, matching real S3
+    /// (GetBucketPolicy is the one bucket subresource that responds with JSON, not XML)
+    static func handlePolicyQuery(bucket: Bucket?, requestId: String) throws -> Response {
+        guard let rawPolicy = bucket?.policy else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucketPolicy",
+                message: "The specified bucket does not have a bucket policy.",
+                requestId: requestId)
+        }
+
+        let response = Response(status: .ok, body: .init(string: rawPolicy))
+        response.headers.contentType = .json
+        return response
     }
 
     static func shouldHandleSubresource(query: String) -> Bool {
@@ -472,7 +481,7 @@ struct S3Service {
         }
 
         if lowerQuery.contains("policy") {
-            return try handlePolicyQuery(req: req)
+            return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
 
         // Handle versioning configuration (GET only - PUT handled in controller)
@@ -594,6 +603,35 @@ struct S3Service {
         }
 
         return authInfo
+    }
+
+    /// Authenticates the request if any credentials are present (header or query), exactly like
+    /// `authenticateWithCache` - a malformed/expired signature always fails here and is never
+    /// treated as anonymous. Only a true absence of credentials falls through to the bucket
+    /// policy, and only for actions in the small public-access whitelist (`S3PolicyAction`).
+    /// Returns nil when the request was authorized anonymously via policy.
+    static func authenticateOrAuthorizePublic(
+        req: Request,
+        bucketName: String,
+        action: S3PolicyAction,
+        key: String?
+    ) async throws -> S3AuthInfo? {
+        let hasCredentials =
+            req.headers.first(name: "authorization") != nil
+            || req.query[String.self, at: "X-Amz-Algorithm"] != nil
+
+        if hasCredentials {
+            return try await authenticateWithCache(req: req, bucketName: bucketName)
+        }
+
+        guard
+            let policy = await BucketPolicyCache.shared.policy(for: bucketName),
+            policy.allowsAnonymous(action: action, bucketName: bucketName, key: key)
+        else {
+            throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
+        }
+
+        return nil
     }
 
     static func authenticateWithDB(

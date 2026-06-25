@@ -2671,4 +2671,237 @@ struct InternalBucketControllerTests {
                 })
         }
     }
+
+    private func publicReadPolicy(bucketName: String) -> String {
+        """
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::\(bucketName)/*"}]}
+        """
+    }
+
+    @Test("Get policy - None set returns null")
+    func testGetPolicyNoneSetReturnsNull() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-policy-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.PolicyDTO.self)
+                    #expect(dto.policy == nil)
+                })
+        }
+    }
+
+    @Test("Set policy - Valid policy succeeds and is retrievable")
+    func testSetPolicyValid() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-policy-bucket")
+            let policyJSON = publicReadPolicy(bucketName: "test-policy-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.PolicyDTO.self)
+                    #expect(dto.policy == policyJSON)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.PolicyDTO.self)
+                    #expect(dto.policy == policyJSON)
+                })
+        }
+    }
+
+    @Test("Set policy - Unsupported policy elements are rejected")
+    func testSetPolicyInvalidRejected() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-policy-bucket")
+            let denyPolicy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::test-policy-bucket/*"}]}
+                """
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: denyPolicy))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Set policy - Non-existent bucket fails")
+    func testSetPolicyNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            let policyJSON = publicReadPolicy(bucketName: "nonexistent")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/nonexistent/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Set policy - Without auth fails")
+    func testSetPolicyUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/policy",
+                beforeRequest: { req in
+                    try req.content.encode(
+                        InternalBucketController.PolicyDTO(policy: publicReadPolicy(bucketName: "test-bucket")))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Get policy - Without auth fails")
+    func testGetPolicyUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/buckets/test-bucket/policy",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete policy - Success")
+    func testDeletePolicySuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-policy-bucket")
+            let policyJSON = publicReadPolicy(bucketName: "test-policy-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: policyJSON))
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.PolicyDTO.self)
+                    #expect(dto.policy == nil)
+                })
+        }
+    }
+
+    @Test("Delete policy - Non-existent bucket fails")
+    func testDeletePolicyNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/nonexistent/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Delete policy - Without auth fails")
+    func testDeletePolicyUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .DELETE, "/api/v1/buckets/test-bucket/policy",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Policy - User cannot manage another user's bucket policy")
+    func testPolicyUserIsolation() async throws {
+        try await withApp { app in
+            let token1 = try await createUserAndLogin(app)
+            try await createBucket(app, token: token1, name: "user1-policy-bucket")
+
+            let token2 = try await createUserAndLogin(app, username: "policy-user2@example.com")
+            let policyJSON = publicReadPolicy(bucketName: "user1-policy-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/user1-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/user1-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/user1-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            // Owner can still manage it normally
+            try await app.test(
+                .PUT, "/api/v1/buckets/user1-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token1)
+                    try req.content.encode(InternalBucketController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
 }

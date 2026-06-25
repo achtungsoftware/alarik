@@ -29,6 +29,10 @@ struct InternalBucketController: RouteCollection {
         let status: String
     }
 
+    struct PolicyDTO: Content {
+        let policy: String?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
@@ -37,6 +41,12 @@ struct InternalBucketController: RouteCollection {
             use: self.getVersioning)
         routes.grouped("buckets").grouped(":bucketName").grouped("versioning").put(
             use: self.setVersioning)
+        routes.grouped("buckets").grouped(":bucketName").grouped("policy").get(
+            use: self.getPolicy)
+        routes.grouped("buckets").grouped(":bucketName").grouped("policy").put(
+            use: self.setPolicy)
+        routes.grouped("buckets").grouped(":bucketName").grouped("policy").delete(
+            use: self.deletePolicy)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects").post(use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
@@ -562,6 +572,90 @@ struct InternalBucketController: RouteCollection {
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
 
         return VersioningStatusDTO(status: newStatus.rawValue)
+    }
+
+    @Sendable
+    func getPolicy(req: Request) async throws -> PolicyDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        return PolicyDTO(policy: bucket.policy)
+    }
+
+    @Sendable
+    func setPolicy(req: Request) async throws -> PolicyDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(PolicyDTO.self)
+
+        guard let rawJSON = input.policy else {
+            throw Abort(.badRequest, reason: "Missing policy")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        let policy: BucketPolicy
+        do {
+            policy = try BucketPolicy.parseAndValidate(
+                rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
+        } catch let error as S3Error {
+            throw Abort(.badRequest, reason: error.message)
+        }
+
+        bucket.policy = rawJSON
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+
+        return PolicyDTO(policy: rawJSON)
+    }
+
+    @Sendable
+    func deletePolicy(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        bucket.policy = nil
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.removePolicy(for: bucketName)
+
+        return .noContent
     }
 
     @Sendable

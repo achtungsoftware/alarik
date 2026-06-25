@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/// Alarik version string (updated by publish.sh)
-public let alarikVersion = "1.0.0-alpha-15"
+import Fluent
 
-/// Global hex lookup table for optimal performance
-public let hexLookupTable: InlineArray<16, UInt8> = [
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,  // 0-7
-    0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66   // 8-9, a-f
-]
+struct AddBucketPolicy: AsyncMigration {
+    func prepare(on database: any Database) async throws {
+        try await database.schema("buckets")
+            .field("policy", .string)
+            .update()
+    }
+
+    func revert(on database: any Database) async throws {
+        try await database.schema("buckets")
+            .deleteField("policy")
+            .update()
+    }
+}

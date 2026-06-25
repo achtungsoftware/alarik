@@ -51,6 +51,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateUser())
     app.migrations.add(CreateAccessKey())
     app.migrations.add(CreateBucket())
+    app.migrations.add(AddBucketPolicy())
 
     app.migrations.add(CreateDefaultUser())
 

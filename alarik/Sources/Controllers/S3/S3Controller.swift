@@ -44,37 +44,46 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
 
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
-        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-
-        // Get bucket for versioning info
-        let bucket = try await Bucket.query(on: req.db)
-            .filter(\.$name == bucketName)
-            .first()
 
         let query = req.url.query ?? ""
         let lowerQuery = query.lowercased()
 
-        // Handle ?uploads - list multipart uploads
+        // Handle ?uploads - list multipart uploads (always requires strict auth - not in the
+        // public-access whitelist)
         if lowerQuery.contains("uploads") && !lowerQuery.contains("uploadid") {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             return try handleListMultipartUploads(req: req, bucketName: bucketName)
         }
 
-        // Handle ?versions - list object versions
+        // Handle ?versions - list object versions (always requires strict auth)
         // Use word boundary check: "versions" but not "versioning"
         let isListVersions = lowerQuery.contains("versions") && !lowerQuery.contains("versioning")
         if isListVersions {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             return try handleListVersions(req: req, bucketName: bucketName)
         }
 
-        // Handle subresource queries (location, policy, versioning config)
+        // Handle subresource queries (location, policy, versioning config) - always requires
+        // strict auth. The bucket is only fetched here (not unconditionally up front) since
+        // it's only needed by the ?versioning/?policy responses - no need to hit the DB for
+        // every plain ListObjects call, anonymous or not.
         let shouldHandle = S3Service.shouldHandleSubresource(query: query)
         if shouldHandle {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
             if let response = try await S3Service.handleSubresourceQuery(
                 query: query, req: req, bucket: bucket)
             {
                 return response
             }
         }
+
+        // Plain ListObjects/ListObjectsV2 - the only bucket-level action eligible for anonymous
+        // access, via a bucket policy granting s3:ListBucket
+        _ = try await S3Service.authenticateOrAuthorizePublic(
+            req: req, bucketName: bucketName, action: .listBucket, key: nil)
 
         let params = S3Service.parseListObjectsParams(from: req, bucketName: bucketName)
 
@@ -151,10 +160,13 @@ struct S3Controller: RouteCollection {
         let keyPath = S3Service.extractObjectKey(from: req)
 
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
-        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // Check for versionId query parameter
         let versionId = req.query[String.self, at: "versionId"]
+
+        _ = try await S3Service.authenticateOrAuthorizePublic(
+            req: req, bucketName: bucketName,
+            action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
 
         // Read object (versioned or non-versioned)
         let (meta, _): (ObjectMeta, Data?)
@@ -215,6 +227,11 @@ struct S3Controller: RouteCollection {
         // Handle PUT ?versioning
         if query.lowercased().contains("versioning") {
             return try await handleVersioningPut(req: req, bucketName: bucketName)
+        }
+
+        // Handle PUT ?policy
+        if query.lowercased().contains("policy") {
+            return try await handleBucketPolicyPut(req: req, bucketName: bucketName)
         }
 
         if Validator.bucketName.validate(bucketName).isFailure {
@@ -279,10 +296,46 @@ struct S3Controller: RouteCollection {
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
 
+    /// Handles PUT /:bucketName?policy - set the bucket policy. Only the bucket owner can set
+    /// their own bucket's policy, so this always requires strict authentication, never policy.
+    @Sendable
+    private func handleBucketPolicyPut(req: Request, bucketName: String) async throws -> Response {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let rawJSON = String(buffer: bodyData)
+
+        let policy = try BucketPolicy.parseAndValidate(
+            rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
+
+        bucket.policy = rawJSON
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+
+        return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
+    }
+
     // DELETE /:bucketName
     @Sendable
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
         let bucketName = try S3Service.extractBucketName(from: req)
+        let query = req.url.query ?? ""
+
+        // Handle DELETE ?policy
+        if query.lowercased().contains("policy") {
+            return try await handleBucketPolicyDelete(req: req, bucketName: bucketName)
+        }
 
         guard
             let bucket = try await Bucket.query(on: req.db)
@@ -316,6 +369,32 @@ struct S3Controller: RouteCollection {
         }
 
         try await BucketService.delete(on: req.db, bucketName: bucketName, userId: bucket.user.id!)
+
+        return .noContent
+    }
+
+    /// Handles DELETE /:bucketName?policy - removes the bucket policy. Always requires strict
+    /// authentication, just like setting it.
+    @Sendable
+    private func handleBucketPolicyDelete(req: Request, bucketName: String) async throws
+        -> HTTPStatus
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        bucket.policy = nil
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.removePolicy(for: bucketName)
 
         return .noContent
     }
@@ -530,10 +609,11 @@ struct S3Controller: RouteCollection {
         let keyPath = S3Service.extractObjectKey(from: req)
 
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
-        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        // Check if this is ListParts (GET with uploadId)
+        // ListParts (GET with uploadId) always requires strict auth - it isn't in the
+        // public-access whitelist, so it's checked before any anonymous-access decision.
         if let uploadId = req.query[String.self, at: "uploadId"] {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             return try handleListParts(
                 req: req,
                 bucketName: bucketName,
@@ -544,6 +624,10 @@ struct S3Controller: RouteCollection {
 
         // Check for versionId query parameter
         let versionId = req.query[String.self, at: "versionId"]
+
+        _ = try await S3Service.authenticateOrAuthorizePublic(
+            req: req, bucketName: bucketName,
+            action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
 
         let meta: ObjectMeta
         let objectData: Data

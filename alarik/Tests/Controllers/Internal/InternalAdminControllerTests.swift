@@ -983,4 +983,245 @@ struct InternalAdminControllerTests {
                 })
         }
     }
+
+    private func createBucketForUser(_ app: Application, bucketName: String, userId: UUID)
+        async throws
+    {
+        let bucket = Bucket(name: bucketName, userId: userId)
+        try await bucket.save(on: app.db)
+        try BucketHandler.create(name: bucketName)
+    }
+
+    private func publicReadPolicy(bucketName: String) -> String {
+        """
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::\(bucketName)/*"}]}
+        """
+    }
+
+    @Test("Get bucket policy as admin - works on any bucket, not just the admin's own")
+    func testGetBucketPolicyAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "admin-policy-other-user-bucket", userId: nonAdminUserId)
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/admin-policy-other-user-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalAdminController.PolicyDTO.self)
+                    #expect(dto.policy == nil)
+                })
+        }
+    }
+
+    @Test("Set bucket policy as admin - can set policy on another user's bucket")
+    func testSetBucketPolicyAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "admin-policy-set-bucket", userId: nonAdminUserId)
+            let policyJSON = publicReadPolicy(bucketName: "admin-policy-set-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/admin-policy-set-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalAdminController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalAdminController.PolicyDTO.self)
+                    #expect(dto.policy == policyJSON)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/admin-policy-set-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalAdminController.PolicyDTO.self)
+                    #expect(dto.policy == policyJSON)
+                })
+        }
+    }
+
+    @Test("Set bucket policy as admin - Unsupported policy elements are rejected")
+    func testSetBucketPolicyInvalidRejectedAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "admin-policy-invalid-bucket", userId: nonAdminUserId)
+            let denyPolicy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::admin-policy-invalid-bucket/*"}]}
+                """
+
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/admin-policy-invalid-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalAdminController.PolicyDTO(policy: denyPolicy))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Set bucket policy as admin - Non-existent bucket fails")
+    func testSetBucketPolicyNonExistentBucketAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            let policyJSON = publicReadPolicy(bucketName: "nonexistent")
+
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/nonexistent/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalAdminController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Delete bucket policy as admin - works on another user's bucket")
+    func testDeleteBucketPolicyAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "admin-policy-delete-bucket", userId: nonAdminUserId)
+            let policyJSON = publicReadPolicy(bucketName: "admin-policy-delete-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/admin-policy-delete-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalAdminController.PolicyDTO(policy: policyJSON))
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/admin/buckets/admin-policy-delete-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/admin-policy-delete-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalAdminController.PolicyDTO.self)
+                    #expect(dto.policy == nil)
+                })
+        }
+    }
+
+    @Test("Get bucket policy as non admin - should fail")
+    func testGetBucketPolicyAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            let adminUser = try await User.query(on: app.db)
+                .filter(\.$username == "alarik")
+                .first()
+            try await createBucketForUser(
+                app, bucketName: "non-admin-get-policy-bucket", userId: adminUser!.id!)
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/non-admin-get-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Set bucket policy as non admin - should fail, even on your own bucket")
+    func testSetBucketPolicyAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            let nonAdminUser = try await User.query(on: app.db)
+                .filter(\.$username == "test@example.com")
+                .first()
+            try await createBucketForUser(
+                app, bucketName: "non-admin-set-policy-bucket", userId: nonAdminUser!.id!)
+            let policyJSON = publicReadPolicy(bucketName: "non-admin-set-policy-bucket")
+
+            // The site-wide admin endpoint must reject this even though the caller owns the
+            // bucket - owners use the self-service /api/v1/buckets/:bucketName/policy path.
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/non-admin-set-policy-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalAdminController.PolicyDTO(policy: policyJSON))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete bucket policy as non admin - should fail")
+    func testDeleteBucketPolicyAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .DELETE, "/api/v1/admin/buckets/some-bucket/policy",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Bucket policy endpoints without auth - should fail")
+    func testBucketPolicyWithoutAuth() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/some-bucket/policy",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/admin/buckets/some-bucket/policy",
+                beforeRequest: { req in
+                    try req.content.encode(
+                        InternalAdminController.PolicyDTO(policy: publicReadPolicy(bucketName: "some-bucket")))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/admin/buckets/some-bucket/policy",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
 }

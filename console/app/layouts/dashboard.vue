@@ -67,14 +67,7 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 to: "/console/admin/buckets",
                 active: route.path.startsWith("/console/admin/buckets"),
                 disabled: !user.value.isAdmin,
-            },
-            {
-                label: "Policies",
-                icon: "i-lucide-shield-user",
-                to: "/console",
-                active: route.path.startsWith("/console/policies"),
-                disabled: true,
-            },
+            }
         ],
         [
             {

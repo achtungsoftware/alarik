@@ -72,6 +72,23 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
             await BucketVersioningCache.shared.load(initialData: versioningData)
 
+            // Load bucket policy cache - skip (not crash) any policy that fails to
+            // re-validate, since it should always have been valid when it was saved
+            let policyData: [(bucketName: String, policy: BucketPolicy)] = allBuckets.compactMap {
+                bucket in
+                guard let rawPolicy = bucket.policy else { return nil }
+                guard
+                    let policy = try? BucketPolicy.parseAndValidate(
+                        rawJSON: rawPolicy, bucketName: bucket.name, requestId: "boot")
+                else {
+                    app.logger.error(
+                        "Failed to load stored policy for bucket '\(bucket.name)' - skipping")
+                    return nil
+                }
+                return (bucketName: bucket.name, policy: policy)
+            }
+            await BucketPolicyCache.shared.load(initialData: policyData)
+
         } catch {
             app.logger.error("Failed to load cache: \(error)")
         }
@@ -82,6 +99,7 @@ final class LoadCacheLifecycle: LifecycleHandler {
                 dump(await AccessKeyBucketMapCache.shared.getMap())
                 dump(await AccessKeySecretKeyMapCache.shared.getMap())
                 dump(await BucketVersioningCache.shared.getMap())
+                dump(await BucketPolicyCache.shared.getMap())
             }
         #endif
     }

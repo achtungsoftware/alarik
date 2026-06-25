@@ -38,6 +38,8 @@ const openDetailModal = ref(false);
 const selectedObject = ref<BrowserItem | null>(null);
 const openPreviewModal = ref(false);
 const previewObject = ref<BrowserItem | null>(null);
+const openBucketPolicyModal = ref(false);
+const selectedBucketForPolicy = ref<Bucket | null>(null);
 
 const { isDeleting, isDownloading, deleteObjects, downloadObjects, downloadSingleObject } = useObjectService();
 const { addToQueue, addFolderToQueue, isUploading, openSlideover, onBatchComplete } = useUploadQueue();
@@ -271,7 +273,27 @@ const columns: TableColumn<BrowserItem>[] = [
         cell: ({ row }) => {
             const item = row.original;
 
-            if (item.isBucket || item.isFolder) {
+            if (item.isBucket) {
+                const bucket = bucketsResponse.value?.items?.find((b) => b.name === item.key);
+                if (!bucket) return;
+
+                return h("div", { class: "flex flex-row items-center gap-2" }, [
+                    h(resolveComponent("UButton"), {
+                        label: "Policy",
+                        variant: "subtle",
+                        color: "neutral",
+                        size: "sm",
+                        icon: "i-lucide-shield",
+                        onClick: (e: Event) => {
+                            e.stopPropagation();
+                            selectedBucketForPolicy.value = bucket;
+                            openBucketPolicyModal.value = true;
+                        },
+                    }),
+                ]);
+            }
+
+            if (item.isFolder) {
                 return;
             }
 
@@ -447,6 +469,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 </script>
 <template>
     <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
+    <BucketPolicyModal v-if="selectedBucketForPolicy && openBucketPolicyModal" v-model:open="openBucketPolicyModal" :bucket="selectedBucketForPolicy" @saved="refreshBuckets" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
     <UploadProgressSlideover />
 

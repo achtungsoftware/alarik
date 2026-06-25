@@ -28,6 +28,7 @@ declare global {
         name: string;
         creationDate: string;
         versioningStatus: string;
+        policy?: string;
         user?: User;
     }
 

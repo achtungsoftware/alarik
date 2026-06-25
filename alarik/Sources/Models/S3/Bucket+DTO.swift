@@ -37,6 +37,10 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "versioning_status")
     var versioningStatus: String
 
+    /// Raw JSON bucket policy document, or nil if no policy has been set
+    @Field(key: "policy")
+    var policy: String?
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
     }

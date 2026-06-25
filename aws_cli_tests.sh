@@ -533,4 +533,129 @@ echo ""
 echo "=== UploadPartCopy Tests Complete ==="
 echo ""
 
+echo "=== Bucket Policy Tests ==="
+
+# Create a bucket with a public object (under public/) and a private object
+echo "Creating bucket for bucket policy tests..."
+aws_s3 s3 mb s3://policy-test-bucket
+echo -n "public content" | aws_s3 s3 cp - s3://policy-test-bucket/public/file.txt
+echo -n "private content" | aws_s3 s3 cp - s3://policy-test-bucket/private/file.txt
+
+# Before any policy, anonymous (no credentials at all) access must fail
+echo "Testing anonymous access before any policy is set..."
+BEFORE_POLICY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
+if [ "$BEFORE_POLICY_CODE" == "403" ]; then
+    echo "PASS: Anonymous GetObject is denied (403) before any bucket policy is set."
+else
+    echo "FAIL: Expected 403 before any policy, got $BEFORE_POLICY_CODE."
+fi
+
+# Put a bucket policy granting anonymous GetObject only under the public/ prefix
+echo "Setting a public-read bucket policy scoped to public/*..."
+POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "PublicReadPublicPrefix",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::policy-test-bucket/public/*"
+    }]
+}
+EOF
+)
+aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$POLICY"
+
+# GetBucketPolicy should echo back what was set
+GET_POLICY_RESPONSE=$(aws_s3 s3api get-bucket-policy --bucket policy-test-bucket | jq -r '.Policy')
+if echo "$GET_POLICY_RESPONSE" | jq -e '.Statement[0].Sid == "PublicReadPublicPrefix"' >/dev/null 2>&1; then
+    echo "PASS: GetBucketPolicy returned the policy that was set."
+else
+    echo "FAIL: GetBucketPolicy did not return the expected policy."
+    echo "  Response: $GET_POLICY_RESPONSE"
+fi
+
+# Anonymous GET on the public-prefixed object must now succeed, with no credentials at all
+echo "Testing genuine anonymous access (plain curl, zero credentials) to the public object..."
+ANON_CONTENT=$(curl -s "$ENDPOINT/policy-test-bucket/public/file.txt")
+ANON_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
+if [ "$ANON_CODE" == "200" ] && [ "$ANON_CONTENT" == "public content" ]; then
+    echo "PASS: Anonymous curl GetObject succeeded with the expected content."
+else
+    echo "FAIL: Anonymous curl GetObject did not succeed as expected."
+    echo "  Status: $ANON_CODE, Content: $ANON_CONTENT"
+fi
+
+# Anonymous GET on the private (non-prefixed) object must still fail
+PRIVATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/private/file.txt")
+if [ "$PRIVATE_CODE" == "403" ]; then
+    echo "PASS: Anonymous GetObject on a key outside the granted prefix is still denied."
+else
+    echo "FAIL: Expected 403 for the private key, got $PRIVATE_CODE."
+fi
+
+# Anonymous PUT must always be rejected, regardless of the policy in place
+PUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT --data "malicious" "$ENDPOINT/policy-test-bucket/public/file.txt")
+if [ "$PUT_CODE" == "403" ] || [ "$PUT_CODE" == "400" ]; then
+    echo "PASS: Anonymous PutObject is rejected even though GetObject is publicly granted."
+else
+    echo "FAIL: Anonymous PutObject was not rejected (status $PUT_CODE)."
+fi
+# Confirm the object content was not actually overwritten by the rejected anonymous PUT
+UNCHANGED_CONTENT=$(aws_s3 s3 cp s3://policy-test-bucket/public/file.txt -)
+if [ "$UNCHANGED_CONTENT" == "public content" ]; then
+    echo "PASS: public/file.txt content is unchanged after the rejected anonymous PUT."
+else
+    echo "FAIL: public/file.txt content changed unexpectedly: $UNCHANGED_CONTENT"
+fi
+
+# Removing the policy must immediately revoke anonymous access (no restart needed)
+echo "Testing DeleteBucketPolicy revokes anonymous access..."
+aws_s3 s3api delete-bucket-policy --bucket policy-test-bucket
+AFTER_DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
+if [ "$AFTER_DELETE_CODE" == "403" ]; then
+    echo "PASS: Anonymous GetObject is denied again immediately after DeleteBucketPolicy."
+else
+    echo "FAIL: Expected 403 after deleting the policy, got $AFTER_DELETE_CODE."
+fi
+
+# A bucket policy granting s3:ListBucket allows an anonymous bucket listing
+echo "Testing anonymous ListBucket via a dedicated policy..."
+LIST_POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:ListBucket",
+        "Resource": "arn:aws:s3:::policy-test-bucket"
+    }]
+}
+EOF
+)
+aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$LIST_POLICY"
+LIST_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket")
+LIST_BODY=$(curl -s "$ENDPOINT/policy-test-bucket")
+if [ "$LIST_CODE" == "200" ] && echo "$LIST_BODY" | grep -q "<Key>public/file.txt</Key>"; then
+    echo "PASS: Anonymous ListBucket succeeded once granted by policy."
+else
+    echo "FAIL: Anonymous ListBucket did not succeed as expected (status $LIST_CODE)."
+fi
+
+# A policy with Effect: Deny must be rejected at write time, not silently accepted
+echo "Testing that PutBucketPolicy rejects unsupported policy elements..."
+DENY_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-test-bucket/*"}]}'
+DENY_OUTPUT=$(aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$DENY_POLICY" 2>&1)
+if echo "$DENY_OUTPUT" | grep -qi "MalformedPolicy\|400"; then
+    echo "PASS: A policy with Effect: Deny was rejected at write time."
+else
+    echo "FAIL: A policy with Effect: Deny was not rejected as expected."
+    echo "  Output: $DENY_OUTPUT"
+fi
+
+echo ""
+echo "=== Bucket Policy Tests Complete ==="
+echo ""
+
 echo "Test complete."
