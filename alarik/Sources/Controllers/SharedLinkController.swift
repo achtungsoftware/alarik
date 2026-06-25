@@ -51,7 +51,10 @@ struct SharedLinkController: RouteCollection {
             throw Abort(.notFound)
         }
 
-        guard let data = result.data else {
+        // The latest version may be a delete marker (object deleted from a versioned bucket
+        // after the link was created) - it reads successfully with empty data, so this must be
+        // checked explicitly, matching every other GetObject-style read in this codebase.
+        guard !result.meta.isDeleteMarker, let data = result.data else {
             throw Abort(.notFound)
         }
 
@@ -61,9 +64,10 @@ struct SharedLinkController: RouteCollection {
         // The share URL itself is an opaque token with no filename in it (by design, so it
         // doesn't leak the bucket/key) - without this, browsers fall back to naming the download
         // after the token, with no extension at all.
+        let fileName = String(link.key.split(separator: "/").last ?? "download")
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
-            value: "attachment; filename=\"\(link.key.split(separator: "/").last ?? "download")\""
+            value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
         )
 
         return response

@@ -94,6 +94,16 @@ extension String {
         return result
     }
 
+    /// Escapes a filename for safe use as a Content-Disposition quoted-string `filename`
+    /// parameter (backslash and double-quote must be escaped per RFC 6266), and strips
+    /// newlines so an untrusted object key can never break out of the header value.
+    var contentDispositionFilenameEscaped: String {
+        self
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .filter { !$0.isNewline }
+    }
+
     /// Reverses `xmlEscaped` - unescapes XML entities found in parsed request bodies.
     /// Must unescape `&amp;` last to avoid turning `&amp;lt;` into `<`.
     var xmlUnescaped: String {

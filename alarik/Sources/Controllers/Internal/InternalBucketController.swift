@@ -220,8 +220,21 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
-        let path = ObjectFileHandler.storagePath(for: input.bucket, key: input.key)
-        guard ObjectFileHandler.keyExists(for: input.bucket, key: input.key, path: path) else {
+        // ObjectFileHandler.keyExists alone only checks the non-versioned path, which is wrong
+        // for buckets with versioning enabled/suspended (those objects live under a separate
+        // versioned path - see writeVersioned). Try the versioned lookup first, matching the
+        // existing pattern used elsewhere (e.g. downloadAsZip's readObjectData).
+        var objectExists = false
+        if let (meta, _) = try? ObjectFileHandler.readVersion(
+            bucketName: input.bucket, key: input.key, versionId: nil, loadData: false),
+            !meta.isDeleteMarker
+        {
+            objectExists = true
+        } else {
+            let path = ObjectFileHandler.storagePath(for: input.bucket, key: input.key)
+            objectExists = ObjectFileHandler.keyExists(for: input.bucket, key: input.key, path: path)
+        }
+        guard objectExists else {
             throw Abort(.notFound, reason: "Object not found")
         }
 
@@ -451,9 +464,10 @@ struct InternalBucketController: RouteCollection {
             subType: meta.contentType.split(separator: "/").last.map(String.init)
                 ?? "octet-stream"
         )
+        let fileName = String(key.split(separator: "/").last ?? "download")
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
-            value: "attachment; filename=\"\(key.split(separator: "/").last ?? "download")\""
+            value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
         )
         response.headers.replaceOrAdd(
             name: .contentLength,

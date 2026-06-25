@@ -72,6 +72,27 @@ struct InternalBucketControllerTests {
         try ObjectFileHandler.write(metadata: meta, data: data, to: path)
     }
 
+    /// Unlike `putObject`, writes through the *versioned* storage path (mirroring a real PUT
+    /// against a bucket with versioning enabled/suspended) rather than the plain, non-versioned
+    /// path - needed to exercise bugs that only show up for versioned buckets.
+    private func putVersionedObject(
+        _ app: Application, bucketName: String, key: String, content: String,
+        versioningStatus: VersioningStatus = .enabled
+    ) async throws {
+        let data = content.data(using: .utf8)!
+        let meta = ObjectMeta(
+            bucketName: bucketName,
+            key: key,
+            size: data.count,
+            contentType: "text/plain",
+            etag: Insecure.MD5.hash(data: data).hex,
+            updatedAt: Date()
+        )
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: meta, data: data, bucketName: bucketName, key: key,
+            versioningStatus: versioningStatus)
+    }
+
     @Test("List buckets - Should return user's buckets")
     func testListBuckets() async throws {
         try await withApp { app in
@@ -2953,6 +2974,42 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async in
                     #expect(res.status == .ok)
                     #expect(res.body.string == "shared content")
+                })
+        }
+    }
+
+    @Test("Share object - Works for an object in a bucket with versioning enabled")
+    func testShareObjectVersionedBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-versioned@example.com")
+            let createDTO = Bucket.Create(name: "share-versioned-bucket", versioningEnabled: true)
+            try await app.test(
+                .POST, "/api/v1/buckets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            // Written through the versioned path, not the plain non-versioned one - this is
+            // what every object in this bucket actually looks like on disk.
+            try await putVersionedObject(
+                app, bucketName: "share-versioned-bucket", key: "file.txt",
+                content: "versioned content")
+
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-versioned-bucket", key: "file.txt",
+                            expiresInSeconds: 3600))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
                 })
         }
     }

@@ -179,4 +179,35 @@ struct SharedLinkControllerTests {
                 })
         }
     }
+
+    @Test("Serve - Object deleted (delete marker) in a versioned bucket fails, not 200 with an empty body")
+    func testServeDeleteMarkerFails() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+            let data = Data("versioned content".utf8)
+            let meta = ObjectMeta(
+                bucketName: "shared-versioned-bucket", key: "file.txt", size: data.count,
+                contentType: "text/plain", etag: Insecure.MD5.hash(data: data).hex,
+                updatedAt: Date())
+            _ = try ObjectFileHandler.writeVersioned(
+                metadata: meta, data: data, bucketName: "shared-versioned-bucket",
+                key: "file.txt", versioningStatus: .enabled)
+
+            let link = SharedLink(
+                userId: userId, bucketName: "shared-versioned-bucket", key: "file.txt",
+                expiresAt: Date().addingTimeInterval(3600))
+            try await link.save(on: app.db)
+
+            // Delete the object - in a versioned bucket this creates a delete marker as the
+            // new latest version, rather than removing the file outright.
+            _ = try ObjectFileHandler.createDeleteMarker(
+                bucketName: "shared-versioned-bucket", key: "file.txt")
+
+            try await app.test(
+                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
 }
