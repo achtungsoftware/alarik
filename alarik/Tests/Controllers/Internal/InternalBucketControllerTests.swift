@@ -3099,4 +3099,155 @@ struct InternalBucketControllerTests {
                 })
         }
     }
+
+    private func createSharedLink(
+        _ app: Application, token: String, bucket: String, key: String
+    ) async throws -> InternalBucketController.ShareResponseDTO {
+        var dto: InternalBucketController.ShareResponseDTO?
+        try await app.test(
+            .POST, "/api/v1/objects/share",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                try req.content.encode(
+                    InternalBucketController.ShareRequestDTO(
+                        bucket: bucket, key: key, expiresInSeconds: 3600))
+            },
+            afterResponse: { res async throws in
+                #expect(res.status == .ok)
+                dto = try res.content.decode(InternalBucketController.ShareResponseDTO.self)
+            })
+        return dto!
+    }
+
+    @Test("List shared links - Only returns the authenticated user's own links")
+    func testListSharedLinksReturnsOwnLinksOnly() async throws {
+        try await withApp { app in
+            let tokenA = try await createUserAndLogin(app, username: "share-list-a@example.com")
+            try await createBucket(app, token: tokenA, name: "share-list-bucket-a")
+            try await putObject(
+                app, bucketName: "share-list-bucket-a", key: "a.txt", content: "a")
+            _ = try await createSharedLink(
+                app, token: tokenA, bucket: "share-list-bucket-a", key: "a.txt")
+
+            let tokenB = try await createUserAndLogin(app, username: "share-list-b@example.com")
+            try await createBucket(app, token: tokenB, name: "share-list-bucket-b")
+            try await putObject(
+                app, bucketName: "share-list-bucket-b", key: "b.txt", content: "b")
+            _ = try await createSharedLink(
+                app, token: tokenB, bucket: "share-list-bucket-b", key: "b.txt")
+
+            try await app.test(
+                .GET, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: tokenA)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<SharedLink.ResponseDTO>.self)
+                    #expect(page.items.count == 1)
+                    #expect(page.items.first?.bucketName == "share-list-bucket-a")
+                })
+        }
+    }
+
+    @Test("List shared links - Without auth fails")
+    func testListSharedLinksUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/objects/share",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete shared link - Success revokes the link immediately")
+    func testDeleteSharedLinkSuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-revoke@example.com")
+            try await createBucket(app, token: token, name: "share-revoke-bucket")
+            try await putObject(
+                app, bucketName: "share-revoke-bucket", key: "file.txt", content: "secret")
+
+            let shared = try await createSharedLink(
+                app, token: token, bucket: "share-revoke-bucket", key: "file.txt")
+            let linkId = pathAndQuery(fromShareURL: shared.url).split(separator: "/").last!
+
+            try await app.test(
+                .DELETE, "/api/v1/objects/share/\(linkId)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            // The link must stop working immediately, not just disappear from the list
+            try await app.test(
+                .GET, pathAndQuery(fromShareURL: shared.url),
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Delete shared link - Cannot delete another user's link")
+    func testDeleteSharedLinkNonOwned() async throws {
+        try await withApp { app in
+            let ownerToken = try await createUserAndLogin(
+                app, username: "share-revoke-owner@example.com")
+            try await createBucket(app, token: ownerToken, name: "share-revoke-owner-bucket")
+            try await putObject(
+                app, bucketName: "share-revoke-owner-bucket", key: "file.txt", content: "secret")
+            let shared = try await createSharedLink(
+                app, token: ownerToken, bucket: "share-revoke-owner-bucket", key: "file.txt")
+            let linkId = pathAndQuery(fromShareURL: shared.url).split(separator: "/").last!
+
+            let otherToken = try await createUserAndLogin(
+                app, username: "share-revoke-other@example.com")
+
+            try await app.test(
+                .DELETE, "/api/v1/objects/share/\(linkId)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            // Untouched - the link must still work
+            try await app.test(
+                .GET, pathAndQuery(fromShareURL: shared.url),
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
+
+    @Test("Delete shared link - Non-existent link fails")
+    func testDeleteSharedLinkNonExistent() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-revoke-404@example.com")
+
+            try await app.test(
+                .DELETE, "/api/v1/objects/share/\(UUID().uuidString)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Delete shared link - Without auth fails")
+    func testDeleteSharedLinkUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .DELETE, "/api/v1/objects/share/\(UUID().uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
 }

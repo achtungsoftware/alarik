@@ -44,6 +44,12 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 active: route.path.startsWith("/console/accessKeys"),
             },
             {
+                label: "Shared Links",
+                icon: "i-lucide-share-2",
+                to: "/console/sharedLinks",
+                active: route.path.startsWith("/console/sharedLinks"),
+            },
+            {
                 label: "Administrator",
                 type: "label",
             },

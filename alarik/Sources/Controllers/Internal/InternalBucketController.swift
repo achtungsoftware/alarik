@@ -65,6 +65,9 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
         routes.grouped("objects", "share").post(use: self.shareObject)
+        routes.grouped("objects", "share").get(use: self.listSharedLinks)
+        routes.grouped("objects", "share").grouped(":sharedLinkId").delete(
+            use: self.deleteSharedLink)
     }
 
     @Sendable
@@ -255,6 +258,42 @@ struct InternalBucketController: RouteCollection {
 
         let url = "\(apiBaseURL)/api/v1/shared/\(link.id!.uuidString)"
         return ShareResponseDTO(url: url, expiresAt: expiresAt)
+    }
+
+    /// Lists shared links created by the authenticated user, across all of their buckets.
+    @Sendable
+    func listSharedLinks(req: Request) async throws -> Page<SharedLink.ResponseDTO> {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        let page: Page<SharedLink> = try await SharedLink.query(on: req.db)
+            .filter(\.$user.$id == auth.userId)
+            .sort(\.$createdAt, .descending)
+            .paginate(for: req)
+
+        return page.map { $0.toResponseDTO() }
+    }
+
+    /// Revokes a shared link early, before it would otherwise expire.
+    @Sendable
+    func deleteSharedLink(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let sharedLinkId = req.parameters.get("sharedLinkId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid shared link ID.")
+        }
+
+        guard
+            let link = try await SharedLink.query(on: req.db)
+                .filter(\.$id == sharedLinkId)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Shared link not found.")
+        }
+
+        try await link.delete(on: req.db)
+
+        return .noContent
     }
 
     @Sendable

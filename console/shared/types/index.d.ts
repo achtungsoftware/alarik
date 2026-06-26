@@ -53,6 +53,15 @@ declare global {
         expirationDate?: string;
     }
 
+    export interface SharedLink {
+        id: string;
+        bucketName: string;
+        key: string;
+        url: string;
+        expiresAt: string;
+        createdAt: string;
+    }
+
     export interface User {
         id: string;
         name: string;
