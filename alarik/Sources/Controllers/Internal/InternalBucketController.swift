@@ -223,21 +223,10 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
-        // ObjectFileHandler.keyExists alone only checks the non-versioned path, which is wrong
-        // for buckets with versioning enabled/suspended (those objects live under a separate
-        // versioned path - see writeVersioned). Try the versioned lookup first, matching the
-        // existing pattern used elsewhere (e.g. downloadAsZip's readObjectData).
-        var objectExists = false
-        if let (meta, _) = try? ObjectFileHandler.readVersion(
-            bucketName: input.bucket, key: input.key, versionId: nil, loadData: false),
-            !meta.isDeleteMarker
-        {
-            objectExists = true
-        } else {
-            let path = ObjectFileHandler.storagePath(for: input.bucket, key: input.key)
-            objectExists = ObjectFileHandler.keyExists(for: input.bucket, key: input.key, path: path)
-        }
-        guard objectExists else {
+        guard
+            try ObjectFileHandler.readCurrentObject(
+                bucketName: input.bucket, key: input.key, loadData: false) != nil
+        else {
             throw Abort(.notFound, reason: "Object not found")
         }
 
@@ -536,26 +525,13 @@ struct InternalBucketController: RouteCollection {
 
         // Helper function to read object data (versioned or non-versioned)
         func readObjectData(bucketName: String, key: String) -> Data? {
-            // Try versioned storage first
-            if let (meta, data) = try? ObjectFileHandler.readVersion(
-                bucketName: bucketName,
-                key: key,
-                versionId: nil,
-                loadData: true
-            ), !meta.isDeleteMarker, let fileData = data {
-                return fileData
+            guard
+                let (_, data) = try? ObjectFileHandler.readCurrentObject(
+                    bucketName: bucketName, key: key, loadData: true)
+            else {
+                return nil
             }
-
-            // Fall back to non-versioned path
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-            if FileManager.default.fileExists(atPath: path),
-                let (_, data) = try? ObjectFileHandler.read(from: path, loadData: true),
-                let fileData = data
-            {
-                return fileData
-            }
-
-            return nil
+            return data
         }
 
         for key in keys {

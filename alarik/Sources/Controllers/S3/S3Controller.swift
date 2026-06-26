@@ -451,6 +451,18 @@ struct S3Controller: RouteCollection {
             )
         }
 
+        // Conditional writes (If-Match/If-None-Match) - only worth the extra disk lookup when
+        // either header is actually present, so plain unconditional PUTs (the overwhelming
+        // majority) pay zero extra cost. Checked before collecting the body so a request that's
+        // going to be rejected doesn't pay for reading/decoding the upload first.
+        if req.headers.first(name: "If-Match") != nil
+            || req.headers.first(name: "If-None-Match") != nil
+        {
+            let existing = try ObjectFileHandler.readCurrentObject(
+                bucketName: bucketName, key: keyPath, loadData: false)
+            try S3Service.validateConditionalPutHeaders(req: req, existingMeta: existing?.meta)
+        }
+
         let maxBodySize = req.application.routes.defaultMaxBodySize.value
         let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
         // S3 allows zero-byte objects, so we use an empty buffer if body is nil

@@ -418,6 +418,34 @@ struct S3Service {
         }
     }
 
+    /// Validates conditional write headers (`If-Match`/`If-None-Match`) for PutObject, against
+    /// the *current* object if one exists (nil if it doesn't). Unlike the GET-side
+    /// `validateConditionalHeaders`, a failed precondition is always `412 PreconditionFailed`
+    /// here - `304 Not Modified` only makes sense for a read, never a write.
+    static func validateConditionalPutHeaders(req: Request, existingMeta: ObjectMeta?) throws {
+        if let ifMatch = req.headers.first(name: "If-Match") {
+            guard let meta = existingMeta, Self.matchesETag(ifMatch, etag: meta.etag) else {
+                throw S3Error(
+                    status: .preconditionFailed,
+                    code: "PreconditionFailed",
+                    message: "At least one of the pre-conditions you specified did not hold",
+                    requestId: req.id
+                )
+            }
+        }
+
+        if let ifNoneMatch = req.headers.first(name: "If-None-Match") {
+            if let meta = existingMeta, Self.matchesETag(ifNoneMatch, etag: meta.etag) {
+                throw S3Error(
+                    status: .preconditionFailed,
+                    code: "PreconditionFailed",
+                    message: "At least one of the pre-conditions you specified did not hold",
+                    requestId: req.id
+                )
+            }
+        }
+    }
+
     /// Validates Content-MD5 header if present
     /// Throws S3Error if the MD5 doesn't match the data
     static func validateContentMD5(req: Request, data: Data) throws {
@@ -498,10 +526,6 @@ struct S3Service {
     static func handleVersioningGet(bucket: Bucket?) -> Response {
         let status = bucket?.versioningStatus ?? VersioningStatus.disabled.rawValue
 
-        print(
-            "[handleVersioningGet] bucket=\(bucket?.name ?? "nil") versioningStatus='\(bucket?.versioningStatus ?? "nil")' status='\(status)'"
-        )
-
         // S3 returns empty VersioningConfiguration for buckets that have never had versioning enabled
         let statusElement: String
         if status == VersioningStatus.disabled.rawValue {
@@ -512,7 +536,6 @@ struct S3Service {
 
         let xml =
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\(statusElement)</VersioningConfiguration>"
-        print("[handleVersioningGet] xml='\(xml)'")
         return buildXMLResponse(data: Data(xml.utf8))
     }
 

@@ -948,6 +948,157 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("PUT Object with If-None-Match: * - Succeeds when the key doesn't exist yet")
+    func testPutObjectIfNoneMatchStarSucceedsWhenAbsent() async throws {
+        let bucketName = "test-put-if-none-match-absent"
+        let content = "new content"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/new.txt", body: Data(content.utf8),
+                additionalHeaders: ["if-none-match": "*"])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/new.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(string: content)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
+
+    @Test("PUT Object with If-None-Match: * - Blocks overwriting an existing key")
+    func testPutObjectIfNoneMatchStarBlocksOverwrite() async throws {
+        let bucketName = "test-put-if-none-match-exists"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "existing.txt", content: "v1")
+
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/existing.txt", body: Data("v2".utf8),
+                additionalHeaders: ["if-none-match": "*"])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/existing.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(string: "v2")
+                },
+                afterResponse: { res in
+                    #expect(res.status == .preconditionFailed)
+                })
+        }
+    }
+
+    @Test("PUT Object with If-None-Match: * - Blocks overwriting in a versioned bucket too")
+    func testPutObjectIfNoneMatchStarBlocksOverwriteVersionedBucket() async throws {
+        let bucketName = "test-put-if-none-match-versioned"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await enableVersioning(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "existing.txt", content: "v1")
+
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/existing.txt", body: Data("v2".utf8),
+                additionalHeaders: ["if-none-match": "*"])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/existing.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(string: "v2")
+                },
+                afterResponse: { res in
+                    #expect(res.status == .preconditionFailed)
+                })
+        }
+    }
+
+    @Test("PUT Object with If-Match - Matching ETag allows the overwrite")
+    func testPutObjectIfMatchSuccess() async throws {
+        let bucketName = "test-put-if-match-success"
+        let content = "v1"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let firstPut = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/test.txt", body: Data(content.utf8))
+            var etag: String = ""
+            try await app.test(
+                .PUT, "/\(bucketName)/test.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: firstPut)
+                    req.body = ByteBuffer(string: content)
+                },
+                afterResponse: { res in
+                    etag = res.headers.first(name: "ETag") ?? ""
+                })
+
+            let secondPut = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/test.txt", body: Data("v2".utf8),
+                additionalHeaders: ["if-match": etag])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/test.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: secondPut)
+                    req.body = ByteBuffer(string: "v2")
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
+
+    @Test("PUT Object with If-Match - Non-matching ETag fails with 412")
+    func testPutObjectIfMatchFailure() async throws {
+        let bucketName = "test-put-if-match-fail"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "test.txt", content: "v1")
+
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/test.txt", body: Data("v2".utf8),
+                additionalHeaders: ["if-match": "\"wrongetag\""])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/test.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(string: "v2")
+                },
+                afterResponse: { res in
+                    #expect(res.status == .preconditionFailed)
+                })
+        }
+    }
+
+    @Test("PUT Object with If-Match - No existing object fails with 412")
+    func testPutObjectIfMatchFailureNoExistingObject() async throws {
+        let bucketName = "test-put-if-match-no-object"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/missing.txt", body: Data("v1".utf8),
+                additionalHeaders: ["if-match": "*"])
+
+            try await app.test(
+                .PUT, "/\(bucketName)/missing.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(string: "v1")
+                },
+                afterResponse: { res in
+                    #expect(res.status == .preconditionFailed)
+                })
+        }
+    }
+
     @Test("HEAD Object with If-Match - Should validate ETag")
     func testHeadObjectWithIfMatch() async throws {
         let bucketName = "test-head-if-match"

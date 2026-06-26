@@ -591,6 +591,28 @@ struct ObjectFileHandler {
         return try read(from: path, loadData: loadData, range: range)
     }
 
+    /// Resolves the *current* version of an object regardless of the bucket's versioning state -
+    /// nil if it doesn't exist (or its latest version is a delete marker), instead of throwing.
+    /// Tries the versioned path first (covers enabled/suspended buckets), then falls back to the
+    /// plain non-versioned path.
+    static func readCurrentObject(bucketName: String, key: String, loadData: Bool) throws -> (
+        meta: ObjectMeta, data: Data?
+    )? {
+        if let (meta, data) = try? readVersion(
+            bucketName: bucketName, key: key, versionId: nil, loadData: loadData),
+            !meta.isDeleteMarker
+        {
+            return (meta, data)
+        }
+
+        let path = storagePath(for: bucketName, key: key)
+        guard keyExists(for: bucketName, key: key, path: path) else {
+            return nil
+        }
+        let (meta, data) = try read(from: path, loadData: loadData)
+        return (meta, data)
+    }
+
     /// Gets the latest version ID for a key
     static func getLatestVersionId(bucketName: String, key: String) throws -> String? {
         let pointerPath = latestPointerPath(for: bucketName, key: key)

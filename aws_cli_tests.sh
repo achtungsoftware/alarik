@@ -724,4 +724,84 @@ echo ""
 echo "=== Share File Tests Complete ==="
 echo ""
 
+echo "=== Conditional Write Tests ==="
+
+echo "Creating buckets for conditional write tests..."
+aws_s3 s3 mb s3://cond-write-bucket
+aws_s3 s3 mb s3://cond-write-bucket-ver
+aws_s3 s3api put-bucket-versioning --bucket cond-write-bucket-ver --versioning-configuration Status=Enabled
+
+# put-object --body requires a real file path (not /dev/stdin), unlike `s3 cp -`
+COND_BODY_FILE=$(mktemp)
+
+# If-None-Match: * means "create only if it doesn't already exist"
+echo "Testing If-None-Match: * succeeds when the key is absent..."
+printf "v1" > "$COND_BODY_FILE"
+CREATE_CODE=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-none-match '*' --output json 2>&1)
+if echo "$CREATE_CODE" | jq -e '.ETag' > /dev/null 2>&1; then
+    echo "PASS: If-None-Match: * succeeded for a brand-new key."
+else
+    echo "FAIL: If-None-Match: * unexpectedly failed for a brand-new key."
+    echo "  Response: $CREATE_CODE"
+fi
+
+echo "Testing If-None-Match: * blocks overwriting an existing key..."
+printf "v2" > "$COND_BODY_FILE"
+OVERWRITE_ERROR=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-none-match '*' 2>&1)
+if echo "$OVERWRITE_ERROR" | grep -q "PreconditionFailed\|412"; then
+    echo "PASS: If-None-Match: * correctly rejected overwriting an existing key."
+else
+    echo "FAIL: If-None-Match: * did not reject the overwrite as expected."
+    echo "  Response: $OVERWRITE_ERROR"
+fi
+
+echo "Testing If-None-Match: * blocks overwriting in a versioned bucket too..."
+echo -n "v1" | aws_s3 s3 cp - s3://cond-write-bucket-ver/existing.txt > /dev/null
+printf "v2" > "$COND_BODY_FILE"
+VERSIONED_OVERWRITE_ERROR=$(aws_s3 s3api put-object --bucket cond-write-bucket-ver --key existing.txt --body "$COND_BODY_FILE" --if-none-match '*' 2>&1)
+if echo "$VERSIONED_OVERWRITE_ERROR" | grep -q "PreconditionFailed\|412"; then
+    echo "PASS: If-None-Match: * correctly rejected the overwrite in a versioned bucket."
+else
+    echo "FAIL: If-None-Match: * did not reject the overwrite in a versioned bucket."
+    echo "  Response: $VERSIONED_OVERWRITE_ERROR"
+fi
+
+# If-Match must match the current ETag for the write to be allowed
+echo "Testing If-Match with the correct ETag allows the overwrite..."
+CURRENT_ETAG=$(aws_s3 s3api head-object --bucket cond-write-bucket --key new.txt | jq -r '.ETag')
+printf "v3" > "$COND_BODY_FILE"
+IF_MATCH_OK=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-match "$CURRENT_ETAG" --output json 2>&1)
+if echo "$IF_MATCH_OK" | jq -e '.ETag' > /dev/null 2>&1; then
+    echo "PASS: If-Match with the correct ETag allowed the overwrite."
+else
+    echo "FAIL: If-Match with the correct ETag was unexpectedly rejected."
+    echo "  Response: $IF_MATCH_OK"
+fi
+
+echo "Testing If-Match with the wrong ETag is rejected..."
+printf "v4" > "$COND_BODY_FILE"
+IF_MATCH_FAIL=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-match '"wrongetag"' 2>&1)
+if echo "$IF_MATCH_FAIL" | grep -q "PreconditionFailed\|412"; then
+    echo "PASS: If-Match with the wrong ETag was correctly rejected."
+else
+    echo "FAIL: If-Match with the wrong ETag was not rejected as expected."
+    echo "  Response: $IF_MATCH_FAIL"
+fi
+
+echo "Testing unconditional PUT still works unchanged..."
+printf "v5" > "$COND_BODY_FILE"
+UNCONDITIONAL=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --output json 2>&1)
+if echo "$UNCONDITIONAL" | jq -e '.ETag' > /dev/null 2>&1; then
+    echo "PASS: Unconditional PUT still works."
+else
+    echo "FAIL: Unconditional PUT unexpectedly failed."
+    echo "  Response: $UNCONDITIONAL"
+fi
+
+rm -f "$COND_BODY_FILE"
+
+echo ""
+echo "=== Conditional Write Tests Complete ==="
+echo ""
+
 echo "Test complete."
