@@ -469,6 +469,8 @@ struct InternalAdminControllerTests {
             // Add to caches
             await AccessKeyUserMapCache.shared.add(accessKey: "TESTKEY1", userId: userId!)
             await AccessKeyUserMapCache.shared.add(accessKey: "TESTKEY2", userId: userId!)
+            await AccessKeySecretKeyMapCache.shared.add(accessKey: "TESTKEY1", secretKey: "secret1")
+            await AccessKeySecretKeyMapCache.shared.add(accessKey: "TESTKEY2", secretKey: "secret2")
 
             // Verify keys are in cache
             let cachedUserId1 = await AccessKeyUserMapCache.shared.userId(for: "TESTKEY1")
@@ -486,11 +488,14 @@ struct InternalAdminControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            // Verify keys are removed from cache
+            // Verify keys are removed from cache - including the secret-key cache, which a
+            // deleted user's S3 credentials would otherwise keep working against until restart.
             let removedUserId1 = await AccessKeyUserMapCache.shared.userId(for: "TESTKEY1")
             let removedUserId2 = await AccessKeyUserMapCache.shared.userId(for: "TESTKEY2")
             #expect(removedUserId1 == nil)
             #expect(removedUserId2 == nil)
+            #expect(await AccessKeySecretKeyMapCache.shared.secretKey(for: "TESTKEY1") == nil)
+            #expect(await AccessKeySecretKeyMapCache.shared.secretKey(for: "TESTKEY2") == nil)
 
             // Verify keys are deleted from DB (cascade)
             let remainingKeys = try await AccessKey.query(on: app.db)

@@ -83,6 +83,30 @@ struct InternalBucketController: RouteCollection {
             use: self.deleteSharedLink)
     }
 
+    /// Fetches a bucket owned by `userId` or throws the standard "Bucket not found" 404 - the
+    /// same self-service ownership check needed by nearly every endpoint in this controller.
+    private func requireOwnedBucket(req: Request, bucketName: String, userId: UUID) async throws
+        -> Bucket
+    {
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+        return bucket
+    }
+
+    /// Same ownership check as `requireOwnedBucket`, for endpoints that only need to confirm
+    /// the bucket exists and is owned by `userId`, without using the bucket object itself.
+    private func requireOwnedBucketExists(req: Request, bucketName: String, userId: UUID)
+        async throws
+    {
+        _ = try await requireOwnedBucket(req: req, bucketName: bucketName, userId: userId)
+    }
+
     @Sendable
     func listBuckets(req: Request) async throws -> Page<Bucket> {
         let auth = try req.auth.require(AuthenticatedUser.self)
@@ -130,14 +154,7 @@ struct InternalBucketController: RouteCollection {
         }
 
         // Verify bucket exists and belongs to user
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         try await BucketService.delete(
             on: req.db, bucketName: bucketName, userId: auth.userId, force: true)
@@ -154,14 +171,7 @@ struct InternalBucketController: RouteCollection {
         }
 
         // Verify bucket exists and belongs to user
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"] ?? "/"
@@ -227,14 +237,8 @@ struct InternalBucketController: RouteCollection {
 
         let input = try req.content.decode(ShareRequestDTO.self)
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == input.bucket)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(
+            req: req, bucketName: input.bucket, userId: auth.userId)
 
         guard
             try ObjectFileHandler.readCurrentObject(
@@ -309,14 +313,7 @@ struct InternalBucketController: RouteCollection {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
 
         // Verify bucket exists and belongs to user
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         // Parse multipart form data
         let input = try req.content.decode(UploadInput.self)
@@ -380,14 +377,7 @@ struct InternalBucketController: RouteCollection {
         }
 
         // Verify bucket exists and belongs to user
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
@@ -432,14 +422,8 @@ struct InternalBucketController: RouteCollection {
         }
 
         // Verify bucket exists and belongs to user
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == input.bucket)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(
+            req: req, bucketName: input.bucket, userId: auth.userId)
 
         // If single file, download directly
         if input.keys.count == 1 && !input.keys[0].hasSuffix("/") {
@@ -631,14 +615,8 @@ struct InternalBucketController: RouteCollection {
         }
 
         // Verify bucket exists and belongs to user
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
         return VersioningStatusDTO(status: bucket.versioningStatus)
     }
@@ -659,14 +637,8 @@ struct InternalBucketController: RouteCollection {
                 reason: "Invalid versioning status. Use 'Enabled', 'Suspended', or 'Disabled'")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
         bucket.versioningStatus = newStatus.rawValue
         try await bucket.save(on: req.db)
@@ -684,16 +656,10 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
-        return PolicyDTO(policy: bucket.policy)
+        return Self.policyResponse(for: bucket)
     }
 
     @Sendable
@@ -704,21 +670,49 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        let input = try req.content.decode(PolicyDTO.self)
+        let rawJSON = try Self.requirePolicyBody(req: req)
 
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        return try await Self.setPolicy(
+            req: req, bucket: bucket, bucketName: bucketName, rawJSON: rawJSON)
+    }
+
+    @Sendable
+    func deletePolicy(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        try await Self.deletePolicy(req: req, bucket: bucket, bucketName: bucketName)
+
+        return .noContent
+    }
+
+    // MARK: - Shared policy logic (also used by InternalAdminController, which resolves the
+    // bucket differently - any bucket, not just owned ones - but shares everything else)
+
+    static func policyResponse(for bucket: Bucket) -> PolicyDTO {
+        PolicyDTO(policy: bucket.policy)
+    }
+
+    static func requirePolicyBody(req: Request) throws -> String {
+        let input = try req.content.decode(PolicyDTO.self)
         guard let rawJSON = input.policy else {
             throw Abort(.badRequest, reason: "Missing policy")
         }
+        return rawJSON
+    }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
-
+    static func setPolicy(req: Request, bucket: Bucket, bucketName: String, rawJSON: String)
+        async throws -> PolicyDTO
+    {
         if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.blockPublicPolicy
             == true
         {
@@ -745,29 +739,11 @@ struct InternalBucketController: RouteCollection {
         return PolicyDTO(policy: rawJSON)
     }
 
-    @Sendable
-    func deletePolicy(req: Request) async throws -> HTTPStatus {
-        let auth = try req.auth.require(AuthenticatedUser.self)
-
-        guard let bucketName = req.parameters.get("bucketName") else {
-            throw Abort(.badRequest, reason: "Missing bucket name")
-        }
-
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
-
+    static func deletePolicy(req: Request, bucket: Bucket, bucketName: String) async throws {
         bucket.policy = nil
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
-
-        return .noContent
     }
 
     @Sendable
@@ -778,14 +754,8 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
         guard let rawTags = bucket.tags else {
             return TagsDTO(tags: [:])
@@ -805,14 +775,8 @@ struct InternalBucketController: RouteCollection {
 
         let input = try req.content.decode(TagsDTO.self)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
         let tagging = Tagging(tags: input.tags)
         bucket.tags = tagging.toJSON()
@@ -829,14 +793,8 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
 
         bucket.tags = nil
         try await bucket.save(on: req.db)
@@ -856,14 +814,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
         }
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         guard
             let (meta, _) = try ObjectFileHandler.readCurrentObject(
@@ -895,14 +846,7 @@ struct InternalBucketController: RouteCollection {
                 reason: "Object tags cannot be greater than \(Tagging.maxTagCount).")
         }
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         guard
             let path = try ObjectFileHandler.resolvePath(
@@ -933,14 +877,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
         }
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         guard
             let path = try ObjectFileHandler.resolvePath(
@@ -973,14 +910,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing 'key' query parameter")
         }
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
 
@@ -1003,14 +933,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing 'versionId' query parameter")
         }
 
-        guard
-            try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == auth.userId)
-                .first() != nil
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         try ObjectFileHandler.deleteVersion(bucketName: bucketName, key: key, versionId: versionId)
 

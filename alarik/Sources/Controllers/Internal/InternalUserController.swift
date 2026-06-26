@@ -202,17 +202,17 @@ struct InternalUserController: RouteCollection {
             await BucketVersioningCache.shared.removeBucket(bucket.name)
         }
 
-        // Remove from all caches
+        // Delete each access key (also clears all 3 caches, including the secret-key one -
+        // skipping that one would leave a deleted user's S3 credentials valid until restart)
         let accessKeys = try await AccessKey.query(on: req.db)
             .filter(\.$user.$id == auth.userId)
             .all()
 
         for accessKey in accessKeys {
-            await AccessKeyUserMapCache.shared.remove(accessKey: accessKey.accessKey)
-            await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey.accessKey)
+            try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
         }
 
-        // Delete the user (buckets and access keys cascade delete in DB)
+        // Delete the user (buckets cascade delete in DB; access keys are already gone above)
         try await auth.user.delete(on: req.db)
 
         return .noContent

@@ -80,10 +80,11 @@ watch(
     () => props.open,
     (val) => {
         open.value = val;
-        if (val && props.bucket && props.item?.key && canPreview) {
+        if (val && props.bucket && props.item?.key && canPreview.value) {
             loadPreview();
         }
-    }
+    },
+    { immediate: true }
 );
 
 watch(open, (val) => {

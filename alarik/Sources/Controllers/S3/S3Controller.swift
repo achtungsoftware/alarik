@@ -39,6 +39,22 @@ struct S3Controller: RouteCollection {
         bucketRoute.delete("**", use: self.handleObjectDelete)
     }
 
+    /// Fetches a bucket by name or throws the standard `NoSuchBucket` error - the same
+    /// 404 shape needed by every bucket subresource handler (policy/tagging/lifecycle/public
+    /// access block) once authentication has already established the caller may act on it.
+    private func fetchBucket(req: Request, bucketName: String) async throws -> Bucket {
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+        return bucket
+    }
+
     @Sendable
     func handleBucketGet(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
@@ -278,15 +294,7 @@ struct S3Controller: RouteCollection {
     private func handleVersioningPut(req: Request, bucketName: String) async throws -> Response {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         // Parse XML body for versioning configuration
         let bodyData = try await req.body.collect().get() ?? ByteBuffer()
@@ -317,15 +325,7 @@ struct S3Controller: RouteCollection {
     private func handleBucketPolicyPut(req: Request, bucketName: String) async throws -> Response {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         // BlockPublicPolicy rejects PutBucketPolicy outright - every policy this system can
         // store grants Principal "*" access (see BucketPolicy.parseAndValidate), so there's no
@@ -362,15 +362,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         let bodyData = try await req.body.collect().get() ?? ByteBuffer()
         let xml = String(buffer: bodyData)
@@ -396,15 +388,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.blockPublicAcls = false
         bucket.ignorePublicAcls = false
@@ -426,15 +410,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         let bodyData = try await req.body.collect().get() ?? ByteBuffer()
         let xml = String(buffer: bodyData)
@@ -454,15 +430,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.tags = nil
         try await bucket.save(on: req.db)
@@ -477,15 +445,7 @@ struct S3Controller: RouteCollection {
     private func handleLifecyclePut(req: Request, bucketName: String) async throws -> Response {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         let bodyData = try await req.body.collect().get() ?? ByteBuffer()
         let xml = String(buffer: bodyData)
@@ -505,15 +465,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.lifecycleRules = nil
         try await bucket.save(on: req.db)
@@ -591,15 +543,7 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchBucket",
-                message: "The specified bucket does not exist.", requestId: req.id)
-        }
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.policy = nil
         try await bucket.save(on: req.db)

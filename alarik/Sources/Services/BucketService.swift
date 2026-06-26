@@ -31,8 +31,14 @@ struct BucketService {
             name: bucketName, userId: userId,
             versioningStatus: versioningEnabled ? .enabled : .disabled)
 
+        // Deliberately outside the do/catch below: if this fails (e.g. the name already
+        // exists - `name` has a unique DB constraint), nothing has been created yet, so there
+        // is nothing to roll back. Rolling back here would otherwise delete an *existing*
+        // bucket's directory that this call never created, just because it shares the
+        // requested name.
+        try await bucket.save(on: database)
+
         do {
-            try await bucket.save(on: database)
             try BucketHandler.create(name: bucketName)
 
             // Get all access keys for this user
@@ -49,8 +55,11 @@ struct BucketService {
             await BucketVersioningCache.shared.addBucket(
                 bucketName, versioningStatus: versioningEnabled ? .enabled : .disabled)
         } catch {
-            try await bucket.delete(on: database)
-            try BucketHandler.delete(name: bucketName, force: true)
+            // Best-effort: each step rolls back independently, so a failure in one (e.g. the
+            // directory was never created) doesn't prevent the others from running, and the
+            // original error - not a secondary rollback failure - is always what's thrown.
+            try? await bucket.delete(on: database)
+            try? BucketHandler.delete(name: bucketName, force: true)
             await BucketVersioningCache.shared.removeBucket(bucketName)
             throw error
         }

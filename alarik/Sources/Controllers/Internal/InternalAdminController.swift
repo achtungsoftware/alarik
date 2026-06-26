@@ -93,6 +93,19 @@ struct InternalAdminController: RouteCollection {
         return .noContent
     }
 
+    /// Fetches any bucket by name (no ownership filter - the admin can manage any user's
+    /// bucket) or throws the standard "Bucket not found" 404.
+    private func fetchAnyBucket(req: Request, bucketName: String) async throws -> Bucket {
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+        return bucket
+    }
+
     @Sendable
     func getBucketPolicy(req: Request) async throws -> PolicyDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
@@ -102,15 +115,9 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await fetchAnyBucket(req: req, bucketName: bucketName)
 
-        return PolicyDTO(policy: bucket.policy)
+        return PolicyDTO(policy: InternalBucketController.policyResponse(for: bucket).policy)
     }
 
     @Sendable
@@ -122,44 +129,12 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        let input = try req.content.decode(PolicyDTO.self)
+        let rawJSON = try InternalBucketController.requirePolicyBody(req: req)
+        let bucket = try await fetchAnyBucket(req: req, bucketName: bucketName)
 
-        guard let rawJSON = input.policy else {
-            throw Abort(.badRequest, reason: "Missing policy")
-        }
-
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
-
-        if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.blockPublicPolicy
-            == true
-        {
-            throw Abort(
-                .forbidden,
-                reason:
-                    "Bucket policies cannot be set while BlockPublicPolicy is enabled in this bucket's Public Access Block configuration."
-            )
-        }
-
-        let policy: BucketPolicy
-        do {
-            policy = try BucketPolicy.parseAndValidate(
-                rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
-        } catch let error as S3Error {
-            throw Abort(.badRequest, reason: error.message)
-        }
-
-        bucket.policy = rawJSON
-        try await bucket.save(on: req.db)
-
-        await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
-
-        return PolicyDTO(policy: rawJSON)
+        let result = try await InternalBucketController.setPolicy(
+            req: req, bucket: bucket, bucketName: bucketName, rawJSON: rawJSON)
+        return PolicyDTO(policy: result.policy)
     }
 
     @Sendable
@@ -171,18 +146,10 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
-            throw Abort(.notFound, reason: "Bucket not found")
-        }
+        let bucket = try await fetchAnyBucket(req: req, bucketName: bucketName)
 
-        bucket.policy = nil
-        try await bucket.save(on: req.db)
-
-        await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        try await InternalBucketController.deletePolicy(
+            req: req, bucket: bucket, bucketName: bucketName)
 
         return .noContent
     }
@@ -297,17 +264,17 @@ struct InternalAdminController: RouteCollection {
             await BucketVersioningCache.shared.removeBucket(bucket.name)
         }
 
-        // Remove from all caches
+        // Delete each access key (also clears all 3 caches, including the secret-key one -
+        // skipping that one would leave a deleted user's S3 credentials valid until restart)
         let accessKeys = try await AccessKey.query(on: req.db)
             .filter(\.$user.$id == userId)
             .all()
 
         for accessKey in accessKeys {
-            await AccessKeyUserMapCache.shared.remove(accessKey: accessKey.accessKey)
-            await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey.accessKey)
+            try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
         }
 
-        // Delete the user (buckets and access keys cascade delete in DB)
+        // Delete the user (buckets cascade delete in DB; access keys are already gone above)
         try await userToDelete.delete(on: req.db)
 
         return .noContent

@@ -682,6 +682,15 @@ struct UserControllerTests {
                 .filter(\.$accessKey == "testkey2")
                 .all()
             #expect(accessKeys2.isEmpty)
+
+            // Verify all 3 caches are cleared too - not just the DB row. Missing the
+            // secret-key cache specifically would leave the deleted user's S3 credentials
+            // valid for SigV4 auth until the server restarts.
+            for key in ["testkey1", "testkey2"] {
+                #expect(await AccessKeySecretKeyMapCache.shared.secretKey(for: key) == nil)
+                #expect(await AccessKeyUserMapCache.shared.userId(for: key) == nil)
+                #expect(await AccessKeyBucketMapCache.shared.exists(accessKey: key) == false)
+            }
         }
     }
 
