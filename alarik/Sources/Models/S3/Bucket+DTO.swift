@@ -56,6 +56,10 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "restrict_public_buckets")
     var restrictPublicBuckets: Bool
 
+    /// JSON-encoded `[String: String]` tag-set, or nil if no tags have been set - see `Tagging`.
+    @Field(key: "tags")
+    var tags: String?
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false

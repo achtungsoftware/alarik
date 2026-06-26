@@ -339,6 +339,34 @@ struct ObjectFileHandlerTests {
         #expect(readMeta.metadata["unicode"] == "こんにちは")
     }
 
+    @Test("Write and read round-trips tags")
+    func writeAndReadRoundTripsTags() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+
+        var metadata = createTestMetadata()
+        metadata.tags = ["env": "prod", "team": "storage"]
+
+        try ObjectFileHandler.write(metadata: metadata, data: createTestData(), to: path)
+        let (readMeta, _) = try ObjectFileHandler.read(from: path)
+
+        #expect(readMeta.tags == ["env": "prod", "team": "storage"])
+    }
+
+    @Test("Tags default to nil when never set")
+    func tagsDefaultToNilWhenNeverSet() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+
+        let metadata = createTestMetadata()
+        #expect(metadata.tags == nil)
+
+        try ObjectFileHandler.write(metadata: metadata, data: createTestData(), to: path)
+        let (readMeta, _) = try ObjectFileHandler.read(from: path)
+
+        #expect(readMeta.tags == nil)
+    }
+
     @Test("Handles binary data correctly")
     func handlesBinaryDataCorrectly() throws {
         let path = createTempPath()

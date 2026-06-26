@@ -29,6 +29,13 @@ struct ObjectMeta: Codable {
     var isLatest: Bool = true
     var isDeleteMarker: Bool = false
 
+    /// Tag-set for this specific version, or nil if untagged. Must stay Optional (not default
+    /// to `[:]`) - Swift's synthesized Decodable doesn't fall back to a default value for a
+    /// missing JSON key on a non-Optional property, only Optional properties get
+    /// `decodeIfPresent` treatment. Required so objects written before this field existed keep
+    /// decoding correctly from their on-disk `.obj` files.
+    var tags: [String: String]?
+
     init(
         bucketName: String,
         key: String,
@@ -39,7 +46,8 @@ struct ObjectMeta: Codable {
         updatedAt: Date,
         versionId: String? = nil,
         isLatest: Bool = true,
-        isDeleteMarker: Bool = false
+        isDeleteMarker: Bool = false,
+        tags: [String: String]? = nil
     ) {
         self.bucketName = bucketName
         self.key = key
@@ -51,6 +59,7 @@ struct ObjectMeta: Codable {
         self.versionId = versionId
         self.isLatest = isLatest
         self.isDeleteMarker = isDeleteMarker
+        self.tags = tags
     }
 
     /// Generates a new version ID (UUID without dashes)

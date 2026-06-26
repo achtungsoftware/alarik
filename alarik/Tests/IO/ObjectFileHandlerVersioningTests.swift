@@ -759,4 +759,163 @@ struct ObjectFileHandlerVersioningTests {
         // All 1000 should be unique
         #expect(ids.count == 1000)
     }
+
+    // MARK: - resolvePath
+
+    @Test("resolvePath - Resolves to the latest version in a versioned bucket")
+    func testResolvePathLatestVersionedObject() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+        let secondVersionId = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v2"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        let path = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: nil)
+
+        #expect(path == ObjectFileHandler.versionedPath(
+            for: "test-bucket", key: "test-file.txt", versionId: secondVersionId))
+    }
+
+    @Test("resolvePath - Resolves to a specific version when versionId is given")
+    func testResolvePathSpecificVersion() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        let firstVersionId = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v2"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        let path = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: firstVersionId)
+
+        #expect(path == ObjectFileHandler.versionedPath(
+            for: "test-bucket", key: "test-file.txt", versionId: firstVersionId))
+    }
+
+    @Test("resolvePath - Resolves to the plain path in a non-versioned bucket")
+    func testResolvePathNonVersioned() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        let path = ObjectFileHandler.storagePath(for: "test-bucket", key: "test-file.txt")
+        try ObjectFileHandler.write(metadata: metadata, data: createTestData("v1"), to: path)
+
+        let resolved = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: nil)
+
+        #expect(resolved == path)
+    }
+
+    @Test("resolvePath - Returns nil for a key that doesn't exist")
+    func testResolvePathNonExistentKey() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let resolved = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "missing.txt", versionId: nil)
+
+        #expect(resolved == nil)
+    }
+
+    @Test("resolvePath - With no versionId, treats a delete marker latest version as not existing")
+    func testResolvePathSkipsDeleteMarkerForCurrentLookup() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+        _ = try ObjectFileHandler.createDeleteMarker(
+            bucketName: "test-bucket", key: "test-file.txt")
+
+        let resolved = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: nil)
+
+        #expect(resolved == nil)
+    }
+
+    @Test("resolvePath - An explicit versionId can still target a delete marker directly")
+    func testResolvePathExplicitVersionIdCanTargetDeleteMarker() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+        let deleteMarker = try ObjectFileHandler.createDeleteMarker(
+            bucketName: "test-bucket", key: "test-file.txt")
+
+        let resolved = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: deleteMarker.versionId)
+
+        #expect(resolved != nil)
+    }
+
+    // MARK: - Tags on versioned objects
+
+    @Test("Tags set on one version do not appear on another version")
+    func testTagsScopedToSpecificVersion() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        var firstMeta = createTestMetadata()
+        firstMeta.tags = ["only-on-first": "true"]
+        let firstVersionId = try ObjectFileHandler.writeVersioned(
+            metadata: firstMeta, data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        let secondMeta = createTestMetadata()
+        let secondVersionId = try ObjectFileHandler.writeVersioned(
+            metadata: secondMeta, data: createTestData("v2"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        let (readFirst, _) = try ObjectFileHandler.readVersion(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: firstVersionId,
+            loadData: false)
+        let (readSecond, _) = try ObjectFileHandler.readVersion(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: secondVersionId,
+            loadData: false)
+
+        #expect(readFirst.tags == ["only-on-first": "true"])
+        #expect(readSecond.tags == nil)
+    }
+
+    @Test("Rewriting a version's metadata with new tags preserves its data and other fields")
+    func testRewritingTagsPreservesDataAndMetadata() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        let metadata = createTestMetadata()
+        let data = createTestData("unchanged content")
+        let versionId = try ObjectFileHandler.writeVersioned(
+            metadata: metadata, data: data,
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        let path = try ObjectFileHandler.resolvePath(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: versionId)!
+        let (readMeta, readData) = try ObjectFileHandler.read(from: path, loadData: true)
+
+        var updatedMeta = readMeta
+        updatedMeta.tags = ["env": "prod"]
+        try ObjectFileHandler.write(metadata: updatedMeta, data: readData!, to: path)
+
+        let (finalMeta, finalData) = try ObjectFileHandler.read(from: path, loadData: true)
+        #expect(finalMeta.tags == ["env": "prod"])
+        #expect(finalMeta.etag == metadata.etag)
+        #expect(finalMeta.size == metadata.size)
+        #expect(finalData == data)
+    }
 }

@@ -878,4 +878,108 @@ echo ""
 echo "=== Public Access Block Tests Complete ==="
 echo ""
 
+echo "=== Tagging Tests ==="
+
+aws_s3 s3 mb s3://tagging-test-bucket
+echo -n "hello" | aws_s3 s3 cp - s3://tagging-test-bucket/file.txt
+
+echo "Testing GetBucketTagging 404s when never configured..."
+BUCKET_TAGGING_UNSET=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
+if echo "$BUCKET_TAGGING_UNSET" | grep -q "NoSuchTagSet"; then
+    echo "PASS: GetBucketTagging correctly 404s when unset."
+else
+    echo "FAIL: GetBucketTagging did not 404 as expected."
+    echo "  Response: $BUCKET_TAGGING_UNSET"
+fi
+
+echo "Testing PutBucketTagging / GetBucketTagging round-trip..."
+aws_s3 s3api put-bucket-tagging --bucket tagging-test-bucket --tagging 'TagSet=[{Key=env,Value=prod},{Key=team,Value=storage}]'
+BUCKET_TAGGING_GET=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
+if echo "$BUCKET_TAGGING_GET" | jq -e '.TagSet | length == 2' > /dev/null 2>&1; then
+    echo "PASS: PutBucketTagging/GetBucketTagging round-trip matches what was set."
+else
+    echo "FAIL: GetBucketTagging did not reflect what was just set."
+    echo "  Response: $BUCKET_TAGGING_GET"
+fi
+
+echo "Testing DeleteBucketTagging resets to unconfigured..."
+aws_s3 s3api delete-bucket-tagging --bucket tagging-test-bucket
+BUCKET_TAGGING_AFTER_DELETE=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
+if echo "$BUCKET_TAGGING_AFTER_DELETE" | grep -q "NoSuchTagSet"; then
+    echo "PASS: DeleteBucketTagging correctly reset the configuration."
+else
+    echo "FAIL: DeleteBucketTagging did not reset as expected."
+    echo "  Response: $BUCKET_TAGGING_AFTER_DELETE"
+fi
+
+echo "Testing GetObjectTagging 200s with an empty TagSet when never tagged..."
+OBJECT_TAGGING_UNSET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key file.txt 2>&1)
+if echo "$OBJECT_TAGGING_UNSET" | jq -e '.TagSet | length == 0' > /dev/null 2>&1; then
+    echo "PASS: GetObjectTagging returns an empty TagSet (200, not a 404) when never tagged."
+else
+    echo "FAIL: GetObjectTagging did not return an empty TagSet as expected."
+    echo "  Response: $OBJECT_TAGGING_UNSET"
+fi
+
+echo "Testing PutObjectTagging / GetObjectTagging round-trip..."
+aws_s3 s3api put-object-tagging --bucket tagging-test-bucket --key file.txt --tagging 'TagSet=[{Key=project,Value=alarik}]'
+OBJECT_TAGGING_GET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key file.txt 2>&1)
+if echo "$OBJECT_TAGGING_GET" | jq -e '.TagSet[0].Key == "project" and .TagSet[0].Value == "alarik"' > /dev/null 2>&1; then
+    echo "PASS: PutObjectTagging/GetObjectTagging round-trip matches what was set."
+else
+    echo "FAIL: GetObjectTagging did not reflect what was just set."
+    echo "  Response: $OBJECT_TAGGING_GET"
+fi
+
+# The object itself must still be readable after the tagging metadata rewrite
+OBJECT_CONTENT_AFTER_TAGGING=$(aws_s3 s3 cp s3://tagging-test-bucket/file.txt -)
+if [ "$OBJECT_CONTENT_AFTER_TAGGING" == "hello" ]; then
+    echo "PASS: Object content is intact after PutObjectTagging."
+else
+    echo "FAIL: Object content was unexpectedly affected by tagging."
+    echo "  Content: $OBJECT_CONTENT_AFTER_TAGGING"
+fi
+
+TAGGING_BODY_FILE=$(mktemp)
+printf "tagged at upload" > "$TAGGING_BODY_FILE"
+
+echo "Testing x-amz-tagging header on PutObject sets tags inline..."
+aws_s3 s3api put-object --bucket tagging-test-bucket --key inline-tagged.txt --body "$TAGGING_BODY_FILE" --tagging 'a=1&b=2' > /dev/null
+INLINE_TAGGING_GET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt 2>&1)
+if echo "$INLINE_TAGGING_GET" | jq -e '.TagSet | length == 2' > /dev/null 2>&1; then
+    echo "PASS: x-amz-tagging header correctly set tags at upload time."
+else
+    echo "FAIL: x-amz-tagging header did not set tags as expected."
+    echo "  Response: $INLINE_TAGGING_GET"
+fi
+
+# A fresh, never-tagged key, distinct from file.txt (already tagged earlier in this section)
+printf "never tagged" > "$TAGGING_BODY_FILE"
+aws_s3 s3api put-object --bucket tagging-test-bucket --key untagged.txt --body "$TAGGING_BODY_FILE" > /dev/null
+rm -f "$TAGGING_BODY_FILE"
+
+echo "Testing x-amz-tagging-count appears only when tags exist..."
+TAGGED_COUNT=$(aws_s3 s3api head-object --bucket tagging-test-bucket --key inline-tagged.txt 2>&1 | jq -r '.TagCount // "missing"')
+UNTAGGED_COUNT=$(aws_s3 s3api head-object --bucket tagging-test-bucket --key untagged.txt 2>&1 | jq -r '.TagCount // "missing"')
+if [ "$TAGGED_COUNT" == "2" ] && [ "$UNTAGGED_COUNT" == "missing" ]; then
+    echo "PASS: x-amz-tagging-count present only on the tagged object."
+else
+    echo "FAIL: x-amz-tagging-count did not match expectations."
+    echo "  Tagged: $TAGGED_COUNT, Untagged: $UNTAGGED_COUNT"
+fi
+
+echo "Testing DeleteObjectTagging removes tags..."
+aws_s3 s3api delete-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt
+OBJECT_TAGGING_AFTER_DELETE=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt 2>&1)
+if echo "$OBJECT_TAGGING_AFTER_DELETE" | jq -e '.TagSet | length == 0' > /dev/null 2>&1; then
+    echo "PASS: DeleteObjectTagging correctly removed all tags."
+else
+    echo "FAIL: DeleteObjectTagging did not remove tags as expected."
+    echo "  Response: $OBJECT_TAGGING_AFTER_DELETE"
+fi
+
+echo ""
+echo "=== Tagging Tests Complete ==="
+echo ""
+
 echo "Test complete."

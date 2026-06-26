@@ -498,6 +498,7 @@ struct S3Service {
             || lowerQuery.contains("versioning")
             || lowerQuery.contains("versions")
             || lowerQuery.contains("publicaccessblock")
+            || lowerQuery.contains("tagging")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
@@ -513,6 +514,10 @@ struct S3Service {
             return try handlePublicAccessBlockGet(bucket: bucket, requestId: req.id)
         }
 
+        if lowerQuery.contains("tagging") {
+            return try handleBucketTaggingGet(bucket: bucket, requestId: req.id)
+        }
+
         if lowerQuery.contains("policy") {
             return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
@@ -525,6 +530,19 @@ struct S3Service {
         // Note: ?versions is handled in the controller for list versions
 
         return nil
+    }
+
+    /// Handles GET ?tagging on a bucket. Matches real S3: a 404 NoSuchTagSet if no tag set has
+    /// ever been configured (verified against the GetBucketTagging API reference) - unlike
+    /// object tagging, which always returns 200 with a possibly-empty TagSet.
+    static func handleBucketTaggingGet(bucket: Bucket?, requestId: String) throws -> Response {
+        guard let rawTags = bucket?.tags else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchTagSet",
+                message: "There is no tag set associated with the bucket.",
+                requestId: requestId)
+        }
+        return buildXMLResponse(data: Data(Tagging.fromJSON(rawTags).toXML().utf8))
     }
 
     /// Handles GET ?publicAccessBlock - returns the bucket's Public Access Block configuration.
@@ -630,6 +648,12 @@ struct S3Service {
         )
 
         addVersionHeaders(to: response, meta: meta)
+
+        // x-amz-tagging-count - only present when the object actually has tags (verified
+        // against the GetObject API reference)
+        if let tagCount = meta.tags?.count, tagCount > 0 {
+            response.headers.add(name: "x-amz-tagging-count", value: String(tagCount))
+        }
 
         return response
     }

@@ -239,6 +239,11 @@ struct S3Controller: RouteCollection {
             return try await handlePublicAccessBlockPut(req: req, bucketName: bucketName)
         }
 
+        // Handle PUT ?tagging
+        if query.lowercased().contains("tagging") {
+            return try await handleBucketTaggingPut(req: req, bucketName: bucketName)
+        }
+
         if Validator.bucketName.validate(bucketName).isFailure {
             throw S3Error(
                 status: .badRequest,
@@ -407,6 +412,59 @@ struct S3Controller: RouteCollection {
         return .noContent
     }
 
+    /// Handles PUT /:bucketName?tagging - sets the bucket's tag-set, overwriting any existing
+    /// tags entirely (real S3 does not merge - verified against the PutBucketTagging API
+    /// reference). Real S3 returns 204 No Content.
+    @Sendable
+    private func handleBucketTaggingPut(req: Request, bucketName: String) async throws
+        -> Response
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let xml = String(buffer: bodyData)
+        let tagging = try Tagging.parse(xml: xml, requestId: req.id)
+
+        bucket.tags = tagging.toJSON()
+        try await bucket.save(on: req.db)
+
+        return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
+    }
+
+    /// Handles DELETE /:bucketName?tagging - removes all of the bucket's tags. Real S3 returns
+    /// 204 No Content.
+    @Sendable
+    private func handleBucketTaggingDelete(req: Request, bucketName: String) async throws
+        -> HTTPStatus
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        bucket.tags = nil
+        try await bucket.save(on: req.db)
+
+        return .noContent
+    }
+
     // DELETE /:bucketName
     @Sendable
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
@@ -416,6 +474,11 @@ struct S3Controller: RouteCollection {
         // Handle DELETE ?publicAccessBlock
         if query.lowercased().contains("publicaccessblock") {
             return try await handlePublicAccessBlockDelete(req: req, bucketName: bucketName)
+        }
+
+        // Handle DELETE ?tagging
+        if query.lowercased().contains("tagging") {
+            return try await handleBucketTaggingDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?policy
@@ -524,6 +587,12 @@ struct S3Controller: RouteCollection {
             )
         }
 
+        // PUT ?tagging - set the tag-set of an existing object/version, distinct from a plain
+        // body PUT
+        if req.url.query?.lowercased().contains("tagging") == true {
+            return try await handleObjectTaggingPut(req: req, bucketName: bucketName, key: keyPath)
+        }
+
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
         // Check if this is a copy operation
@@ -585,6 +654,19 @@ struct S3Controller: RouteCollection {
             }
         }
 
+        // x-amz-tagging sets tags inline at upload time - URL query-string encoded (verified
+        // against the PutObject API reference)
+        if let taggingHeader = req.headers.first(name: "x-amz-tagging") {
+            let tagging = Tagging.parseHeaderValue(taggingHeader)
+            guard tagging.tags.count <= Tagging.maxTagCount else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidTag",
+                    message: "Object tags cannot be greater than \(Tagging.maxTagCount).",
+                    requestId: req.id)
+            }
+            meta.tags = tagging.tags
+        }
+
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: "\"\(etag)\"")
 
@@ -605,6 +687,111 @@ struct S3Controller: RouteCollection {
         }
 
         return Response(status: .ok, headers: headers)
+    }
+
+    /// Handles PUT /:bucket/:key?tagging - sets the tag-set of a specific object version (or
+    /// the current one if no `versionId` is given). Modifies the existing version's metadata in
+    /// place - does not create a new version. Real S3 returns 200 with x-amz-version-id
+    /// (verified against the PutObjectTagging API reference). Auth is already done by the
+    /// caller (`handleObjectPut`) before dispatching here.
+    @Sendable
+    private func handleObjectTaggingPut(req: Request, bucketName: String, key: String)
+        async throws -> Response
+    {
+        let versionId = req.query[String.self, at: "versionId"]
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId)
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+        guard let data = data else {
+            throw S3Error(
+                status: .internalServerError, code: "InternalError",
+                message: "Could not read object data", requestId: req.id)
+        }
+
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let xml = String(buffer: bodyData)
+        let tagging = try Tagging.parse(xml: xml, requestId: req.id)
+
+        var updatedMeta = meta
+        updatedMeta.tags = tagging.tags
+        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+
+        var headers = HTTPHeaders()
+        if let versionId = meta.versionId {
+            headers.add(name: "x-amz-version-id", value: versionId)
+        }
+        return Response(status: .ok, headers: headers)
+    }
+
+    /// Handles GET /:bucket/:key?tagging - returns the tag-set of a specific object version (or
+    /// the current one). Always 200, even with no tags (verified against the GetObjectTagging
+    /// API reference - unlike bucket tagging, which 404s when unset).
+    @Sendable
+    private func handleObjectTaggingGet(req: Request, bucketName: String, key: String)
+        async throws -> Response
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        let versionId = req.query[String.self, at: "versionId"]
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId)
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        let (meta, _) = try ObjectFileHandler.read(from: path, loadData: false)
+        let tagging = Tagging(tags: meta.tags ?? [:])
+
+        let response = S3Service.buildXMLResponse(data: Data(tagging.toXML().utf8))
+        if let versionId = meta.versionId {
+            response.headers.add(name: "x-amz-version-id", value: versionId)
+        }
+        return response
+    }
+
+    /// Handles DELETE /:bucket/:key?tagging - removes all tags from a specific object version
+    /// (or the current one). Real S3 returns 204 No Content. Auth is already done by the
+    /// caller (`handleObjectDelete`) before dispatching here.
+    @Sendable
+    private func handleObjectTaggingDelete(req: Request, bucketName: String, key: String)
+        async throws -> Response
+    {
+        let versionId = req.query[String.self, at: "versionId"]
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId)
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+        guard let data = data else {
+            throw S3Error(
+                status: .internalServerError, code: "InternalError",
+                message: "Could not read object data", requestId: req.id)
+        }
+
+        var updatedMeta = meta
+        updatedMeta.tags = nil
+        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+
+        var headers = HTTPHeaders()
+        if let versionId = meta.versionId {
+            headers.add(name: "x-amz-version-id", value: versionId)
+        }
+        return Response(status: .noContent, headers: headers)
     }
 
     // Helper method to handle copy operations
@@ -718,6 +905,12 @@ struct S3Controller: RouteCollection {
                 key: keyPath,
                 uploadId: uploadId
             )
+        }
+
+        // GetObjectTagging - a different permission than GetObject in real S3, not covered by
+        // the bucket-policy public-access whitelist, so it always requires strict auth.
+        if req.url.query?.lowercased().contains("tagging") == true {
+            return try await handleObjectTaggingGet(req: req, bucketName: bucketName, key: keyPath)
         }
 
         // Check for versionId query parameter
@@ -882,6 +1075,12 @@ struct S3Controller: RouteCollection {
                 key: keyPath,
                 uploadId: uploadId
             )
+        }
+
+        // DeleteObjectTagging - distinct from deleting the object/version itself
+        if req.url.query?.lowercased().contains("tagging") == true {
+            return try await handleObjectTaggingDelete(
+                req: req, bucketName: bucketName, key: keyPath)
         }
 
         let versionId = req.query[String.self, at: "versionId"]

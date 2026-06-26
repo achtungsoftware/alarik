@@ -613,6 +613,43 @@ struct ObjectFileHandler {
         return (meta, data)
     }
 
+    /// Resolves the on-disk path for a specific version (or the current/latest version if
+    /// `versionId` is nil), regardless of the bucket's versioning state - nil if it doesn't
+    /// exist. Used by operations that need to modify a version's metadata in place (e.g. object
+    /// tagging), where the caller needs the path itself, not just the decoded contents.
+    ///
+    /// For a "current version" lookup (`versionId == nil`), a delete marker counts as "doesn't
+    /// exist" - matching GetObject's own delete-marker handling, and `readCurrentObject`'s. An
+    /// explicit `versionId` may still target a delete marker directly (e.g. to inspect it).
+    static func resolvePath(bucketName: String, key: String, versionId: String?) throws -> String?
+    {
+        let path: String
+        if let versionId = versionId {
+            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+        } else if isVersioned(bucketName: bucketName, key: key) {
+            guard let latestVersionId = try getLatestVersionId(bucketName: bucketName, key: key)
+            else {
+                return nil
+            }
+            path = versionedPath(for: bucketName, key: key, versionId: latestVersionId)
+        } else {
+            path = storagePath(for: bucketName, key: key)
+        }
+
+        guard keyExists(for: bucketName, key: key, path: path) else {
+            return nil
+        }
+
+        if versionId == nil {
+            let (meta, _) = try read(from: path, loadData: false)
+            if meta.isDeleteMarker {
+                return nil
+            }
+        }
+
+        return path
+    }
+
     /// Gets the latest version ID for a key
     static func getLatestVersionId(bucketName: String, key: String) throws -> String? {
         let pointerPath = latestPointerPath(for: bucketName, key: key)

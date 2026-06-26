@@ -36,6 +36,9 @@ const loadingVersions = ref(false);
 const deletingVersionId = ref<string | null>(null);
 const openPreviewModal = ref(false);
 const previewObject = ref<BrowserItem | null>(null);
+const tagRows = ref<{ key: string; value: string }[]>([]);
+const loadingTags = ref(false);
+const savingTags = ref(false);
 
 watch(
     () => props.open,
@@ -43,6 +46,7 @@ watch(
         open.value = val;
         if (val && props.item && props.bucketName) {
             fetchVersions();
+            fetchTags();
         }
     }
 );
@@ -51,8 +55,80 @@ watch(open, (val) => {
     emit("update:open", val);
     if (!val) {
         versions.value = [];
+        tagRows.value = [];
     }
 });
+
+async function fetchTags() {
+    if (!props.item || !props.bucketName) return;
+
+    loadingTags.value = true;
+    try {
+        const response = await $fetch<{ tags: Record<string, string> }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/tags`, {
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+            params: {
+                bucket: props.bucketName,
+                key: props.item.key,
+            },
+        });
+        tagRows.value = Object.entries(response.tags).map(([key, value]) => ({ key, value }));
+    } catch (error) {
+        console.error("Failed to fetch tags:", error);
+        tagRows.value = [];
+    } finally {
+        loadingTags.value = false;
+    }
+}
+
+function addTagRow() {
+    tagRows.value.push({ key: "", value: "" });
+}
+
+function removeTagRow(index: number) {
+    tagRows.value.splice(index, 1);
+}
+
+async function saveTags() {
+    if (!props.item || !props.bucketName) return;
+
+    savingTags.value = true;
+    try {
+        const tags: Record<string, string> = {};
+        for (const row of tagRows.value) {
+            if (row.key.trim() === "") continue;
+            tags[row.key.trim()] = row.value;
+        }
+
+        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/tags`, {
+            method: "PUT",
+            body: JSON.stringify({ tags }),
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${jwtCookie.value}`,
+            },
+            params: {
+                bucket: props.bucketName,
+                key: props.item.key,
+            },
+        });
+
+        toast.add({
+            title: "Tags saved",
+            description: `The tags for "${props.item.key}" were updated.`,
+            icon: "i-lucide-circle-check",
+            color: "success",
+        });
+    } catch (error: any) {
+        toast.add({
+            title: "Save Failed",
+            description: error.data?.reason ?? "Failed to save tags",
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+    } finally {
+        savingTags.value = false;
+    }
+}
 
 async function fetchVersions() {
     if (!props.item || !props.bucketName) return;
@@ -212,6 +288,29 @@ function getVersionStatusBadge(version: BrowserItem) {
                             <NameValueLabel name="Version Id" v-if="props.item.versionId" :value="props.item.versionId" />
                             <NameValueLabel name="Is Latest" v-if="props.item.isLatest !== undefined" :value="props.item.isLatest ? 'Yes' : 'No'" />
                             <NameValueLabel name="Is Delete Marker" v-if="props.item.isDeleteMarker" :value="'Yes'" />
+                        </div>
+                    </template>
+                </UCard>
+
+                <UCard variant="subtle">
+                    <template #header>
+                        <CardHeader title="Tags" size="sm" :badge="tagRows.length > 0 ? tagRows.length + '' : undefined" />
+                    </template>
+                    <template #default>
+                        <div v-if="loadingTags" class="flex items-center justify-center p-4">
+                            <LoadingIndicator />
+                        </div>
+                        <div v-else class="space-y-2">
+                            <div v-for="(row, index) in tagRows" :key="index" class="flex gap-2">
+                                <UInput v-model="row.key" placeholder="Key" variant="subtle" size="sm" class="flex-1" />
+                                <UInput v-model="row.value" placeholder="Value" variant="subtle" size="sm" class="flex-1" />
+                                <UButton icon="i-lucide-x" color="neutral" variant="subtle" size="sm" aria-label="Remove tag" @click="removeTagRow(index)" />
+                            </div>
+
+                            <div class="flex items-center justify-between">
+                                <UButton label="Add Tag" icon="i-lucide-plus" variant="subtle" color="neutral" size="sm" @click="addTagRow" />
+                                <UButton label="Save Tags" :loading="savingTags" color="primary" size="sm" @click="saveTags" />
+                            </div>
                         </div>
                     </template>
                 </UCard>

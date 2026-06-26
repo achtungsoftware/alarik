@@ -2926,6 +2926,424 @@ struct InternalBucketControllerTests {
         }
     }
 
+    // MARK: - Bucket tags
+
+    @Test("Get bucket tags - None set returns an empty dictionary")
+    func testGetBucketTagsNoneSetReturnsEmpty() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-tags-bucket")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags.isEmpty)
+                })
+        }
+    }
+
+    @Test("Set bucket tags - Succeeds and is retrievable")
+    func testSetBucketTagsValid() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-tags-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.TagsDTO(tags: ["env": "prod", "team": "storage"]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags == ["env": "prod", "team": "storage"])
+                })
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags == ["env": "prod", "team": "storage"])
+                })
+        }
+    }
+
+    @Test("Set bucket tags - Overwrites entirely rather than merging")
+    func testSetBucketTagsOverwritesEntirely() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-tags-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["b": "2"]))
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags == ["b": "2"])
+                })
+        }
+    }
+
+    @Test("Set bucket tags - Non-existent bucket fails")
+    func testSetBucketTagsNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/nonexistent/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Set bucket tags - Without auth fails")
+    func testSetBucketTagsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/tags",
+                beforeRequest: { req in
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Get bucket tags - Without auth fails")
+    func testGetBucketTagsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/buckets/test-bucket/tags",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete bucket tags - Success")
+    func testDeleteBucketTagsSuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-tags-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/buckets/test-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags.isEmpty)
+                })
+        }
+    }
+
+    @Test("Delete bucket tags - Non-existent bucket fails")
+    func testDeleteBucketTagsNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/nonexistent/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Delete bucket tags - Without auth fails")
+    func testDeleteBucketTagsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .DELETE, "/api/v1/buckets/test-bucket/tags",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Bucket tags - User cannot manage another user's bucket tags")
+    func testBucketTagsUserIsolation() async throws {
+        try await withApp { app in
+            let token1 = try await createUserAndLogin(app)
+            try await createBucket(app, token: token1, name: "user1-tags-bucket")
+
+            let token2 = try await createUserAndLogin(app, username: "tags-user2@example.com")
+
+            try await app.test(
+                .GET, "/api/v1/buckets/user1-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/user1-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/buckets/user1-tags-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    // MARK: - Object tags
+
+    @Test("Get object tags - None set returns an empty dictionary")
+    func testGetObjectTagsNoneSetReturnsEmpty() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-obj-tags-bucket")
+            try await putObject(
+                app, bucketName: "test-obj-tags-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .GET, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags.isEmpty)
+                })
+        }
+    }
+
+    @Test("Set object tags - Succeeds and is retrievable")
+    func testSetObjectTagsValid() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-obj-tags-bucket")
+            try await putObject(
+                app, bucketName: "test-obj-tags-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.TagsDTO(tags: ["project": "alarik"]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags == ["project": "alarik"])
+                })
+
+            try await app.test(
+                .GET, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags == ["project": "alarik"])
+                })
+
+            // The object itself must be untouched
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=test-obj-tags-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                })
+        }
+    }
+
+    @Test("Set object tags - More than 10 tags is rejected")
+    func testSetObjectTagsTooManyRejected() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-obj-tags-bucket")
+            try await putObject(
+                app, bucketName: "test-obj-tags-bucket", key: "file.txt", content: "data")
+
+            var tags: [String: String] = [:]
+            for i in 0..<11 {
+                tags["key\(i)"] = "value\(i)"
+            }
+
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: tags))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Set object tags - Non-existent object fails")
+    func testSetObjectTagsNonExistentObject() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-obj-tags-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=missing.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Set object tags - Without auth fails")
+    func testSetObjectTagsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=test-bucket&key=file.txt",
+                beforeRequest: { req in
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Delete object tags - Success")
+    func testDeleteObjectTagsSuccess() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-obj-tags-bucket")
+            try await putObject(
+                app, bucketName: "test-obj-tags-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                })
+
+            try await app.test(
+                .DELETE, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/objects/tags?bucket=test-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
+                    #expect(dto.tags.isEmpty)
+                })
+        }
+    }
+
+    @Test("Delete object tags - Without auth fails")
+    func testDeleteObjectTagsUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .DELETE, "/api/v1/objects/tags?bucket=test-bucket&key=file.txt",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Object tags - User cannot manage tags on another user's bucket")
+    func testObjectTagsUserIsolation() async throws {
+        try await withApp { app in
+            let token1 = try await createUserAndLogin(app)
+            try await createBucket(app, token: token1, name: "user1-obj-tags-bucket")
+            try await putObject(
+                app, bucketName: "user1-obj-tags-bucket", key: "file.txt", content: "data")
+
+            let token2 = try await createUserAndLogin(
+                app, username: "obj-tags-user2@example.com")
+
+            try await app.test(
+                .GET, "/api/v1/objects/tags?bucket=user1-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/objects/tags?bucket=user1-obj-tags-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token2)
+                    try req.content.encode(InternalBucketController.TagsDTO(tags: ["a": "1"]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
     /// Extracts just the path + query from a generated absolute share URL, since `app.test`
     /// dispatches on the path. No Host-header workaround is needed here (unlike a presigned
     /// URL) - this route doesn't use SigV4 at all.

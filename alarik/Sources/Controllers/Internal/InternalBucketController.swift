@@ -33,6 +33,10 @@ struct InternalBucketController: RouteCollection {
         let policy: String?
     }
 
+    struct TagsDTO: Content {
+        let tags: [String: String]
+    }
+
     struct ShareRequestDTO: Content {
         let bucket: String
         let key: String
@@ -58,12 +62,21 @@ struct InternalBucketController: RouteCollection {
             use: self.setPolicy)
         routes.grouped("buckets").grouped(":bucketName").grouped("policy").delete(
             use: self.deletePolicy)
+        routes.grouped("buckets").grouped(":bucketName").grouped("tags").get(
+            use: self.getBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("tags").put(
+            use: self.setBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("tags").delete(
+            use: self.deleteBucketTags)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects").post(use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
+        routes.grouped("objects", "tags").get(use: self.getObjectTags)
+        routes.grouped("objects", "tags").put(use: self.setObjectTags)
+        routes.grouped("objects", "tags").delete(use: self.deleteObjectTags)
         routes.grouped("objects", "share").post(use: self.shareObject)
         routes.grouped("objects", "share").get(use: self.listSharedLinks)
         routes.grouped("objects", "share").grouped(":sharedLinkId").delete(
@@ -753,6 +766,197 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+
+        return .noContent
+    }
+
+    @Sendable
+    func getBucketTags(req: Request) async throws -> TagsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        guard let rawTags = bucket.tags else {
+            return TagsDTO(tags: [:])
+        }
+        return TagsDTO(tags: Tagging.fromJSON(rawTags).tags)
+    }
+
+    /// Sets the bucket's tags, overwriting any existing tags entirely - matches the
+    /// S3-protocol PutBucketTagging semantics (no merge).
+    @Sendable
+    func setBucketTags(req: Request) async throws -> TagsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(TagsDTO.self)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        let tagging = Tagging(tags: input.tags)
+        bucket.tags = tagging.toJSON()
+        try await bucket.save(on: req.db)
+
+        return TagsDTO(tags: tagging.tags)
+    }
+
+    @Sendable
+    func deleteBucketTags(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        bucket.tags = nil
+        try await bucket.save(on: req.db)
+
+        return .noContent
+    }
+
+    /// Returns the tags of the *current* version of an object. Internal API doesn't expose
+    /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
+    @Sendable
+    func getObjectTags(req: Request) async throws -> TagsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        guard
+            let (meta, _) = try ObjectFileHandler.readCurrentObject(
+                bucketName: bucketName, key: key, loadData: false)
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        return TagsDTO(tags: meta.tags ?? [:])
+    }
+
+    /// Sets the tags of the *current* version of an object, overwriting any existing tags
+    /// entirely. Does not create a new version - modifies the existing version's metadata in
+    /// place, matching the S3-protocol PutObjectTagging semantics.
+    @Sendable
+    func setObjectTags(req: Request) async throws -> TagsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+
+        let input = try req.content.decode(TagsDTO.self)
+        guard input.tags.count <= Tagging.maxTagCount else {
+            throw Abort(
+                .badRequest,
+                reason: "Object tags cannot be greater than \(Tagging.maxTagCount).")
+        }
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: nil)
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+        guard let data = data else {
+            throw Abort(.internalServerError, reason: "Could not read object data")
+        }
+
+        var updatedMeta = meta
+        updatedMeta.tags = input.tags
+        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+
+        return TagsDTO(tags: input.tags)
+    }
+
+    @Sendable
+    func deleteObjectTags(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+
+        guard
+            try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .filter(\.$user.$id == auth.userId)
+                .first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
+
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: nil)
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+        guard let data = data else {
+            throw Abort(.internalServerError, reason: "Could not read object data")
+        }
+
+        var updatedMeta = meta
+        updatedMeta.tags = nil
+        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
 
         return .noContent
     }
