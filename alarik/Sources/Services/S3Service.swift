@@ -499,6 +499,7 @@ struct S3Service {
             || lowerQuery.contains("versions")
             || lowerQuery.contains("publicaccessblock")
             || lowerQuery.contains("tagging")
+            || lowerQuery.contains("lifecycle")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
@@ -518,6 +519,10 @@ struct S3Service {
             return try handleBucketTaggingGet(bucket: bucket, requestId: req.id)
         }
 
+        if lowerQuery.contains("lifecycle") {
+            return try handleLifecycleGet(bucket: bucket, requestId: req.id)
+        }
+
         if lowerQuery.contains("policy") {
             return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
@@ -530,6 +535,18 @@ struct S3Service {
         // Note: ?versions is handled in the controller for list versions
 
         return nil
+    }
+
+    /// Handles GET ?lifecycle on a bucket. Matches real S3: a 404 NoSuchLifecycleConfiguration
+    /// if none has ever been set (verified against the GetBucketLifecycleConfiguration API
+    /// reference).
+    static func handleLifecycleGet(bucket: Bucket?, requestId: String) throws -> Response {
+        guard let rawRules = bucket?.lifecycleRules else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchLifecycleConfiguration",
+                message: "The lifecycle configuration does not exist.", requestId: requestId)
+        }
+        return buildXMLResponse(data: Data(LifecycleConfiguration.fromJSON(rawRules).toXML().utf8))
     }
 
     /// Handles GET ?tagging on a bucket. Matches real S3: a 404 NoSuchTagSet if no tag set has

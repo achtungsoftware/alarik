@@ -244,6 +244,11 @@ struct S3Controller: RouteCollection {
             return try await handleBucketTaggingPut(req: req, bucketName: bucketName)
         }
 
+        // Handle PUT ?lifecycle
+        if query.lowercased().contains("lifecycle") {
+            return try await handleLifecyclePut(req: req, bucketName: bucketName)
+        }
+
         if Validator.bucketName.validate(bucketName).isFailure {
             throw S3Error(
                 status: .badRequest,
@@ -465,6 +470,57 @@ struct S3Controller: RouteCollection {
         return .noContent
     }
 
+    /// Handles PUT /:bucketName?lifecycle - sets the bucket's lifecycle configuration,
+    /// overwriting any existing configuration entirely. Real S3 returns 200 OK with an empty
+    /// body (verified against the PutBucketLifecycleConfiguration API reference).
+    @Sendable
+    private func handleLifecyclePut(req: Request, bucketName: String) async throws -> Response {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let xml = String(buffer: bodyData)
+        let configuration = try LifecycleConfiguration.parse(xml: xml, requestId: req.id)
+
+        bucket.lifecycleRules = configuration.toJSON()
+        try await bucket.save(on: req.db)
+
+        return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+    }
+
+    /// Handles DELETE /:bucketName?lifecycle - removes the bucket's lifecycle configuration.
+    /// Real S3 returns 204 No Content.
+    @Sendable
+    private func handleLifecycleDelete(req: Request, bucketName: String) async throws
+        -> HTTPStatus
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        bucket.lifecycleRules = nil
+        try await bucket.save(on: req.db)
+
+        return .noContent
+    }
+
     // DELETE /:bucketName
     @Sendable
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
@@ -479,6 +535,11 @@ struct S3Controller: RouteCollection {
         // Handle DELETE ?tagging
         if query.lowercased().contains("tagging") {
             return try await handleBucketTaggingDelete(req: req, bucketName: bucketName)
+        }
+
+        // Handle DELETE ?lifecycle
+        if query.lowercased().contains("lifecycle") {
+            return try await handleLifecycleDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?policy

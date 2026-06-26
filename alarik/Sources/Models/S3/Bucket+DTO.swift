@@ -60,6 +60,11 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "tags")
     var tags: String?
 
+    /// JSON-encoded `[LifecycleRule]`, or nil if no lifecycle configuration has been set - see
+    /// `LifecycleConfiguration`.
+    @Field(key: "lifecycle_rules")
+    var lifecycleRules: String?
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false

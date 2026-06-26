@@ -55,6 +55,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateSharedLink())
     app.migrations.add(AddBucketPublicAccessBlock())
     app.migrations.add(AddBucketTags())
+    app.migrations.add(AddBucketLifecycleRules())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -121,6 +122,23 @@ public func configure(_ app: Application) async throws {
                     }
                 } catch {
                     app.logger.error("Failed to clean up expired shared links: \(error)")
+                }
+            }
+        }
+
+        // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
+        // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
+        // the way short-lived access keys/share links are. Matches real S3, which evaluates
+        // lifecycle rules roughly once a day.
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .zero,
+            delay: .hours(1)
+        ) { task in
+            Task {
+                do {
+                    try await LifecycleService.runSweep(app: app)
+                } catch {
+                    app.logger.error("Failed to run lifecycle sweep: \(error)")
                 }
             }
         }

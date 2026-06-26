@@ -982,4 +982,64 @@ echo ""
 echo "=== Tagging Tests Complete ==="
 echo ""
 
+echo "=== Lifecycle Tests ==="
+
+aws_s3 s3 mb s3://lifecycle-test-bucket
+
+echo "Testing GetBucketLifecycleConfiguration 404s when never configured..."
+LIFECYCLE_GET_UNSET=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
+if echo "$LIFECYCLE_GET_UNSET" | grep -q "NoSuchLifecycleConfiguration"; then
+    echo "PASS: GetBucketLifecycleConfiguration correctly 404s when unset."
+else
+    echo "FAIL: GetBucketLifecycleConfiguration did not 404 as expected."
+    echo "  Response: $LIFECYCLE_GET_UNSET"
+fi
+
+echo "Testing PutBucketLifecycleConfiguration / GetBucketLifecycleConfiguration round-trip..."
+aws_s3 s3api put-bucket-lifecycle-configuration --bucket lifecycle-test-bucket --lifecycle-configuration '{
+    "Rules": [{
+        "ID": "expire-logs",
+        "Filter": {"Prefix": "logs/"},
+        "Status": "Enabled",
+        "Expiration": {"Days": 30}
+    }]
+}'
+LIFECYCLE_GET=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
+if echo "$LIFECYCLE_GET" | jq -e '.Rules[0].Filter.Prefix == "logs/" and .Rules[0].Expiration.Days == 30' > /dev/null 2>&1; then
+    echo "PASS: PutBucketLifecycleConfiguration/GetBucketLifecycleConfiguration round-trip matches what was set."
+else
+    echo "FAIL: GetBucketLifecycleConfiguration did not reflect what was just set."
+    echo "  Response: $LIFECYCLE_GET"
+fi
+
+echo "Testing PutBucketLifecycleConfiguration rejects unsupported elements (Transition)..."
+LIFECYCLE_REJECTED=$(aws_s3 s3api put-bucket-lifecycle-configuration --bucket lifecycle-test-bucket --lifecycle-configuration '{
+    "Rules": [{
+        "ID": "transition-rule",
+        "Filter": {"Prefix": "documents/"},
+        "Status": "Enabled",
+        "Transitions": [{"Days": 30, "StorageClass": "GLACIER"}]
+    }]
+}' 2>&1)
+if echo "$LIFECYCLE_REJECTED" | grep -q "MalformedXML"; then
+    echo "PASS: PutBucketLifecycleConfiguration correctly rejected an unsupported Transition rule."
+else
+    echo "FAIL: PutBucketLifecycleConfiguration did not reject the unsupported rule as expected."
+    echo "  Response: $LIFECYCLE_REJECTED"
+fi
+
+echo "Testing DeleteBucketLifecycle resets to unconfigured..."
+aws_s3 s3api delete-bucket-lifecycle --bucket lifecycle-test-bucket
+LIFECYCLE_GET_AFTER_DELETE=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
+if echo "$LIFECYCLE_GET_AFTER_DELETE" | grep -q "NoSuchLifecycleConfiguration"; then
+    echo "PASS: DeleteBucketLifecycle correctly reset the configuration."
+else
+    echo "FAIL: DeleteBucketLifecycle did not reset as expected."
+    echo "  Response: $LIFECYCLE_GET_AFTER_DELETE"
+fi
+
+echo ""
+echo "=== Lifecycle Tests Complete ==="
+echo ""
+
 echo "Test complete."
