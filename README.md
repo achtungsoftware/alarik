@@ -12,6 +12,10 @@
   <img src="https://img.shields.io/badge/language-Swift-F05138" />
 
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey" />
+
+  <a href="https://github.com/sponsors/achtungsoftware" target="_blank">
+    <img src="https://img.shields.io/badge/sponsor-%E2%9D%A4-ff69b4" />
+  </a>
 </p>
 
 # Alarik - a High-Performance S3-Compatible Object Storage
