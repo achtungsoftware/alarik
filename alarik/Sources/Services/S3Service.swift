@@ -497,6 +497,7 @@ struct S3Service {
             || lowerQuery.contains("policy")
             || lowerQuery.contains("versioning")
             || lowerQuery.contains("versions")
+            || lowerQuery.contains("publicaccessblock")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
@@ -506,6 +507,10 @@ struct S3Service {
 
         if lowerQuery.contains("location") {
             return handleLocationQuery(req: req)
+        }
+
+        if lowerQuery.contains("publicaccessblock") {
+            return try handlePublicAccessBlockGet(bucket: bucket, requestId: req.id)
         }
 
         if lowerQuery.contains("policy") {
@@ -520,6 +525,23 @@ struct S3Service {
         // Note: ?versions is handled in the controller for list versions
 
         return nil
+    }
+
+    /// Handles GET ?publicAccessBlock - returns the bucket's Public Access Block configuration.
+    /// Matches real S3: a 404 NoSuchPublicAccessBlockConfiguration if none has ever been set,
+    /// same shape as GetBucketPolicy's NoSuchBucketPolicy.
+    static func handlePublicAccessBlockGet(bucket: Bucket?, requestId: String) throws -> Response
+    {
+        guard let bucket = bucket,
+            bucket.blockPublicAcls || bucket.ignorePublicAcls || bucket.blockPublicPolicy
+                || bucket.restrictPublicBuckets
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchPublicAccessBlockConfiguration",
+                message: "The public access block configuration was not found.",
+                requestId: requestId)
+        }
+        return buildXMLResponse(data: Data(bucket.publicAccessBlock.toXML().utf8))
     }
 
     /// Handles GET ?versioning - returns bucket versioning configuration
@@ -645,6 +667,15 @@ struct S3Service {
 
         if hasCredentials {
             return try await authenticateWithCache(req: req, bucketName: bucketName)
+        }
+
+        // RestrictPublicBuckets blocks anonymous access outright, regardless of what the bucket
+        // policy says - it only ever affects this no-credentials branch, never authenticated
+        // (owner/SigV4) requests.
+        if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.restrictPublicBuckets
+            == true
+        {
+            throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 
         guard

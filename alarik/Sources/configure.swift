@@ -53,6 +53,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateBucket())
     app.migrations.add(AddBucketPolicy())
     app.migrations.add(CreateSharedLink())
+    app.migrations.add(AddBucketPublicAccessBlock())
 
     app.migrations.add(CreateDefaultUser())
 

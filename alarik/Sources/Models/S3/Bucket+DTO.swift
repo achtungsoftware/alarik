@@ -41,8 +41,27 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "policy")
     var policy: String?
 
+    /// Public Access Block settings - see `PublicAccessBlockConfiguration`. `blockPublicAcls`/
+    /// `ignorePublicAcls` are accepted/stored for client compatibility (e.g. Terraform sets all
+    /// 4 unconditionally) but are no-ops, since this system has no ACL concept at all.
+    @Field(key: "block_public_acls")
+    var blockPublicAcls: Bool
+
+    @Field(key: "ignore_public_acls")
+    var ignorePublicAcls: Bool
+
+    @Field(key: "block_public_policy")
+    var blockPublicPolicy: Bool
+
+    @Field(key: "restrict_public_buckets")
+    var restrictPublicBuckets: Bool
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
+        self.blockPublicAcls = false
+        self.ignorePublicAcls = false
+        self.blockPublicPolicy = false
+        self.restrictPublicBuckets = false
     }
 
     init(name: String, userId: UUID) {
@@ -50,6 +69,10 @@ final class Bucket: Content, Model, @unchecked Sendable {
         self.creationDate = Date()
         self.$user.id = userId
         self.versioningStatus = VersioningStatus.disabled.rawValue
+        self.blockPublicAcls = false
+        self.ignorePublicAcls = false
+        self.blockPublicPolicy = false
+        self.restrictPublicBuckets = false
     }
 
     init(name: String, userId: UUID, creationDate: Date) {
@@ -57,6 +80,10 @@ final class Bucket: Content, Model, @unchecked Sendable {
         self.creationDate = creationDate
         self.$user.id = userId
         self.versioningStatus = VersioningStatus.disabled.rawValue
+        self.blockPublicAcls = false
+        self.ignorePublicAcls = false
+        self.blockPublicPolicy = false
+        self.restrictPublicBuckets = false
     }
 
     init(name: String, userId: UUID, versioningStatus: VersioningStatus) {
@@ -64,6 +91,20 @@ final class Bucket: Content, Model, @unchecked Sendable {
         self.creationDate = Date()
         self.$user.id = userId
         self.versioningStatus = versioningStatus.rawValue
+        self.blockPublicAcls = false
+        self.ignorePublicAcls = false
+        self.blockPublicPolicy = false
+        self.restrictPublicBuckets = false
+    }
+
+    /// Current public access block configuration for this bucket.
+    var publicAccessBlock: PublicAccessBlockConfiguration {
+        PublicAccessBlockConfiguration(
+            blockPublicAcls: blockPublicAcls,
+            ignorePublicAcls: ignorePublicAcls,
+            blockPublicPolicy: blockPublicPolicy,
+            restrictPublicBuckets: restrictPublicBuckets
+        )
     }
 
     func toResponseDTO() -> Bucket.ResponseDTO {

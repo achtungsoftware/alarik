@@ -234,6 +234,11 @@ struct S3Controller: RouteCollection {
             return try await handleBucketPolicyPut(req: req, bucketName: bucketName)
         }
 
+        // Handle PUT ?publicAccessBlock
+        if query.lowercased().contains("publicaccessblock") {
+            return try await handlePublicAccessBlockPut(req: req, bucketName: bucketName)
+        }
+
         if Validator.bucketName.validate(bucketName).isFailure {
             throw S3Error(
                 status: .badRequest,
@@ -312,6 +317,19 @@ struct S3Controller: RouteCollection {
                 message: "The specified bucket does not exist.", requestId: req.id)
         }
 
+        // BlockPublicPolicy rejects PutBucketPolicy outright - every policy this system can
+        // store grants Principal "*" access (see BucketPolicy.parseAndValidate), so there's no
+        // policy content to inspect; any policy at all is a public-access grant.
+        if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.blockPublicPolicy
+            == true
+        {
+            throw S3Error(
+                status: .forbidden, code: "AccessDenied",
+                message:
+                    "Bucket policies cannot be set while BlockPublicPolicy is enabled in this bucket's Public Access Block configuration.",
+                requestId: req.id)
+        }
+
         let bodyData = try await req.body.collect().get() ?? ByteBuffer()
         let rawJSON = String(buffer: bodyData)
 
@@ -326,11 +344,79 @@ struct S3Controller: RouteCollection {
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
 
+    /// Handles PUT /:bucketName?publicAccessBlock - set the bucket's Public Access Block
+    /// configuration.
+    @Sendable
+    private func handlePublicAccessBlockPut(req: Request, bucketName: String) async throws
+        -> Response
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
+        let xml = String(buffer: bodyData)
+        let configuration = PublicAccessBlockConfiguration.parse(xml: xml)
+
+        bucket.blockPublicAcls = configuration.blockPublicAcls
+        bucket.ignorePublicAcls = configuration.ignorePublicAcls
+        bucket.blockPublicPolicy = configuration.blockPublicPolicy
+        bucket.restrictPublicBuckets = configuration.restrictPublicBuckets
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.setPublicAccessBlock(
+            for: bucketName, configuration: configuration)
+
+        return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+    }
+
+    /// Handles DELETE /:bucketName?publicAccessBlock - removes the bucket's Public Access Block
+    /// configuration (resetting all 4 flags to false). Real S3 returns 204 No Content.
+    @Sendable
+    private func handlePublicAccessBlockDelete(req: Request, bucketName: String) async throws
+        -> HTTPStatus
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        guard
+            let bucket = try await Bucket.query(on: req.db)
+                .filter(\.$name == bucketName)
+                .first()
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchBucket",
+                message: "The specified bucket does not exist.", requestId: req.id)
+        }
+
+        bucket.blockPublicAcls = false
+        bucket.ignorePublicAcls = false
+        bucket.blockPublicPolicy = false
+        bucket.restrictPublicBuckets = false
+        try await bucket.save(on: req.db)
+
+        await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+
+        return .noContent
+    }
+
     // DELETE /:bucketName
     @Sendable
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
+
+        // Handle DELETE ?publicAccessBlock
+        if query.lowercased().contains("publicaccessblock") {
+            return try await handlePublicAccessBlockDelete(req: req, bucketName: bucketName)
+        }
 
         // Handle DELETE ?policy
         if query.lowercased().contains("policy") {

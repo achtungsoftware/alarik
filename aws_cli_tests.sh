@@ -804,4 +804,78 @@ echo ""
 echo "=== Conditional Write Tests Complete ==="
 echo ""
 
+echo "=== Public Access Block Tests ==="
+
+aws_s3 s3 mb s3://pab-test-bucket
+echo -n "hello" | aws_s3 s3 cp - s3://pab-test-bucket/file.txt
+
+echo "Testing GetPublicAccessBlock 404s when never configured..."
+PAB_GET_UNSET=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
+if echo "$PAB_GET_UNSET" | grep -q "NoSuchPublicAccessBlockConfiguration"; then
+    echo "PASS: GetPublicAccessBlock correctly 404s when unset."
+else
+    echo "FAIL: GetPublicAccessBlock did not 404 as expected."
+    echo "  Response: $PAB_GET_UNSET"
+fi
+
+echo "Testing PutPublicAccessBlock / GetPublicAccessBlock round-trip..."
+aws_s3 s3api put-public-access-block --bucket pab-test-bucket \
+    --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=false,BlockPublicPolicy=true,RestrictPublicBuckets=false"
+PAB_GET=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
+if echo "$PAB_GET" | jq -e '.PublicAccessBlockConfiguration.BlockPublicAcls == true and .PublicAccessBlockConfiguration.BlockPublicPolicy == true and .PublicAccessBlockConfiguration.RestrictPublicBuckets == false' > /dev/null 2>&1; then
+    echo "PASS: PutPublicAccessBlock/GetPublicAccessBlock round-trip matches what was set."
+else
+    echo "FAIL: GetPublicAccessBlock did not reflect what was just set."
+    echo "  Response: $PAB_GET"
+fi
+
+echo "Testing BlockPublicPolicy rejects PutBucketPolicy..."
+PAB_POLICY_REJECTED=$(aws_s3 s3api put-bucket-policy --bucket pab-test-bucket --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::pab-test-bucket/*\"}]}" 2>&1)
+if echo "$PAB_POLICY_REJECTED" | grep -q "AccessDenied"; then
+    echo "PASS: BlockPublicPolicy correctly rejected PutBucketPolicy."
+else
+    echo "FAIL: BlockPublicPolicy did not reject PutBucketPolicy as expected."
+    echo "  Response: $PAB_POLICY_REJECTED"
+fi
+
+echo "Testing RestrictPublicBuckets blocks anonymous access despite a public policy..."
+aws_s3 s3api put-public-access-block --bucket pab-test-bucket \
+    --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+aws_s3 s3api put-bucket-policy --bucket pab-test-bucket --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::pab-test-bucket/*\"}]}"
+
+ANON_BEFORE_RESTRICT=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/pab-test-bucket/file.txt")
+aws_s3 s3api put-public-access-block --bucket pab-test-bucket \
+    --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=true"
+ANON_AFTER_RESTRICT=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/pab-test-bucket/file.txt")
+
+if [ "$ANON_BEFORE_RESTRICT" == "200" ] && [ "$ANON_AFTER_RESTRICT" == "403" ]; then
+    echo "PASS: RestrictPublicBuckets correctly blocked anonymous access (200 -> 403)."
+else
+    echo "FAIL: RestrictPublicBuckets did not change anonymous access as expected."
+    echo "  Before: $ANON_BEFORE_RESTRICT, After: $ANON_AFTER_RESTRICT"
+fi
+
+# The owner's authenticated access must be unaffected by RestrictPublicBuckets
+OWNER_CONTENT=$(aws_s3 s3 cp s3://pab-test-bucket/file.txt -)
+if [ "$OWNER_CONTENT" == "hello" ]; then
+    echo "PASS: Owner's authenticated access still works under RestrictPublicBuckets."
+else
+    echo "FAIL: Owner's authenticated access was unexpectedly affected."
+    echo "  Content: $OWNER_CONTENT"
+fi
+
+echo "Testing DeletePublicAccessBlock resets to unconfigured..."
+aws_s3 s3api delete-public-access-block --bucket pab-test-bucket
+PAB_GET_AFTER_DELETE=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
+if echo "$PAB_GET_AFTER_DELETE" | grep -q "NoSuchPublicAccessBlockConfiguration"; then
+    echo "PASS: DeletePublicAccessBlock correctly reset the configuration."
+else
+    echo "FAIL: DeletePublicAccessBlock did not reset as expected."
+    echo "  Response: $PAB_GET_AFTER_DELETE"
+fi
+
+echo ""
+echo "=== Public Access Block Tests Complete ==="
+echo ""
+
 echo "Test complete."

@@ -89,6 +89,21 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
             await BucketPolicyCache.shared.load(initialData: policyData)
 
+            // Load public access block cache - only buckets with at least one flag set are
+            // worth caching, an all-false bucket behaves identically to "not in the map".
+            let publicAccessBlockData:
+                [(bucketName: String, configuration: PublicAccessBlockConfiguration)] =
+                    allBuckets.compactMap { bucket in
+                        let config = bucket.publicAccessBlock
+                        guard
+                            config.blockPublicAcls || config.ignorePublicAcls
+                                || config.blockPublicPolicy || config.restrictPublicBuckets
+                        else { return nil }
+                        return (bucketName: bucket.name, configuration: config)
+                    }
+            await BucketPolicyCache.shared.loadPublicAccessBlocks(
+                initialData: publicAccessBlockData)
+
         } catch {
             app.logger.error("Failed to load cache: \(error)")
         }
@@ -100,6 +115,7 @@ final class LoadCacheLifecycle: LifecycleHandler {
                 dump(await AccessKeySecretKeyMapCache.shared.getMap())
                 dump(await BucketVersioningCache.shared.getMap())
                 dump(await BucketPolicyCache.shared.getMap())
+                dump(await BucketPolicyCache.shared.getPublicAccessBlockMap())
             }
         #endif
     }

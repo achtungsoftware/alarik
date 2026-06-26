@@ -136,6 +136,16 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
+        if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.blockPublicPolicy
+            == true
+        {
+            throw Abort(
+                .forbidden,
+                reason:
+                    "Bucket policies cannot be set while BlockPublicPolicy is enabled in this bucket's Public Access Block configuration."
+            )
+        }
+
         let policy: BucketPolicy
         do {
             policy = try BucketPolicy.parseAndValidate(

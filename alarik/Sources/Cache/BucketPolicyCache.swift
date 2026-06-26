@@ -16,12 +16,16 @@ limitations under the License.
 
 import Foundation
 
-/// Caches already-parsed bucket policies so the request hot path (every anonymous request)
-/// never touches the database or re-parses JSON. Mirrors BucketVersioningCache.
+/// Caches already-parsed bucket policies (and public access block settings) so the request hot
+/// path (every anonymous request) never touches the database or re-parses JSON. Both live in one
+/// cache, rather than as two separate actors, since they're loaded/invalidated at the exact same
+/// lifecycle points and together answer one question: "can an anonymous caller in?" Mirrors
+/// BucketVersioningCache.
 final actor BucketPolicyCache {
     public static let shared = BucketPolicyCache()
 
     private var map: [String: BucketPolicy] = [:]
+    private var publicAccessBlockMap: [String: PublicAccessBlockConfiguration] = [:]
 
     func load(initialData: [(bucketName: String, policy: BucketPolicy)]) {
         for entry in initialData {
@@ -46,5 +50,36 @@ final actor BucketPolicyCache {
 
     func getMap() -> [String: BucketPolicy] {
         map
+    }
+
+    func loadPublicAccessBlocks(
+        initialData: [(bucketName: String, configuration: PublicAccessBlockConfiguration)]
+    ) {
+        for entry in initialData {
+            publicAccessBlockMap[entry.bucketName] = entry.configuration
+        }
+    }
+
+    /// Get the public access block configuration for a bucket, or nil if never configured
+    /// (equivalent to all-false - nothing blocked).
+    func publicAccessBlock(for bucketName: String) -> PublicAccessBlockConfiguration? {
+        publicAccessBlockMap[bucketName]
+    }
+
+    /// Set/replace the public access block configuration for a bucket
+    func setPublicAccessBlock(
+        for bucketName: String, configuration: PublicAccessBlockConfiguration
+    ) {
+        publicAccessBlockMap[bucketName] = configuration
+    }
+
+    /// Remove a bucket's public access block configuration (DeletePublicAccessBlock, or bucket
+    /// deletion)
+    func removePublicAccessBlock(for bucketName: String) {
+        publicAccessBlockMap.removeValue(forKey: bucketName)
+    }
+
+    func getPublicAccessBlockMap() -> [String: PublicAccessBlockConfiguration] {
+        publicAccessBlockMap
     }
 }

@@ -72,6 +72,7 @@ struct BucketService {
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
         await BucketVersioningCache.shared.removeBucket(bucketName)
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
         try BucketHandler.delete(name: bucketName, force: force)
     }
 }
