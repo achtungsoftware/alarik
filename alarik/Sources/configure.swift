@@ -26,14 +26,12 @@ public func configure(_ app: Application) async throws {
     app.routes.defaultMaxBodySize = "5tb"
     app.http.server.configuration.supportPipelining = true
 
-    #if DEBUG
-        let consoleBaseUrl = "http://localhost:3000"
+    let consoleBaseUrl = ConsoleBaseURL.resolve()
 
+    #if DEBUG
         // In debug, test & profiling - store the db relative to the work dir
         app.databases.use(.sqlite(.file("db.sqlite")), as: .sqlite)
     #else
-        let consoleBaseUrl = Environment.get("CONSOLE_BASE_URL") ?? "http://localhost:3000"
-
         try FileManager.default.createDirectory(
             atPath: "Storage/buckets",
             withIntermediateDirectories: true
@@ -56,6 +54,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddBucketPublicAccessBlock())
     app.migrations.add(AddBucketTags())
     app.migrations.add(AddBucketLifecycleRules())
+    app.migrations.add(CreateOIDCProvider())
+    app.migrations.add(AddUserOIDCFields())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -123,6 +123,10 @@ public func configure(_ app: Application) async throws {
                 } catch {
                     app.logger.error("Failed to clean up expired shared links: \(error)")
                 }
+
+                // In-flight OIDC login attempts (state/nonce/PKCE verifier) older than 10
+                // minutes - a login that never completes a round-trip should not linger.
+                await OIDCStateCache.shared.removeExpired(olderThan: 600)
             }
         }
 

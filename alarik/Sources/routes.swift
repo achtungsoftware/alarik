@@ -22,8 +22,11 @@ func routes(_ app: Application) throws {
     // API - INTERNAL
     let apiV1: any RoutesBuilder = app.grouped("api", "v1")
     try apiV1.register(collection: InternalUserController())
+    try apiV1.register(collection: InternalAuthOIDCController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBaseController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalAdminController())
+    try apiV1.grouped(InternalAuthenticator()).register(
+        collection: InternalAdminOIDCProviderController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBucketController())
 
     // Public, unauthenticated shared-file links - kept under /api/v1 (ungrouped, so no

@@ -28,6 +28,39 @@ const loginState = reactive({
     password: "",
 });
 
+const ssoProviders = ref<{ id: string; name: string }[]>([]);
+
+const oidcErrorMessages: Record<string, string> = {
+    missing_code_or_state: "The SSO provider did not return the expected response.",
+    invalid_or_expired_state: "Your SSO login attempt expired. Please try again.",
+    token_exchange_failed: "Could not complete sign-in with the SSO provider.",
+    invalid_id_token: "The SSO provider returned an invalid token.",
+    issuer_mismatch: "The SSO provider returned an unexpected response.",
+    audience_mismatch: "The SSO provider returned an unexpected response.",
+    nonce_mismatch: "Your SSO login attempt expired. Please try again.",
+    missing_email_claim: "Your SSO provider did not share an email address with Alarik.",
+    email_not_verified: "Your SSO provider has not verified your email address.",
+    no_matching_account: "No Alarik account matches your SSO email. Contact an admin.",
+};
+
+onMounted(async () => {
+    try {
+        ssoProviders.value = await $fetch<{ id: string; name: string }[]>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/auth/oidc/providers`);
+    } catch {
+        ssoProviders.value = [];
+    }
+
+    const route = useRoute();
+    const oidcError = route.query.oidcError as string | undefined;
+    if (oidcError) {
+        loginError.value = oidcErrorMessages[oidcError] ?? "SSO sign-in failed.";
+    }
+});
+
+function loginWithSSO(providerId: string) {
+    window.location.href = `${useRuntimeConfig().public.apiBaseUrl}/api/v1/auth/oidc/login/${providerId}`;
+}
+
 async function login(e: Event) {
     e.preventDefault();
 
@@ -84,7 +117,8 @@ async function login(e: Event) {
                         </UFormField>
                         <div class="mt-6 flex flex-col gap-3">
                             <UButton :loading="isLoadingLogin" label="Log In" type="submit" block size="xl" />
-                            <USeparator v-if="allowAccountCreation" label="or" />
+                            <USeparator v-if="ssoProviders.length > 0 || allowAccountCreation" label="or" />
+                            <UButton v-for="provider in ssoProviders" :key="provider.id" :label="`Sign in with ${provider.name}`" block size="xl" color="neutral" variant="subtle" @click="loginWithSSO(provider.id)" />
                             <UButton v-if="allowAccountCreation" to="/createAccount" label="Create Account" block size="xl" color="neutral" variant="subtle" />
                         </div>
                     </UForm>

@@ -73,6 +73,13 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 to: "/console/admin/buckets",
                 active: route.path.startsWith("/console/admin/buckets"),
                 disabled: !user.value.isAdmin,
+            },
+            {
+                label: "OIDC Providers",
+                icon: "i-lucide-key-round",
+                to: "/console/admin/oidcProviders",
+                active: route.path.startsWith("/console/admin/oidcProviders"),
+                disabled: !user.value.isAdmin,
             }
         ],
         [

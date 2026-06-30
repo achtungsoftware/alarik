@@ -17,10 +17,6 @@ limitations under the License.
 import Foundation
 import Vapor
 
-#if canImport(Security)
-    import Security
-#endif
-
 struct S3Credentials: Content {
     let accessKeyId: String
     let secretAccessKey: String
@@ -38,28 +34,7 @@ struct S3KeyGenerator {
     /// Generates an S3-compatible secret access key
     /// Format: 40 base64 characters
     static func generateSecretAccessKey() -> String {
-        var bytes = [UInt8](repeating: 0, count: 30)
-
-        #if canImport(Security)
-            // macOS/iOS path - use Security framework
-            let result = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-            guard result == errSecSuccess else {
-                fatalError("Failed to generate random bytes")
-            }
-        #else
-            // Linux path - use /dev/urandom
-            guard let file = fopen("/dev/urandom", "r") else {
-                fatalError("Failed to open /dev/urandom")
-            }
-            defer { fclose(file) }
-
-            let bytesRead = fread(&bytes, 1, bytes.count, file)
-            guard bytesRead == bytes.count else {
-                fatalError("Failed to read random bytes from /dev/urandom")
-            }
-        #endif
-
-        return Data(bytes).base64EncodedString()
+        Data(SecureRandomBytes.generate(count: 30)).base64EncodedString()
     }
 
     /// Generates a complete set of S3 credentials

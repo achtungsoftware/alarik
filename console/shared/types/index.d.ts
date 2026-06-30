@@ -69,6 +69,14 @@ declare global {
         isAdmin: boolean;
     }
 
+    export interface OIDCProvider {
+        id: string;
+        name: string;
+        issuerURL: string;
+        clientId: string;
+        enabled: boolean;
+    }
+
     // Fluent Page
     export interface Page<T> {
         items: T[];

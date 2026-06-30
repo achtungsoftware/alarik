@@ -37,6 +37,15 @@ final class User: Model, @unchecked Sendable {
     @Field(key: "is_admin")
     var isAdmin: Bool
 
+    @Field(key: "oidc_subject")
+    var oidcSubject: String?
+
+    // Subject values are only unique within a single provider's namespace, not globally - so
+    // matching/linking a user to an OIDC identity always keys on this pair together, never on
+    // oidcSubject alone.
+    @Field(key: "oidc_provider_id")
+    var oidcProviderId: UUID?
+
     init() {}
 
     init(id: UUID? = nil, name: String, username: String, passwordHash: String, isAdmin: Bool) {
@@ -45,6 +54,8 @@ final class User: Model, @unchecked Sendable {
         self.username = username
         self.passwordHash = passwordHash
         self.isAdmin = isAdmin
+        self.oidcSubject = nil
+        self.oidcProviderId = nil
     }
 
     func toResponseDTO() -> User.ResponseDTO {
