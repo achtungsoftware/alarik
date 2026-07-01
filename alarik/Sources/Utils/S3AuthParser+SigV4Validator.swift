@@ -388,7 +388,7 @@ struct SigV4Validator {
         let calculatedSignatureData = try hmacSHA256(key: signingKey, data: Data(stringToSign.utf8))
 
         // For streaming/chunked, this is the seed signature; validate chunks separately
-        let isStreaming = canonicalRequest.contains("\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD\n")
+        let isStreaming = canonicalRequest.hasSuffix("\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD")
         if isStreaming {
             // Use constant-time comparison to prevent timing attacks
             if calculatedSignatureData.constantTimeCompare(to: authInfo.signature) {

@@ -1428,7 +1428,12 @@ struct S3Controller: RouteCollection {
                 continue
             }
 
-            let etag = String(blockContent[etagRange]).replacingOccurrences(of: "\"", with: "")
+            // Go's encoding/xml encodes " as &#34; in element text; decode before stripping.
+            let etag = String(blockContent[etagRange])
+                .replacingOccurrences(of: "&#34;", with: "\"")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: "\"", with: "")
             parts.append((partNumber: partNumber, etag: etag))
         }
 
@@ -1473,7 +1478,17 @@ struct S3Controller: RouteCollection {
                 message: "Request body is empty.", requestId: req.id)
         }
 
-        let partData = Data(buffer.readableBytesView)
+        var mutableBuffer = buffer
+        let isChunked =
+            req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") ?? false
+        let hasChunkedHeader =
+            req.headers.first(name: "x-amz-content-sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        let partData: Data =
+            if isChunked || hasChunkedHeader {
+                try ChunkedDataDecoder.decode(buffer: &mutableBuffer)
+            } else {
+                Data(mutableBuffer.readableBytesView)
+            }
 
         // Validate Content-MD5 if provided
         try S3Service.validateContentMD5(req: req, data: partData)
