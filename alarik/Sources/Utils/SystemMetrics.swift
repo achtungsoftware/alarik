@@ -33,7 +33,13 @@ enum SystemMetrics {
     /// interval - see `MetricsCollector`.
     static func processCPUTime() -> Double? {
         var usage = rusage()
-        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return nil }
+        // Glibc imports RUSAGE_SELF as a __rusage_who enum, but getrusage takes a plain Int32
+        #if os(Linux)
+            let who = Int32(RUSAGE_SELF.rawValue)
+        #else
+            let who = RUSAGE_SELF
+        #endif
+        guard getrusage(who, &usage) == 0 else { return nil }
         let user = Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
         let system = Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
         return user + system
