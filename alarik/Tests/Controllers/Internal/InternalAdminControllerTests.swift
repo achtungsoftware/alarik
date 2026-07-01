@@ -528,6 +528,64 @@ struct InternalAdminControllerTests {
         }
     }
 
+    @Test("Get system stats as admin - should pass with sane values")
+    func testGetSystemStats() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/systemStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let stats = try res.content.decode(InternalAdminController.SystemStats.self)
+
+                    #expect(stats.metrics.uptimeSeconds >= 0)
+                    #expect(stats.metrics.coreCount >= 1)
+                    // The login + this request went through MetricsMiddleware already
+                    #expect(stats.metrics.totalRequests >= 1)
+                    #expect(stats.metrics.history.count >= 1)
+                    // Gauges must be readable on every supported platform
+                    #expect(stats.metrics.processMemoryBytes ?? 0 > 0)
+                    #expect(stats.metrics.systemMemoryTotalBytes ?? 0 > 0)
+
+                    #expect(stats.accessKeyCount >= 0)
+                    #expect(stats.sharedLinkCount >= 0)
+                    #expect(stats.oidcProviderCount >= 0)
+                    #expect(stats.multipartUploadCount >= 0)
+                })
+        }
+    }
+
+    @Test("Get system stats as non admin - should fail")
+    func testGetSystemStatsAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/systemStats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Get system stats without auth - should fail")
+    func testGetSystemStatsWithoutAuth() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/admin/systemStats",
+                afterResponse: { res async throws in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
     @Test("Get storage stats as non admin - should fail")
     func testGetStorageStatsAsNonAdmin() async throws {
         try await withApp { app in

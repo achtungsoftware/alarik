@@ -33,6 +33,17 @@ struct InternalAdminController: RouteCollection {
         let userCount: Int
     }
 
+    /// Runtime metrics (CPU/RAM/traffic + last-hour history) plus cheap resource counts that
+    /// don't require walking the storage tree - the dashboard polls this every few seconds, so
+    /// it must stay inexpensive (unlike `storageStats`, which walks the whole bucket dir).
+    struct SystemStats: Content {
+        let metrics: MetricsCollector.Snapshot
+        let accessKeyCount: Int
+        let sharedLinkCount: Int
+        let oidcProviderCount: Int
+        let multipartUploadCount: Int
+    }
+
     struct PolicyDTO: Content {
         let policy: String?
     }
@@ -53,6 +64,9 @@ struct InternalAdminController: RouteCollection {
 
         routes.grouped("admin")
             .get("storageStats", use: getStorageStats)
+
+        routes.grouped("admin")
+            .get("systemStats", use: getSystemStats)
 
         routes.grouped("admin")
             .get("buckets", use: self.listBuckets)
@@ -307,6 +321,46 @@ struct InternalAdminController: RouteCollection {
             bucketCount: bucketCount,
             userCount: userCount
         )
+    }
+
+    @Sendable
+    func getSystemStats(req: Request) async throws -> SystemStats {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        let metrics = await MetricsCollector.shared.snapshot()
+
+        let accessKeyCount = try await AccessKey.query(on: req.db).count()
+        let sharedLinkCount = try await SharedLink.query(on: req.db).count()
+        let oidcProviderCount = try await OIDCProvider.query(on: req.db).count()
+
+        return SystemStats(
+            metrics: metrics,
+            accessKeyCount: accessKeyCount,
+            sharedLinkCount: sharedLinkCount,
+            oidcProviderCount: oidcProviderCount,
+            multipartUploadCount: Self.countMultipartUploads()
+        )
+    }
+
+    /// Counts in-progress multipart uploads: one upload == one
+    /// `Storage/multipart/{bucket}/{uploadId}/` directory. Two shallow directory listings,
+    /// never a recursive walk.
+    private static func countMultipartUploads() -> Int {
+        let fileManager = FileManager.default
+        guard
+            let buckets = try? fileManager.contentsOfDirectory(
+                atPath: MultipartFileHandler.rootPath)
+        else { return 0 }
+
+        var count = 0
+        for bucket in buckets {
+            let bucketPath = MultipartFileHandler.rootPath + bucket
+            if let uploads = try? fileManager.contentsOfDirectory(atPath: bucketPath) {
+                count += uploads.count
+            }
+        }
+        return count
     }
 
     private static func getDiskSpace(for url: URL) -> (total: Int64, available: Int64) {

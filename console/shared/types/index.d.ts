@@ -24,6 +24,41 @@ declare global {
         userCount: number;
     }
 
+    export interface MetricsMinuteBucket {
+        // ISO string or unix seconds, depending on the server's date encoder
+        timestamp: string | number;
+        bytesIn: number;
+        bytesOut: number;
+        requests: number;
+        errors: number;
+        cpuPercent?: number;
+        memoryBytes?: number;
+    }
+
+    export interface SystemStats {
+        metrics: {
+            uptimeSeconds: number;
+            totalBytesIn: number;
+            totalBytesOut: number;
+            totalRequests: number;
+            totalErrors: number;
+            processCPUPercent?: number;
+            systemCPUPercent?: number;
+            processMemoryBytes?: number;
+            systemMemoryTotalBytes?: number;
+            systemMemoryAvailableBytes?: number;
+            loadAverage1?: number;
+            loadAverage5?: number;
+            loadAverage15?: number;
+            coreCount: number;
+            history: MetricsMinuteBucket[];
+        };
+        accessKeyCount: number;
+        sharedLinkCount: number;
+        oidcProviderCount: number;
+        multipartUploadCount: number;
+    }
+
     export interface Bucket {
         name: string;
         creationDate: string;

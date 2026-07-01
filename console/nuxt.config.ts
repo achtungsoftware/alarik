@@ -17,7 +17,7 @@ limitations under the License.
 export default defineNuxtConfig({
     compatibilityDate: "2025-07-15",
     devtools: { enabled: true },
-    modules: ["@nuxt/ui"],
+    modules: ["@nuxt/ui", "nuxt-charts"],
     css: ["~/assets/css/main.css"],
     routeRules: {
         // renders only on client-side

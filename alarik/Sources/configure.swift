@@ -75,6 +75,9 @@ public func configure(_ app: Application) async throws {
         )
     )
 
+    // Outermost, so it sees final responses (including errors already converted by
+    // S3ErrorMiddleware) and counts their status and size correctly.
+    app.middleware.use(MetricsMiddleware())
     app.middleware.use(cors)
     app.middleware.use(S3ErrorMiddleware())
 
@@ -127,6 +130,18 @@ public func configure(_ app: Application) async throws {
                 // In-flight OIDC login attempts (state/nonce/PKCE verifier) older than 10
                 // minutes - a login that never completes a round-trip should not linger.
                 await OIDCStateCache.shared.removeExpired(olderThan: 600)
+            }
+        }
+
+        // CPU/memory gauge sampling for the admin dashboard. Frequent but trivially cheap
+        // (a couple of /proc reads); also drives the per-minute history buckets so charts
+        // fill in even while nobody is watching the dashboard.
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .seconds(5),
+            delay: .seconds(5)
+        ) { task in
+            Task {
+                await MetricsCollector.shared.sample()
             }
         }
 
