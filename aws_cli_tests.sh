@@ -1042,4 +1042,205 @@ echo ""
 echo "=== Lifecycle Tests Complete ==="
 echo ""
 
+# ── Range reads ────────────────────────────────────────────────────────────────
+echo "=== Range Read Tests ==="
+
+RANGE_BUCKET="range-test-bucket"
+RANGE_SRC=$(mktemp); RANGE_DST=$(mktemp)
+printf '0123456789ABCDEF' > "$RANGE_SRC"
+aws_s3 s3api create-bucket --bucket "$RANGE_BUCKET" > /dev/null 2>&1
+aws_s3 s3api put-object --bucket "$RANGE_BUCKET" --key range-obj --body "$RANGE_SRC" > /dev/null 2>&1
+
+aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
+    --range "bytes=0-3" "$RANGE_DST" > /dev/null 2>&1
+if [ "$(cat "$RANGE_DST")" = "0123" ]; then
+    echo "PASS: Range read bytes=0-3 returned correct slice."
+else
+    echo "FAIL: Range read bytes=0-3 returned unexpected content: '$(cat "$RANGE_DST")'"
+fi
+
+aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
+    --range "bytes=10-15" "$RANGE_DST" > /dev/null 2>&1
+if [ "$(cat "$RANGE_DST")" = "ABCDEF" ]; then
+    echo "PASS: Range read bytes=10-15 returned correct slice."
+else
+    echo "FAIL: Range read bytes=10-15 returned unexpected content: '$(cat "$RANGE_DST")'"
+fi
+
+aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
+    --range "bytes=-4" "$RANGE_DST" > /dev/null 2>&1
+if [ "$(cat "$RANGE_DST")" = "CDEF" ]; then
+    echo "PASS: Suffix range read bytes=-4 returned correct slice."
+else
+    echo "FAIL: Suffix range read bytes=-4 returned unexpected content: '$(cat "$RANGE_DST")'"
+fi
+
+rm -f "$RANGE_SRC" "$RANGE_DST"
+aws_s3 s3api delete-object --bucket "$RANGE_BUCKET" --key range-obj > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$RANGE_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Range Read Tests Complete ==="
+echo ""
+
+# ── Content-MD5 validation ─────────────────────────────────────────────────────
+echo "=== Content-MD5 Tests ==="
+
+MD5_BUCKET="md5-test-bucket"
+MD5_SRC=$(mktemp)
+printf 'hello world' > "$MD5_SRC"
+CORRECT_MD5=$(openssl dgst -md5 -binary "$MD5_SRC" | base64)
+BAD_MD5="AAAAAAAAAAAAAAAAAAAAAA=="
+aws_s3 s3api create-bucket --bucket "$MD5_BUCKET" > /dev/null 2>&1
+
+MD5_OK=$(aws_s3 s3api put-object \
+    --bucket "$MD5_BUCKET" --key md5-obj \
+    --body "$MD5_SRC" --content-md5 "$CORRECT_MD5" 2>&1)
+if echo "$MD5_OK" | grep -q "ETag"; then
+    echo "PASS: PutObject with correct Content-MD5 succeeded."
+else
+    echo "FAIL: PutObject with correct Content-MD5 unexpectedly failed: $MD5_OK"
+fi
+
+MD5_BAD=$(aws_s3 s3api put-object \
+    --bucket "$MD5_BUCKET" --key md5-obj \
+    --body "$MD5_SRC" --content-md5 "$BAD_MD5" 2>&1)
+if echo "$MD5_BAD" | grep -qE "BadDigest|InvalidDigest"; then
+    echo "PASS: PutObject with wrong Content-MD5 was correctly rejected."
+else
+    echo "FAIL: PutObject with wrong Content-MD5 was not rejected: $MD5_BAD"
+fi
+
+rm -f "$MD5_SRC"
+aws_s3 s3api delete-object --bucket "$MD5_BUCKET" --key md5-obj > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$MD5_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Content-MD5 Tests Complete ==="
+echo ""
+
+# ── Custom x-amz-meta-* roundtrip ─────────────────────────────────────────────
+echo "=== Custom Metadata Tests ==="
+
+META_BUCKET="meta-test-bucket"
+META_SRC=$(mktemp); META_DST=$(mktemp)
+printf 'metadata test data' > "$META_SRC"
+aws_s3 s3api create-bucket --bucket "$META_BUCKET" > /dev/null 2>&1
+
+aws_s3 s3api put-object --bucket "$META_BUCKET" --key meta-obj \
+    --body "$META_SRC" \
+    --metadata '{"author":"julian","project":"alarik"}' > /dev/null 2>&1
+
+META_RESP=$(aws_s3 s3api head-object --bucket "$META_BUCKET" --key meta-obj 2>&1)
+if echo "$META_RESP" | grep -q '"author"' && echo "$META_RESP" | grep -q '"julian"'; then
+    echo "PASS: Custom metadata 'author' roundtrip via HeadObject."
+else
+    echo "FAIL: Custom metadata 'author' missing from HeadObject response: $META_RESP"
+fi
+if echo "$META_RESP" | grep -q '"project"' && echo "$META_RESP" | grep -q '"alarik"'; then
+    echo "PASS: Custom metadata 'project' roundtrip via HeadObject."
+else
+    echo "FAIL: Custom metadata 'project' missing from HeadObject response: $META_RESP"
+fi
+
+META_GET=$(aws_s3 s3api get-object --bucket "$META_BUCKET" --key meta-obj "$META_DST" 2>&1)
+if echo "$META_GET" | grep -q '"author"' && echo "$META_GET" | grep -q '"julian"'; then
+    echo "PASS: Custom metadata 'author' also present on GetObject response."
+else
+    echo "FAIL: Custom metadata 'author' missing from GetObject response: $META_GET"
+fi
+
+rm -f "$META_SRC" "$META_DST"
+aws_s3 s3api delete-object --bucket "$META_BUCKET" --key meta-obj > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$META_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Custom Metadata Tests Complete ==="
+echo ""
+
+# ── Copy conditions (x-amz-copy-source-if-*) ──────────────────────────────────
+echo "=== Copy Condition Tests ==="
+
+COPY_COND_BUCKET="copy-cond-bucket"
+COPY_COND_SRC=$(mktemp)
+printf 'source data' > "$COPY_COND_SRC"
+aws_s3 s3api create-bucket --bucket "$COPY_COND_BUCKET" > /dev/null 2>&1
+
+aws_s3 s3api put-object --bucket "$COPY_COND_BUCKET" --key src \
+    --body "$COPY_COND_SRC" > /dev/null 2>&1
+SRC_ETAG=$(aws_s3 s3api head-object --bucket "$COPY_COND_BUCKET" --key src \
+    --query 'ETag' --output text 2>/dev/null | tr -d '"')
+
+CC_OK=$(aws_s3 s3api copy-object \
+    --bucket "$COPY_COND_BUCKET" --key dst-ok \
+    --copy-source "$COPY_COND_BUCKET/src" \
+    --copy-source-if-match "\"$SRC_ETAG\"" 2>&1)
+if echo "$CC_OK" | grep -q "ETag"; then
+    echo "PASS: copy-source-if-match with correct ETag succeeded."
+else
+    echo "FAIL: copy-source-if-match with correct ETag failed: $CC_OK"
+fi
+
+CC_FAIL=$(aws_s3 s3api copy-object \
+    --bucket "$COPY_COND_BUCKET" --key dst-fail \
+    --copy-source "$COPY_COND_BUCKET/src" \
+    --copy-source-if-match '"wrongetag00000000000000000000000"' 2>&1)
+if echo "$CC_FAIL" | grep -qE "PreconditionFailed|412"; then
+    echo "PASS: copy-source-if-match with wrong ETag was correctly rejected."
+else
+    echo "FAIL: copy-source-if-match with wrong ETag was not rejected: $CC_FAIL"
+fi
+
+CC_NM_OK=$(aws_s3 s3api copy-object \
+    --bucket "$COPY_COND_BUCKET" --key dst-nm-ok \
+    --copy-source "$COPY_COND_BUCKET/src" \
+    --copy-source-if-none-match '"wrongetag00000000000000000000000"' 2>&1)
+if echo "$CC_NM_OK" | grep -q "ETag"; then
+    echo "PASS: copy-source-if-none-match with non-matching ETag succeeded."
+else
+    echo "FAIL: copy-source-if-none-match with non-matching ETag failed: $CC_NM_OK"
+fi
+
+CC_NM_FAIL=$(aws_s3 s3api copy-object \
+    --bucket "$COPY_COND_BUCKET" --key dst-nm-fail \
+    --copy-source "$COPY_COND_BUCKET/src" \
+    --copy-source-if-none-match "\"$SRC_ETAG\"" 2>&1)
+if echo "$CC_NM_FAIL" | grep -qE "PreconditionFailed|412"; then
+    echo "PASS: copy-source-if-none-match with matching ETag was correctly rejected."
+else
+    echo "FAIL: copy-source-if-none-match with matching ETag was not rejected: $CC_NM_FAIL"
+fi
+
+rm -f "$COPY_COND_SRC"
+aws_s3 s3 rm "s3://$COPY_COND_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$COPY_COND_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Copy Condition Tests Complete ==="
+echo ""
+
+# ── Multipart ETag format ──────────────────────────────────────────────────────
+echo "=== Multipart ETag Format Tests ==="
+
+MP_ETAG_BUCKET="mp-etag-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$MP_ETAG_BUCKET" > /dev/null 2>&1
+
+dd if=/dev/urandom bs=1M count=12 2>/dev/null | \
+    aws_s3 s3 cp - "s3://$MP_ETAG_BUCKET/mp-etag-obj" > /dev/null 2>&1
+MP_ETAG=$(aws_s3 s3api head-object --bucket "$MP_ETAG_BUCKET" --key mp-etag-obj \
+    --query 'ETag' --output text 2>/dev/null | tr -d '"')
+
+if echo "$MP_ETAG" | grep -qE '^[0-9a-f]{32}-[0-9]+$'; then
+    echo "PASS: Multipart upload ETag is in S3 format '<md5>-<partcount>': $MP_ETAG"
+else
+    echo "FAIL: Multipart upload ETag '$MP_ETAG' does not match expected '<md5>-<partcount>' format."
+fi
+
+aws_s3 s3 rm "s3://$MP_ETAG_BUCKET/mp-etag-obj" > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$MP_ETAG_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Multipart ETag Format Tests Complete ==="
+echo ""
+
 echo "Test complete."

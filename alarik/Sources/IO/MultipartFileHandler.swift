@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Crypto
 import Foundation
 
 struct MultipartFileHandler {
@@ -114,8 +113,7 @@ struct MultipartFileHandler {
                 userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
         }
 
-        // Calculate ETag (MD5 hash)
-        let etag = Insecure.MD5.hash(data: data).hex
+        let etag = S3Service.computeETag(data)
 
         // Write part data
         let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
@@ -195,7 +193,7 @@ struct MultipartFileHandler {
                 let partMeta = try jsonDecoder.decode(MultipartPartMeta.self, from: partMetaData)
 
                 // Verify ETag matches
-                if partMeta.etag != part.etag.replacingOccurrences(of: "\"", with: "") {
+                if partMeta.etag != S3Service.normalizeETag(part.etag) {
                     throw NSError(
                         domain: "InvalidPart", code: 400,
                         userInfo: [
@@ -208,7 +206,7 @@ struct MultipartFileHandler {
             // Read part data
             let partData = try Data(contentsOf: URL(fileURLWithPath: partFilePath))
             finalData.append(partData)
-            partEtags.append(part.etag.replacingOccurrences(of: "\"", with: ""))
+            partEtags.append(S3Service.normalizeETag(part.etag))
         }
 
         // Calculate final ETag (S3 style: MD5 of concatenated binary MD5 hashes + "-" + part count)
@@ -228,7 +226,7 @@ struct MultipartFileHandler {
             }
             binaryEtags.append(contentsOf: bytes)
         }
-        let etagHash = Insecure.MD5.hash(data: binaryEtags).hex
+        let etagHash = S3Service.computeETag(binaryEtags)
         let finalEtag = "\(etagHash)-\(sortedParts.count)"
 
         // Create the final object using ObjectFileHandler

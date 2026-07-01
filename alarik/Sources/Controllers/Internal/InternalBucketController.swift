@@ -329,8 +329,7 @@ struct InternalBucketController: RouteCollection {
         // Read file data
         let fileData = Data(buffer: input.data.data)
 
-        // Calculate ETag
-        let etag = Insecure.MD5.hash(data: fileData).hex
+        let etag = S3Service.computeETag(fileData)
 
         // Create object metadata
         var meta = ObjectMeta(

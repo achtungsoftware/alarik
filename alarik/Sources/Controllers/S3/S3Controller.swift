@@ -297,8 +297,7 @@ struct S3Controller: RouteCollection {
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         // Parse XML body for versioning configuration
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let bodyString = String(buffer: bodyData)
+        let bodyString = try await S3Service.collectBodyString(req: req)
 
         // Simple XML parsing for versioning status
         var newStatus = VersioningStatus.disabled
@@ -340,8 +339,7 @@ struct S3Controller: RouteCollection {
                 requestId: req.id)
         }
 
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let rawJSON = String(buffer: bodyData)
+        let rawJSON = try await S3Service.collectBodyString(req: req)
 
         let policy = try BucketPolicy.parseAndValidate(
             rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
@@ -364,8 +362,7 @@ struct S3Controller: RouteCollection {
 
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let xml = String(buffer: bodyData)
+        let xml = try await S3Service.collectBodyString(req: req)
         let configuration = PublicAccessBlockConfiguration.parse(xml: xml)
 
         bucket.blockPublicAcls = configuration.blockPublicAcls
@@ -412,8 +409,7 @@ struct S3Controller: RouteCollection {
 
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let xml = String(buffer: bodyData)
+        let xml = try await S3Service.collectBodyString(req: req)
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
         bucket.tags = tagging.toJSON()
@@ -447,8 +443,7 @@ struct S3Controller: RouteCollection {
 
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let xml = String(buffer: bodyData)
+        let xml = try await S3Service.collectBodyString(req: req)
         let configuration = try LifecycleConfiguration.parse(xml: xml, requestId: req.id)
 
         bucket.lifecycleRules = configuration.toJSON()
@@ -623,26 +618,13 @@ struct S3Controller: RouteCollection {
             try S3Service.validateConditionalPutHeaders(req: req, existingMeta: existing?.meta)
         }
 
-        let maxBodySize = req.application.routes.defaultMaxBodySize.value
-        let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
-        // S3 allows zero-byte objects, so we use an empty buffer if body is nil
-        var buffer = bodyBuffer ?? ByteBuffer()
-
-        let isChunked =
-            req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") ?? false
-        let hasChunkedHeader =
-            req.headers.first(name: "x-amz-content-sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        let dataToWrite: Data =
-            if isChunked || hasChunkedHeader {
-                try ChunkedDataDecoder.decode(buffer: &buffer)
-            } else {
-                Data(buffer.readableBytesView)
-            }
+        // S3 allows zero-byte objects; collectBodyData returns empty Data for a missing body.
+        let dataToWrite = try await S3Service.collectBodyData(req: req)
 
         // Validate Content-MD5 if provided
         try S3Service.validateContentMD5(req: req, data: dataToWrite)
 
-        let etag = Insecure.MD5.hash(data: dataToWrite).hex
+        let etag = S3Service.computeETag(dataToWrite)
         var meta = ObjectMeta(
             bucketName: bucketName,
             key: keyPath,
@@ -673,7 +655,7 @@ struct S3Controller: RouteCollection {
         }
 
         var headers = HTTPHeaders()
-        headers.add(name: "ETag", value: "\"\(etag)\"")
+        headers.add(name: "ETag", value: S3Service.quoteETag(etag))
 
         // Write with versioning support
         if versioningStatus != .disabled {
@@ -720,8 +702,7 @@ struct S3Controller: RouteCollection {
                 message: "Could not read object data", requestId: req.id)
         }
 
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let xml = String(buffer: bodyData)
+        let xml = try await S3Service.collectBodyString(req: req)
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
         var updatedMeta = meta
@@ -845,7 +826,7 @@ struct S3Controller: RouteCollection {
             contentType = sourceMeta.contentType
         }
 
-        let etag = Insecure.MD5.hash(data: data).hex
+        let etag = S3Service.computeETag(data)
         let destinationMeta = ObjectMeta(
             bucketName: destinationBucket,
             key: destinationKey,
@@ -1130,8 +1111,7 @@ struct S3Controller: RouteCollection {
     /// Multi-Object Delete - POST /:bucket?delete
     @Sendable
     private func handleDeleteObjects(req: Request, bucketName: String) async throws -> Response {
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let bodyString = String(buffer: bodyData)
+        let bodyString = try await S3Service.collectBodyString(req: req)
 
         let (objects, quiet) = try parseDeleteObjectsBody(bodyString, requestId: req.id)
 
@@ -1331,10 +1311,9 @@ struct S3Controller: RouteCollection {
         }
 
         // Parse the CompleteMultipartUpload XML body
-        let bodyData = try await req.body.collect().get() ?? ByteBuffer()
-        let bodyString = String(buffer: bodyData)
+        let bodyString = try await S3Service.collectBodyString(req: req)
 
-        let parts = try parseCompleteMultipartUploadBody(bodyString, requestId: req.id)
+        let parts = try S3Service.parseCompleteMultipartBody(bodyString, requestId: req.id)
 
         // Get versioning status
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
@@ -1381,70 +1360,6 @@ struct S3Controller: RouteCollection {
         return Response(status: .ok, headers: headers, body: .init(string: xml))
     }
 
-    /// Parses the CompleteMultipartUpload XML body
-    private func parseCompleteMultipartUploadBody(
-        _ body: String,
-        requestId: String
-    ) throws -> [(partNumber: Int, etag: String)] {
-        var parts: [(partNumber: Int, etag: String)] = []
-
-        // Match each <Part>...</Part> block first
-        let partBlockPattern = #"<Part>(.*?)</Part>"#
-        let partBlockRegex = try NSRegularExpression(
-            pattern: partBlockPattern, options: [.dotMatchesLineSeparators])
-        let range = NSRange(body.startIndex..., in: body)
-
-        let partBlocks = partBlockRegex.matches(in: body, options: [], range: range)
-
-        // Patterns to extract PartNumber and ETag from within a Part block
-        let partNumberPattern = #"<PartNumber>\s*(\d+)\s*</PartNumber>"#
-        let etagPattern = #"<ETag>\s*"?([^<"]+)"?\s*</ETag>"#
-
-        let partNumberRegex = try NSRegularExpression(pattern: partNumberPattern, options: [])
-        let etagRegex = try NSRegularExpression(pattern: etagPattern, options: [])
-
-        for partBlock in partBlocks {
-            guard let blockRange = Range(partBlock.range(at: 1), in: body) else {
-                continue
-            }
-            let blockContent = String(body[blockRange])
-            let blockNSRange = NSRange(blockContent.startIndex..., in: blockContent)
-
-            // Extract PartNumber
-            guard
-                let partNumberMatch = partNumberRegex.firstMatch(
-                    in: blockContent, options: [], range: blockNSRange),
-                let partNumRange = Range(partNumberMatch.range(at: 1), in: blockContent),
-                let partNumber = Int(blockContent[partNumRange])
-            else {
-                continue
-            }
-
-            guard
-                let etagMatch = etagRegex.firstMatch(
-                    in: blockContent, options: [], range: blockNSRange),
-                let etagRange = Range(etagMatch.range(at: 1), in: blockContent)
-            else {
-                continue
-            }
-
-            // Go's encoding/xml encodes " as &#34; in element text; decode before stripping.
-            let etag = String(blockContent[etagRange])
-                .replacingOccurrences(of: "&#34;", with: "\"")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .trimmingCharacters(in: .whitespaces)
-                .replacingOccurrences(of: "\"", with: "")
-            parts.append((partNumber: partNumber, etag: etag))
-        }
-
-        if parts.isEmpty {
-            throw S3Error(
-                status: .badRequest, code: "MalformedXML",
-                message: "The XML you provided was not well-formed.", requestId: requestId)
-        }
-
-        return parts
-    }
 
     /// UploadPart - handled in handleObjectPut when partNumber & uploadId are present
     @Sendable
@@ -1469,26 +1384,13 @@ struct S3Controller: RouteCollection {
                 message: "Part number must be between 1 and 10000.", requestId: req.id)
         }
 
-        // Read part data
-        let maxBodySize = req.application.routes.defaultMaxBodySize.value
-        let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
-        guard let buffer = bodyBuffer, buffer.readableBytes > 0 else {
+        // Read part data (unlike PutObject, an empty UploadPart is always an error)
+        let partData = try await S3Service.collectBodyData(req: req)
+        guard !partData.isEmpty else {
             throw S3Error(
                 status: .badRequest, code: "MissingRequestBodyError",
                 message: "Request body is empty.", requestId: req.id)
         }
-
-        var mutableBuffer = buffer
-        let isChunked =
-            req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") ?? false
-        let hasChunkedHeader =
-            req.headers.first(name: "x-amz-content-sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        let partData: Data =
-            if isChunked || hasChunkedHeader {
-                try ChunkedDataDecoder.decode(buffer: &mutableBuffer)
-            } else {
-                Data(mutableBuffer.readableBytesView)
-            }
 
         // Validate Content-MD5 if provided
         try S3Service.validateContentMD5(req: req, data: partData)
@@ -1502,7 +1404,7 @@ struct S3Controller: RouteCollection {
         )
 
         var headers = HTTPHeaders()
-        headers.add(name: "ETag", value: "\"\(etag)\"")
+        headers.add(name: "ETag", value: S3Service.quoteETag(etag))
 
         return Response(status: .ok, headers: headers)
     }

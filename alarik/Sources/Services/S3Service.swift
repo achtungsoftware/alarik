@@ -339,21 +339,12 @@ struct S3Service {
         return directive.uppercased() == "REPLACE"
     }
 
-    /// Checks if the provided ETag matches the object's ETag
-    /// Handles both quoted ("etag") and unquoted (etag) formats, and wildcard (*)
+    /// Checks if the provided ETag matches the object's ETag.
+    /// Handles quoted, unquoted, entity-encoded, and wildcard (*) forms.
     private static func matchesETag(_ headerValue: String, etag: String) -> Bool {
         let trimmed = headerValue.trimmingCharacters(in: .whitespaces)
-
-        // Handle wildcard
-        if trimmed == "*" {
-            return true
-        }
-
-        // Remove quotes from both values for comparison
-        let normalizedHeader = trimmed.replacingOccurrences(of: "\"", with: "")
-        let normalizedETag = etag.replacingOccurrences(of: "\"", with: "")
-
-        return normalizedHeader == normalizedETag
+        if trimmed == "*" { return true }
+        return normalizeETag(trimmed) == normalizeETag(etag)
     }
 
     /// Validates conditional request headers against object metadata
@@ -828,6 +819,98 @@ struct S3Service {
     /// bucket ever had versioning enabled.
     /// Throws NoSuchKey if the object doesn't exist, or if its latest version is a delete
     /// marker and no explicit versionId was requested (matching GetObject semantics).
+    // MARK: – ETag utilities
+
+    /// Computes the MD5-based S3 ETag for a data blob.
+    static func computeETag(_ data: Data) -> String {
+        Insecure.MD5.hash(data: data).hex
+    }
+
+    /// Wraps a bare ETag hex string in the AWS wire-format quotes (`"<hash>"`).
+    static func quoteETag(_ etag: String) -> String {
+        "\"\(etag)\""
+    }
+
+    /// Normalises an ETag value received from a client over the wire.
+    /// Handles literal surrounding `"`, XML entity-encoded quotes (`&#34;`, `&quot;`),
+    /// and leading/trailing whitespace.  Returns the bare lowercase hex string.
+    static func normalizeETag(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "&#34;", with: "\"")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "\"", with: "")
+    }
+
+    // MARK: – Body collection
+
+    /// Collects the request body as a `String`.
+    static func collectBodyString(req: Request) async throws -> String {
+        let buffer = try await req.body.collect().get() ?? ByteBuffer()
+        return String(buffer: buffer)
+    }
+
+    /// Collects the request body and, when the request uses AWS chunked transfer encoding,
+    /// strips the chunk framing to return only the actual content bytes.
+    /// Returns empty `Data` for requests with no body (valid for PutObject zero-byte objects).
+    static func collectBodyData(req: Request) async throws -> Data {
+        let maxBodySize = req.application.routes.defaultMaxBodySize.value
+        let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
+        var buffer = bodyBuffer ?? ByteBuffer()
+        let isChunked =
+            req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") ?? false
+        let hasChunkedHeader =
+            req.headers.first(name: "x-amz-content-sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        if isChunked || hasChunkedHeader {
+            return try ChunkedDataDecoder.decode(buffer: &buffer)
+        }
+        return Data(buffer.readableBytesView)
+    }
+
+    // MARK: – Multipart XML parsing
+
+    /// Parses the `<CompleteMultipartUpload>` XML body and returns an ordered list of
+    /// `(partNumber, etag)` pairs with normalised (bare hex, no quotes) ETags.
+    static func parseCompleteMultipartBody(
+        _ body: String, requestId: String
+    ) throws -> [(partNumber: Int, etag: String)] {
+        var parts: [(partNumber: Int, etag: String)] = []
+
+        let partBlockRegex = try NSRegularExpression(
+            pattern: #"<Part>(.*?)</Part>"#, options: [.dotMatchesLineSeparators])
+        let partNumberRegex = try NSRegularExpression(
+            pattern: #"<PartNumber>\s*(\d+)\s*</PartNumber>"#, options: [])
+        // Capture everything between <ETag> and </ETag>; entity-decoding is done below.
+        let etagRegex = try NSRegularExpression(
+            pattern: #"<ETag>\s*([^<]+?)\s*</ETag>"#, options: [])
+
+        let fullRange = NSRange(body.startIndex..., in: body)
+        for block in partBlockRegex.matches(in: body, options: [], range: fullRange) {
+            guard let blockRange = Range(block.range(at: 1), in: body) else { continue }
+            let content = String(body[blockRange])
+            let contentRange = NSRange(content.startIndex..., in: content)
+
+            guard
+                let pnMatch = partNumberRegex.firstMatch(
+                    in: content, options: [], range: contentRange),
+                let pnRange = Range(pnMatch.range(at: 1), in: content),
+                let partNumber = Int(content[pnRange]),
+                let etagMatch = etagRegex.firstMatch(
+                    in: content, options: [], range: contentRange),
+                let etagRange = Range(etagMatch.range(at: 1), in: content)
+            else { continue }
+
+            parts.append((partNumber: partNumber, etag: normalizeETag(String(content[etagRange]))))
+        }
+
+        if parts.isEmpty {
+            throw S3Error(
+                status: .badRequest, code: "MalformedXML",
+                message: "The XML you provided was not well-formed.", requestId: requestId)
+        }
+        return parts
+    }
+
     static func readVersionedObjectForCopy(
         bucketName: String,
         key: String,
