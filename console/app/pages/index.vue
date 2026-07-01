@@ -41,6 +41,7 @@ const oidcErrorMessages: Record<string, string> = {
     missing_email_claim: "Your SSO provider did not share an email address with Alarik.",
     email_not_verified: "Your SSO provider has not verified your email address.",
     no_matching_account: "No Alarik account matches your SSO email. Contact an admin.",
+    account_creation_failed: "Could not create your account. Please try again.",
 };
 
 onMounted(async () => {

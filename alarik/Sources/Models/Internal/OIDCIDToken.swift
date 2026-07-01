@@ -32,10 +32,14 @@ struct OIDCIDToken: JWTPayload {
     /// field), and `username` doubles as the trusted join key in this system, so skipping this
     /// check would let anyone log in as any existing user just by knowing their username.
     let emailVerified: Bool?
+    /// Display name, sent by most IdPs when the `profile` scope is granted. Only used as the
+    /// initial `name` of an auto-provisioned account (never for matching), falling back to the
+    /// email when absent.
+    let name: String?
     let nonce: String?
 
     enum CodingKeys: String, CodingKey {
-        case iss, aud, exp, sub, email, nonce
+        case iss, aud, exp, sub, email, name, nonce
         case emailVerified = "email_verified"
     }
 

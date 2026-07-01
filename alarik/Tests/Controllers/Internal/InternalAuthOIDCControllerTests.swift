@@ -47,6 +47,7 @@ struct InternalAuthOIDCControllerTests {
             // the `email` scope is granted) - tests that specifically need an unverified email
             // override this explicitly, exercising the rejection path on its own.
             var emailVerified: Bool? = true
+            var name: String?
             var nonce: String?
             var audience = ""
             var expired = false
@@ -57,14 +58,15 @@ struct InternalAuthOIDCControllerTests {
 
             func set(
                 issuerURL: String? = nil, sub: String? = nil, email: String?? = nil,
-                emailVerified: Bool?? = nil, nonce: String?? = nil, audience: String? = nil,
-                expired: Bool? = nil, tokenStatus: HTTPStatus? = nil,
+                emailVerified: Bool?? = nil, name: String?? = nil, nonce: String?? = nil,
+                audience: String? = nil, expired: Bool? = nil, tokenStatus: HTTPStatus? = nil,
                 discoveryIssuerOverride: String?? = nil
             ) {
                 if let issuerURL { self.issuerURL = issuerURL }
                 if let sub { self.sub = sub }
                 if let email { self.email = email }
                 if let emailVerified { self.emailVerified = emailVerified }
+                if let name { self.name = name }
                 if let nonce { self.nonce = nonce }
                 if let audience { self.audience = audience }
                 if let expired { self.expired = expired }
@@ -139,6 +141,7 @@ struct InternalAuthOIDCControllerTests {
                     sub: SubjectClaim(value: await state.sub),
                     email: await state.email,
                     emailVerified: await state.emailVerified,
+                    name: await state.name,
                     nonce: await state.nonce
                 )
                 let jwt = try await signingKeys.sign(idToken, kid: kid)
@@ -562,28 +565,211 @@ struct InternalAuthOIDCControllerTests {
         }
     }
 
-    @Test("callback rejects login when no local account matches (no auto-provisioning)")
+    /// Runs `body` with `ALLOW_ACCOUNT_CREATION` set to `value` (or unset for `nil`), restoring
+    /// the previous value afterwards. Safe here because the suite is `.serialized`.
+    private func withAccountCreationEnv(
+        _ value: String?, _ body: () async throws -> Void
+    ) async throws {
+        let previous = Environment.get("ALLOW_ACCOUNT_CREATION")
+        if let value {
+            setenv("ALLOW_ACCOUNT_CREATION", value, 1)
+        } else {
+            unsetenv("ALLOW_ACCOUNT_CREATION")
+        }
+        defer {
+            if let previous {
+                setenv("ALLOW_ACCOUNT_CREATION", previous, 1)
+            } else {
+                unsetenv("ALLOW_ACCOUNT_CREATION")
+            }
+        }
+        try await body()
+    }
+
+    @Test("callback rejects login when no local account matches and ALLOW_ACCOUNT_CREATION is unset")
     func callbackNoMatchingAccount() async throws {
         let provider = try await FakeOIDCProvider.start()
         defer { Task { try? await provider.shutdown() } }
 
-        try await withApp(oidc: provider) { app, providerId in
-            let id = try #require(providerId)
-            let (state, nonce) = try await performLoginRedirect(app, providerId: id)
-            await provider.state.set(sub: "sub-nobody", email: "nobody@example.com", nonce: nonce)
+        try await withAccountCreationEnv(nil) {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-nobody", email: "nobody@example.com", nonce: nonce)
 
-            try await app.test(
-                .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
-                afterResponse: { res async throws in
-                    #expect(res.status == .seeOther)
-                    let location = res.headers.first(name: .location)
-                    #expect(fragment(from: location)["error"] == "no_matching_account")
-                })
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let location = res.headers.first(name: .location)
+                        #expect(fragment(from: location)["error"] == "no_matching_account")
+                    })
 
-            let users = try await User.query(on: app.db)
-                .filter(\.$username == "nobody@example.com")
-                .all()
-            #expect(users.isEmpty)
+                let users = try await User.query(on: app.db)
+                    .filter(\.$username == "nobody@example.com")
+                    .all()
+                #expect(users.isEmpty)
+            }
+        }
+    }
+
+    @Test("callback rejects login when ALLOW_ACCOUNT_CREATION is explicitly false - no account is created")
+    func callbackNoProvisioningWhenExplicitlyDisabled() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withAccountCreationEnv("false") {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-disabled", email: "disabled@example.com", nonce: nonce)
+
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let location = res.headers.first(name: .location)
+                        let frag = fragment(from: location)
+                        #expect(frag["error"] == "no_matching_account")
+                        #expect(frag["token"] == nil)
+                    })
+
+                let users = try await User.query(on: app.db)
+                    .filter(\.$username == "disabled@example.com")
+                    .all()
+                #expect(users.isEmpty)
+            }
+        }
+    }
+
+    @Test("callback auto-provisions a linked, non-admin account when ALLOW_ACCOUNT_CREATION is true")
+    func callbackProvisionsAccountWhenEnabled() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withAccountCreationEnv("true") {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-brand-new", email: "brand-new@example.com",
+                    name: .some("Brand New Person"), nonce: nonce)
+
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let location = res.headers.first(name: .location)
+                        let token = try #require(fragment(from: location)["token"])
+
+                        let created = try #require(
+                            try await User.query(on: app.db)
+                                .filter(\.$username == "brand-new@example.com")
+                                .first())
+                        #expect(created.name == "Brand New Person")
+                        #expect(created.isAdmin == false)
+                        #expect(created.oidcProviderId == id)
+                        #expect(created.oidcSubject == "sub-brand-new")
+
+                        let sessionToken = try await app.jwt.keys.verify(
+                            token, as: SessionToken.self)
+                        #expect(sessionToken.userId == created.id)
+                    })
+            }
+        }
+    }
+
+    @Test("auto-provisioned account falls back to the email as display name when the IdP sends no name claim")
+    func callbackProvisionedNameFallsBackToEmail() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withAccountCreationEnv("true") {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-nameless", email: "nameless@example.com", name: .some(nil),
+                    nonce: nonce)
+
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let created = try #require(
+                            try await User.query(on: app.db)
+                                .filter(\.$username == "nameless@example.com")
+                                .first())
+                        #expect(created.name == "nameless@example.com")
+                    })
+            }
+        }
+    }
+
+    @Test("auto-provisioning still rejects an unverified email even when ALLOW_ACCOUNT_CREATION is true")
+    func callbackProvisioningRejectsUnverifiedEmail() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withAccountCreationEnv("true") {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-unverified", email: "unverified@example.com",
+                    emailVerified: .some(false), nonce: nonce)
+
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let location = res.headers.first(name: .location)
+                        #expect(fragment(from: location)["error"] == "email_not_verified")
+                    })
+
+                let users = try await User.query(on: app.db)
+                    .filter(\.$username == "unverified@example.com")
+                    .all()
+                #expect(users.isEmpty)
+            }
+        }
+    }
+
+    @Test("ALLOW_ACCOUNT_CREATION=true still links an existing account instead of creating a duplicate")
+    func callbackProvisioningPrefersExistingAccount() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withAccountCreationEnv("true") {
+            try await withApp(oidc: provider) { app, providerId in
+                let id = try #require(providerId)
+                let existing = try await createUser(app, username: "pre-existing@example.com")
+
+                let (state, nonce) = try await performLoginRedirect(app, providerId: id)
+                await provider.state.set(
+                    sub: "sub-pre-existing", email: "pre-existing@example.com", nonce: nonce)
+
+                try await app.test(
+                    .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    afterResponse: { res async throws in
+                        #expect(res.status == .seeOther)
+                        let location = res.headers.first(name: .location)
+                        let token = try #require(fragment(from: location)["token"])
+
+                        let sessionToken = try await app.jwt.keys.verify(
+                            token, as: SessionToken.self)
+                        #expect(sessionToken.userId == existing.id)
+                    })
+
+                // Exactly one account with this username - linked, not duplicated.
+                let matches = try await User.query(on: app.db)
+                    .filter(\.$username == "pre-existing@example.com")
+                    .all()
+                #expect(matches.count == 1)
+                #expect(matches.first?.oidcSubject == "sub-pre-existing")
+            }
         }
     }
 

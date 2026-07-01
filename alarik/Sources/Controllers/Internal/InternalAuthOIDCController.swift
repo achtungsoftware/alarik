@@ -22,12 +22,15 @@ import Vapor
 /// Providers are admin-managed (see `InternalAdminOIDCProviderController`), not per-user - a
 /// deployment can offer several simultaneously, each shown as its own button on the login page.
 ///
-/// No auto-provisioning: a local `User` must already exist with `username` equal to the value
-/// the IdP sends in the ID token's `email` claim. The first successful OIDC login for that email
-/// links the account to that specific provider (stores `oidcProviderId` + the IdP's `sub` -
-/// subjects are only unique within one provider's namespace, so both are required to identify a
-/// link); every login after that is matched directly by the `(providerId, sub)` pair. If no
-/// local account matches, the login is rejected.
+/// A local `User` must already exist with `username` equal to the value the IdP sends in the ID
+/// token's `email` claim. The first successful OIDC login for that email links the account to
+/// that specific provider (stores `oidcProviderId` + the IdP's `sub` - subjects are only unique
+/// within one provider's namespace, so both are required to identify a link); every login after
+/// that is matched directly by the `(providerId, sub)` pair.
+///
+/// If no local account matches: when `ALLOW_ACCOUNT_CREATION=true` (the same env switch that
+/// gates the console's local signup form) a new non-admin account is auto-provisioned with
+/// `username` = the verified email and linked immediately; otherwise the login is rejected.
 struct InternalAuthOIDCController: RouteCollection {
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("auth", "oidc").get("providers", use: self.providers)
@@ -205,21 +208,48 @@ struct InternalAuthOIDCController: RouteCollection {
             // First-login linking trusts the `email` claim to find an existing account, so the
             // claim must be verified - an IdP that lets a caller set an arbitrary, unverified
             // `email` would otherwise let anyone log in as any existing user just by knowing
-            // their username (which doubles as their email in this system).
+            // their username (which doubles as their email in this system). The same applies to
+            // auto-provisioning below: an unverified email must never mint an account either.
             guard idToken.emailVerified == true else {
                 return errorRedirect("email_not_verified")
             }
-            guard
-                let existingByUsername = try await User.query(on: req.db)
-                    .filter(\.$username == email)
-                    .first()
-            else {
+            if let existingByUsername = try await User.query(on: req.db)
+                .filter(\.$username == email)
+                .first()
+            {
+                existingByUsername.oidcProviderId = providerId
+                existingByUsername.oidcSubject = idToken.sub.value
+                try await existingByUsername.save(on: req.db)
+                user = existingByUsername
+            } else if Environment.get("ALLOW_ACCOUNT_CREATION") == "true" {
+                // Auto-provision, gated by the same env switch as the console's local signup
+                // form. Deliberately a strict string comparison with no DEBUG bypass - an
+                // account springing into existence from an SSO login is exactly the kind of
+                // thing that must never happen because of a build-configuration default.
+                let newUser = User(
+                    name: idToken.name ?? email,
+                    username: email,
+                    // Random throwaway password: the account starts SSO-only. The user can set
+                    // a real password later via account settings if local login is wanted.
+                    passwordHash: try Bcrypt.hash(OIDCPKCE.randomURLSafeString()),
+                    isAdmin: false
+                )
+                newUser.oidcProviderId = providerId
+                newUser.oidcSubject = idToken.sub.value
+                do {
+                    try await newUser.save(on: req.db)
+                } catch {
+                    // Unique-constraint race: another request created this username between our
+                    // lookup and save. Surface a retryable error rather than a 500.
+                    if let dbError = error as? any DatabaseError, dbError.isConstraintFailure {
+                        return errorRedirect("account_creation_failed")
+                    }
+                    throw error
+                }
+                user = newUser
+            } else {
                 return errorRedirect("no_matching_account")
             }
-            existingByUsername.oidcProviderId = providerId
-            existingByUsername.oidcSubject = idToken.sub.value
-            try await existingByUsername.save(on: req.db)
-            user = existingByUsername
         }
 
         let payload = try SessionToken(with: user)
