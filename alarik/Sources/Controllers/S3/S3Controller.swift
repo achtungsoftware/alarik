@@ -964,7 +964,7 @@ struct S3Controller: RouteCollection {
             try S3Service.validateConditionalHeaders(req: req, meta: meta)
 
             // Parse range header
-            let byteRange = S3RangeParser.parseRange(from: req, fileSize: meta.size)
+            let byteRange = try S3RangeParser.parseRange(from: req, fileSize: meta.size)
 
             if let range = byteRange {
                 let (_, rangeData) = try ObjectFileHandler.readVersion(
@@ -1026,7 +1026,7 @@ struct S3Controller: RouteCollection {
 
             let (m, _) = try ObjectFileHandler.read(from: path, loadData: false)
             try S3Service.validateConditionalHeaders(req: req, meta: m)
-            let byteRange = S3RangeParser.parseRange(from: req, fileSize: m.size)
+            let byteRange = try S3RangeParser.parseRange(from: req, fileSize: m.size)
 
             let data: Data
             if let range = byteRange {
@@ -1540,9 +1540,13 @@ struct S3Controller: RouteCollection {
         key: String,
         uploadId: String
     ) throws -> Response {
-        // Verify upload exists and get metadata
-        let _ = try MultipartFileHandler.getUploadMeta(
-            bucketName: bucketName, uploadId: uploadId)
+        // Verify upload exists - a missing/aborted upload must surface as NoSuchUpload,
+        // not as whatever the file layer throws (which would become a 500)
+        guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchUpload",
+                message: "The specified upload does not exist.", requestId: req.id)
+        }
 
         let maxParts = req.query[Int.self, at: "max-parts"] ?? 1000
         let partNumberMarker = req.query[Int.self, at: "part-number-marker"] ?? 0

@@ -8,6 +8,19 @@ export AWS_DEFAULT_REGION="us-east-1"
 
 ENDPOINT="http://localhost:8080"
 
+PASS_COUNT=0
+FAIL_COUNT=0
+
+pass() {
+    echo "PASS: $1"
+    ((PASS_COUNT++))
+}
+
+fail() {
+    echo "FAIL: $1"
+    ((FAIL_COUNT++))
+}
+
 aws_s3() {
     aws --endpoint-url "$ENDPOINT" --region us-east-1 "$@"
 }
@@ -38,17 +51,17 @@ echo "Verifying non-versioned buckets..."
 for bucket in bucket-no-ver-1 bucket-no-ver-2; do
     content=$(aws_s3 s3 cp s3://$bucket/test.txt -)
     if [ "$content" == "Updated content v2" ]; then
-        echo "PASS: $bucket has expected content 'v2' (overwritten)."
+        pass "$bucket has expected content 'v2' (overwritten)."
     else
-        echo "FAIL: $bucket has unexpected content: $content"
+        fail "$bucket has unexpected content: $content"
     fi
 
     # Check list-object-versions (should show only one version or none explicitly)
     versions=$(aws_s3 s3api list-object-versions --bucket $bucket --prefix test.txt | jq '.Versions | length')
     if [ "$versions" -le 1 ]; then  # Non-versioned may show current as one "version"
-        echo "PASS: $bucket has no versioning (1 or fewer versions)."
+        pass "$bucket has no versioning (1 or fewer versions)."
     else
-        echo "FAIL: $bucket unexpectedly has multiple versions: $versions"
+        fail "$bucket unexpectedly has multiple versions: $versions"
     fi
 done
 
@@ -67,26 +80,26 @@ for bucket in bucket-ver-1 bucket-ver-2; do
     # Check current content
     content=$(aws_s3 s3 cp s3://$bucket/test.txt -)
     if [ "$content" == "Updated content v2" ]; then
-        echo "PASS: $bucket current content is 'v2'."
+        pass "$bucket current content is 'v2'."
     else
-        echo "FAIL: $bucket current content: $content"
+        fail "$bucket current content: $content"
     fi
 
     # Check metadata of current object
     metadata=$(aws_s3 s3api head-object --bucket $bucket --key test.txt | jq '.Metadata.key2')
     if [ "$metadata" == '"value2"' ]; then
-        echo "PASS: $bucket current metadata is correct."
+        pass "$bucket current metadata is correct."
     else
-        echo "FAIL: $bucket current metadata: $metadata"
+        fail "$bucket current metadata: $metadata"
     fi
 
     # List versions and get the previous version ID
     versions_output=$(aws_s3 s3api list-object-versions --bucket $bucket --prefix test.txt)
     version_count=$(echo "$versions_output" | jq '.Versions | length')
     if [ "$version_count" -eq 2 ]; then
-        echo "PASS: $bucket has 2 versions as expected."
+        pass "$bucket has 2 versions as expected."
     else
-        echo "FAIL: $bucket has $version_count versions."
+        fail "$bucket has $version_count versions."
     fi
 
     # Get the older version ID (assuming the first in list is latest, second is older)
@@ -95,17 +108,17 @@ for bucket in bucket-ver-1 bucket-ver-2; do
     # Download older version and check content
     older_content=$(aws_s3 s3api get-object --bucket $bucket --key test.txt --version-id "$older_version_id" /dev/stdout 2>/dev/null | head -n 1)
     if [ "$older_content" == "Initial content v1" ]; then
-        echo "PASS: $bucket older version content is 'v1'."
+        pass "$bucket older version content is 'v1'."
     else
-        echo "FAIL: $bucket older version content: $older_content"
+        fail "$bucket older version content: $older_content"
     fi
 
     # Check metadata of older version
     older_metadata=$(aws_s3 s3api head-object --bucket $bucket --key test.txt --version-id "$older_version_id" | jq '.Metadata.key1')
     if [ "$older_metadata" == '"value1"' ]; then
-        echo "PASS: $bucket older metadata is correct."
+        pass "$bucket older metadata is correct."
     else
-        echo "FAIL: $bucket older metadata: $older_metadata"
+        fail "$bucket older metadata: $older_metadata"
     fi
 done
 
@@ -134,9 +147,9 @@ aws_s3 s3 cp s3://multipart-test-bucket/large-file.bin "$DOWNLOADED_FILE"
 DOWNLOADED_MD5=$(md5 -q "$DOWNLOADED_FILE" 2>/dev/null || md5sum "$DOWNLOADED_FILE" | cut -d' ' -f1)
 
 if [ "$ORIGINAL_MD5" == "$DOWNLOADED_MD5" ]; then
-    echo "PASS: Multipart upload - file integrity verified (MD5 match)."
+    pass "Multipart upload - file integrity verified (MD5 match)."
 else
-    echo "FAIL: Multipart upload - file integrity check failed."
+    fail "Multipart upload - file integrity check failed."
     echo "  Original MD5:   $ORIGINAL_MD5"
     echo "  Downloaded MD5: $DOWNLOADED_MD5"
 fi
@@ -151,9 +164,9 @@ CREATE_RESPONSE=$(aws_s3 s3api create-multipart-upload --bucket multipart-test-b
 UPLOAD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.UploadId')
 
 if [ -n "$UPLOAD_ID" ] && [ "$UPLOAD_ID" != "null" ]; then
-    echo "PASS: CreateMultipartUpload returned UploadId: $UPLOAD_ID"
+    pass "CreateMultipartUpload returned UploadId: $UPLOAD_ID"
 else
-    echo "FAIL: CreateMultipartUpload did not return UploadId"
+    fail "CreateMultipartUpload did not return UploadId"
     echo "  Response: $CREATE_RESPONSE"
 fi
 
@@ -172,15 +185,15 @@ PART2_RESPONSE=$(aws_s3 s3api upload-part --bucket multipart-test-bucket --key m
 ETAG2=$(echo "$PART2_RESPONSE" | jq -r '.ETag')
 
 if [ -n "$ETAG1" ] && [ "$ETAG1" != "null" ]; then
-    echo "PASS: UploadPart 1 returned ETag: $ETAG1"
+    pass "UploadPart 1 returned ETag: $ETAG1"
 else
-    echo "FAIL: UploadPart 1 did not return ETag"
+    fail "UploadPart 1 did not return ETag"
 fi
 
 if [ -n "$ETAG2" ] && [ "$ETAG2" != "null" ]; then
-    echo "PASS: UploadPart 2 returned ETag: $ETAG2"
+    pass "UploadPart 2 returned ETag: $ETAG2"
 else
-    echo "FAIL: UploadPart 2 did not return ETag"
+    fail "UploadPart 2 did not return ETag"
 fi
 
 # List parts
@@ -189,9 +202,9 @@ LIST_PARTS_RESPONSE=$(aws_s3 s3api list-parts --bucket multipart-test-bucket --k
 PARTS_COUNT=$(echo "$LIST_PARTS_RESPONSE" | jq '.Parts | length')
 
 if [ "$PARTS_COUNT" -eq 2 ]; then
-    echo "PASS: ListParts shows 2 parts."
+    pass "ListParts shows 2 parts."
 else
-    echo "FAIL: ListParts shows $PARTS_COUNT parts (expected 2)."
+    fail "ListParts shows $PARTS_COUNT parts (expected 2)."
 fi
 
 # Complete multipart upload
@@ -205,9 +218,9 @@ COMPLETE_RESPONSE=$(aws_s3 s3api complete-multipart-upload \
 FINAL_ETAG=$(echo "$COMPLETE_RESPONSE" | jq -r '.ETag')
 
 if [ -n "$FINAL_ETAG" ] && [ "$FINAL_ETAG" != "null" ]; then
-    echo "PASS: CompleteMultipartUpload returned ETag: $FINAL_ETAG"
+    pass "CompleteMultipartUpload returned ETag: $FINAL_ETAG"
 else
-    echo "FAIL: CompleteMultipartUpload did not return ETag"
+    fail "CompleteMultipartUpload did not return ETag"
     echo "  Response: $COMPLETE_RESPONSE"
 fi
 
@@ -225,9 +238,9 @@ EXPECTED_PART2="This is part 2 of the multipart upload."
 EXPECTED=$(printf "%s\n%s\n" "$EXPECTED_PART1" "$EXPECTED_PART2")
 
 if [ "$CONTENT" == "$EXPECTED" ]; then
-    echo "PASS: Completed multipart object has correct content."
+    pass "Completed multipart object has correct content."
 else
-    echo "FAIL: Completed multipart object has unexpected content."
+    fail "Completed multipart object has unexpected content."
     echo "  Content length: ${#CONTENT}"
     echo "  Expected length: ${#EXPECTED}"
     # Debug: show hex for comparison if lengths differ
@@ -250,9 +263,9 @@ LIST_UPLOADS_RESPONSE=$(aws_s3 s3api list-multipart-uploads --bucket multipart-t
 UPLOADS_COUNT=$(echo "$LIST_UPLOADS_RESPONSE" | jq '.Uploads | length')
 
 if [ "$UPLOADS_COUNT" -ge 1 ]; then
-    echo "PASS: ListMultipartUploads shows $UPLOADS_COUNT in-progress upload(s)."
+    pass "ListMultipartUploads shows $UPLOADS_COUNT in-progress upload(s)."
 else
-    echo "FAIL: ListMultipartUploads shows no uploads."
+    fail "ListMultipartUploads shows no uploads."
 fi
 
 # Test AbortMultipartUpload
@@ -264,9 +277,9 @@ LIST_UPLOADS_AFTER=$(aws_s3 s3api list-multipart-uploads --bucket multipart-test
 UPLOADS_AFTER=$(echo "$LIST_UPLOADS_AFTER" | jq '.Uploads | length // 0')
 
 if [ "$UPLOADS_AFTER" -eq 0 ]; then
-    echo "PASS: AbortMultipartUpload - upload was aborted."
+    pass "AbortMultipartUpload - upload was aborted."
 else
-    echo "FAIL: AbortMultipartUpload - upload still exists."
+    fail "AbortMultipartUpload - upload still exists."
 fi
 
 # Cleanup temp files
@@ -295,9 +308,9 @@ DELETE_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-test-bucke
 DELETED_COUNT=$(echo "$DELETE_RESPONSE" | jq '.Deleted | length')
 
 if [ "$DELETED_COUNT" -eq 2 ]; then
-    echo "PASS: DeleteObjects reported 2 deleted keys."
+    pass "DeleteObjects reported 2 deleted keys."
 else
-    echo "FAIL: DeleteObjects reported $DELETED_COUNT deleted keys (expected 2)."
+    fail "DeleteObjects reported $DELETED_COUNT deleted keys (expected 2)."
     echo "  Response: $DELETE_RESPONSE"
 fi
 
@@ -305,9 +318,9 @@ fi
 A_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key a.txt 2>&1)
 B_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key b.txt 2>&1)
 if echo "$A_EXISTS" | grep -qi "not found\|404" && echo "$B_EXISTS" | grep -qi "not found\|404"; then
-    echo "PASS: Both deleted objects are gone (HeadObject 404)."
+    pass "Both deleted objects are gone (HeadObject 404)."
 else
-    echo "FAIL: A deleted object still exists."
+    fail "A deleted object still exists."
     echo "  a.txt HeadObject: $A_EXISTS"
     echo "  b.txt HeadObject: $B_EXISTS"
 fi
@@ -315,9 +328,9 @@ fi
 # c.txt should be untouched
 C_CONTENT=$(aws_s3 s3 cp s3://delete-objects-test-bucket/c.txt -)
 if [ "$C_CONTENT" == "content c" ]; then
-    echo "PASS: Untouched object c.txt still has its original content."
+    pass "Untouched object c.txt still has its original content."
 else
-    echo "FAIL: c.txt content changed unexpectedly: $C_CONTENT"
+    fail "c.txt content changed unexpectedly: $C_CONTENT"
 fi
 
 # Deleting an already-deleted / non-existent key should still succeed (idempotent)
@@ -328,9 +341,9 @@ NONEXISTENT_DELETED=$(echo "$NONEXISTENT_RESPONSE" | jq '.Deleted | length')
 NONEXISTENT_ERRORS=$(echo "$NONEXISTENT_RESPONSE" | jq '.Errors | length // 0')
 
 if [ "$NONEXISTENT_DELETED" -eq 1 ] && [ "$NONEXISTENT_ERRORS" -eq 0 ]; then
-    echo "PASS: Deleting a non-existent key is treated as a successful delete."
+    pass "Deleting a non-existent key is treated as a successful delete."
 else
-    echo "FAIL: Deleting a non-existent key did not behave idempotently."
+    fail "Deleting a non-existent key did not behave idempotently."
     echo "  Response: $NONEXISTENT_RESPONSE"
 fi
 
@@ -348,17 +361,17 @@ else
 fi
 
 if [ "$QUIET_DELETED" -eq 0 ]; then
-    echo "PASS: Quiet mode suppressed Deleted entries in the response."
+    pass "Quiet mode suppressed Deleted entries in the response."
 else
-    echo "FAIL: Quiet mode still returned Deleted entries."
+    fail "Quiet mode still returned Deleted entries."
     echo "  Response: $QUIET_RESPONSE"
 fi
 
 D_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-test-bucket --key d.txt 2>&1)
 if echo "$D_EXISTS" | grep -qi "not found\|404"; then
-    echo "PASS: d.txt was actually deleted despite Quiet mode."
+    pass "d.txt was actually deleted despite Quiet mode."
 else
-    echo "FAIL: d.txt still exists after a Quiet-mode delete."
+    fail "d.txt still exists after a Quiet-mode delete."
 fi
 
 # Multi-Object Delete against a versioned bucket - should create delete markers
@@ -372,25 +385,25 @@ VERSIONED_DELETE_RESPONSE=$(aws_s3 s3api delete-objects --bucket delete-objects-
 DELETE_MARKER=$(echo "$VERSIONED_DELETE_RESPONSE" | jq -r '.Deleted[0].DeleteMarker // false')
 
 if [ "$DELETE_MARKER" == "true" ]; then
-    echo "PASS: DeleteObjects created a delete marker in a versioned bucket."
+    pass "DeleteObjects created a delete marker in a versioned bucket."
 else
-    echo "FAIL: DeleteObjects did not create a delete marker."
+    fail "DeleteObjects did not create a delete marker."
     echo "  Response: $VERSIONED_DELETE_RESPONSE"
 fi
 
 # Object should appear gone via normal GET, but still listed via list-object-versions
 V_EXISTS=$(aws_s3 s3api head-object --bucket delete-objects-versioned-bucket --key v.txt 2>&1)
 if echo "$V_EXISTS" | grep -qi "not found\|404"; then
-    echo "PASS: Object behind a delete marker is no longer visible via HeadObject."
+    pass "Object behind a delete marker is no longer visible via HeadObject."
 else
-    echo "FAIL: Object is still visible after a delete-marker delete."
+    fail "Object is still visible after a delete-marker delete."
 fi
 
 V_VERSIONS=$(aws_s3 s3api list-object-versions --bucket delete-objects-versioned-bucket --prefix v.txt | jq '.DeleteMarkers | length // 0')
 if [ "$V_VERSIONS" -ge 1 ]; then
-    echo "PASS: list-object-versions shows the delete marker."
+    pass "list-object-versions shows the delete marker."
 else
-    echo "FAIL: list-object-versions does not show a delete marker."
+    fail "list-object-versions does not show a delete marker."
 fi
 
 echo ""
@@ -414,9 +427,9 @@ CREATE_RESPONSE=$(aws_s3 s3api create-multipart-upload --bucket upload-part-copy
 UPLOAD_ID=$(echo "$CREATE_RESPONSE" | jq -r '.UploadId')
 
 if [ -n "$UPLOAD_ID" ] && [ "$UPLOAD_ID" != "null" ]; then
-    echo "PASS: CreateMultipartUpload returned UploadId: $UPLOAD_ID"
+    pass "CreateMultipartUpload returned UploadId: $UPLOAD_ID"
 else
-    echo "FAIL: CreateMultipartUpload did not return UploadId"
+    fail "CreateMultipartUpload did not return UploadId"
 fi
 
 # UploadPartCopy - copy the whole source object as part 1
@@ -428,9 +441,9 @@ COPY_PART1_RESPONSE=$(aws_s3 s3api upload-part-copy \
 ETAG1=$(echo "$COPY_PART1_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
 
 if [ -n "$ETAG1" ]; then
-    echo "PASS: UploadPartCopy returned ETag for part 1: $ETAG1"
+    pass "UploadPartCopy returned ETag for part 1: $ETAG1"
 else
-    echo "FAIL: UploadPartCopy did not return an ETag for part 1."
+    fail "UploadPartCopy did not return an ETag for part 1."
     echo "  Response: $COPY_PART1_RESPONSE"
 fi
 
@@ -444,9 +457,9 @@ COPY_PART2_RESPONSE=$(aws_s3 s3api upload-part-copy \
 ETAG2=$(echo "$COPY_PART2_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
 
 if [ -n "$ETAG2" ]; then
-    echo "PASS: UploadPartCopy with a byte range returned ETag for part 2: $ETAG2"
+    pass "UploadPartCopy with a byte range returned ETag for part 2: $ETAG2"
 else
-    echo "FAIL: UploadPartCopy with a byte range did not return an ETag."
+    fail "UploadPartCopy with a byte range did not return an ETag."
     echo "  Response: $COPY_PART2_RESPONSE"
 fi
 
@@ -458,9 +471,9 @@ COMPLETE_RESPONSE=$(aws_s3 s3api complete-multipart-upload \
 FINAL_ETAG=$(echo "$COMPLETE_RESPONSE" | jq -r '.ETag // empty')
 
 if [ -n "$FINAL_ETAG" ]; then
-    echo "PASS: CompleteMultipartUpload (from copied parts) returned ETag: $FINAL_ETAG"
+    pass "CompleteMultipartUpload (from copied parts) returned ETag: $FINAL_ETAG"
 else
-    echo "FAIL: CompleteMultipartUpload (from copied parts) did not return an ETag."
+    fail "CompleteMultipartUpload (from copied parts) did not return an ETag."
     echo "  Response: $COMPLETE_RESPONSE"
 fi
 
@@ -468,9 +481,9 @@ fi
 DEST_CONTENT=$(aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest.txt -)
 EXPECTED_CONTENT="0123456789ABCDEFGHIJ0123456789"
 if [ "$DEST_CONTENT" == "$EXPECTED_CONTENT" ]; then
-    echo "PASS: Assembled object has the expected content from both copied parts."
+    pass "Assembled object has the expected content from both copied parts."
 else
-    echo "FAIL: Assembled object content mismatch."
+    fail "Assembled object content mismatch."
     echo "  Expected: $EXPECTED_CONTENT"
     echo "  Got:      $DEST_CONTENT"
 fi
@@ -485,9 +498,9 @@ BAD_COPY_OUTPUT=$(aws_s3 s3api upload-part-copy \
     --copy-source upload-part-copy-source-bucket/does-not-exist.txt 2>&1)
 
 if echo "$BAD_COPY_OUTPUT" | grep -qi "NoSuchKey\|not found\|404"; then
-    echo "PASS: UploadPartCopy from a non-existent source key failed as expected."
+    pass "UploadPartCopy from a non-existent source key failed as expected."
 else
-    echo "FAIL: UploadPartCopy from a non-existent source key did not fail as expected."
+    fail "UploadPartCopy from a non-existent source key did not fail as expected."
     echo "  Output: $BAD_COPY_OUTPUT"
 fi
 aws_s3 s3api abort-multipart-upload --bucket upload-part-copy-dest-bucket --key dest2.txt --upload-id "$UPLOAD_ID2" >/dev/null 2>&1
@@ -510,9 +523,9 @@ ETAG3=$(echo "$COPY_VERSIONED_RESPONSE" | jq -r '.CopyPartResult.ETag // empty')
 SOURCE_VERSION_ID=$(echo "$COPY_VERSIONED_RESPONSE" | jq -r '.CopySourceVersionId // empty')
 
 if [ "$SOURCE_VERSION_ID" == "$VERSION_ID_1" ]; then
-    echo "PASS: UploadPartCopy reported the correct source version ID."
+    pass "UploadPartCopy reported the correct source version ID."
 else
-    echo "FAIL: UploadPartCopy did not report the expected source version ID."
+    fail "UploadPartCopy did not report the expected source version ID."
     echo "  Expected: $VERSION_ID_1"
     echo "  Got:      $SOURCE_VERSION_ID"
 fi
@@ -523,9 +536,9 @@ aws_s3 s3api complete-multipart-upload \
 
 DEST3_CONTENT=$(aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest3.txt -)
 if [ "$DEST3_CONTENT" == "version one content" ]; then
-    echo "PASS: UploadPartCopy correctly copied the older source version's content."
+    pass "UploadPartCopy correctly copied the older source version's content."
 else
-    echo "FAIL: UploadPartCopy did not copy the requested source version's content."
+    fail "UploadPartCopy did not copy the requested source version's content."
     echo "  Got: $DEST3_CONTENT"
 fi
 
@@ -545,9 +558,9 @@ echo -n "private content" | aws_s3 s3 cp - s3://policy-test-bucket/private/file.
 echo "Testing anonymous access before any policy is set..."
 BEFORE_POLICY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
 if [ "$BEFORE_POLICY_CODE" == "403" ]; then
-    echo "PASS: Anonymous GetObject is denied (403) before any bucket policy is set."
+    pass "Anonymous GetObject is denied (403) before any bucket policy is set."
 else
-    echo "FAIL: Expected 403 before any policy, got $BEFORE_POLICY_CODE."
+    fail "Expected 403 before any policy, got $BEFORE_POLICY_CODE."
 fi
 
 # Put a bucket policy granting anonymous GetObject only under the public/ prefix
@@ -570,9 +583,9 @@ aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$POLICY"
 # GetBucketPolicy should echo back what was set
 GET_POLICY_RESPONSE=$(aws_s3 s3api get-bucket-policy --bucket policy-test-bucket | jq -r '.Policy')
 if echo "$GET_POLICY_RESPONSE" | jq -e '.Statement[0].Sid == "PublicReadPublicPrefix"' >/dev/null 2>&1; then
-    echo "PASS: GetBucketPolicy returned the policy that was set."
+    pass "GetBucketPolicy returned the policy that was set."
 else
-    echo "FAIL: GetBucketPolicy did not return the expected policy."
+    fail "GetBucketPolicy did not return the expected policy."
     echo "  Response: $GET_POLICY_RESPONSE"
 fi
 
@@ -581,33 +594,33 @@ echo "Testing genuine anonymous access (plain curl, zero credentials) to the pub
 ANON_CONTENT=$(curl -s "$ENDPOINT/policy-test-bucket/public/file.txt")
 ANON_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
 if [ "$ANON_CODE" == "200" ] && [ "$ANON_CONTENT" == "public content" ]; then
-    echo "PASS: Anonymous curl GetObject succeeded with the expected content."
+    pass "Anonymous curl GetObject succeeded with the expected content."
 else
-    echo "FAIL: Anonymous curl GetObject did not succeed as expected."
+    fail "Anonymous curl GetObject did not succeed as expected."
     echo "  Status: $ANON_CODE, Content: $ANON_CONTENT"
 fi
 
 # Anonymous GET on the private (non-prefixed) object must still fail
 PRIVATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/private/file.txt")
 if [ "$PRIVATE_CODE" == "403" ]; then
-    echo "PASS: Anonymous GetObject on a key outside the granted prefix is still denied."
+    pass "Anonymous GetObject on a key outside the granted prefix is still denied."
 else
-    echo "FAIL: Expected 403 for the private key, got $PRIVATE_CODE."
+    fail "Expected 403 for the private key, got $PRIVATE_CODE."
 fi
 
 # Anonymous PUT must always be rejected, regardless of the policy in place
 PUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT --data "malicious" "$ENDPOINT/policy-test-bucket/public/file.txt")
 if [ "$PUT_CODE" == "403" ] || [ "$PUT_CODE" == "400" ]; then
-    echo "PASS: Anonymous PutObject is rejected even though GetObject is publicly granted."
+    pass "Anonymous PutObject is rejected even though GetObject is publicly granted."
 else
-    echo "FAIL: Anonymous PutObject was not rejected (status $PUT_CODE)."
+    fail "Anonymous PutObject was not rejected (status $PUT_CODE)."
 fi
 # Confirm the object content was not actually overwritten by the rejected anonymous PUT
 UNCHANGED_CONTENT=$(aws_s3 s3 cp s3://policy-test-bucket/public/file.txt -)
 if [ "$UNCHANGED_CONTENT" == "public content" ]; then
-    echo "PASS: public/file.txt content is unchanged after the rejected anonymous PUT."
+    pass "public/file.txt content is unchanged after the rejected anonymous PUT."
 else
-    echo "FAIL: public/file.txt content changed unexpectedly: $UNCHANGED_CONTENT"
+    fail "public/file.txt content changed unexpectedly: $UNCHANGED_CONTENT"
 fi
 
 # Removing the policy must immediately revoke anonymous access (no restart needed)
@@ -615,9 +628,9 @@ echo "Testing DeleteBucketPolicy revokes anonymous access..."
 aws_s3 s3api delete-bucket-policy --bucket policy-test-bucket
 AFTER_DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket/public/file.txt")
 if [ "$AFTER_DELETE_CODE" == "403" ]; then
-    echo "PASS: Anonymous GetObject is denied again immediately after DeleteBucketPolicy."
+    pass "Anonymous GetObject is denied again immediately after DeleteBucketPolicy."
 else
-    echo "FAIL: Expected 403 after deleting the policy, got $AFTER_DELETE_CODE."
+    fail "Expected 403 after deleting the policy, got $AFTER_DELETE_CODE."
 fi
 
 # A bucket policy granting s3:ListBucket allows an anonymous bucket listing
@@ -638,9 +651,9 @@ aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$LIST_POLIC
 LIST_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/policy-test-bucket")
 LIST_BODY=$(curl -s "$ENDPOINT/policy-test-bucket")
 if [ "$LIST_CODE" == "200" ] && echo "$LIST_BODY" | grep -q "<Key>public/file.txt</Key>"; then
-    echo "PASS: Anonymous ListBucket succeeded once granted by policy."
+    pass "Anonymous ListBucket succeeded once granted by policy."
 else
-    echo "FAIL: Anonymous ListBucket did not succeed as expected (status $LIST_CODE)."
+    fail "Anonymous ListBucket did not succeed as expected (status $LIST_CODE)."
 fi
 
 # A policy with Effect: Deny must be rejected at write time, not silently accepted
@@ -648,9 +661,9 @@ echo "Testing that PutBucketPolicy rejects unsupported policy elements..."
 DENY_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-test-bucket/*"}]}'
 DENY_OUTPUT=$(aws_s3 s3api put-bucket-policy --bucket policy-test-bucket --policy "$DENY_POLICY" 2>&1)
 if echo "$DENY_OUTPUT" | grep -qi "MalformedPolicy\|400"; then
-    echo "PASS: A policy with Effect: Deny was rejected at write time."
+    pass "A policy with Effect: Deny was rejected at write time."
 else
-    echo "FAIL: A policy with Effect: Deny was not rejected as expected."
+    fail "A policy with Effect: Deny was not rejected as expected."
     echo "  Output: $DENY_OUTPUT"
 fi
 
@@ -675,9 +688,9 @@ SHARE_RESPONSE=$(curl -s -X POST "$ENDPOINT/api/v1/objects/share" \
 SHARE_URL=$(echo "$SHARE_RESPONSE" | jq -r '.url // empty')
 
 if [ -n "$SHARE_URL" ]; then
-    echo "PASS: Share endpoint returned a URL."
+    pass "Share endpoint returned a URL."
 else
-    echo "FAIL: Share endpoint did not return a URL."
+    fail "Share endpoint did not return a URL."
     echo "  Response: $SHARE_RESPONSE"
 fi
 
@@ -687,9 +700,9 @@ SHARE_CONTENT=$(curl -s "$SHARE_URL")
 SHARE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$SHARE_URL")
 
 if [ "$SHARE_CODE" == "200" ] && [ "$SHARE_CONTENT" == "share me" ]; then
-    echo "PASS: Anonymous curl on the share link succeeded with the expected content."
+    pass "Anonymous curl on the share link succeeded with the expected content."
 else
-    echo "FAIL: Anonymous curl on the share link did not succeed as expected."
+    fail "Anonymous curl on the share link did not succeed as expected."
     echo "  Status: $SHARE_CODE, Content: $SHARE_CONTENT"
 fi
 
@@ -702,9 +715,9 @@ TOO_LONG_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ENDPOINT/api/v1
     -d '{"bucket":"share-test-bucket","key":"shared-file.txt","expiresInSeconds":604801}')
 
 if [ "$TOO_LONG_CODE" == "400" ]; then
-    echo "PASS: A 7-day+ expiry was rejected."
+    pass "A 7-day+ expiry was rejected."
 else
-    echo "FAIL: Expected 400 for an over-long expiry, got $TOO_LONG_CODE."
+    fail "Expected 400 for an over-long expiry, got $TOO_LONG_CODE."
 fi
 
 # Sharing a non-existent object must fail
@@ -715,9 +728,9 @@ NON_EXISTENT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ENDPOINT/ap
     -d '{"bucket":"share-test-bucket","key":"does-not-exist.txt","expiresInSeconds":3600}')
 
 if [ "$NON_EXISTENT_CODE" == "404" ]; then
-    echo "PASS: Sharing a non-existent object was rejected."
+    pass "Sharing a non-existent object was rejected."
 else
-    echo "FAIL: Expected 404 for a non-existent object, got $NON_EXISTENT_CODE."
+    fail "Expected 404 for a non-existent object, got $NON_EXISTENT_CODE."
 fi
 
 echo ""
@@ -739,9 +752,9 @@ echo "Testing If-None-Match: * succeeds when the key is absent..."
 printf "v1" > "$COND_BODY_FILE"
 CREATE_CODE=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-none-match '*' --output json 2>&1)
 if echo "$CREATE_CODE" | jq -e '.ETag' > /dev/null 2>&1; then
-    echo "PASS: If-None-Match: * succeeded for a brand-new key."
+    pass "If-None-Match: * succeeded for a brand-new key."
 else
-    echo "FAIL: If-None-Match: * unexpectedly failed for a brand-new key."
+    fail "If-None-Match: * unexpectedly failed for a brand-new key."
     echo "  Response: $CREATE_CODE"
 fi
 
@@ -749,9 +762,9 @@ echo "Testing If-None-Match: * blocks overwriting an existing key..."
 printf "v2" > "$COND_BODY_FILE"
 OVERWRITE_ERROR=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-none-match '*' 2>&1)
 if echo "$OVERWRITE_ERROR" | grep -q "PreconditionFailed\|412"; then
-    echo "PASS: If-None-Match: * correctly rejected overwriting an existing key."
+    pass "If-None-Match: * correctly rejected overwriting an existing key."
 else
-    echo "FAIL: If-None-Match: * did not reject the overwrite as expected."
+    fail "If-None-Match: * did not reject the overwrite as expected."
     echo "  Response: $OVERWRITE_ERROR"
 fi
 
@@ -760,9 +773,9 @@ echo -n "v1" | aws_s3 s3 cp - s3://cond-write-bucket-ver/existing.txt > /dev/nul
 printf "v2" > "$COND_BODY_FILE"
 VERSIONED_OVERWRITE_ERROR=$(aws_s3 s3api put-object --bucket cond-write-bucket-ver --key existing.txt --body "$COND_BODY_FILE" --if-none-match '*' 2>&1)
 if echo "$VERSIONED_OVERWRITE_ERROR" | grep -q "PreconditionFailed\|412"; then
-    echo "PASS: If-None-Match: * correctly rejected the overwrite in a versioned bucket."
+    pass "If-None-Match: * correctly rejected the overwrite in a versioned bucket."
 else
-    echo "FAIL: If-None-Match: * did not reject the overwrite in a versioned bucket."
+    fail "If-None-Match: * did not reject the overwrite in a versioned bucket."
     echo "  Response: $VERSIONED_OVERWRITE_ERROR"
 fi
 
@@ -772,9 +785,9 @@ CURRENT_ETAG=$(aws_s3 s3api head-object --bucket cond-write-bucket --key new.txt
 printf "v3" > "$COND_BODY_FILE"
 IF_MATCH_OK=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-match "$CURRENT_ETAG" --output json 2>&1)
 if echo "$IF_MATCH_OK" | jq -e '.ETag' > /dev/null 2>&1; then
-    echo "PASS: If-Match with the correct ETag allowed the overwrite."
+    pass "If-Match with the correct ETag allowed the overwrite."
 else
-    echo "FAIL: If-Match with the correct ETag was unexpectedly rejected."
+    fail "If-Match with the correct ETag was unexpectedly rejected."
     echo "  Response: $IF_MATCH_OK"
 fi
 
@@ -782,9 +795,9 @@ echo "Testing If-Match with the wrong ETag is rejected..."
 printf "v4" > "$COND_BODY_FILE"
 IF_MATCH_FAIL=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --if-match '"wrongetag"' 2>&1)
 if echo "$IF_MATCH_FAIL" | grep -q "PreconditionFailed\|412"; then
-    echo "PASS: If-Match with the wrong ETag was correctly rejected."
+    pass "If-Match with the wrong ETag was correctly rejected."
 else
-    echo "FAIL: If-Match with the wrong ETag was not rejected as expected."
+    fail "If-Match with the wrong ETag was not rejected as expected."
     echo "  Response: $IF_MATCH_FAIL"
 fi
 
@@ -792,9 +805,9 @@ echo "Testing unconditional PUT still works unchanged..."
 printf "v5" > "$COND_BODY_FILE"
 UNCONDITIONAL=$(aws_s3 s3api put-object --bucket cond-write-bucket --key new.txt --body "$COND_BODY_FILE" --output json 2>&1)
 if echo "$UNCONDITIONAL" | jq -e '.ETag' > /dev/null 2>&1; then
-    echo "PASS: Unconditional PUT still works."
+    pass "Unconditional PUT still works."
 else
-    echo "FAIL: Unconditional PUT unexpectedly failed."
+    fail "Unconditional PUT unexpectedly failed."
     echo "  Response: $UNCONDITIONAL"
 fi
 
@@ -812,9 +825,9 @@ echo -n "hello" | aws_s3 s3 cp - s3://pab-test-bucket/file.txt
 echo "Testing GetPublicAccessBlock 404s when never configured..."
 PAB_GET_UNSET=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
 if echo "$PAB_GET_UNSET" | grep -q "NoSuchPublicAccessBlockConfiguration"; then
-    echo "PASS: GetPublicAccessBlock correctly 404s when unset."
+    pass "GetPublicAccessBlock correctly 404s when unset."
 else
-    echo "FAIL: GetPublicAccessBlock did not 404 as expected."
+    fail "GetPublicAccessBlock did not 404 as expected."
     echo "  Response: $PAB_GET_UNSET"
 fi
 
@@ -823,18 +836,18 @@ aws_s3 s3api put-public-access-block --bucket pab-test-bucket \
     --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=false,BlockPublicPolicy=true,RestrictPublicBuckets=false"
 PAB_GET=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
 if echo "$PAB_GET" | jq -e '.PublicAccessBlockConfiguration.BlockPublicAcls == true and .PublicAccessBlockConfiguration.BlockPublicPolicy == true and .PublicAccessBlockConfiguration.RestrictPublicBuckets == false' > /dev/null 2>&1; then
-    echo "PASS: PutPublicAccessBlock/GetPublicAccessBlock round-trip matches what was set."
+    pass "PutPublicAccessBlock/GetPublicAccessBlock round-trip matches what was set."
 else
-    echo "FAIL: GetPublicAccessBlock did not reflect what was just set."
+    fail "GetPublicAccessBlock did not reflect what was just set."
     echo "  Response: $PAB_GET"
 fi
 
 echo "Testing BlockPublicPolicy rejects PutBucketPolicy..."
 PAB_POLICY_REJECTED=$(aws_s3 s3api put-bucket-policy --bucket pab-test-bucket --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::pab-test-bucket/*\"}]}" 2>&1)
 if echo "$PAB_POLICY_REJECTED" | grep -q "AccessDenied"; then
-    echo "PASS: BlockPublicPolicy correctly rejected PutBucketPolicy."
+    pass "BlockPublicPolicy correctly rejected PutBucketPolicy."
 else
-    echo "FAIL: BlockPublicPolicy did not reject PutBucketPolicy as expected."
+    fail "BlockPublicPolicy did not reject PutBucketPolicy as expected."
     echo "  Response: $PAB_POLICY_REJECTED"
 fi
 
@@ -849,18 +862,18 @@ aws_s3 s3api put-public-access-block --bucket pab-test-bucket \
 ANON_AFTER_RESTRICT=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/pab-test-bucket/file.txt")
 
 if [ "$ANON_BEFORE_RESTRICT" == "200" ] && [ "$ANON_AFTER_RESTRICT" == "403" ]; then
-    echo "PASS: RestrictPublicBuckets correctly blocked anonymous access (200 -> 403)."
+    pass "RestrictPublicBuckets correctly blocked anonymous access (200 -> 403)."
 else
-    echo "FAIL: RestrictPublicBuckets did not change anonymous access as expected."
+    fail "RestrictPublicBuckets did not change anonymous access as expected."
     echo "  Before: $ANON_BEFORE_RESTRICT, After: $ANON_AFTER_RESTRICT"
 fi
 
 # The owner's authenticated access must be unaffected by RestrictPublicBuckets
 OWNER_CONTENT=$(aws_s3 s3 cp s3://pab-test-bucket/file.txt -)
 if [ "$OWNER_CONTENT" == "hello" ]; then
-    echo "PASS: Owner's authenticated access still works under RestrictPublicBuckets."
+    pass "Owner's authenticated access still works under RestrictPublicBuckets."
 else
-    echo "FAIL: Owner's authenticated access was unexpectedly affected."
+    fail "Owner's authenticated access was unexpectedly affected."
     echo "  Content: $OWNER_CONTENT"
 fi
 
@@ -868,9 +881,9 @@ echo "Testing DeletePublicAccessBlock resets to unconfigured..."
 aws_s3 s3api delete-public-access-block --bucket pab-test-bucket
 PAB_GET_AFTER_DELETE=$(aws_s3 s3api get-public-access-block --bucket pab-test-bucket 2>&1)
 if echo "$PAB_GET_AFTER_DELETE" | grep -q "NoSuchPublicAccessBlockConfiguration"; then
-    echo "PASS: DeletePublicAccessBlock correctly reset the configuration."
+    pass "DeletePublicAccessBlock correctly reset the configuration."
 else
-    echo "FAIL: DeletePublicAccessBlock did not reset as expected."
+    fail "DeletePublicAccessBlock did not reset as expected."
     echo "  Response: $PAB_GET_AFTER_DELETE"
 fi
 
@@ -886,9 +899,9 @@ echo -n "hello" | aws_s3 s3 cp - s3://tagging-test-bucket/file.txt
 echo "Testing GetBucketTagging 404s when never configured..."
 BUCKET_TAGGING_UNSET=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
 if echo "$BUCKET_TAGGING_UNSET" | grep -q "NoSuchTagSet"; then
-    echo "PASS: GetBucketTagging correctly 404s when unset."
+    pass "GetBucketTagging correctly 404s when unset."
 else
-    echo "FAIL: GetBucketTagging did not 404 as expected."
+    fail "GetBucketTagging did not 404 as expected."
     echo "  Response: $BUCKET_TAGGING_UNSET"
 fi
 
@@ -896,9 +909,9 @@ echo "Testing PutBucketTagging / GetBucketTagging round-trip..."
 aws_s3 s3api put-bucket-tagging --bucket tagging-test-bucket --tagging 'TagSet=[{Key=env,Value=prod},{Key=team,Value=storage}]'
 BUCKET_TAGGING_GET=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
 if echo "$BUCKET_TAGGING_GET" | jq -e '.TagSet | length == 2' > /dev/null 2>&1; then
-    echo "PASS: PutBucketTagging/GetBucketTagging round-trip matches what was set."
+    pass "PutBucketTagging/GetBucketTagging round-trip matches what was set."
 else
-    echo "FAIL: GetBucketTagging did not reflect what was just set."
+    fail "GetBucketTagging did not reflect what was just set."
     echo "  Response: $BUCKET_TAGGING_GET"
 fi
 
@@ -906,18 +919,18 @@ echo "Testing DeleteBucketTagging resets to unconfigured..."
 aws_s3 s3api delete-bucket-tagging --bucket tagging-test-bucket
 BUCKET_TAGGING_AFTER_DELETE=$(aws_s3 s3api get-bucket-tagging --bucket tagging-test-bucket 2>&1)
 if echo "$BUCKET_TAGGING_AFTER_DELETE" | grep -q "NoSuchTagSet"; then
-    echo "PASS: DeleteBucketTagging correctly reset the configuration."
+    pass "DeleteBucketTagging correctly reset the configuration."
 else
-    echo "FAIL: DeleteBucketTagging did not reset as expected."
+    fail "DeleteBucketTagging did not reset as expected."
     echo "  Response: $BUCKET_TAGGING_AFTER_DELETE"
 fi
 
 echo "Testing GetObjectTagging 200s with an empty TagSet when never tagged..."
 OBJECT_TAGGING_UNSET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key file.txt 2>&1)
 if echo "$OBJECT_TAGGING_UNSET" | jq -e '.TagSet | length == 0' > /dev/null 2>&1; then
-    echo "PASS: GetObjectTagging returns an empty TagSet (200, not a 404) when never tagged."
+    pass "GetObjectTagging returns an empty TagSet (200, not a 404) when never tagged."
 else
-    echo "FAIL: GetObjectTagging did not return an empty TagSet as expected."
+    fail "GetObjectTagging did not return an empty TagSet as expected."
     echo "  Response: $OBJECT_TAGGING_UNSET"
 fi
 
@@ -925,18 +938,18 @@ echo "Testing PutObjectTagging / GetObjectTagging round-trip..."
 aws_s3 s3api put-object-tagging --bucket tagging-test-bucket --key file.txt --tagging 'TagSet=[{Key=project,Value=alarik}]'
 OBJECT_TAGGING_GET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key file.txt 2>&1)
 if echo "$OBJECT_TAGGING_GET" | jq -e '.TagSet[0].Key == "project" and .TagSet[0].Value == "alarik"' > /dev/null 2>&1; then
-    echo "PASS: PutObjectTagging/GetObjectTagging round-trip matches what was set."
+    pass "PutObjectTagging/GetObjectTagging round-trip matches what was set."
 else
-    echo "FAIL: GetObjectTagging did not reflect what was just set."
+    fail "GetObjectTagging did not reflect what was just set."
     echo "  Response: $OBJECT_TAGGING_GET"
 fi
 
 # The object itself must still be readable after the tagging metadata rewrite
 OBJECT_CONTENT_AFTER_TAGGING=$(aws_s3 s3 cp s3://tagging-test-bucket/file.txt -)
 if [ "$OBJECT_CONTENT_AFTER_TAGGING" == "hello" ]; then
-    echo "PASS: Object content is intact after PutObjectTagging."
+    pass "Object content is intact after PutObjectTagging."
 else
-    echo "FAIL: Object content was unexpectedly affected by tagging."
+    fail "Object content was unexpectedly affected by tagging."
     echo "  Content: $OBJECT_CONTENT_AFTER_TAGGING"
 fi
 
@@ -947,9 +960,9 @@ echo "Testing x-amz-tagging header on PutObject sets tags inline..."
 aws_s3 s3api put-object --bucket tagging-test-bucket --key inline-tagged.txt --body "$TAGGING_BODY_FILE" --tagging 'a=1&b=2' > /dev/null
 INLINE_TAGGING_GET=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt 2>&1)
 if echo "$INLINE_TAGGING_GET" | jq -e '.TagSet | length == 2' > /dev/null 2>&1; then
-    echo "PASS: x-amz-tagging header correctly set tags at upload time."
+    pass "x-amz-tagging header correctly set tags at upload time."
 else
-    echo "FAIL: x-amz-tagging header did not set tags as expected."
+    fail "x-amz-tagging header did not set tags as expected."
     echo "  Response: $INLINE_TAGGING_GET"
 fi
 
@@ -962,9 +975,9 @@ echo "Testing x-amz-tagging-count appears only when tags exist..."
 TAGGED_COUNT=$(aws_s3 s3api head-object --bucket tagging-test-bucket --key inline-tagged.txt 2>&1 | jq -r '.TagCount // "missing"')
 UNTAGGED_COUNT=$(aws_s3 s3api head-object --bucket tagging-test-bucket --key untagged.txt 2>&1 | jq -r '.TagCount // "missing"')
 if [ "$TAGGED_COUNT" == "2" ] && [ "$UNTAGGED_COUNT" == "missing" ]; then
-    echo "PASS: x-amz-tagging-count present only on the tagged object."
+    pass "x-amz-tagging-count present only on the tagged object."
 else
-    echo "FAIL: x-amz-tagging-count did not match expectations."
+    fail "x-amz-tagging-count did not match expectations."
     echo "  Tagged: $TAGGED_COUNT, Untagged: $UNTAGGED_COUNT"
 fi
 
@@ -972,9 +985,9 @@ echo "Testing DeleteObjectTagging removes tags..."
 aws_s3 s3api delete-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt
 OBJECT_TAGGING_AFTER_DELETE=$(aws_s3 s3api get-object-tagging --bucket tagging-test-bucket --key inline-tagged.txt 2>&1)
 if echo "$OBJECT_TAGGING_AFTER_DELETE" | jq -e '.TagSet | length == 0' > /dev/null 2>&1; then
-    echo "PASS: DeleteObjectTagging correctly removed all tags."
+    pass "DeleteObjectTagging correctly removed all tags."
 else
-    echo "FAIL: DeleteObjectTagging did not remove tags as expected."
+    fail "DeleteObjectTagging did not remove tags as expected."
     echo "  Response: $OBJECT_TAGGING_AFTER_DELETE"
 fi
 
@@ -989,9 +1002,9 @@ aws_s3 s3 mb s3://lifecycle-test-bucket
 echo "Testing GetBucketLifecycleConfiguration 404s when never configured..."
 LIFECYCLE_GET_UNSET=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
 if echo "$LIFECYCLE_GET_UNSET" | grep -q "NoSuchLifecycleConfiguration"; then
-    echo "PASS: GetBucketLifecycleConfiguration correctly 404s when unset."
+    pass "GetBucketLifecycleConfiguration correctly 404s when unset."
 else
-    echo "FAIL: GetBucketLifecycleConfiguration did not 404 as expected."
+    fail "GetBucketLifecycleConfiguration did not 404 as expected."
     echo "  Response: $LIFECYCLE_GET_UNSET"
 fi
 
@@ -1006,9 +1019,9 @@ aws_s3 s3api put-bucket-lifecycle-configuration --bucket lifecycle-test-bucket -
 }'
 LIFECYCLE_GET=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
 if echo "$LIFECYCLE_GET" | jq -e '.Rules[0].Filter.Prefix == "logs/" and .Rules[0].Expiration.Days == 30' > /dev/null 2>&1; then
-    echo "PASS: PutBucketLifecycleConfiguration/GetBucketLifecycleConfiguration round-trip matches what was set."
+    pass "PutBucketLifecycleConfiguration/GetBucketLifecycleConfiguration round-trip matches what was set."
 else
-    echo "FAIL: GetBucketLifecycleConfiguration did not reflect what was just set."
+    fail "GetBucketLifecycleConfiguration did not reflect what was just set."
     echo "  Response: $LIFECYCLE_GET"
 fi
 
@@ -1022,9 +1035,9 @@ LIFECYCLE_REJECTED=$(aws_s3 s3api put-bucket-lifecycle-configuration --bucket li
     }]
 }' 2>&1)
 if echo "$LIFECYCLE_REJECTED" | grep -q "MalformedXML"; then
-    echo "PASS: PutBucketLifecycleConfiguration correctly rejected an unsupported Transition rule."
+    pass "PutBucketLifecycleConfiguration correctly rejected an unsupported Transition rule."
 else
-    echo "FAIL: PutBucketLifecycleConfiguration did not reject the unsupported rule as expected."
+    fail "PutBucketLifecycleConfiguration did not reject the unsupported rule as expected."
     echo "  Response: $LIFECYCLE_REJECTED"
 fi
 
@@ -1032,9 +1045,9 @@ echo "Testing DeleteBucketLifecycle resets to unconfigured..."
 aws_s3 s3api delete-bucket-lifecycle --bucket lifecycle-test-bucket
 LIFECYCLE_GET_AFTER_DELETE=$(aws_s3 s3api get-bucket-lifecycle-configuration --bucket lifecycle-test-bucket 2>&1)
 if echo "$LIFECYCLE_GET_AFTER_DELETE" | grep -q "NoSuchLifecycleConfiguration"; then
-    echo "PASS: DeleteBucketLifecycle correctly reset the configuration."
+    pass "DeleteBucketLifecycle correctly reset the configuration."
 else
-    echo "FAIL: DeleteBucketLifecycle did not reset as expected."
+    fail "DeleteBucketLifecycle did not reset as expected."
     echo "  Response: $LIFECYCLE_GET_AFTER_DELETE"
 fi
 
@@ -1054,25 +1067,25 @@ aws_s3 s3api put-object --bucket "$RANGE_BUCKET" --key range-obj --body "$RANGE_
 aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
     --range "bytes=0-3" "$RANGE_DST" > /dev/null 2>&1
 if [ "$(cat "$RANGE_DST")" = "0123" ]; then
-    echo "PASS: Range read bytes=0-3 returned correct slice."
+    pass "Range read bytes=0-3 returned correct slice."
 else
-    echo "FAIL: Range read bytes=0-3 returned unexpected content: '$(cat "$RANGE_DST")'"
+    fail "Range read bytes=0-3 returned unexpected content: '$(cat "$RANGE_DST")'"
 fi
 
 aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
     --range "bytes=10-15" "$RANGE_DST" > /dev/null 2>&1
 if [ "$(cat "$RANGE_DST")" = "ABCDEF" ]; then
-    echo "PASS: Range read bytes=10-15 returned correct slice."
+    pass "Range read bytes=10-15 returned correct slice."
 else
-    echo "FAIL: Range read bytes=10-15 returned unexpected content: '$(cat "$RANGE_DST")'"
+    fail "Range read bytes=10-15 returned unexpected content: '$(cat "$RANGE_DST")'"
 fi
 
 aws_s3 s3api get-object --bucket "$RANGE_BUCKET" --key range-obj \
     --range "bytes=-4" "$RANGE_DST" > /dev/null 2>&1
 if [ "$(cat "$RANGE_DST")" = "CDEF" ]; then
-    echo "PASS: Suffix range read bytes=-4 returned correct slice."
+    pass "Suffix range read bytes=-4 returned correct slice."
 else
-    echo "FAIL: Suffix range read bytes=-4 returned unexpected content: '$(cat "$RANGE_DST")'"
+    fail "Suffix range read bytes=-4 returned unexpected content: '$(cat "$RANGE_DST")'"
 fi
 
 rm -f "$RANGE_SRC" "$RANGE_DST"
@@ -1097,18 +1110,18 @@ MD5_OK=$(aws_s3 s3api put-object \
     --bucket "$MD5_BUCKET" --key md5-obj \
     --body "$MD5_SRC" --content-md5 "$CORRECT_MD5" 2>&1)
 if echo "$MD5_OK" | grep -q "ETag"; then
-    echo "PASS: PutObject with correct Content-MD5 succeeded."
+    pass "PutObject with correct Content-MD5 succeeded."
 else
-    echo "FAIL: PutObject with correct Content-MD5 unexpectedly failed: $MD5_OK"
+    fail "PutObject with correct Content-MD5 unexpectedly failed: $MD5_OK"
 fi
 
 MD5_BAD=$(aws_s3 s3api put-object \
     --bucket "$MD5_BUCKET" --key md5-obj \
     --body "$MD5_SRC" --content-md5 "$BAD_MD5" 2>&1)
 if echo "$MD5_BAD" | grep -qE "BadDigest|InvalidDigest"; then
-    echo "PASS: PutObject with wrong Content-MD5 was correctly rejected."
+    pass "PutObject with wrong Content-MD5 was correctly rejected."
 else
-    echo "FAIL: PutObject with wrong Content-MD5 was not rejected: $MD5_BAD"
+    fail "PutObject with wrong Content-MD5 was not rejected: $MD5_BAD"
 fi
 
 rm -f "$MD5_SRC"
@@ -1133,21 +1146,21 @@ aws_s3 s3api put-object --bucket "$META_BUCKET" --key meta-obj \
 
 META_RESP=$(aws_s3 s3api head-object --bucket "$META_BUCKET" --key meta-obj 2>&1)
 if echo "$META_RESP" | grep -q '"author"' && echo "$META_RESP" | grep -q '"julian"'; then
-    echo "PASS: Custom metadata 'author' roundtrip via HeadObject."
+    pass "Custom metadata 'author' roundtrip via HeadObject."
 else
-    echo "FAIL: Custom metadata 'author' missing from HeadObject response: $META_RESP"
+    fail "Custom metadata 'author' missing from HeadObject response: $META_RESP"
 fi
 if echo "$META_RESP" | grep -q '"project"' && echo "$META_RESP" | grep -q '"alarik"'; then
-    echo "PASS: Custom metadata 'project' roundtrip via HeadObject."
+    pass "Custom metadata 'project' roundtrip via HeadObject."
 else
-    echo "FAIL: Custom metadata 'project' missing from HeadObject response: $META_RESP"
+    fail "Custom metadata 'project' missing from HeadObject response: $META_RESP"
 fi
 
 META_GET=$(aws_s3 s3api get-object --bucket "$META_BUCKET" --key meta-obj "$META_DST" 2>&1)
 if echo "$META_GET" | grep -q '"author"' && echo "$META_GET" | grep -q '"julian"'; then
-    echo "PASS: Custom metadata 'author' also present on GetObject response."
+    pass "Custom metadata 'author' also present on GetObject response."
 else
-    echo "FAIL: Custom metadata 'author' missing from GetObject response: $META_GET"
+    fail "Custom metadata 'author' missing from GetObject response: $META_GET"
 fi
 
 rm -f "$META_SRC" "$META_DST"
@@ -1176,9 +1189,9 @@ CC_OK=$(aws_s3 s3api copy-object \
     --copy-source "$COPY_COND_BUCKET/src" \
     --copy-source-if-match "\"$SRC_ETAG\"" 2>&1)
 if echo "$CC_OK" | grep -q "ETag"; then
-    echo "PASS: copy-source-if-match with correct ETag succeeded."
+    pass "copy-source-if-match with correct ETag succeeded."
 else
-    echo "FAIL: copy-source-if-match with correct ETag failed: $CC_OK"
+    fail "copy-source-if-match with correct ETag failed: $CC_OK"
 fi
 
 CC_FAIL=$(aws_s3 s3api copy-object \
@@ -1186,9 +1199,9 @@ CC_FAIL=$(aws_s3 s3api copy-object \
     --copy-source "$COPY_COND_BUCKET/src" \
     --copy-source-if-match '"wrongetag00000000000000000000000"' 2>&1)
 if echo "$CC_FAIL" | grep -qE "PreconditionFailed|412"; then
-    echo "PASS: copy-source-if-match with wrong ETag was correctly rejected."
+    pass "copy-source-if-match with wrong ETag was correctly rejected."
 else
-    echo "FAIL: copy-source-if-match with wrong ETag was not rejected: $CC_FAIL"
+    fail "copy-source-if-match with wrong ETag was not rejected: $CC_FAIL"
 fi
 
 CC_NM_OK=$(aws_s3 s3api copy-object \
@@ -1196,9 +1209,9 @@ CC_NM_OK=$(aws_s3 s3api copy-object \
     --copy-source "$COPY_COND_BUCKET/src" \
     --copy-source-if-none-match '"wrongetag00000000000000000000000"' 2>&1)
 if echo "$CC_NM_OK" | grep -q "ETag"; then
-    echo "PASS: copy-source-if-none-match with non-matching ETag succeeded."
+    pass "copy-source-if-none-match with non-matching ETag succeeded."
 else
-    echo "FAIL: copy-source-if-none-match with non-matching ETag failed: $CC_NM_OK"
+    fail "copy-source-if-none-match with non-matching ETag failed: $CC_NM_OK"
 fi
 
 CC_NM_FAIL=$(aws_s3 s3api copy-object \
@@ -1206,9 +1219,9 @@ CC_NM_FAIL=$(aws_s3 s3api copy-object \
     --copy-source "$COPY_COND_BUCKET/src" \
     --copy-source-if-none-match "\"$SRC_ETAG\"" 2>&1)
 if echo "$CC_NM_FAIL" | grep -qE "PreconditionFailed|412"; then
-    echo "PASS: copy-source-if-none-match with matching ETag was correctly rejected."
+    pass "copy-source-if-none-match with matching ETag was correctly rejected."
 else
-    echo "FAIL: copy-source-if-none-match with matching ETag was not rejected: $CC_NM_FAIL"
+    fail "copy-source-if-none-match with matching ETag was not rejected: $CC_NM_FAIL"
 fi
 
 rm -f "$COPY_COND_SRC"
@@ -1231,9 +1244,9 @@ MP_ETAG=$(aws_s3 s3api head-object --bucket "$MP_ETAG_BUCKET" --key mp-etag-obj 
     --query 'ETag' --output text 2>/dev/null | tr -d '"')
 
 if echo "$MP_ETAG" | grep -qE '^[0-9a-f]{32}-[0-9]+$'; then
-    echo "PASS: Multipart upload ETag is in S3 format '<md5>-<partcount>': $MP_ETAG"
+    pass "Multipart upload ETag is in S3 format '<md5>-<partcount>': $MP_ETAG"
 else
-    echo "FAIL: Multipart upload ETag '$MP_ETAG' does not match expected '<md5>-<partcount>' format."
+    fail "Multipart upload ETag '$MP_ETAG' does not match expected '<md5>-<partcount>' format."
 fi
 
 aws_s3 s3 rm "s3://$MP_ETAG_BUCKET/mp-etag-obj" > /dev/null 2>&1
@@ -1243,4 +1256,328 @@ echo ""
 echo "=== Multipart ETag Format Tests Complete ==="
 echo ""
 
-echo "Test complete."
+# ── Presigned URLs (query auth) ────────────────────────────────────────────────
+echo "=== Presigned URL Tests ==="
+
+PRESIGN_BUCKET="presign-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$PRESIGN_BUCKET" > /dev/null 2>&1
+echo "presigned content" | aws_s3 s3 cp - "s3://$PRESIGN_BUCKET/presigned.txt" > /dev/null 2>&1
+
+PRESIGNED_URL=$(aws_s3 s3 presign "s3://$PRESIGN_BUCKET/presigned.txt" --expires-in 300)
+PRESIGN_BODY=$(curl -s "$PRESIGNED_URL")
+if [ "$PRESIGN_BODY" == "presigned content" ]; then
+    pass "Presigned GET URL returns the object content without headers auth."
+else
+    fail "Presigned GET URL returned unexpected content: $PRESIGN_BODY"
+fi
+
+# Tampering with the signature must be rejected
+TAMPERED_URL=$(echo "$PRESIGNED_URL" | sed 's/X-Amz-Signature=......../X-Amz-Signature=00000000/')
+TAMPERED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$TAMPERED_URL")
+if [ "$TAMPERED_CODE" == "403" ] || [ "$TAMPERED_CODE" == "401" ]; then
+    pass "Tampered presigned signature is rejected ($TAMPERED_CODE)."
+else
+    fail "Tampered presigned signature was not rejected (HTTP $TAMPERED_CODE)."
+fi
+
+# Unauthenticated access without presign must be rejected
+PLAIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/$PRESIGN_BUCKET/presigned.txt")
+if [ "$PLAIN_CODE" == "403" ] || [ "$PLAIN_CODE" == "401" ]; then
+    pass "Unauthenticated GET without presign is rejected ($PLAIN_CODE)."
+else
+    fail "Unauthenticated GET without presign was not rejected (HTTP $PLAIN_CODE)."
+fi
+
+aws_s3 s3 rm "s3://$PRESIGN_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$PRESIGN_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Presigned URL Tests Complete ==="
+echo ""
+
+# ── Special characters in object keys ─────────────────────────────────────────
+echo "=== Special Character Key Tests ==="
+
+SPECIAL_BUCKET="special-keys-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$SPECIAL_BUCKET" > /dev/null 2>&1
+
+# Keys that commonly break S3 implementations (URL encoding, signing, listing)
+SPECIAL_KEYS=(
+    "file with spaces.txt"
+    "ümläut-ánd-àccents.txt"
+    "plus+sign.txt"
+    "parens(1).txt"
+    "equals=and&ampersand.txt"
+    "deep/nested/path/file.txt"
+    "dots..in..key.txt"
+)
+
+for key in "${SPECIAL_KEYS[@]}"; do
+    echo "content of $key" | aws_s3 s3 cp - "s3://$SPECIAL_BUCKET/$key" > /dev/null 2>&1
+    ROUNDTRIP=$(aws_s3 s3 cp "s3://$SPECIAL_BUCKET/$key" - 2>/dev/null)
+    if [ "$ROUNDTRIP" == "content of $key" ]; then
+        pass "Key round-trip: '$key'"
+    else
+        fail "Key round-trip failed for '$key' (got: '$ROUNDTRIP')"
+    fi
+done
+
+# All keys must appear in a listing (--no-paginate: the CLI's auto-pagination
+# aggregates pages and drops per-page fields like KeyCount)
+LISTED_COUNT=$(aws_s3 s3api list-objects-v2 --bucket "$SPECIAL_BUCKET" --no-paginate --query 'KeyCount' --output text 2>/dev/null)
+if [ "$LISTED_COUNT" == "${#SPECIAL_KEYS[@]}" ]; then
+    pass "All ${#SPECIAL_KEYS[@]} special-character keys appear in listing."
+else
+    fail "Expected ${#SPECIAL_KEYS[@]} keys in listing, got: $LISTED_COUNT"
+fi
+
+aws_s3 s3 rm "s3://$SPECIAL_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$SPECIAL_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Special Character Key Tests Complete ==="
+echo ""
+
+# ── Zero-byte objects ─────────────────────────────────────────────────────────
+echo "=== Zero-Byte Object Tests ==="
+
+ZERO_BUCKET="zero-byte-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$ZERO_BUCKET" > /dev/null 2>&1
+
+ZERO_FILE=$(mktemp)
+aws_s3 s3 cp "$ZERO_FILE" "s3://$ZERO_BUCKET/empty.txt" > /dev/null 2>&1
+
+ZERO_SIZE=$(aws_s3 s3api head-object --bucket "$ZERO_BUCKET" --key empty.txt --query 'ContentLength' --output text 2>/dev/null)
+if [ "$ZERO_SIZE" == "0" ]; then
+    pass "Zero-byte object HEAD reports ContentLength 0."
+else
+    fail "Zero-byte object HEAD reports ContentLength: $ZERO_SIZE"
+fi
+
+# MD5 of empty input is d41d8cd98f00b204e9800998ecf8427e
+ZERO_ETAG=$(aws_s3 s3api head-object --bucket "$ZERO_BUCKET" --key empty.txt --query 'ETag' --output text 2>/dev/null | tr -d '"')
+if [ "$ZERO_ETAG" == "d41d8cd98f00b204e9800998ecf8427e" ]; then
+    pass "Zero-byte object has the canonical empty-MD5 ETag."
+else
+    fail "Zero-byte object ETag is: $ZERO_ETAG"
+fi
+
+ZERO_OUT=$(mktemp)
+aws_s3 s3api get-object --bucket "$ZERO_BUCKET" --key empty.txt "$ZERO_OUT" > /dev/null 2>&1
+if [ ! -s "$ZERO_OUT" ]; then
+    pass "Zero-byte object GET returns an empty body."
+else
+    fail "Zero-byte object GET returned $(wc -c < "$ZERO_OUT") bytes."
+fi
+rm -f "$ZERO_FILE" "$ZERO_OUT"
+
+aws_s3 s3 rm "s3://$ZERO_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$ZERO_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Zero-Byte Object Tests Complete ==="
+echo ""
+
+# ── ListObjectsV2 pagination & delimiter ──────────────────────────────────────
+echo "=== ListObjectsV2 Pagination Tests ==="
+
+LIST_BUCKET="list-v2-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$LIST_BUCKET" > /dev/null 2>&1
+
+for i in 1 2 3 4 5; do
+    echo "obj $i" | aws_s3 s3 cp - "s3://$LIST_BUCKET/obj-$i.txt" > /dev/null 2>&1
+done
+echo "nested" | aws_s3 s3 cp - "s3://$LIST_BUCKET/dir-a/nested.txt" > /dev/null 2>&1
+echo "nested" | aws_s3 s3 cp - "s3://$LIST_BUCKET/dir-b/nested.txt" > /dev/null 2>&1
+
+# Page 1: max-keys=3 must be truncated with a continuation token
+PAGE1=$(aws_s3 s3api list-objects-v2 --bucket "$LIST_BUCKET" --max-keys 3 2>/dev/null)
+P1_TRUNC=$(echo "$PAGE1" | jq -r '.IsTruncated')
+P1_COUNT=$(echo "$PAGE1" | jq -r '.KeyCount')
+P1_TOKEN=$(echo "$PAGE1" | jq -r '.NextContinuationToken // empty')
+if [ "$P1_TRUNC" == "true" ] && [ "$P1_COUNT" == "3" ] && [ -n "$P1_TOKEN" ]; then
+    pass "ListObjectsV2 page 1: truncated, KeyCount=3, NextContinuationToken present."
+else
+    fail "ListObjectsV2 page 1 unexpected: IsTruncated=$P1_TRUNC KeyCount=$P1_COUNT token='$P1_TOKEN'"
+fi
+
+# Follow the token until the end; total keys must be 7 with no duplicates
+TOTAL_KEYS=$(echo "$PAGE1" | jq -r '.Contents[].Key')
+TOKEN="$P1_TOKEN"
+GUARD=0
+while [ -n "$TOKEN" ] && [ "$GUARD" -lt 10 ]; do
+    PAGE=$(aws_s3 s3api list-objects-v2 --bucket "$LIST_BUCKET" --max-keys 3 --continuation-token "$TOKEN" 2>/dev/null)
+    TOTAL_KEYS="$TOTAL_KEYS
+$(echo "$PAGE" | jq -r '.Contents[].Key')"
+    TOKEN=$(echo "$PAGE" | jq -r '.NextContinuationToken // empty')
+    ((GUARD++))
+done
+UNIQUE_COUNT=$(echo "$TOTAL_KEYS" | sort -u | grep -c .)
+if [ "$UNIQUE_COUNT" == "7" ]; then
+    pass "ListObjectsV2 pagination returns all 7 keys exactly once."
+else
+    fail "ListObjectsV2 pagination returned $UNIQUE_COUNT unique keys, expected 7."
+fi
+
+# Delimiter: dir-a/ and dir-b/ must come back as CommonPrefixes, 5 root keys
+DELIM=$(aws_s3 s3api list-objects-v2 --bucket "$LIST_BUCKET" --delimiter "/" 2>/dev/null)
+PREFIX_COUNT=$(echo "$DELIM" | jq -r '.CommonPrefixes | length')
+ROOT_COUNT=$(echo "$DELIM" | jq -r '.Contents | length')
+if [ "$PREFIX_COUNT" == "2" ] && [ "$ROOT_COUNT" == "5" ]; then
+    pass "Delimiter listing: 2 CommonPrefixes, 5 root keys."
+else
+    fail "Delimiter listing unexpected: $PREFIX_COUNT prefixes, $ROOT_COUNT root keys."
+fi
+
+# Prefix filter (--no-paginate to keep KeyCount in the response)
+PREFIXED=$(aws_s3 s3api list-objects-v2 --bucket "$LIST_BUCKET" --prefix "dir-a/" --no-paginate --query 'KeyCount' --output text 2>/dev/null)
+if [ "$PREFIXED" == "1" ]; then
+    pass "Prefix filter 'dir-a/' returns exactly 1 key."
+else
+    fail "Prefix filter 'dir-a/' returned KeyCount: $PREFIXED"
+fi
+
+aws_s3 s3 rm "s3://$LIST_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$LIST_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== ListObjectsV2 Pagination Tests Complete ==="
+echo ""
+
+# ── Error responses ───────────────────────────────────────────────────────────
+echo "=== Error Response Tests ==="
+
+ERR_BUCKET="error-tests-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$ERR_BUCKET" > /dev/null 2>&1
+
+# GET on a missing key must be NoSuchKey
+ERR_OUT=$(aws_s3 s3api get-object --bucket "$ERR_BUCKET" --key does-not-exist.txt /dev/null 2>&1)
+if echo "$ERR_OUT" | grep -q "NoSuchKey"; then
+    pass "GET on missing key returns NoSuchKey."
+else
+    fail "GET on missing key returned: $ERR_OUT"
+fi
+
+# HEAD on a missing key must be a 404 (no body per S3 semantics)
+ERR_OUT=$(aws_s3 s3api head-object --bucket "$ERR_BUCKET" --key does-not-exist.txt 2>&1)
+if echo "$ERR_OUT" | grep -qE "404|Not Found"; then
+    pass "HEAD on missing key returns 404."
+else
+    fail "HEAD on missing key returned: $ERR_OUT"
+fi
+
+# Operations on a missing bucket must be NoSuchBucket
+ERR_OUT=$(aws_s3 s3api list-objects-v2 --bucket "no-such-bucket-$$" 2>&1)
+if echo "$ERR_OUT" | grep -q "NoSuchBucket"; then
+    pass "List on missing bucket returns NoSuchBucket."
+else
+    fail "List on missing bucket returned: $ERR_OUT"
+fi
+
+# Deleting a non-empty bucket must fail with BucketNotEmpty
+echo "occupier" | aws_s3 s3 cp - "s3://$ERR_BUCKET/occupier.txt" > /dev/null 2>&1
+ERR_OUT=$(aws_s3 s3api delete-bucket --bucket "$ERR_BUCKET" 2>&1)
+if echo "$ERR_OUT" | grep -qE "BucketNotEmpty|409"; then
+    pass "Deleting a non-empty bucket is rejected (BucketNotEmpty)."
+else
+    fail "Deleting a non-empty bucket returned: $ERR_OUT"
+fi
+
+# Range starting beyond the object size must be 416 InvalidRange
+# (verified against S3 docs: suffix ranges larger than the object return the
+#  whole object instead - tested in the range section above)
+ERR_OUT=$(aws_s3 s3api get-object --bucket "$ERR_BUCKET" --key occupier.txt --range "bytes=999999-1000000" /dev/null 2>&1)
+if echo "$ERR_OUT" | grep -qE "InvalidRange|416|Requested Range Not Satisfiable"; then
+    pass "Range beyond object size returns 416 InvalidRange."
+else
+    fail "Range beyond object size returned: $ERR_OUT"
+fi
+
+# Suffix range larger than the object must return the ENTIRE object (206), not 416
+SUFFIX_OUT=$(mktemp)
+aws_s3 s3api get-object --bucket "$ERR_BUCKET" --key occupier.txt --range "bytes=-999999" "$SUFFIX_OUT" > /dev/null 2>&1
+FULL_CONTENT=$(cat "$SUFFIX_OUT"; rm -f "$SUFFIX_OUT")
+if [ "$FULL_CONTENT" == "occupier" ]; then
+    pass "Oversized suffix range returns the entire object."
+else
+    fail "Oversized suffix range returned: '$FULL_CONTENT'"
+fi
+
+aws_s3 s3 rm "s3://$ERR_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$ERR_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Error Response Tests Complete ==="
+echo ""
+
+# ── Multipart edge cases ──────────────────────────────────────────────────────
+echo "=== Multipart Edge Case Tests ==="
+
+MP_EDGE_BUCKET="mp-edge-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$MP_EDGE_BUCKET" > /dev/null 2>&1
+
+# Abort: parts must be gone afterwards
+UPLOAD_ID=$(aws_s3 s3api create-multipart-upload --bucket "$MP_EDGE_BUCKET" --key aborted.bin --query 'UploadId' --output text 2>/dev/null)
+MP_PART=$(mktemp)
+dd if=/dev/urandom of="$MP_PART" bs=1M count=5 2>/dev/null
+aws_s3 s3api upload-part --bucket "$MP_EDGE_BUCKET" --key aborted.bin --part-number 1 --upload-id "$UPLOAD_ID" --body "$MP_PART" > /dev/null 2>&1
+aws_s3 s3api abort-multipart-upload --bucket "$MP_EDGE_BUCKET" --key aborted.bin --upload-id "$UPLOAD_ID" > /dev/null 2>&1
+ERR_OUT=$(aws_s3 s3api list-parts --bucket "$MP_EDGE_BUCKET" --key aborted.bin --upload-id "$UPLOAD_ID" 2>&1)
+if echo "$ERR_OUT" | grep -qE "NoSuchUpload|404"; then
+    pass "Aborted multipart upload is gone (list-parts returns NoSuchUpload)."
+else
+    fail "list-parts after abort returned: $ERR_OUT"
+fi
+
+# Complete with a wrong ETag must be InvalidPart
+UPLOAD_ID=$(aws_s3 s3api create-multipart-upload --bucket "$MP_EDGE_BUCKET" --key badetag.bin --query 'UploadId' --output text 2>/dev/null)
+aws_s3 s3api upload-part --bucket "$MP_EDGE_BUCKET" --key badetag.bin --part-number 1 --upload-id "$UPLOAD_ID" --body "$MP_PART" > /dev/null 2>&1
+ERR_OUT=$(aws_s3 s3api complete-multipart-upload --bucket "$MP_EDGE_BUCKET" --key badetag.bin --upload-id "$UPLOAD_ID" \
+    --multipart-upload '{"Parts":[{"PartNumber":1,"ETag":"\"00000000000000000000000000000000\""}]}' 2>&1)
+if echo "$ERR_OUT" | grep -q "InvalidPart"; then
+    pass "Complete with a wrong part ETag is rejected (InvalidPart)."
+else
+    fail "Complete with wrong ETag returned: $ERR_OUT"
+fi
+aws_s3 s3api abort-multipart-upload --bucket "$MP_EDGE_BUCKET" --key badetag.bin --upload-id "$UPLOAD_ID" > /dev/null 2>&1
+
+# Upload-part on a nonexistent upload id must be NoSuchUpload
+ERR_OUT=$(aws_s3 s3api upload-part --bucket "$MP_EDGE_BUCKET" --key ghost.bin --part-number 1 --upload-id "does-not-exist" --body "$MP_PART" 2>&1)
+if echo "$ERR_OUT" | grep -qE "NoSuchUpload|404"; then
+    pass "upload-part with unknown upload id returns NoSuchUpload."
+else
+    fail "upload-part with unknown upload id returned: $ERR_OUT"
+fi
+
+rm -f "$MP_PART"
+aws_s3 s3 rm "s3://$MP_EDGE_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$MP_EDGE_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Multipart Edge Case Tests Complete ==="
+echo ""
+
+# ── Content-Type preservation ─────────────────────────────────────────────────
+echo "=== Content-Type Tests ==="
+
+CT_BUCKET="content-type-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$CT_BUCKET" > /dev/null 2>&1
+
+echo "<html></html>" | aws_s3 s3 cp - "s3://$CT_BUCKET/page.html" --content-type "text/html" > /dev/null 2>&1
+CT=$(aws_s3 s3api head-object --bucket "$CT_BUCKET" --key page.html --query 'ContentType' --output text 2>/dev/null)
+if [ "$CT" == "text/html" ]; then
+    pass "Explicit Content-Type is preserved on HEAD."
+else
+    fail "Content-Type came back as: $CT"
+fi
+
+aws_s3 s3 rm "s3://$CT_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$CT_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Content-Type Tests Complete ==="
+echo ""
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo "=== Results: $PASS_COUNT passed, $FAIL_COUNT failed ==="
+[ "$FAIL_COUNT" -eq 0 ] && exit 0 || exit 1

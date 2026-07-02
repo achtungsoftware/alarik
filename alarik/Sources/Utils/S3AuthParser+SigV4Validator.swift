@@ -284,9 +284,15 @@ struct SigV4Validator {
             throw S3Error(
                 status: .badRequest, code: "InvalidArgument", message: "Host must be signed")
         }
-        guard authInfo.signedHeaders.contains("x-amz-date") else {
-            throw S3Error(
-                status: .badRequest, code: "InvalidArgument", message: "x-amz-date must be signed")
+        // Header auth only: for query auth (presigned URLs) the date travels as the
+        // X-Amz-Date query parameter and SignedHeaders typically lists just "host" -
+        // requiring a signed x-amz-date header would reject every standard presigned URL.
+        if authInfo.expires == nil {
+            guard authInfo.signedHeaders.contains("x-amz-date") else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidArgument",
+                    message: "x-amz-date must be signed")
+            }
         }
         if authInfo.token != nil {
             guard authInfo.signedHeaders.contains("x-amz-security-token") else {
@@ -310,10 +316,17 @@ struct SigV4Validator {
         }
 
         let skew = abs(Date().timeIntervalSince(requestDate))
-        guard skew < 15 * 60 else {
-            throw S3Error(
-                status: .badRequest, code: "RequestTimeTooSkewed",
-                message: "Request time skew exceeds 15 minutes")
+
+        // Query auth is bounded by its own X-Amz-Expires window (like real S3, where a
+        // presigned URL can be valid for up to 7 days); the 15-minute skew rule applies
+        // only to header auth - imposing it on presigned URLs would silently cap every
+        // URL's usable lifetime at 15 minutes regardless of the requested expiry.
+        if authInfo.expires == nil {
+            guard skew < 15 * 60 else {
+                throw S3Error(
+                    status: .badRequest, code: "RequestTimeTooSkewed",
+                    message: "Request time skew exceeds 15 minutes")
+            }
         }
 
         // Expires check for query auth
