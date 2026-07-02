@@ -92,8 +92,8 @@ struct S3AuthParser {
             return try parseFromQuery(request: request)
         } else {
             throw S3Error(
-                status: .badRequest, code: "MissingAuthentication",
-                message: "No authentication provided")
+                status: .forbidden, code: "AccessDenied",
+                message: "Access Denied")
         }
     }
 
@@ -113,8 +113,9 @@ struct S3AuthParser {
         }
         let algorithm = components[0]
         guard algorithm == supportedAlgorithm else {
+            // S3's code for a bad algorithm in the Authorization header
             throw S3Error(
-                status: .badRequest, code: "UnsupportedAlgorithm",
+                status: .badRequest, code: "AuthorizationHeaderMalformed",
                 message: "Only \(supportedAlgorithm) is supported")
         }
         let parts = components[1...].joined(separator: " ").components(separatedBy: ",").map {
@@ -179,8 +180,9 @@ struct S3AuthParser {
         guard let algorithm = request.query[String.self, at: "X-Amz-Algorithm"],
             algorithm == supportedAlgorithm
         else {
+            // S3's code for bad presigned-URL query parameters
             throw S3Error(
-                status: .badRequest, code: "UnsupportedAlgorithm",
+                status: .badRequest, code: "AuthorizationQueryParametersError",
                 message: "Only \(supportedAlgorithm) is supported")
         }
         guard let credential = request.query[String.self, at: "X-Amz-Credential"] else {
@@ -265,14 +267,21 @@ struct SigV4Validator {
             let secretKey = await AccessKeySecretKeyMapCache.shared.secretKey(
                 for: authInfo.accessKey)
         else {
+            // S3's dedicated code for an unknown access key (403)
             throw S3Error(
-                status: .forbidden, code: "AccessDenied", message: "Error finding secret key")
+                status: .forbidden, code: "InvalidAccessKeyId",
+                message: "The access key ID you provided does not exist in our records.")
         }
 
         let validator: SigV4Validator = SigV4Validator(secretKey: secretKey)
         let isValid: Bool = try validator.validate(request: req, authInfo: authInfo)
         if !isValid {
-            throw S3Error(status: .forbidden, code: "AccessDenied", message: "Error validating")
+            // S3's dedicated code for a failed signature check (403)
+            throw S3Error(
+                status: .forbidden, code: "SignatureDoesNotMatch",
+                message:
+                    "The request signature we calculated does not match the signature you provided. Check your key and signing method."
+            )
         }
 
         return authInfo
@@ -324,7 +333,7 @@ struct SigV4Validator {
         if authInfo.expires == nil {
             guard skew < 15 * 60 else {
                 throw S3Error(
-                    status: .badRequest, code: "RequestTimeTooSkewed",
+                    status: .forbidden, code: "RequestTimeTooSkewed",
                     message: "Request time skew exceeds 15 minutes")
             }
         }
@@ -333,7 +342,7 @@ struct SigV4Validator {
         if let expires = authInfo.expires {
             guard skew < Double(expires) else {
                 throw S3Error(
-                    status: .badRequest, code: "AccessDenied", message: "Presigned URL has expired")
+                    status: .forbidden, code: "AccessDenied", message: "Request has expired")
             }
         }
 
@@ -676,7 +685,7 @@ struct SigV4Validator {
             // Use constant-time comparison to prevent timing attacks
             guard computedChunkSigData.constantTimeCompare(to: chunkSig) else {
                 throw S3Error(
-                    status: .badRequest, code: "SignatureDoesNotMatch",
+                    status: .forbidden, code: "SignatureDoesNotMatch",
                     message: "Chunk signature mismatch")
             }
             previousSig = computedChunkSigData.hexString()

@@ -607,7 +607,7 @@ struct AdditionalS3AuthTests {
                 _ = try S3AuthParser.parse(request: req)
                 Issue.record("Expected parse to throw")
             } catch let error as S3Error {
-                #expect(error.code == "UnsupportedAlgorithm")
+                #expect(error.code == "AuthorizationHeaderMalformed")
             }
         }
     }
@@ -625,7 +625,7 @@ struct AdditionalS3AuthTests {
                 _ = try S3AuthParser.parse(request: req)
                 Issue.record("Expected parse to throw")
             } catch let error as S3Error {
-                #expect(error.code == "UnsupportedAlgorithm")
+                #expect(error.code == "AuthorizationQueryParametersError")
             }
         }
     }

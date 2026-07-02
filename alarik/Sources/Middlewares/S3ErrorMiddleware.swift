@@ -19,8 +19,20 @@ import XMLCoder
 
 struct S3ErrorMiddleware: Middleware {
     func respond(to request: Request, chainingTo next: any Responder) -> EventLoopFuture<Response> {
-        next.respond(to: request).flatMapError { error in
+        next.respond(to: request).map { response in
+            // Real S3 stamps every response (success or error) with request IDs - clients
+            // and support tooling rely on them for correlation
+            Self.addRequestIdHeaders(to: response, requestId: request.id)
+            return response
+        }.flatMapError { error in
             if let s3Error = error as? S3Error {
+                // A 304 must not carry a body (RFC 9110)
+                if s3Error.status == .notModified {
+                    let response = Response(status: .notModified)
+                    Self.addRequestIdHeaders(to: response, requestId: s3Error.requestId)
+                    return request.eventLoop.makeSucceededFuture(response)
+                }
+
                 // Build XML response for S3Error
                 let payload = S3ErrorResponse(
                     Code: s3Error.code,
@@ -37,13 +49,10 @@ struct S3ErrorMiddleware: Middleware {
 
                     var headers = HTTPHeaders()
                     headers.contentType = .xml
-                    headers.replaceOrAdd(name: "x-amz-request-id", value: s3Error.requestId)
-                    headers.replaceOrAdd(
-                        name: "x-amz-id-2",
-                        value: s3Error.requestId + "-" + String(Int.random(in: 1000...9999)))
 
                     let response = Response(
                         status: s3Error.status, headers: headers, body: .init(data: xmlData))
+                    Self.addRequestIdHeaders(to: response, requestId: s3Error.requestId)
                     return request.eventLoop.makeSucceededFuture(response)
                 } catch {
                     // If encoding fails, fall through to default
@@ -53,6 +62,17 @@ struct S3ErrorMiddleware: Middleware {
                 // Not S3Error, fall through to default
                 return self.defaultErrorHandling(request: request, error: error)
             }
+        }
+    }
+
+    private static func addRequestIdHeaders(to response: Response, requestId: String) {
+        if response.headers.first(name: "x-amz-request-id") == nil {
+            response.headers.add(name: "x-amz-request-id", value: requestId)
+        }
+        if response.headers.first(name: "x-amz-id-2") == nil {
+            response.headers.add(
+                name: "x-amz-id-2",
+                value: requestId + "-" + String(Int.random(in: 1000...9999)))
         }
     }
 

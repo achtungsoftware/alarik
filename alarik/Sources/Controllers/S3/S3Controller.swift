@@ -273,7 +273,20 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        if (try await Bucket.query(on: req.db).filter(\.$name == bucketName).first()) != nil {
+        // Authenticate BEFORE the existence check - answering 409 to unsigned requests
+        // would let anyone enumerate bucket names without credentials
+        let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
+
+        if let existing = try await Bucket.query(on: req.db).filter(\.$name == bucketName).first()
+        {
+            // us-east-1 semantics (the region Alarik reports): re-creating a bucket you
+            // already own is a 200 OK no-op; only someone else's bucket is a 409
+            // (verified against the CreateBucket API reference)
+            if existing.$user.id == key.user.id {
+                let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+                response.headers.replaceOrAdd(name: "Location", value: "/\(bucketName)")
+                return response
+            }
             throw S3Error(
                 status: .conflict,
                 code: "BucketAlreadyExists",
@@ -281,7 +294,6 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
         try await BucketService.create(on: req.db, bucketName: bucketName, userId: key.user.id!)
 
         let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
