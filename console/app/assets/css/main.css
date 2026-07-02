@@ -33,16 +33,6 @@ limitations under the License.
     --ui-text-toned: var(--ui-color-neutral-600);
 
 
-    /* Main background color */
-    --ui-bg: var(--color-white);
-    /* Subtle background */
-    --ui-bg-muted: var(--ui-color-neutral-50);
-    /* Slightly elevated background */
-    --ui-bg-elevated: var(--ui-color-neutral-100);
-    /* More prominent background */
-    --ui-bg-accented: var(--ui-color-neutral-200);
-    /* Inverted background color */
-    --ui-bg-inverted: var(--ui-color-neutral-900);
 
     /* Default border color */
     --ui-border: var(--ui-color-neutral-200);
@@ -70,16 +60,6 @@ limitations under the License.
     /* Most prominent text */
     --ui-text-highlighted: #ededed;
 
-    /* Main background color */
-    --ui-bg: #000;
-    /* Subtle background */
-    --ui-bg-muted: var(--ui-color-neutral-950);
-    /* Slightly elevated background */
-    --ui-bg-elevated: var(--ui-color-neutral-800);
-    /* More prominent background */
-    --ui-bg-accented: var(--ui-color-neutral-700);
-    /* Inverted background color */
-    --ui-bg-inverted: var(--color-white);
 
     /* Default border color */
     --ui-border: var(--ui-color-neutral-800);

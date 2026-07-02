@@ -16,7 +16,7 @@ limitations under the License.
 
 export default defineNuxtConfig({
     compatibilityDate: "2025-07-15",
-    devtools: { enabled: true },
+    devtools: { enabled: false },
     modules: ["@nuxt/ui", "nuxt-charts"],
     css: ["~/assets/css/main.css"],
     routeRules: {
@@ -31,7 +31,7 @@ export default defineNuxtConfig({
     },
     runtimeConfig: {
         public: {
-            appVersion: "1.0.0-alpha-21", // Updated by publish.sh
+            appVersion: "1.0.0-alpha-22", // Updated by publish.sh
             apiBaseUrl: "http://localhost:8080",
             consoleBaseUrl: "http://localhost:3000",
             allowAccountCreation: false,
