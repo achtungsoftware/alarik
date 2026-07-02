@@ -179,10 +179,7 @@ async function sendTest(rule: NotificationRule) {
             <div class="space-y-4">
                 <UAlert v-if="error != ''" title="Error" :description="error" color="error" variant="subtle" />
 
-                <p class="text-sm text-muted">
-                    Alarik POSTs an S3-compatible event to each enabled URL when matching objects change. Add a secret to receive an
-                    <span class="font-mono">X-Alarik-Signature-256</span> HMAC header for verification.
-                </p>
+                <UAlert description="Alarik POSTs an S3-compatible event to each enabled URL when matching objects change. Add a secret to receive an X-Alarik-Signature-256 HMAC header for verification." color="info" variant="subtle" />
 
                 <div v-if="isLoading" class="flex items-center justify-center p-6">
                     <LoadingIndicator />
@@ -209,7 +206,7 @@ async function sendTest(rule: NotificationRule) {
 
                             <UInput v-model="rule.url" placeholder="https://example.com/webhook" variant="subtle" class="w-full" icon="i-lucide-link" />
 
-                            <USelectMenu v-model="rule.events" :items="EVENT_OPTIONS" value-key="value" multiple placeholder="Select events" variant="subtle" class="w-full" />
+                            <USelectMenu v-model="rule.events" :items="EVENT_OPTIONS" value-key="value" multiple placeholder="Select events" variant="subtle" class="w-full" size="lg" />
 
                             <div class="flex gap-2">
                                 <UInput v-model="rule.prefix" placeholder="Prefix filter (optional)" variant="subtle" class="flex-1" />

@@ -69,7 +69,7 @@ function canRemove(status: UploadStatus): boolean {
 </script>
 
 <template>
-    <USlideover v-model:open="isSlideoverOpen" title="Uploads" :ui="{ content: 'w-full max-w-md' }">
+    <USlideover v-model:open="isSlideoverOpen" inset title="Uploads" :ui="{ content: 'w-full max-w-md' }">
         <template #body>
             <div class="flex flex-col h-full">
                 <!-- Overall Progress -->
