@@ -51,12 +51,28 @@ const endpoint = computed(() => `${useRuntimeConfig().public.apiBaseUrl}/api/v1/
 
 const rules = ref<NotificationRule[]>([]);
 
+interface Delivery {
+    id: string;
+    ruleId: string;
+    url: string;
+    state: "pending" | "failed";
+    attempts: number;
+    nextAttemptAt: string;
+    lastError?: string;
+    createdAt: string;
+}
+
+const deliveries = ref<Delivery[]>([]);
+const isLoadingDeliveries = ref(false);
+const retryingId = ref<string | null>(null);
+
 watch(
     () => props.open,
     (val) => {
         open.value = val;
         if (val) {
             fetchRules();
+            fetchDeliveries();
         }
     },
     { immediate: true }
@@ -170,6 +186,64 @@ async function sendTest(rule: NotificationRule) {
         testingId.value = null;
     }
 }
+
+async function fetchDeliveries() {
+    try {
+        isLoadingDeliveries.value = true;
+
+        const response = await $fetch<{ deliveries: Delivery[] }>(`${endpoint.value}/deliveries`, {
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        });
+        deliveries.value = response.deliveries;
+    } catch (err: any) {
+        // Non-fatal: the rules editor above is the primary content of this modal, a failed
+        // delivery-history fetch shouldn't block using it.
+        console.error("Failed to fetch deliveries:", err);
+    } finally {
+        isLoadingDeliveries.value = false;
+    }
+}
+
+async function retryDelivery(delivery: Delivery) {
+    try {
+        retryingId.value = delivery.id;
+
+        await $fetch(`${endpoint.value}/deliveries/${delivery.id}/retry`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        });
+
+        toast.add({
+            title: "Retry queued",
+            description: `Redelivery to ${delivery.url} has been queued.`,
+            icon: "i-lucide-refresh-ccw",
+            color: "success",
+        });
+
+        await fetchDeliveries();
+    } catch (err: any) {
+        toast.add({
+            title: "Retry Failed",
+            description: err.response?._data?.reason ?? "Unknown error",
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+    } finally {
+        retryingId.value = null;
+    }
+}
+
+function relativeTime(iso: string): string {
+    const diffMs = Date.now() - new Date(iso).getTime();
+    const diffSec = Math.round(diffMs / 1000);
+    if (Math.abs(diffSec) < 60) return "just now";
+    const diffMin = Math.round(diffSec / 60);
+    if (Math.abs(diffMin) < 60) return `${diffMin}m ago`;
+    const diffHour = Math.round(diffMin / 60);
+    if (Math.abs(diffHour) < 24) return `${diffHour}h ago`;
+    const diffDay = Math.round(diffHour / 24);
+    return `${diffDay}d ago`;
+}
 </script>
 <template>
     <UModal v-model:open="open" :title="`Webhooks — ${bucket.name}`" :ui="{ footer: 'justify-end', content: 'max-w-2xl' }">
@@ -221,6 +295,48 @@ async function sendTest(rule: NotificationRule) {
 
                     <UEmpty v-if="rules.length === 0" title="No Webhooks" description="This bucket has no notification rules yet." icon="i-lucide-webhook" size="sm" variant="naked" />
                 </div>
+
+                <UCard variant="subtle">
+                    <template #header>
+                        <CardHeader title="Recent Deliveries" size="sm" :badge="deliveries.length > 0 ? deliveries.length + '' : undefined">
+                            <template #rightContent>
+                                <UButton icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" :loading="isLoadingDeliveries" @click="fetchDeliveries" />
+                            </template>
+                        </CardHeader>
+                    </template>
+                    <template #default>
+                        <div v-if="isLoadingDeliveries && deliveries.length === 0" class="flex items-center justify-center p-4">
+                            <LoadingIndicator />
+                        </div>
+                        <UEmpty v-else-if="deliveries.length === 0" title="No Deliveries Yet" description="Events will show up here once something happens in this bucket." icon="i-lucide-inbox" size="sm" variant="naked" />
+                        <div v-else class="divide-y divide-default -mx-4">
+                            <div v-for="delivery in deliveries" :key="delivery.id" class="px-4 py-2 flex items-start justify-between gap-2">
+                                <div class="min-w-0 flex-1">
+                                    <div class="flex items-center gap-2">
+                                        <UBadge :color="delivery.state === 'failed' ? 'error' : 'warning'" variant="subtle" size="xs">
+                                            {{ delivery.state === "failed" ? "Failed" : "Pending" }}
+                                        </UBadge>
+                                        <span class="text-xs text-muted truncate">{{ delivery.url }}</span>
+                                    </div>
+                                    <div class="text-xs text-muted mt-1">
+                                        {{ relativeTime(delivery.createdAt) }} · {{ delivery.attempts }} attempt{{ delivery.attempts === 1 ? "" : "s" }}
+                                        <span v-if="delivery.lastError" :title="delivery.lastError"> · {{ delivery.lastError.length > 40 ? delivery.lastError.substring(0, 40) + "…" : delivery.lastError }}</span>
+                                    </div>
+                                </div>
+                                <UButton
+                                    v-if="delivery.state === 'failed'"
+                                    label="Retry"
+                                    icon="i-lucide-refresh-ccw"
+                                    variant="subtle"
+                                    color="neutral"
+                                    size="xs"
+                                    :loading="retryingId === delivery.id"
+                                    @click="retryDelivery(delivery)"
+                                />
+                            </div>
+                        </div>
+                    </template>
+                </UCard>
             </div>
         </template>
 

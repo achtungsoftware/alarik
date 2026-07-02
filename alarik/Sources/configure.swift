@@ -58,6 +58,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddUserOIDCFields())
     app.migrations.add(AddBucketNotificationConfig())
     app.migrations.add(CreateNotificationDelivery())
+    app.migrations.add(AddNotificationDeliveryLastError())
 
     app.migrations.add(CreateDefaultUser())
 

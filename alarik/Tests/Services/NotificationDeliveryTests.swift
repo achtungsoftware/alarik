@@ -450,4 +450,170 @@ struct NotificationDeliveryTests {
                 afterResponse: { res async in #expect(res.status == .badRequest) })
         }
     }
+
+    // MARK: - Delivery health (list + retry)
+
+    @Test("listing deliveries reports a failed delivery's attempt count and last error")
+    func listDeliveriesReportsFailureDetails() async throws {
+        let receiver = try await FakeReceiver.start()
+        defer { Task { try? await receiver.shutdown() } }
+
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            _ = try await configureBucket(app, bucket: "health-bucket", receiver: receiver)
+            await receiver.state.setFailFirst(99)
+
+            await NotificationService.emit(
+                event: .objectCreatedPut, bucketName: "health-bucket", key: "a.txt", size: 1,
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+
+            // Drive one failed attempt so attempts/lastError are populated
+            await NotificationDispatcher.shared.drain()
+            try await Task.sleep(nanoseconds: 200_000_000)
+
+            try await app.test(
+                .GET, "/api/v1/buckets/health-bucket/notifications/deliveries",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(
+                        InternalBucketController.DeliveriesDTO.self)
+                    let delivery = try #require(dto.deliveries.first)
+                    #expect(delivery.state == "pending")
+                    #expect(delivery.attempts >= 1)
+                    #expect(delivery.lastError != nil)
+                    #expect(delivery.lastError?.contains("503") == true)
+                })
+        }
+    }
+
+    @Test("a dead-lettered delivery can be retried and redelivers")
+    func retryDeadLetteredDelivery() async throws {
+        let receiver = try await FakeReceiver.start()
+        defer { Task { try? await receiver.shutdown() } }
+
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            _ = try await configureBucket(app, bucket: "retry-health-bucket", receiver: receiver)
+
+            // Fail every attempt until the row is dead-lettered
+            await receiver.state.setFailFirst(NotificationDispatcher.maxAttempts + 5)
+
+            await NotificationService.emit(
+                event: .objectCreatedPut, bucketName: "retry-health-bucket", key: "a.txt",
+                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+
+            // Force through every retry immediately (skip the real backoff) until dead-lettered
+            var isFailed = false
+            for _ in 0..<(NotificationDispatcher.maxAttempts + 2) {
+                await NotificationDispatcher.shared.drain()
+                if let row = try await NotificationDelivery.query(on: app.db)
+                    .filter(\.$bucketName == "retry-health-bucket")
+                    .first()
+                {
+                    if row.state == NotificationDelivery.State.failed.rawValue {
+                        isFailed = true
+                        break
+                    }
+                    row.nextAttemptAt = Date().addingTimeInterval(-1)
+                    try await row.save(on: app.db)
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            #expect(isFailed)
+
+            let deadRow = try #require(
+                try await NotificationDelivery.query(on: app.db)
+                    .filter(\.$bucketName == "retry-health-bucket")
+                    .first())
+            #expect(deadRow.state == NotificationDelivery.State.failed.rawValue)
+
+            // Now let the receiver succeed and retry via the API
+            await receiver.state.setFailFirst(0)
+
+            try await app.test(
+                .POST,
+                "/api/v1/buckets/retry-health-bucket/notifications/deliveries/\(deadRow.id!.uuidString)/retry",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.DeliveryDTO.self)
+                    #expect(dto.state == "pending")
+                    #expect(dto.attempts == 0)
+                })
+
+            #expect(try await waitForDeliveries(receiver, atLeast: 1))
+            #expect(
+                try await NotificationDelivery.query(on: app.db)
+                    .filter(\.$bucketName == "retry-health-bucket")
+                    .count() == 0)
+        }
+    }
+
+    @Test("retry only affects deliveries belonging to the requested bucket")
+    func retryScopedToOwnBucket() async throws {
+        let receiver = try await FakeReceiver.start()
+        defer { Task { try? await receiver.shutdown() } }
+
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            _ = try await configureBucket(app, bucket: "scope-bucket-a", receiver: receiver)
+            _ = try await configureBucket(app, bucket: "scope-bucket-b", receiver: receiver)
+            await receiver.state.setFailFirst(99)
+
+            await NotificationService.emit(
+                event: .objectCreatedPut, bucketName: "scope-bucket-b", key: "a.txt", size: 1,
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+            await NotificationDispatcher.shared.drain()
+
+            let rowInB = try #require(
+                try await NotificationDelivery.query(on: app.db)
+                    .filter(\.$bucketName == "scope-bucket-b")
+                    .first())
+
+            // Attempting to retry bucket-b's delivery through bucket-a's path must 404
+            try await app.test(
+                .POST,
+                "/api/v1/buckets/scope-bucket-a/notifications/deliveries/\(rowInB.id!.uuidString)/retry",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("listing/retrying deliveries requires ownership and auth")
+    func deliveriesEndpointsRequireOwnershipAndAuth() async throws {
+        let receiver = try await FakeReceiver.start()
+        defer { Task { try? await receiver.shutdown() } }
+
+        try await withApp { app in
+            _ = try await configureBucket(app, bucket: "owned-bucket", receiver: receiver)
+
+            // No auth at all
+            try await app.test(
+                .GET, "/api/v1/buckets/owned-bucket/notifications/deliveries",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+
+            // Authenticated, but a different (non-owning) user
+            let otherToken = try await createUserAndLogin(
+                app, username: "not-the-owner@example.com")
+            try await app.test(
+                .GET, "/api/v1/buckets/owned-bucket/notifications/deliveries",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
 }

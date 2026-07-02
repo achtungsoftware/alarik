@@ -1287,4 +1287,113 @@ struct InternalAdminControllerTests {
                 })
         }
     }
+
+    // MARK: - Bucket stats
+
+    private func putTestObject(bucketName: String, key: String, content: String) throws {
+        let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+        let data = content.data(using: .utf8)!
+        let meta = ObjectMeta(
+            bucketName: bucketName,
+            key: key,
+            size: data.count,
+            contentType: "text/plain",
+            etag: Insecure.MD5.hash(data: data).hex,
+            updatedAt: Date()
+        )
+        try ObjectFileHandler.write(metadata: meta, data: data, to: path)
+    }
+
+    @Test("Get bucket stats as admin - reports size and object count, works on any user's bucket")
+    func testGetBucketStatsAsAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "stats-bucket", userId: nonAdminUserId)
+            try putTestObject(bucketName: "stats-bucket", key: "a.txt", content: "12345")
+            try putTestObject(bucketName: "stats-bucket", key: "dir/b.txt", content: "1234567890")
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/stats-bucket/stats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalAdminController.BucketStatsDTO.self)
+                    #expect(dto.objectCount == 2)
+                    // .obj files store a metadata envelope alongside the payload, so on-disk
+                    // size is somewhat larger than the raw content bytes (15) - assert it's at
+                    // least that much rather than pinning the exact envelope format.
+                    #expect(dto.sizeBytes >= 15)
+                })
+        }
+    }
+
+    @Test("Get bucket stats as admin - empty bucket reports zero")
+    func testGetBucketStatsEmptyBucket() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            let nonAdminUserId = try await createNonAdminUserWithAccessKey(app)
+            try await createBucketForUser(
+                app, bucketName: "empty-stats-bucket", userId: nonAdminUserId)
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/empty-stats-bucket/stats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalAdminController.BucketStatsDTO.self)
+                    #expect(dto.objectCount == 0)
+                    #expect(dto.sizeBytes == 0)
+                })
+        }
+    }
+
+    @Test("Get bucket stats as admin - Non-existent bucket fails")
+    func testGetBucketStatsNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/does-not-exist/stats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Get bucket stats as non admin - should fail")
+    func testGetBucketStatsAsNonAdmin() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/some-bucket/stats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("Get bucket stats without auth - should fail")
+    func testGetBucketStatsWithoutAuth() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/admin/buckets/some-bucket/stats",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
 }

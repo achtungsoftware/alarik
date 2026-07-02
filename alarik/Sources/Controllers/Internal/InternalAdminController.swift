@@ -48,6 +48,11 @@ struct InternalAdminController: RouteCollection {
         let policy: String?
     }
 
+    struct BucketStatsDTO: Content {
+        let sizeBytes: Int64
+        let objectCount: Int
+    }
+
     func boot(routes: any RoutesBuilder) throws {
 
         routes.grouped("admin").grouped("users")
@@ -80,6 +85,9 @@ struct InternalAdminController: RouteCollection {
             use: self.setBucketPolicy)
         routes.grouped("admin").grouped("buckets").grouped(":bucketName").grouped("policy").delete(
             use: self.deleteBucketPolicy)
+
+        routes.grouped("admin").grouped("buckets").grouped(":bucketName").grouped("stats").get(
+            use: self.getBucketStats)
     }
 
     @Sendable
@@ -166,6 +174,24 @@ struct InternalAdminController: RouteCollection {
             req: req, bucket: bucket, bucketName: bucketName)
 
         return .noContent
+    }
+
+    /// Disk usage and object count for a single bucket. Deliberately its own on-demand
+    /// endpoint rather than a field on `listBuckets` - a recursive directory walk per bucket
+    /// on every page load would make the bucket list slow to scale; the console fetches this
+    /// lazily, one call per row already on screen.
+    @Sendable
+    func getBucketStats(req: Request) async throws -> BucketStatsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+        _ = try await fetchAnyBucket(req: req, bucketName: bucketName)
+
+        let (sizeBytes, objectCount) = BucketHandler.calculateStats(bucketName: bucketName)
+        return BucketStatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
     }
 
     @Sendable

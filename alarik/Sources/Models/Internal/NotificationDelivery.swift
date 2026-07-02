@@ -63,6 +63,12 @@ final class NotificationDelivery: Model, @unchecked Sendable {
     @Field(key: "state")
     var state: String
 
+    /// The reason the most recent delivery attempt failed - an HTTP status ("HTTP 503") or a
+    /// transport error description. Nil until the first failure; not cleared on success since
+    /// a successful row is deleted outright, never left around with a stale error.
+    @Field(key: "last_error")
+    var lastError: String?
+
     @Field(key: "created_at")
     var createdAt: Date
 

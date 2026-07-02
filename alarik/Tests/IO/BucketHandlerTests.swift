@@ -182,4 +182,146 @@ struct BucketHandlerTests {
             #expect(try BucketHandler.countKeys(name: "testbucket") == 0)
         }
     }
+
+    // MARK: - calculateStats
+
+    @Test("calculateStats - Non-existent bucket reports zero")
+    func testCalculateStatsNonExistentBucket() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            let stats = BucketHandler.calculateStats(bucketName: "does-not-exist")
+            #expect(stats.sizeBytes == 0)
+            #expect(stats.objectCount == 0)
+        }
+    }
+
+    @Test("calculateStats - Empty bucket reports zero")
+    func testCalculateStatsEmptyBucket() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "empty-stats")
+            let stats = BucketHandler.calculateStats(bucketName: "empty-stats")
+            #expect(stats.sizeBytes == 0)
+            #expect(stats.objectCount == 0)
+        }
+    }
+
+    @Test("calculateStats - Sums size of every file but only counts .obj files as objects")
+    func testCalculateStatsMixedFiles() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "stats-bucket")
+            let bucketURL = BucketHandler.bucketURL(for: "stats-bucket")
+
+            // Two real objects (5 + 10 bytes) plus a non-.obj sidecar file (3 bytes) that
+            // should count toward size but not objectCount
+            try "12345".write(
+                to: bucketURL.appendingPathComponent("a.txt.obj"), atomically: true,
+                encoding: .utf8)
+            try "1234567890".write(
+                to: bucketURL.appendingPathComponent("b.txt.obj"), atomically: true,
+                encoding: .utf8)
+            try "xyz".write(
+                to: bucketURL.appendingPathComponent("notes.meta"), atomically: true,
+                encoding: .utf8)
+
+            let stats = BucketHandler.calculateStats(bucketName: "stats-bucket")
+            #expect(stats.objectCount == 2)
+            #expect(stats.sizeBytes == 18)  // 5 + 10 + 3
+        }
+    }
+
+    @Test("calculateStats - Recurses into nested folders")
+    func testCalculateStatsNested() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "nested-stats")
+            let bucketURL = BucketHandler.bucketURL(for: "nested-stats")
+
+            try "12345".write(
+                to: bucketURL.appendingPathComponent("root.txt.obj"), atomically: true,
+                encoding: .utf8)
+
+            let subDir = bucketURL.appendingPathComponent("dir/sub")
+            try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+            try "1234567890".write(
+                to: subDir.appendingPathComponent("deep.txt.obj"), atomically: true,
+                encoding: .utf8)
+
+            let stats = BucketHandler.calculateStats(bucketName: "nested-stats")
+            #expect(stats.objectCount == 2)
+            #expect(stats.sizeBytes == 15)
+        }
+    }
+
+    @Test("calculateStats - A non-empty prefix scopes the walk to just that folder")
+    func testCalculateStatsScopedToPrefix() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "scoped-stats")
+            let bucketURL = BucketHandler.bucketURL(for: "scoped-stats")
+
+            try "12345".write(
+                to: bucketURL.appendingPathComponent("root.txt.obj"), atomically: true,
+                encoding: .utf8)
+
+            let folderA = bucketURL.appendingPathComponent("folderA")
+            try FileManager.default.createDirectory(at: folderA, withIntermediateDirectories: true)
+            try "1234567890".write(
+                to: folderA.appendingPathComponent("a.txt.obj"), atomically: true, encoding: .utf8)
+            try "12".write(
+                to: folderA.appendingPathComponent("b.txt.obj"), atomically: true, encoding: .utf8)
+
+            let folderB = bucketURL.appendingPathComponent("folderB")
+            try FileManager.default.createDirectory(at: folderB, withIntermediateDirectories: true)
+            try "1".write(
+                to: folderB.appendingPathComponent("c.txt.obj"), atomically: true, encoding: .utf8)
+
+            // Whole bucket sees everything
+            let wholeBucket = BucketHandler.calculateStats(bucketName: "scoped-stats")
+            #expect(wholeBucket.objectCount == 4)
+            #expect(wholeBucket.sizeBytes == 18)  // 5 + 10 + 2 + 1
+
+            // Scoped to folderA only sees its own two objects
+            let scoped = BucketHandler.calculateStats(bucketName: "scoped-stats", prefix: "folderA")
+            #expect(scoped.objectCount == 2)
+            #expect(scoped.sizeBytes == 12)  // 10 + 2
+        }
+    }
+
+    @Test("calculateStats - A non-existent prefix within a real bucket reports zero, not the whole bucket")
+    func testCalculateStatsNonExistentPrefix() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "prefix-miss-stats")
+            let bucketURL = BucketHandler.bucketURL(for: "prefix-miss-stats")
+            try "12345".write(
+                to: bucketURL.appendingPathComponent("root.txt.obj"), atomically: true,
+                encoding: .utf8)
+
+            let stats = BucketHandler.calculateStats(
+                bucketName: "prefix-miss-stats", prefix: "no-such-folder")
+            #expect(stats.sizeBytes == 0)
+            #expect(stats.objectCount == 0)
+        }
+    }
+
+    @Test("calculateStats - Path traversal in prefix is sanitized, never escaping the bucket")
+    func testCalculateStatsPrefixTraversalSanitized() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            try BucketHandler.create(name: "traversal-stats")
+            let bucketURL = BucketHandler.bucketURL(for: "traversal-stats")
+            try "12345".write(
+                to: bucketURL.appendingPathComponent("root.txt.obj"), atomically: true,
+                encoding: .utf8)
+
+            // "../../etc" sanitizes down to "etc" (a nonexistent folder inside the bucket),
+            // never escapes to a real path outside the bucket directory
+            let stats = BucketHandler.calculateStats(
+                bucketName: "traversal-stats", prefix: "../../etc")
+            #expect(stats.sizeBytes == 0)
+            #expect(stats.objectCount == 0)
+        }
+    }
 }

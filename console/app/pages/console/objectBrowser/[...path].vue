@@ -47,8 +47,23 @@ const selectedBucketForNotifications = ref<Bucket | null>(null);
 const openShareModal = ref(false);
 const shareObject = ref<BrowserItem | null>(null);
 
+const searchInput = ref("");
+const searchQuery = ref("");
+let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+watch(searchInput, (val) => {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+        searchQuery.value = val.trim();
+    }, 300);
+});
+watch(searchQuery, () => {
+    page.value = 1;
+    rowSelection.value = {};
+});
+
 const { isDeleting, isDownloading, deleteObjects, downloadObjects, downloadSingleObject } = useObjectService();
 const { addToQueue, addFolderToQueue, isUploading, openSlideover, onBatchComplete } = useUploadQueue();
+const { filesFromDataTransfer } = useDragDropFiles();
 
 // Refresh the list when uploads complete
 onBatchComplete(() => {
@@ -69,10 +84,12 @@ const currentPrefix = computed(() => {
     return pathSegments.slice(1).join("/") + "/";
 });
 
-// Reset page when navigation changes
+// Reset page and search when navigation changes
 watch([currentBucket, currentPrefix], () => {
     page.value = 1;
     rowSelection.value = {};
+    searchInput.value = "";
+    searchQuery.value = "";
 });
 
 const selectedItems = computed(() => {
@@ -158,6 +175,7 @@ const {
     params: {
         bucket: currentBucket,
         prefix: currentPrefix,
+        search: searchQuery,
         page: page,
         per: itemsPerPage,
     },
@@ -168,9 +186,9 @@ const {
     default: () => ({ items: [], metadata: { page: 1, per: 100, total: 0 } }),
 });
 
-// Fetch objects when navigating into a bucket
+// Fetch objects when navigating into a bucket, or when the search query changes
 watch(
-    [currentBucket, currentPrefix, page],
+    [currentBucket, currentPrefix, page, searchQuery],
     () => {
         if (currentBucket.value) {
             refresh();
@@ -202,6 +220,46 @@ const displayItems = computed<BrowserItem[]>(() => {
 
 const status = computed(() => {
     return !currentBucket.value ? bucketsStatus.value : objectsStatus.value;
+});
+
+// Bucket/folder sizes aren't in the list response (a recursive directory walk per row on
+// every page load would make listing slow to scale) - instead fetched lazily, one small
+// request per bucket/folder already visible on the current page. Keyed by item.key, which is
+// unique within a single listing (root = bucket names, inside a bucket = folder keys).
+interface EntryStats {
+    sizeBytes: number;
+    objectCount: number;
+}
+const entryStats = ref<Record<string, EntryStats | "loading" | "error">>({});
+
+watch(
+    displayItems,
+    (items) => {
+        for (const item of items) {
+            if (!item.isFolder) continue;
+            if (entryStats.value[item.key]) continue;
+
+            entryStats.value[item.key] = "loading";
+            const params = item.isBucket ? { bucket: item.key } : { bucket: currentBucket.value, prefix: item.key };
+            $fetch<EntryStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/stats`, {
+                headers: { Authorization: `Bearer ${jwtCookie.value}` },
+                params,
+            })
+                .then((stats) => {
+                    entryStats.value[item.key] = stats;
+                })
+                .catch(() => {
+                    entryStats.value[item.key] = "error";
+                });
+        }
+    },
+    { immediate: true }
+);
+
+// Cheap invalidation on navigation - stale folder stats from a different bucket/prefix must
+// never bleed into a fresh listing that happens to reuse the same folder name.
+watch([currentBucket, currentPrefix], () => {
+    entryStats.value = {};
 });
 
 // Pagination metadata
@@ -258,8 +316,13 @@ const columns: TableColumn<BrowserItem>[] = [
         accessorKey: "size",
         header: "Size",
         cell: ({ row }) => {
-            if (row.original.isFolder || row.original.isBucket) return "-";
-            return formatBytes(row.original.size);
+            const item = row.original;
+            if (!item.isFolder) return formatBytes(item.size);
+
+            const stats = entryStats.value[item.key];
+            if (!stats || stats === "loading") return h(resolveComponent("LoadingIndicator"), { size: 14 });
+            if (stats === "error") return h("span", { class: "text-muted" }, "—");
+            return formatBytes(stats.sizeBytes);
         },
     },
     {
@@ -450,6 +513,49 @@ async function downloadSelected() {
     }
 }
 
+function clearSearch() {
+    searchInput.value = "";
+}
+
+// Drag-and-drop upload - only active while browsing inside a bucket. Uses an enter/leave
+// counter (not a boolean) because dragenter/dragleave fire on every child element as the
+// pointer crosses them, not just once for the drop zone as a whole.
+const isDraggingOver = ref(false);
+let dragCounter = 0;
+
+function onDragEnter() {
+    if (!currentBucket.value) return;
+    dragCounter++;
+    isDraggingOver.value = true;
+}
+
+function onDragLeave() {
+    if (!currentBucket.value) return;
+    dragCounter--;
+    if (dragCounter <= 0) {
+        dragCounter = 0;
+        isDraggingOver.value = false;
+    }
+}
+
+async function onDrop(event: DragEvent) {
+    dragCounter = 0;
+    isDraggingOver.value = false;
+    if (!currentBucket.value || !event.dataTransfer) return;
+
+    const { files, hasFolders } = await filesFromDataTransfer(event.dataTransfer);
+    if (files.length === 0) return;
+
+    // addFolderToQueue preserves structure via webkitRelativePath when present and falls back
+    // to a flat root placement otherwise, so it's correct for both folder and plain file drops
+    // (including a mixed drop of both).
+    if (hasFolders) {
+        addFolderToQueue(currentBucket.value, currentPrefix.value, files);
+    } else {
+        addToQueue(currentBucket.value, currentPrefix.value, files);
+    }
+}
+
 function triggerFileUpload() {
     fileInput.value?.click();
 }
@@ -510,7 +616,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
 }
 </script>
 <template>
-    <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" />
+    <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" @saved="refresh" />
     <BucketPolicyModal v-if="selectedBucketForPolicy && openBucketPolicyModal" v-model:open="openBucketPolicyModal" :bucket="selectedBucketForPolicy" @saved="refreshBuckets" />
     <BucketTagsModal v-if="selectedBucketForTags && openBucketTagsModal" v-model:open="openBucketTagsModal" :bucket="selectedBucketForTags" @saved="refreshBuckets" />
     <BucketNotificationsModal v-if="selectedBucketForNotifications && openBucketNotificationsModal" v-model:open="openBucketNotificationsModal" :bucket="selectedBucketForNotifications" @saved="refreshBuckets" />
@@ -584,19 +690,58 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
                 </template>
             </UDashboardNavbar>
 
-            <UDashboardToolbar v-if="breadcrumbItems.length > 1">
+            <UDashboardToolbar v-if="breadcrumbItems.length > 1 || currentBucket">
                 <template #left>
-                    <UBreadcrumb :items="breadcrumbItems">
+                    <UBreadcrumb :items="breadcrumbItems" class="min-w-0 shrink truncate">
                         <template #separator>
                             <span class="mx-2 text-muted">/</span>
                         </template>
                     </UBreadcrumb>
                 </template>
+                <template #right>
+                    <UInput
+                        v-if="currentBucket"
+                        v-model="searchInput"
+                        placeholder="Search…"
+                        icon="i-lucide-search"
+                        variant="subtle"
+                        size="sm"
+                        class="hidden sm:block sm:w-64"
+                        :trailing="searchInput.length > 0"
+                    >
+                        <template v-if="searchInput.length > 0" #trailing>
+                            <UButton icon="i-lucide-x" color="neutral" variant="link" size="xs" aria-label="Clear search" @click="clearSearch" />
+                        </template>
+                    </UInput>
+                </template>
             </UDashboardToolbar>
+
+            <div v-if="currentBucket" class="px-4 py-2 border-b border-default sm:hidden">
+                <UInput
+                    v-model="searchInput"
+                    placeholder="Search this bucket…"
+                    icon="i-lucide-search"
+                    variant="subtle"
+                    size="sm"
+                    class="w-full"
+                    :trailing="searchInput.length > 0"
+                >
+                    <template v-if="searchInput.length > 0" #trailing>
+                        <UButton icon="i-lucide-x" color="neutral" variant="link" size="xs" aria-label="Clear search" @click="clearSearch" />
+                    </template>
+                </UInput>
+            </div>
         </template>
 
         <template #body>
-            <div class="flex flex-col">
+            <div class="flex flex-col relative" @dragenter.prevent="onDragEnter" @dragover.prevent @dragleave.prevent="onDragLeave" @drop.prevent="onDrop">
+                <div v-if="isDraggingOver" class="absolute inset-0 z-10 flex items-center justify-center bg-primary/10 border-2 border-dashed border-primary rounded-lg pointer-events-none m-2">
+                    <div class="flex flex-col items-center gap-2 text-primary">
+                        <UIcon name="i-lucide-upload-cloud" class="w-10 h-10" />
+                        <span class="font-medium">Drop files or folders to upload</span>
+                    </div>
+                </div>
+
                 <!-- File browser table -->
                 <UTable
                     v-model:row-selection="rowSelection"

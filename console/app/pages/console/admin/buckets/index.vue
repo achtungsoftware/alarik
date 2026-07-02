@@ -56,6 +56,35 @@ const {
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
 
+// Size/object-count aren't in the list response (a recursive directory walk per bucket on
+// every page load would make this list slow to scale) - instead fetched lazily, one small
+// request per bucket already visible on the current page.
+interface BucketStats {
+    sizeBytes: number;
+    objectCount: number;
+}
+const bucketStats = ref<Record<string, BucketStats | "loading" | "error">>({});
+
+watch(
+    fetchResponse,
+    (response) => {
+        for (const bucket of response?.items ?? []) {
+            if (bucketStats.value[bucket.name]) continue;
+            bucketStats.value[bucket.name] = "loading";
+            $fetch<BucketStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets/${bucket.name}/stats`, {
+                headers: { Authorization: `Bearer ${jwtCookie.value}` },
+            })
+                .then((stats) => {
+                    bucketStats.value[bucket.name] = stats;
+                })
+                .catch(() => {
+                    bucketStats.value[bucket.name] = "error";
+                });
+        }
+    },
+    { immediate: true }
+);
+
 const columns: TableColumn<Bucket>[] = [
     {
         id: "select",
@@ -94,6 +123,26 @@ const columns: TableColumn<Bucket>[] = [
                 label: row.original.versioningStatus,
                 variant: row.original.versioningStatus == "Enabled" ? "solid" : "subtle"
             }),
+    },
+    {
+        id: "size",
+        header: "Size",
+        cell: ({ row }) => {
+            const stats = bucketStats.value[row.original.name];
+            if (!stats || stats === "loading") return h(resolveComponent("LoadingIndicator"), { size: 16 });
+            if (stats === "error") return h("span", { class: "text-muted" }, "—");
+            return formatBytes(stats.sizeBytes);
+        },
+    },
+    {
+        id: "objectCount",
+        header: "Objects",
+        cell: ({ row }) => {
+            const stats = bucketStats.value[row.original.name];
+            if (!stats || stats === "loading") return h(resolveComponent("LoadingIndicator"), { size: 16 });
+            if (stats === "error") return h("span", { class: "text-muted" }, "—");
+            return stats.objectCount.toLocaleString();
+        },
     },
     {
         accessorKey: "creationDate",

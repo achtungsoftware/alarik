@@ -27,7 +27,7 @@ const props = withDefaults(
     }
 );
 
-const emit = defineEmits(["update:open", "close", "versionDeleted"]);
+const emit = defineEmits(["update:open", "close", "versionDeleted", "saved"]);
 const open = ref(props.open);
 const jwtCookie = useJWTCookie();
 const toast = useToast();
@@ -40,6 +40,11 @@ const tagRows = ref<{ key: string; value: string }[]>([]);
 const loadingTags = ref(false);
 const savingTags = ref(false);
 
+const contentTypeInput = ref("");
+const metadataRows = ref<{ key: string; value: string }[]>([]);
+const loadingMetadata = ref(false);
+const savingMetadata = ref(false);
+
 watch(
     () => props.open,
     (val) => {
@@ -47,6 +52,7 @@ watch(
         if (val && props.item && props.bucketName) {
             fetchVersions();
             fetchTags();
+            fetchMetadata();
         }
     }
 );
@@ -56,8 +62,93 @@ watch(open, (val) => {
     if (!val) {
         versions.value = [];
         tagRows.value = [];
+        metadataRows.value = [];
     }
 });
+
+async function fetchMetadata() {
+    if (!props.item || !props.bucketName) return;
+
+    loadingMetadata.value = true;
+    try {
+        const response = await $fetch<{ contentType: string; metadata: Record<string, string> }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/metadata`, {
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+            params: {
+                bucket: props.bucketName,
+                key: props.item.key,
+            },
+        });
+        contentTypeInput.value = response.contentType;
+        metadataRows.value = Object.entries(response.metadata).map(([key, value]) => ({ key, value }));
+    } catch (error) {
+        console.error("Failed to fetch metadata:", error);
+        contentTypeInput.value = props.item.contentType;
+        metadataRows.value = [];
+    } finally {
+        loadingMetadata.value = false;
+    }
+}
+
+function addMetadataRow() {
+    metadataRows.value.push({ key: "", value: "" });
+}
+
+function removeMetadataRow(index: number) {
+    metadataRows.value.splice(index, 1);
+}
+
+async function saveMetadata() {
+    if (!props.item || !props.bucketName) return;
+    if (contentTypeInput.value.trim() === "") {
+        toast.add({
+            title: "Save Failed",
+            description: "Content-Type cannot be empty.",
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+        return;
+    }
+
+    savingMetadata.value = true;
+    try {
+        const metadata: Record<string, string> = {};
+        for (const row of metadataRows.value) {
+            if (row.key.trim() === "") continue;
+            metadata[row.key.trim()] = row.value;
+        }
+
+        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/metadata`, {
+            method: "PUT",
+            body: JSON.stringify({ contentType: contentTypeInput.value.trim(), metadata }),
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${jwtCookie.value}`,
+            },
+            params: {
+                bucket: props.bucketName,
+                key: props.item.key,
+            },
+        });
+
+        toast.add({
+            title: "Metadata saved",
+            description: `Content-Type and metadata for "${props.item.key}" were updated.`,
+            icon: "i-lucide-circle-check",
+            color: "success",
+        });
+
+        emit("saved");
+    } catch (error: any) {
+        toast.add({
+            title: "Save Failed",
+            description: error.data?.reason ?? "Failed to save metadata",
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+    } finally {
+        savingMetadata.value = false;
+    }
+}
 
 async function fetchTags() {
     if (!props.item || !props.bucketName) return;
@@ -282,12 +373,39 @@ function getVersionStatusBadge(version: BrowserItem) {
                         <div>
                             <NameValueLabel name="Key" :value="props.item.key" />
                             <NameValueLabel name="ETag" :value="props.item.etag" />
-                            <NameValueLabel name="Content-Type" :value="props.item.contentType" />
                             <NameValueLabel name="Size" :value="formatBytes(props.item.size)" />
                             <NameValueLabel name="Last Modified" :value="new Date(props.item.lastModified).toLocaleString()" />
                             <NameValueLabel name="Version Id" v-if="props.item.versionId" :value="props.item.versionId" />
                             <NameValueLabel name="Is Latest" v-if="props.item.isLatest !== undefined" :value="props.item.isLatest ? 'Yes' : 'No'" />
                             <NameValueLabel name="Is Delete Marker" v-if="props.item.isDeleteMarker" :value="'Yes'" />
+                        </div>
+                    </template>
+                </UCard>
+
+                <UCard variant="subtle">
+                    <template #header>
+                        <CardHeader title="Content-Type & Metadata" size="sm" />
+                    </template>
+                    <template #default>
+                        <div v-if="loadingMetadata" class="flex items-center justify-center p-4">
+                            <LoadingIndicator />
+                        </div>
+                        <div v-else class="space-y-3">
+                            <UInput v-model="contentTypeInput" placeholder="Content-Type" variant="subtle" size="sm" class="w-full" />
+
+                            <div class="space-y-2">
+                                <div v-for="(row, index) in metadataRows" :key="index" class="flex gap-2">
+                                    <UInput v-model="row.key" placeholder="x-amz-meta-key" variant="subtle" size="sm" class="flex-1" />
+                                    <UInput v-model="row.value" placeholder="Value" variant="subtle" size="sm" class="flex-1" />
+                                    <UButton icon="i-lucide-x" color="neutral" variant="subtle" size="sm" aria-label="Remove metadata entry" @click="removeMetadataRow(index)" />
+                                </div>
+
+                                <UButton label="Add Metadata" icon="i-lucide-plus" variant="subtle" color="neutral" size="sm" @click="addMetadataRow" />
+                            </div>
+
+                            <div class="flex justify-end">
+                                <UButton label="Save" :loading="savingMetadata" color="primary" size="sm" @click="saveMetadata" />
+                            </div>
                         </div>
                     </template>
                 </UCard>

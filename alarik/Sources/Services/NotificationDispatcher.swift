@@ -106,6 +106,7 @@ final actor NotificationDispatcher {
     /// schedules a retry with exponential backoff, dead-lettering after `maxAttempts`.
     private static func deliver(_ row: NotificationDelivery, app: Application) async {
         var succeeded = false
+        var failureReason: String?
         do {
             let response = try await app.client.post(URI(string: row.url)) { clientReq in
                 clientReq.headers.contentType = .json
@@ -119,8 +120,12 @@ final actor NotificationDispatcher {
                 clientReq.body = ByteBuffer(string: row.payload)
             }.get()
             succeeded = (200..<300).contains(response.status.code)
+            if !succeeded {
+                failureReason = "HTTP \(response.status.code)"
+            }
         } catch {
             succeeded = false
+            failureReason = "\(error)"
         }
 
         do {
@@ -128,6 +133,7 @@ final actor NotificationDispatcher {
                 try await row.delete(on: app.db)
             } else {
                 row.attempts += 1
+                row.lastError = failureReason
                 if row.attempts >= maxAttempts {
                     row.state = NotificationDelivery.State.failed.rawValue
                     app.logger.warning(

@@ -37,8 +37,44 @@ struct InternalBucketController: RouteCollection {
         let tags: [String: String]
     }
 
+    struct ObjectMetadataDTO: Content {
+        let contentType: String
+        let metadata: [String: String]
+    }
+
+    struct StatsDTO: Content {
+        let sizeBytes: Int64
+        let objectCount: Int
+    }
+
     struct NotificationConfigDTO: Content {
         let rules: [NotificationRule]
+    }
+
+    struct DeliveryDTO: Content {
+        let id: UUID
+        let ruleId: UUID
+        let url: String
+        let state: String
+        let attempts: Int
+        let nextAttemptAt: Date
+        let lastError: String?
+        let createdAt: Date
+
+        init(from delivery: NotificationDelivery) {
+            self.id = delivery.id!
+            self.ruleId = delivery.ruleId
+            self.url = delivery.url
+            self.state = delivery.state
+            self.attempts = delivery.attempts
+            self.nextAttemptAt = delivery.nextAttemptAt
+            self.lastError = delivery.lastError
+            self.createdAt = delivery.createdAt
+        }
+    }
+
+    struct DeliveriesDTO: Content {
+        let deliveries: [DeliveryDTO]
     }
 
     struct ShareRequestDTO: Content {
@@ -78,7 +114,13 @@ struct InternalBucketController: RouteCollection {
             use: self.setBucketNotifications)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
             .grouped(":ruleId").grouped("test").post(use: self.testBucketNotification)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
+            .grouped("deliveries").get(use: self.listBucketNotificationDeliveries)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
+            .grouped("deliveries").grouped(":deliveryId").grouped("retry")
+            .post(use: self.retryBucketNotificationDelivery)
         routes.grouped("objects").get(use: self.listObjects)
+        routes.grouped("objects", "stats").get(use: self.getObjectStats)
         routes.grouped("objects").post(use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
@@ -87,6 +129,8 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("objects", "tags").get(use: self.getObjectTags)
         routes.grouped("objects", "tags").put(use: self.setObjectTags)
         routes.grouped("objects", "tags").delete(use: self.deleteObjectTags)
+        routes.grouped("objects", "metadata").get(use: self.getObjectMetadata)
+        routes.grouped("objects", "metadata").put(use: self.setObjectMetadata)
         routes.grouped("objects", "share").post(use: self.shareObject)
         routes.grouped("objects", "share").get(use: self.listSharedLinks)
         routes.grouped("objects", "share").grouped(":sharedLinkId").delete(
@@ -184,7 +228,13 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let prefix = req.query[String.self, at: "prefix"] ?? ""
-        let delimiter = req.query[String.self, at: "delimiter"] ?? "/"
+        let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
+
+        // A search term means "find this anywhere under the current folder", so listing goes
+        // recursive (no delimiter, hence no folder/commonPrefix grouping) instead of the normal
+        // single-level folder view.
+        let isSearching = search?.isEmpty == false
+        let delimiter = isSearching ? "" : (req.query[String.self, at: "delimiter"] ?? "/")
 
         let (objects, commonPrefixes, _, _) = try ObjectFileHandler.listObjects(
             bucketName: bucketName,
@@ -196,7 +246,7 @@ struct InternalBucketController: RouteCollection {
         // Convert objects to DTOs
         var items: [ObjectMeta.ResponseDTO] = []
 
-        // Add folders (common prefixes)
+        // Add folders (common prefixes) - none when searching, since listing is recursive
         for commonPrefix in commonPrefixes {
             items.append(ObjectMeta.ResponseDTO(folderKey: commonPrefix))
         }
@@ -204,6 +254,10 @@ struct InternalBucketController: RouteCollection {
         // Add files
         for object in objects {
             items.append(ObjectMeta.ResponseDTO(from: object))
+        }
+
+        if let search, isSearching {
+            items = items.filter { $0.key.localizedCaseInsensitiveContains(search) }
         }
 
         // Sort: folders first, then by name
@@ -230,6 +284,29 @@ struct InternalBucketController: RouteCollection {
                 total: items.count
             )
         )
+    }
+
+    /// Disk usage and object count for a bucket you own, optionally scoped to a folder
+    /// (`prefix`) rather than the whole bucket - same underlying walk `listObjects` and the
+    /// admin bucket list use (`BucketHandler.calculateStats`), just ownership-gated instead of
+    /// admin-gated. Deliberately its own on-demand endpoint rather than a field embedded in
+    /// `listObjects` - a recursive directory walk per row on every page load would make listing
+    /// slow to scale; the console fetches this lazily, one call per bucket/folder row already
+    /// on screen.
+    @Sendable
+    func getObjectStats(req: Request) async throws -> StatsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"] else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' query parameter")
+        }
+        let prefix = req.query[String.self, at: "prefix"] ?? ""
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        let (sizeBytes, objectCount) = BucketHandler.calculateStats(
+            bucketName: bucketName, prefix: prefix)
+        return StatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
     }
 
     /// Cap on how long a shared link can stay valid. Kept at the same 7 days as a real S3
@@ -951,6 +1028,65 @@ struct InternalBucketController: RouteCollection {
         return .accepted
     }
 
+    /// Lists the bucket's most recent outbox rows (pending and dead-lettered), most-recent
+    /// first - lets an owner see whether their webhooks are actually being delivered, and why
+    /// a delivery is stuck or has failed.
+    @Sendable
+    func listBucketNotificationDeliveries(req: Request) async throws -> DeliveriesDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        let deliveries = try await NotificationDelivery.query(on: req.db)
+            .filter(\.$bucketName == bucketName)
+            .sort(\.$createdAt, .descending)
+            .limit(100)
+            .all()
+
+        return DeliveriesDTO(deliveries: deliveries.map(DeliveryDTO.init))
+    }
+
+    /// Requeues a dead-lettered (or still-pending) delivery for immediate redelivery - resets
+    /// the retry backoff and attempt count so it gets a fresh run of `maxAttempts`, and wakes
+    /// the dispatcher so it doesn't wait for the next background tick.
+    @Sendable
+    func retryBucketNotificationDelivery(req: Request) async throws -> DeliveryDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+        guard let deliveryId = req.parameters.get("deliveryId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid delivery id")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        // Scope the lookup to this bucket too, not just the id - a delivery id alone doesn't
+        // prove the caller owns the bucket it belongs to.
+        guard
+            let delivery = try await NotificationDelivery.query(on: req.db)
+                .filter(\.$id == deliveryId)
+                .filter(\.$bucketName == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Delivery not found")
+        }
+
+        delivery.state = NotificationDelivery.State.pending.rawValue
+        delivery.attempts = 0
+        delivery.nextAttemptAt = Date()
+        try await delivery.save(on: req.db)
+
+        NotificationDispatcher.shared.wake()
+
+        return DeliveryDTO(from: delivery)
+    }
+
     /// Returns the tags of the *current* version of an object. Internal API doesn't expose
     /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
     @Sendable
@@ -1014,6 +1150,73 @@ struct InternalBucketController: RouteCollection {
         try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
 
         return TagsDTO(tags: input.tags)
+    }
+
+    @Sendable
+    func getObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard
+            let (meta, _) = try ObjectFileHandler.readCurrentObject(
+                bucketName: bucketName, key: key, loadData: false)
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        return ObjectMetadataDTO(contentType: meta.contentType, metadata: meta.metadata)
+    }
+
+    /// Updates the Content-Type and custom (`x-amz-meta-*`) metadata of the *current* version
+    /// of an object, in place - same shape as `setObjectTags`: no new version, no re-upload of
+    /// the body, and (also matching real S3's PutObjectTagging/metadata-only semantics) no
+    /// webhook notification, since the object's data hasn't changed.
+    @Sendable
+    func setObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+
+        let input = try req.content.decode(ObjectMetadataDTO.self)
+        guard !input.contentType.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw Abort(.badRequest, reason: "Content-Type cannot be empty.")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: nil)
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+
+        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
+        guard let data = data else {
+            throw Abort(.internalServerError, reason: "Could not read object data")
+        }
+
+        // Lowercase keys, same normalization handleObjectPut applies to x-amz-meta-* headers
+        let normalizedMetadata = Dictionary(
+            uniqueKeysWithValues: input.metadata.map { ($0.key.lowercased(), $0.value) })
+
+        var updatedMeta = meta
+        updatedMeta.contentType = input.contentType
+        updatedMeta.metadata = normalizedMetadata
+        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+
+        return ObjectMetadataDTO(contentType: input.contentType, metadata: normalizedMetadata)
     }
 
     @Sendable

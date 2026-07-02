@@ -99,4 +99,55 @@ struct BucketHandler {
         }
         return count
     }
+
+    /// Disk usage and object count under `prefix` within a bucket - an empty prefix (the
+    /// default) means the whole bucket, a non-empty one scopes to that folder, so this serves
+    /// both the admin bucket list and per-folder stats in the object browser. One enumerator
+    /// pass sums every file's on-disk size and counts `.obj` files (the object storage unit -
+    /// see `ObjectFileHandler`), so a size+count pair costs exactly one filesystem walk.
+    static func calculateStats(bucketName: String, prefix: String = "") -> (
+        sizeBytes: Int64, objectCount: Int
+    ) {
+        var sanitizedPrefix = prefix
+        if sanitizedPrefix.contains("..") {
+            let components = sanitizedPrefix.components(separatedBy: "/")
+            sanitizedPrefix = components.map { $0.replacingOccurrences(of: "..", with: "") }
+                .filter { !$0.isEmpty }
+                .joined(separator: "/")
+        }
+
+        let url =
+            sanitizedPrefix.isEmpty
+            ? bucketURL(for: bucketName)
+            : bucketURL(for: bucketName).appendingPathComponent(sanitizedPrefix)
+
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else {
+            return (0, 0)
+        }
+
+        guard
+            let enumerator = fileManager.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return (0, 0)
+        }
+
+        var totalSize: Int64 = 0
+        var objectCount = 0
+        while let fileURL = enumerator.nextObject() as? URL {
+            if let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey]),
+                let fileSize = resourceValues.fileSize
+            {
+                totalSize += Int64(fileSize)
+            }
+            if fileURL.pathExtension == "obj" {
+                objectCount += 1
+            }
+        }
+        return (totalSize, objectCount)
+    }
 }

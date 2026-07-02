@@ -519,6 +519,167 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("List objects - Search matches recursively across folders, ignoring the delimiter")
+    func testListObjectsSearch() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "search-bucket")
+
+            try await putObject(
+                app, bucketName: "search-bucket", key: "report-2024.pdf", content: "a")
+            try await putObject(
+                app, bucketName: "search-bucket", key: "notes.txt", content: "b")
+            try await putObject(
+                app, bucketName: "search-bucket", key: "archive/report-2023.pdf", content: "c")
+            try await putObject(
+                app, bucketName: "search-bucket", key: "archive/deep/report-final.pdf",
+                content: "d")
+
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=search-bucket&search=report",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let keys = Set(page.items.map(\.key))
+                    // Matches at every depth, including deeply nested
+                    #expect(keys == ["report-2024.pdf", "archive/report-2023.pdf", "archive/deep/report-final.pdf"])
+                    // No folder/commonPrefix entries - search listing is always recursive
+                    #expect(page.items.allSatisfy { !$0.isFolder })
+                })
+        }
+    }
+
+    @Test("List objects - Search is case-insensitive and returns nothing for no match")
+    func testListObjectsSearchCaseInsensitiveNoMatch() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "search-bucket-2")
+
+            try await putObject(
+                app, bucketName: "search-bucket-2", key: "Invoice.PDF", content: "a")
+
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=search-bucket-2&search=invoice",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.map(\.key) == ["Invoice.PDF"])
+                })
+
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=search-bucket-2&search=nonexistent",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.isEmpty)
+                })
+        }
+    }
+
+    // MARK: - Object/bucket stats
+
+    @Test("Get object stats - Whole bucket reports total size and object count")
+    func testGetObjectStatsWholeBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "stats-bucket")
+            try await putObject(app, bucketName: "stats-bucket", key: "a.txt", content: "12345")
+            try await putObject(
+                app, bucketName: "stats-bucket", key: "dir/b.txt", content: "1234567890")
+
+            try await app.test(
+                .GET, "/api/v1/objects/stats?bucket=stats-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.StatsDTO.self)
+                    #expect(dto.objectCount == 2)
+                    #expect(dto.sizeBytes >= 15)
+                })
+        }
+    }
+
+    @Test("Get object stats - A prefix scopes stats to just that folder")
+    func testGetObjectStatsScopedToFolder() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "stats-bucket-2")
+            try await putObject(app, bucketName: "stats-bucket-2", key: "root.txt", content: "x")
+            try await putObject(
+                app, bucketName: "stats-bucket-2", key: "photos/a.jpg", content: "12345")
+            try await putObject(
+                app, bucketName: "stats-bucket-2", key: "photos/b.jpg", content: "1234567890")
+
+            try await app.test(
+                .GET, "/api/v1/objects/stats?bucket=stats-bucket-2&prefix=photos",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.StatsDTO.self)
+                    #expect(dto.objectCount == 2)
+                })
+        }
+    }
+
+    @Test("Get object stats - Non-existent bucket fails")
+    func testGetObjectStatsNonExistentBucket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await app.test(
+                .GET, "/api/v1/objects/stats?bucket=does-not-exist",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Get object stats - A user cannot see stats for another user's bucket")
+    func testGetObjectStatsNotOwned() async throws {
+        try await withApp { app in
+            let ownerToken = try await createUserAndLogin(app, username: "stats-owner@example.com")
+            try await createBucket(app, token: ownerToken, name: "not-yours-stats")
+
+            let otherToken = try await createUserAndLogin(
+                app, username: "stats-other@example.com")
+
+            try await app.test(
+                .GET, "/api/v1/objects/stats?bucket=not-yours-stats",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Get object stats - Without auth fails")
+    func testGetObjectStatsWithoutAuth() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/objects/stats?bucket=some-bucket",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
     @Test("List objects - With folders and files (delimiter)")
     func testListObjectsWithFolders() async throws {
         try await withApp { app in
@@ -3663,6 +3824,142 @@ struct InternalBucketControllerTests {
         try await withApp { app in
             try await app.test(
                 .DELETE, "/api/v1/objects/share/\(UUID().uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    // MARK: - Object metadata
+
+    @Test("Get object metadata - Returns the object's Content-Type and empty custom metadata by default")
+    func testGetObjectMetadataDefault() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "meta-bucket")
+            try await putObject(
+                app, bucketName: "meta-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .GET, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    #expect(dto.contentType == "text/plain")
+                    #expect(dto.metadata.isEmpty)
+                })
+        }
+    }
+
+    @Test("Set object metadata - Updates Content-Type and custom metadata in place, without a new version or changed data")
+    func testSetObjectMetadataValid() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "meta-bucket")
+            try await putObject(
+                app, bucketName: "meta-bucket", key: "file.txt", content: "unchanged-data")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ObjectMetadataDTO(
+                            contentType: "application/json", metadata: ["Author": "julian"]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    #expect(dto.contentType == "application/json")
+                    // Keys are lowercased, matching x-amz-meta-* normalization on the S3 path
+                    #expect(dto.metadata == ["author": "julian"])
+                })
+
+            try await app.test(
+                .GET, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    #expect(dto.contentType == "application/json")
+                    #expect(dto.metadata == ["author": "julian"])
+                })
+
+            // The object's data and size are untouched, and no new version was created
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=meta-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.count == 1)
+                    #expect(page.items.first?.size == "unchanged-data".utf8.count)
+                })
+        }
+    }
+
+    @Test("Set object metadata - Empty Content-Type is rejected")
+    func testSetObjectMetadataEmptyContentTypeRejected() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "meta-bucket")
+            try await putObject(
+                app, bucketName: "meta-bucket", key: "file.txt", content: "data")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ObjectMetadataDTO(contentType: "  ", metadata: [:]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
+    @Test("Set object metadata - Non-existent object fails")
+    func testSetObjectMetadataMissingObjectFails() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "meta-bucket")
+
+            try await app.test(
+                .PUT, "/api/v1/objects/metadata?bucket=meta-bucket&key=missing.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ObjectMetadataDTO(
+                            contentType: "text/plain", metadata: [:]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Object metadata - Without auth fails")
+    func testObjectMetadataUnauthorized() async throws {
+        try await withApp { app in
+            try await app.test(
+                .GET, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                afterResponse: { res async in
+                    #expect(res.status == .unauthorized)
+                })
+
+            try await app.test(
+                .PUT, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
+                beforeRequest: { req in
+                    try req.content.encode(
+                        InternalBucketController.ObjectMetadataDTO(
+                            contentType: "text/plain", metadata: [:]))
+                },
                 afterResponse: { res async in
                     #expect(res.status == .unauthorized)
                 })
