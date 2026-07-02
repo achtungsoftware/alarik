@@ -1,0 +1,57 @@
+/*
+Copyright 2025-present Julian Gerhards
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Foundation
+
+/// In-memory mirror of every bucket's notification configuration, loaded at boot and kept in
+/// sync on writes - so the object write/delete hot paths can check "does this bucket have any
+/// webhook rules?" with a single actor dictionary lookup and zero database access.
+final actor NotificationConfigCache {
+    public static let shared = NotificationConfigCache()
+
+    private var map: [String: NotificationConfiguration] = [:]
+
+    func load(initialData: [(bucketName: String, config: NotificationConfiguration)]) {
+        for entry in initialData {
+            map[entry.bucketName] = entry.config
+        }
+    }
+
+    /// Returns the bucket's configuration, or nil when the bucket has no (enabled) rules -
+    /// nil is the fast path taken by every request on buckets without webhooks.
+    func config(for bucketName: String) -> NotificationConfiguration? {
+        guard let config = map[bucketName], config.rules.contains(where: \.enabled) else {
+            return nil
+        }
+        return config
+    }
+
+    func setConfig(for bucketName: String, config: NotificationConfiguration) {
+        if config.rules.isEmpty {
+            map.removeValue(forKey: bucketName)
+        } else {
+            map[bucketName] = config
+        }
+    }
+
+    func removeBucket(_ bucketName: String) {
+        map.removeValue(forKey: bucketName)
+    }
+
+    func getMap() -> [String: NotificationConfiguration] {
+        map
+    }
+}

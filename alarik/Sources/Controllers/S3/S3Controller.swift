@@ -265,6 +265,18 @@ struct S3Controller: RouteCollection {
             return try await handleLifecyclePut(req: req, bucketName: bucketName)
         }
 
+        // PUT ?notification - Alarik's webhook rules target http(s) URLs, not the SNS/SQS/Lambda
+        // ARNs the S3 XML format carries, so there's nothing meaningful an S3 client could PUT
+        // here. Managed via the console / internal API instead (GET ?notification still works).
+        if query.lowercased().contains("notification") {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+            throw S3Error(
+                status: .notImplemented, code: "NotImplemented",
+                message:
+                    "Configuring bucket notifications via the S3 API is not supported. Manage webhooks through the Alarik console or internal API.",
+                requestId: req.id)
+        }
+
         if Validator.bucketName.validate(bucketName).isFailure {
             throw S3Error(
                 status: .badRequest,
@@ -670,6 +682,7 @@ struct S3Controller: RouteCollection {
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
 
         // Write with versioning support
+        var writtenVersionId: String? = nil
         if versioningStatus != .disabled {
             let versionId = try ObjectFileHandler.writeVersioned(
                 metadata: meta,
@@ -679,11 +692,17 @@ struct S3Controller: RouteCollection {
                 versioningStatus: versioningStatus
             )
             headers.add(name: "x-amz-version-id", value: versionId)
+            writtenVersionId = versionId
         } else {
             // Non-versioned write
             let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
             try ObjectFileHandler.write(metadata: meta, data: dataToWrite, to: path)
         }
+
+        await NotificationService.emit(
+            event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
+            size: dataToWrite.count, etag: etag, versionId: writtenVersionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
 
         return Response(status: .ok, headers: headers)
     }
@@ -872,6 +891,11 @@ struct S3Controller: RouteCollection {
         if let sourceVersionId = sourceMeta.versionId {
             headers.add(name: "x-amz-copy-source-version-id", value: sourceVersionId)
         }
+
+        await NotificationService.emit(
+            event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
+            size: destinationMeta.size, etag: etag, versionId: versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
 
         // Build copy result response (S3 returns XML for copy operations)
         let copyResult = """
@@ -1099,6 +1123,12 @@ struct S3Controller: RouteCollection {
             headers.add(name: "x-amz-delete-marker", value: "true")
         }
 
+        await NotificationService.emit(
+            event: outcome.isDeleteMarker ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
+            bucketName: bucketName, key: keyPath, size: nil, etag: nil,
+            versionId: outcome.versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+
         return Response(status: .noContent, headers: headers)
     }
 
@@ -1156,6 +1186,13 @@ struct S3Controller: RouteCollection {
                         deleteMarker: outcome.isDeleteMarker ? true : nil,
                         deleteMarkerVersionId: outcome.isDeleteMarker ? outcome.versionId : nil
                     ))
+
+                await NotificationService.emit(
+                    event: outcome.isDeleteMarker
+                        ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
+                    bucketName: bucketName, key: object.key, size: nil, etag: nil,
+                    versionId: outcome.versionId,
+                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
             } catch {
                 errors.append(
                     DeleteErrorEntry(
@@ -1333,6 +1370,7 @@ struct S3Controller: RouteCollection {
         // Complete the upload
         let etag: String
         let versionId: String?
+        let finalSize: Int
         do {
             let result = try MultipartFileHandler.completeUpload(
                 bucketName: bucketName,
@@ -1342,6 +1380,7 @@ struct S3Controller: RouteCollection {
             )
             etag = result.etag
             versionId = result.versionId
+            finalSize = result.size
         } catch let error as NSError {
             // Convert NSError to S3Error
             let code = error.domain == "InvalidPartOrder" ? "InvalidPartOrder" : "InvalidPart"
@@ -1349,6 +1388,11 @@ struct S3Controller: RouteCollection {
                 status: .badRequest, code: code,
                 message: error.localizedDescription, requestId: req.id)
         }
+
+        await NotificationService.emit(
+            event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
+            size: finalSize, etag: etag, versionId: versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
 
         // Build response headers
         var headers = HTTPHeaders()

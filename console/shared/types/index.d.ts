@@ -59,6 +59,16 @@ declare global {
         multipartUploadCount: number;
     }
 
+    export interface NotificationRule {
+        id: string;
+        url: string;
+        secret?: string;
+        events: string[];
+        prefix?: string;
+        suffix?: string;
+        enabled: boolean;
+    }
+
     export interface Bucket {
         name: string;
         creationDate: string;

@@ -65,6 +65,10 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "lifecycle_rules")
     var lifecycleRules: String?
 
+    /// JSON-encoded `NotificationConfiguration` (webhook rules), or nil if none configured.
+    @Field(key: "notification_config")
+    var notificationConfig: String?
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false

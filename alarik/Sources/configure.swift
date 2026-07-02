@@ -56,6 +56,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddBucketLifecycleRules())
     app.migrations.add(CreateOIDCProvider())
     app.migrations.add(AddUserOIDCFields())
+    app.migrations.add(AddBucketNotificationConfig())
+    app.migrations.add(CreateNotificationDelivery())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -92,7 +94,17 @@ public func configure(_ app: Application) async throws {
 
     app.lifecycle.use(LoadCacheLifecycle())
 
+    // Outbound HTTP timeouts (webhook deliveries, OIDC fetches): a hung remote endpoint
+    // must never wedge a background task or login flow indefinitely
+    app.http.client.configuration.timeout = .init(
+        connect: .seconds(5), read: .seconds(10))
+
     try await app.autoMigrate()
+
+    // The webhook dispatcher needs the app for db/client access; configured in every
+    // environment so tests can drive drains manually (only the periodic tick below is
+    // gated to non-testing)
+    await NotificationDispatcher.shared.configure(app: app)
 
     try routes(app)
 
@@ -145,6 +157,19 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Webhook outbox tick: fresh events are delivered near-instantly via the explicit
+        // wake() in NotificationService - this tick exists to pick up retries whose backoff
+        // has elapsed (and anything left over from before a restart). The drain query is a
+        // single indexed SELECT, so a 2-second cadence costs effectively nothing when idle.
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .seconds(2),
+            delay: .seconds(2)
+        ) { task in
+            Task {
+                await NotificationDispatcher.shared.drain()
+            }
+        }
+
         // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
         // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
         // the way short-lived access keys/share links are. Matches real S3, which evaluates
@@ -158,6 +183,12 @@ public func configure(_ app: Application) async throws {
                     try await LifecycleService.runSweep(app: app)
                 } catch {
                     app.logger.error("Failed to run lifecycle sweep: \(error)")
+                }
+
+                do {
+                    try await NotificationDispatcher.purgeExpiredFailures(on: app.db)
+                } catch {
+                    app.logger.error("Failed to purge expired webhook failures: \(error)")
                 }
             }
         }

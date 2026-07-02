@@ -1578,6 +1578,37 @@ echo ""
 echo "=== Content-Type Tests Complete ==="
 echo ""
 
+# ── Bucket notification subresource ───────────────────────────────────────────
+echo "=== Bucket Notification Tests ==="
+
+NOTIF_BUCKET="notif-subresource-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$NOTIF_BUCKET" > /dev/null 2>&1
+
+# GET ?notification on an unconfigured bucket returns an empty configuration (200),
+# NOT a 404 - verified against the GetBucketNotificationConfiguration API reference
+NOTIF_GET=$(aws_s3 s3api get-bucket-notification-configuration --bucket "$NOTIF_BUCKET" 2>&1)
+if echo "$NOTIF_GET" | grep -qiE "error|exception"; then
+    fail "GET notification on unconfigured bucket errored: $NOTIF_GET"
+else
+    pass "GET notification on an unconfigured bucket returns an empty config (no error)."
+fi
+
+# PUT ?notification via the S3 API is deliberately NotImplemented (Alarik webhooks target
+# http(s) URLs, not the SNS/SQS/Lambda ARNs the S3 XML format carries)
+NOTIF_PUT=$(aws_s3 s3api put-bucket-notification-configuration --bucket "$NOTIF_BUCKET" \
+    --notification-configuration '{}' 2>&1)
+if echo "$NOTIF_PUT" | grep -qiE "NotImplemented|501"; then
+    pass "PUT notification via S3 API is correctly rejected as NotImplemented."
+else
+    fail "PUT notification via S3 API was not rejected as NotImplemented: $NOTIF_PUT"
+fi
+
+aws_s3 s3api delete-bucket --bucket "$NOTIF_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Bucket Notification Tests Complete ==="
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "=== Results: $PASS_COUNT passed, $FAIL_COUNT failed ==="
 [ "$FAIL_COUNT" -eq 0 ] && exit 0 || exit 1

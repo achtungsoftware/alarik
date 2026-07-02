@@ -35,14 +35,15 @@ struct LifecycleService {
 
             for rule in enabledRules {
                 if let expirationDays = rule.expirationDays {
-                    try expireCurrentObjects(
+                    try await expireCurrentObjects(
                         bucketName: bucket.name, prefix: rule.prefix, days: expirationDays,
-                        versioningStatus: versioningStatus)
+                        versioningStatus: versioningStatus, on: app.db)
                 }
 
                 if let noncurrentDays = rule.noncurrentVersionExpirationDays {
-                    try expireNoncurrentVersions(
-                        bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays)
+                    try await expireNoncurrentVersions(
+                        bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays,
+                        on: app.db)
                 }
 
                 if let abortDays = rule.abortIncompleteMultipartUploadDays {
@@ -57,16 +58,23 @@ struct LifecycleService {
     /// In a versioned bucket this creates a delete marker; otherwise it's a permanent delete -
     /// identical to a normal DELETE request, matching real S3's lifecycle Expiration behavior.
     private static func expireCurrentObjects(
-        bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus
-    ) throws {
+        bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus,
+        on db: any Database
+    ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(
             bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
         for object in objects where object.updatedAt <= cutoff {
-            _ = try S3Service.deleteObject(
+            let outcome = try S3Service.deleteObject(
                 bucketName: bucketName, key: object.key, versionId: nil,
                 versioningStatus: versioningStatus)
+
+            await NotificationService.emit(
+                event: outcome.isDeleteMarker
+                    ? .lifecycleExpirationDeleteMarkerCreated : .lifecycleExpirationDelete,
+                bucketName: bucketName, key: object.key, size: nil, etag: nil,
+                versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, on: db)
         }
     }
 
@@ -75,9 +83,9 @@ struct LifecycleService {
     /// noncurrent, so this is approximated as the creation time of the next-newer version in
     /// the chain (the version that superseded them) - the closest equivalent derivable from the
     /// existing storage format.
-    private static func expireNoncurrentVersions(bucketName: String, prefix: String, days: Int)
-        throws
-    {
+    private static func expireNoncurrentVersions(
+        bucketName: String, prefix: String, days: Int, on db: any Database
+    ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (versions, deleteMarkers, _, _, _, _) = try ObjectFileHandler.listAllVersions(
             bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
@@ -97,6 +105,11 @@ struct LifecycleService {
 
                 try ObjectFileHandler.deleteVersion(
                     bucketName: bucketName, key: key, versionId: versionId)
+
+                await NotificationService.emit(
+                    event: .lifecycleExpirationDelete, bucketName: bucketName, key: key,
+                    size: nil, etag: nil, versionId: versionId,
+                    requestId: UUID().uuidString, sourceIP: nil, on: db)
             }
         }
     }

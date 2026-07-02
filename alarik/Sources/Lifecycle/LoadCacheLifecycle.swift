@@ -104,6 +104,16 @@ final class LoadCacheLifecycle: LifecycleHandler {
             await BucketPolicyCache.shared.loadPublicAccessBlocks(
                 initialData: publicAccessBlockData)
 
+            // Load notification (webhook) configuration cache
+            let notificationData: [(bucketName: String, config: NotificationConfiguration)] =
+                allBuckets.compactMap { bucket in
+                    guard let raw = bucket.notificationConfig else { return nil }
+                    let config = NotificationConfiguration.fromJSON(raw)
+                    guard !config.rules.isEmpty else { return nil }
+                    return (bucketName: bucket.name, config: config)
+                }
+            await NotificationConfigCache.shared.load(initialData: notificationData)
+
         } catch {
             app.logger.error("Failed to load cache: \(error)")
         }

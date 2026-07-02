@@ -82,6 +82,14 @@ struct BucketService {
         await BucketVersioningCache.shared.removeBucket(bucketName)
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+        await NotificationConfigCache.shared.removeBucket(bucketName)
+
+        // Drop any queued webhook deliveries for the deleted bucket - retrying them would
+        // announce objects in a bucket that no longer exists
+        try await NotificationDelivery.query(on: database)
+            .filter(\.$bucketName == bucketName)
+            .delete()
+
         try BucketHandler.delete(name: bucketName, force: force)
     }
 }

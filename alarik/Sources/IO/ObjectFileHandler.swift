@@ -216,7 +216,10 @@ struct ObjectFileHandler {
     }
 
     /// Deletes all objects with a given prefix (folder deletion).
-    static func deletePrefix(bucketName: String, prefix: String) throws -> Int {
+    /// Deletes every object under `prefix` and returns the keys that were removed - the caller
+    /// needs the exact list to emit one delete notification per object (no silent bulk deletes).
+    @discardableResult
+    static func deletePrefix(bucketName: String, prefix: String) throws -> [String] {
         // Sanitize the prefix - remove path traversal attempts
         var sanitizedPrefix = prefix
         if sanitizedPrefix.contains("..") {
@@ -241,7 +244,7 @@ struct ObjectFileHandler {
         let bucketURL = BucketHandler.bucketURL(for: bucketName)
 
         guard FileManager.default.fileExists(atPath: bucketURL.path) else {
-            return 0
+            return []
         }
 
         guard
@@ -251,10 +254,10 @@ struct ObjectFileHandler {
                 options: [.skipsHiddenFiles]
             )
         else {
-            return 0
+            return []
         }
 
-        var deletedCount = 0
+        var deletedKeys: [String] = []
 
         // Collect all objects with the prefix
         for case let fileURL as URL in enumerator {
@@ -272,11 +275,11 @@ struct ObjectFileHandler {
             // Check if this key starts with the sanitized prefix
             if key.hasPrefix(sanitizedPrefix) {
                 try? FileManager.default.removeItem(at: fileURL)
-                deletedCount += 1
+                deletedKeys.append(key)
             }
         }
 
-        return deletedCount
+        return deletedKeys
     }
 
     /// Lists all objects in a bucket with optional prefix filtering

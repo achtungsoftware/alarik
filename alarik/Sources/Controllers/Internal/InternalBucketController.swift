@@ -37,6 +37,10 @@ struct InternalBucketController: RouteCollection {
         let tags: [String: String]
     }
 
+    struct NotificationConfigDTO: Content {
+        let rules: [NotificationRule]
+    }
+
     struct ShareRequestDTO: Content {
         let bucket: String
         let key: String
@@ -68,6 +72,12 @@ struct InternalBucketController: RouteCollection {
             use: self.setBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").delete(
             use: self.deleteBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications").get(
+            use: self.getBucketNotifications)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications").put(
+            use: self.setBucketNotifications)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
+            .grouped(":ruleId").grouped("test").post(use: self.testBucketNotification)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects").post(use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
@@ -360,6 +370,11 @@ struct InternalBucketController: RouteCollection {
             try ObjectFileHandler.write(metadata: meta, data: fileData, to: path)
         }
 
+        await NotificationService.emit(
+            event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
+            size: meta.size, etag: etag, versionId: meta.versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+
         return ObjectMeta.ResponseDTO(from: meta)
     }
 
@@ -382,11 +397,21 @@ struct InternalBucketController: RouteCollection {
 
         // Check if this is a folder (prefix) deletion
         if key.hasSuffix("/") {
-            // Delete all objects with this prefix
-            _ = try ObjectFileHandler.deletePrefix(bucketName: bucketName, prefix: key)
+            // Delete all objects with this prefix, emitting one event per removed object
+            let deletedKeys = try ObjectFileHandler.deletePrefix(bucketName: bucketName, prefix: key)
+            for deletedKey in deletedKeys {
+                await NotificationService.emit(
+                    event: .objectRemovedDelete, bucketName: bucketName, key: deletedKey,
+                    size: nil, etag: nil, versionId: nil,
+                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            }
         } else if versioningStatus == .enabled {
             // Versioning enabled - create delete marker instead of permanent delete
-            _ = try ObjectFileHandler.createDeleteMarker(bucketName: bucketName, key: key)
+            let marker = try ObjectFileHandler.createDeleteMarker(bucketName: bucketName, key: key)
+            await NotificationService.emit(
+                event: .objectRemovedDeleteMarkerCreated, bucketName: bucketName, key: key,
+                size: nil, etag: nil, versionId: marker.versionId,
+                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         } else {
             // Versioning disabled or suspended - permanent delete
             // Check versioned storage first
@@ -406,6 +431,11 @@ struct InternalBucketController: RouteCollection {
             if FileManager.default.fileExists(atPath: path) {
                 try FileManager.default.removeItem(atPath: path)
             }
+
+            await NotificationService.emit(
+                event: .objectRemovedDelete, bucketName: bucketName, key: key,
+                size: nil, etag: nil, versionId: nil,
+                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         }
 
         return .noContent
@@ -801,6 +831,126 @@ struct InternalBucketController: RouteCollection {
         return .noContent
     }
 
+    // MARK: - Bucket notifications (webhooks)
+
+    @Sendable
+    func getBucketNotifications(req: Request) async throws -> NotificationConfigDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard let raw = bucket.notificationConfig else {
+            return NotificationConfigDTO(rules: [])
+        }
+        return NotificationConfigDTO(rules: NotificationConfiguration.fromJSON(raw).rules)
+    }
+
+    /// Replaces the bucket's webhook rules wholesale. Validates every rule, assigns ids to
+    /// new rules, and gates private-address targets to admins (SSRF).
+    @Sendable
+    func setBucketNotifications(req: Request) async throws -> NotificationConfigDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(NotificationConfigDTO.self)
+
+        guard input.rules.count <= NotificationConfiguration.maxRuleCount else {
+            throw Abort(
+                .badRequest,
+                reason:
+                    "A bucket may have at most \(NotificationConfiguration.maxRuleCount) notification rules."
+            )
+        }
+
+        // Validate + normalize each rule (fresh id for new rules so ids are always server-owned)
+        let normalizedRules = try input.rules.map { rule -> NotificationRule in
+            try WebhookURLValidator.validateStructure(rule.url)
+            if WebhookURLValidator.isInternalHost(rule.url) && !auth.isAdmin {
+                throw Abort(
+                    .forbidden,
+                    reason:
+                        "Only administrators can configure webhooks pointing at private or loopback addresses."
+                )
+            }
+
+            let unknownEvents = rule.events.filter { !NotificationRule.supportedEvents.contains($0) }
+            guard unknownEvents.isEmpty else {
+                throw Abort(
+                    .badRequest, reason: "Unsupported event type(s): \(unknownEvents.joined(separator: ", "))"
+                )
+            }
+            guard !rule.events.isEmpty else {
+                throw Abort(.badRequest, reason: "Each notification rule must subscribe to at least one event.")
+            }
+
+            var normalized = rule
+            if normalized.id == NotificationRule.zeroUUID {
+                normalized.id = UUID()
+            }
+            return normalized
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        let config = NotificationConfiguration(rules: normalizedRules)
+        bucket.notificationConfig = normalizedRules.isEmpty ? nil : config.toJSON()
+        try await bucket.save(on: req.db)
+
+        await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
+
+        // Stop delivering already-queued events for rules that were just removed - if a rule
+        // is deleted because its endpoint is wrong or compromised, in-flight deliveries to the
+        // old URL must not keep firing until they exhaust their retries.
+        let keptIds = normalizedRules.map(\.id)
+        let purge = NotificationDelivery.query(on: req.db)
+            .filter(\.$bucketName == bucketName)
+        // `!~ []` is driver-dependent, so when every rule was removed just purge the whole
+        // bucket's outbox rather than relying on a NOT IN () clause.
+        if !keptIds.isEmpty {
+            purge.filter(\.$ruleId !~ keptIds)
+        }
+        try await purge.delete()
+
+        return NotificationConfigDTO(rules: normalizedRules)
+    }
+
+    /// Enqueues an `s3:TestEvent` for one rule, proving end-to-end delivery (incl. signature)
+    /// without needing a real object operation.
+    @Sendable
+    func testBucketNotification(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+        guard let ruleId = req.parameters.get("ruleId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid rule id")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard let raw = bucket.notificationConfig,
+            let rule = NotificationConfiguration.fromJSON(raw).rules.first(where: { $0.id == ruleId })
+        else {
+            throw Abort(.notFound, reason: "Notification rule not found")
+        }
+
+        try await NotificationService.emitTestEvent(
+            rule: rule, bucketName: bucketName, requestId: req.id, on: req.db)
+
+        return .accepted
+    }
+
     /// Returns the tags of the *current* version of an object. Internal API doesn't expose
     /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
     @Sendable
@@ -935,6 +1085,11 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         try ObjectFileHandler.deleteVersion(bucketName: bucketName, key: key, versionId: versionId)
+
+        await NotificationService.emit(
+            event: .objectRemovedDelete, bucketName: bucketName, key: key,
+            size: nil, etag: nil, versionId: versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
 
         return .noContent
     }

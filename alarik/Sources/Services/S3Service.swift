@@ -491,6 +491,7 @@ struct S3Service {
             || lowerQuery.contains("publicaccessblock")
             || lowerQuery.contains("tagging")
             || lowerQuery.contains("lifecycle")
+            || lowerQuery.contains("notification")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
@@ -514,6 +515,10 @@ struct S3Service {
             return try handleLifecycleGet(bucket: bucket, requestId: req.id)
         }
 
+        if lowerQuery.contains("notification") {
+            return handleNotificationGet(bucket: bucket)
+        }
+
         if lowerQuery.contains("policy") {
             return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
@@ -526,6 +531,15 @@ struct S3Service {
         // Note: ?versions is handled in the controller for list versions
 
         return nil
+    }
+
+    /// Handles GET ?notification on a bucket. Unlike ?lifecycle/?tagging, real S3 returns an
+    /// empty `<NotificationConfiguration/>` (200) rather than a 404 when none is set (verified
+    /// against the GetBucketNotificationConfiguration API reference).
+    static func handleNotificationGet(bucket: Bucket?) -> Response {
+        let config: NotificationConfiguration =
+            bucket?.notificationConfig.map(NotificationConfiguration.fromJSON) ?? .empty
+        return buildXMLResponse(data: Data(config.toXML().utf8))
     }
 
     /// Handles GET ?lifecycle on a bucket. Matches real S3: a 404 NoSuchLifecycleConfiguration
