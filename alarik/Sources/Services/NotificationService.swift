@@ -46,7 +46,7 @@ struct NotificationService {
     private struct Record: Encodable {
         let eventVersion = "2.4"
         let eventSource = "alarik:s3"
-        let awsRegion = "us-east-1"
+        let awsRegion: String
         let eventTime: String
         let eventName: String
         let userIdentity: PrincipalIdentity
@@ -205,6 +205,7 @@ struct NotificationService {
                 .replacingOccurrences(of: "%20", with: "+") ?? key
 
         let record = Record(
+            awsRegion: AlarikRegion.resolve(),
             eventTime: Date().iso8601String,
             // The payload's eventName drops the "s3:" prefix, per AWS's message structure
             eventName: String(event.rawValue.dropFirst(3)),

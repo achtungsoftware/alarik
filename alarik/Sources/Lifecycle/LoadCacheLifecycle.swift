@@ -114,6 +114,16 @@ final class LoadCacheLifecycle: LifecycleHandler {
                 }
             await NotificationConfigCache.shared.load(initialData: notificationData)
 
+            // Load replication configuration cache
+            let replicationData: [(bucketName: String, config: ReplicationConfiguration)] =
+                allBuckets.compactMap { bucket in
+                    guard let raw = bucket.replicationConfig else { return nil }
+                    let config = ReplicationConfiguration.fromJSON(raw)
+                    guard !config.rules.isEmpty else { return nil }
+                    return (bucketName: bucket.name, config: config)
+                }
+            await ReplicationConfigCache.shared.load(initialData: replicationData)
+
         } catch {
             app.logger.error("Failed to load cache: \(error)")
         }

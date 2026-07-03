@@ -458,11 +458,16 @@ struct S3Service {
         }
     }
 
+    /// Handles GET ?location. Matches real S3's `us-east-1` quirk: that region reports an
+    /// *empty* `LocationConstraint` element (a bucket's `LocationConstraint` is null/absent
+    /// specifically when it's in us-east-1 - verified against the GetBucketLocation API
+    /// reference); every other configured region reports its name as element text.
     static func handleLocationQuery(req: Request) -> Response {
-        let region = "us-east-1"
+        let region = AlarikRegion.resolve()
+        let content = region == AlarikRegion.default ? "" : region
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
-            <LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\(region)</LocationConstraint>
+            <LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\(content)</LocationConstraint>
             """
         return buildXMLResponse(data: Data(xml.utf8))
     }
@@ -492,6 +497,7 @@ struct S3Service {
             || lowerQuery.contains("tagging")
             || lowerQuery.contains("lifecycle")
             || lowerQuery.contains("notification")
+            || lowerQuery.contains("replication")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
@@ -519,6 +525,10 @@ struct S3Service {
             return handleNotificationGet(bucket: bucket)
         }
 
+        if lowerQuery.contains("replication") {
+            return try handleReplicationGet(bucket: bucket, requestId: req.id)
+        }
+
         if lowerQuery.contains("policy") {
             return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
@@ -540,6 +550,18 @@ struct S3Service {
         let config: NotificationConfiguration =
             bucket?.notificationConfig.map(NotificationConfiguration.fromJSON) ?? .empty
         return buildXMLResponse(data: Data(config.toXML().utf8))
+    }
+
+    /// Handles GET ?replication on a bucket. Matches real S3: a 404
+    /// ReplicationConfigurationNotFoundError if none has ever been set (verified against the
+    /// GetBucketReplication API reference - unlike ?notification, which returns an empty 200).
+    static func handleReplicationGet(bucket: Bucket?, requestId: String) throws -> Response {
+        guard let raw = bucket?.replicationConfig else {
+            throw S3Error(
+                status: .notFound, code: "ReplicationConfigurationNotFoundError",
+                message: "The replication configuration was not found.", requestId: requestId)
+        }
+        return buildXMLResponse(data: Data(ReplicationConfiguration.fromJSON(raw).toXML().utf8))
     }
 
     /// Handles GET ?lifecycle on a bucket. Matches real S3: a 404 NoSuchLifecycleConfiguration

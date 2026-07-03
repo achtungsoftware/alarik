@@ -668,4 +668,115 @@ struct AdditionalS3AuthTests {
             #expect(isValid == false)
         }
     }
+
+    // MARK: - Region validation (ALARIK_REGION / AlarikRegion)
+
+    @Test("a request correctly signed for the default region validates")
+    func testValidateAcceptsDefaultRegion() async throws {
+        try await withApp { app in
+            let eventLoop = app.eventLoopGroup.next()
+
+            let accessKey = "AKIAIOSFODNN7EXAMPLE"
+            let secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+            let signer = AWSSigner(
+                credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                name: "s3", region: AlarikRegion.default)
+
+            let url = URL(string: "https://examplebucket.s3.amazonaws.com/testfile.txt")!
+            let signedHeaders = signer.signHeaders(
+                url: url, method: .GET, headers: ["host": "examplebucket.s3.amazonaws.com"],
+                body: .none)
+
+            let req = Request(
+                application: app, method: .GET, url: URI(string: url.absoluteString), on: eventLoop)
+            for (key, value) in signedHeaders {
+                req.headers.add(name: key, value: value)
+            }
+
+            let authInfo = try S3AuthParser.parse(request: req)
+            let validator = SigV4Validator(secretKey: secretKey)
+            #expect(try validator.validate(request: req, authInfo: authInfo) == true)
+        }
+    }
+
+    @Test("a header-signed request for the wrong region is rejected with AuthorizationHeaderMalformed")
+    func testValidateRejectsWrongRegionHeaderAuth() async throws {
+        try await withApp { app in
+            let eventLoop = app.eventLoopGroup.next()
+
+            let accessKey = "AKIAIOSFODNN7EXAMPLE"
+            let secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+            // Deliberately signed for a region that isn't Alarik's configured region
+            // (AlarikRegion.default, "us-east-1", since ALARIK_REGION isn't set in tests).
+            let signer = AWSSigner(
+                credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                name: "s3", region: "eu-west-1")
+
+            let url = URL(string: "https://examplebucket.s3.eu-west-1.amazonaws.com/testfile.txt")!
+            let signedHeaders = signer.signHeaders(
+                url: url, method: .GET, headers: ["host": "examplebucket.s3.eu-west-1.amazonaws.com"],
+                body: .none)
+
+            let req = Request(
+                application: app, method: .GET, url: URI(string: url.absoluteString), on: eventLoop)
+            for (key, value) in signedHeaders {
+                req.headers.add(name: key, value: value)
+            }
+
+            let authInfo = try S3AuthParser.parse(request: req)
+            #expect(authInfo.region == "eu-west-1")
+
+            let validator = SigV4Validator(secretKey: secretKey)
+            do {
+                _ = try validator.validate(request: req, authInfo: authInfo)
+                Issue.record("Expected validate to throw a region-mismatch error")
+            } catch let error as S3Error {
+                #expect(error.code == "AuthorizationHeaderMalformed")
+                #expect(error.status == .badRequest)
+                #expect(error.message.contains("'eu-west-1'"))
+                #expect(error.message.contains("'\(AlarikRegion.default)'"))
+            }
+        }
+    }
+
+    @Test("a query-signed (presigned URL) request for the wrong region is rejected with AuthorizationQueryParametersError")
+    func testValidateRejectsWrongRegionQueryAuth() async throws {
+        try await withApp { app in
+            let eventLoop = app.eventLoopGroup.next()
+
+            let accessKey = "AKIAIOSFODNN7EXAMPLE"
+            let secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+            let signer = AWSSigner(
+                credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                name: "s3", region: "ap-south-1")
+
+            let url = URL(string: "https://examplebucket.s3.ap-south-1.amazonaws.com/testfile.txt")!
+            let presignedURL = signer.signURL(
+                url: url, method: .GET, headers: ["host": "examplebucket.s3.ap-south-1.amazonaws.com"],
+                expires: .seconds(3600))
+
+            let req = Request(
+                application: app, method: .GET, url: URI(string: presignedURL.absoluteString),
+                on: eventLoop)
+            req.headers.add(name: "host", value: "examplebucket.s3.ap-south-1.amazonaws.com")
+
+            let authInfo = try S3AuthParser.parse(request: req)
+            #expect(authInfo.region == "ap-south-1")
+            #expect(authInfo.expires != nil)
+
+            let validator = SigV4Validator(secretKey: secretKey)
+            do {
+                _ = try validator.validate(request: req, authInfo: authInfo)
+                Issue.record("Expected validate to throw a region-mismatch error")
+            } catch let error as S3Error {
+                #expect(error.code == "AuthorizationQueryParametersError")
+                #expect(error.status == .badRequest)
+                #expect(error.message.contains("'ap-south-1'"))
+                #expect(error.message.contains("'\(AlarikRegion.default)'"))
+            }
+        }
+    }
 }

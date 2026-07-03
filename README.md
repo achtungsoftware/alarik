@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue" />
   </a>
 
-  <img src="https://img.shields.io/badge/status-alpha-orange" />
+  <img src="https://img.shields.io/badge/status-beta-orange" />
   
   <img src="https://img.shields.io/badge/language-Swift-F05138" />
 
@@ -49,6 +49,7 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Bucket policies | JSON policy documents, public access block |
 | Lifecycle rules | Expiration, noncurrent version expiration, incomplete multipart cleanup |
 | Bucket webhooks | AWS-event-shaped notifications over HTTP (see below) |
+| Bucket replication | Continuous, SigV4-signed replication to remote S3-compatible targets (see below) |
 | SigV4 authentication | Header and query auth, chunked (streaming) payloads |
 
 ### Web Console
@@ -84,6 +85,17 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Delivery health | Inspect pending/failed deliveries and retry on demand, from the console or API |
 | Event & key filtering | Subscribe by event type, key prefix, and/or suffix |
 
+### Bucket Replication
+
+| Feature | Notes |
+| --- | --- |
+| Real S3 protocol | SigV4-signed `PutObject`/multipart/`DeleteObject` requests, works against any S3-compatible target |
+| Target + rule model | Reusable remote targets (endpoint, credentials), referenced by prefix-filtered rules |
+| Reliable delivery | Persistent outbox, survives restarts, exponential backoff retries |
+| Opt-in delete & existing-object replication | Deletes and pre-existing objects are never replicated unless a rule opts in |
+| Resync | On-demand replication of a bucket's existing objects for a rule |
+| Task health | Inspect pending/failed replication tasks and retry on demand, from the console or API |
+
 See the [documentation](https://alarik.io/docs) for the full API reference.
 
 ## Installation
@@ -100,7 +112,7 @@ Because we rely on S3-compatible storage every day, we are fully invested in ens
 
 ## Performance
 
-Alarik is built with a strong focus on low-latency I/O and highly parallel request handling. New benchmarks on a dedicated Linux machine show that Alarik delivers competitive and in many cases superior throughput compared to MinIO or RustFS, even in early alpha stages.
+Alarik is built with a strong focus on low-latency I/O and highly parallel request handling. New benchmarks on a dedicated Linux machine show that Alarik delivers competitive and in many cases superior throughput compared to MinIO or RustFS, even in early beta stages.
 
 ### Benchmark Alarik vs MinIO
 
@@ -115,16 +127,6 @@ We use MinIO’s own benchmarking tool, `warp`, to measure performance. Both the
 #### MinIO
 
 <img src="assets/minio_benchmark.png" />
-
-## State of Development
-
-Alarik is currently in **Alpha** - under rapid, active development.
-
--   Expect breaking changes and incomplete feature sets.
--   Core S3-compatible storage functionality is already operational.
--   Stabilization, documentation, and production-grade hardening are in progress.
-
-Contributions, issues, feedback, and real-world testing are **highly encouraged**.
 
 ## Contributing
 

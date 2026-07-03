@@ -2,9 +2,10 @@
 
 # Runs the entire Alarik test battery and prints a final scoreboard:
 #
-#   1. Swift unit tests        (swift test --no-parallel)
-#   2. AWS CLI S3 tests        (aws_cli_tests.sh)
-#   3. rclone S3 tests         (rclone_tests.sh)
+#   1. Swift unit tests          (swift test --no-parallel)
+#   2. AWS CLI S3 tests          (aws_cli_tests.sh)
+#   3. rclone S3 tests           (rclone_tests.sh)
+#   4. Bucket replication tests  (replication_tests.sh - 2 real server instances)
 #
 # The S3 test suites run against a freshly built server that is started with a
 # clean, temporary state directory (empty database + storage) per suite, so
@@ -157,6 +158,24 @@ else
     record "rclone S3 tests" "FAIL" "server did not start"
 fi
 stop_server
+echo ""
+
+# ── 5. Bucket replication tests ─────────────────────────────────────────────────
+# Unlike the suites above, this one manages its own two server processes (a real
+# source + target instance, on ports 8081/8082)
+echo "--- Bucket replication tests (2 real instances) ---"
+if (cd "$ROOT" && bash replication_tests.sh) > "$LOG_DIR/replication-tests.log" 2>&1; then
+    REPLICATION_RESULT="PASS"
+else
+    REPLICATION_RESULT="FAIL"
+fi
+REPLICATION_PASSES=$(grep -c "^PASS:" "$LOG_DIR/replication-tests.log")
+REPLICATION_FAILS=$(grep -c "^FAIL:" "$LOG_DIR/replication-tests.log")
+echo "$REPLICATION_RESULT: $REPLICATION_PASSES passed, $REPLICATION_FAILS failed"
+if [ "$REPLICATION_FAILS" -gt 0 ]; then
+    grep "^FAIL:" "$LOG_DIR/replication-tests.log" | sed 's/^/  /'
+fi
+record "Bucket replication tests" "$REPLICATION_RESULT" "$REPLICATION_PASSES passed, $REPLICATION_FAILS failed"
 echo ""
 
 # ── Scoreboard ─────────────────────────────────────────────────────────────────

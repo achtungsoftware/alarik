@@ -44,6 +44,8 @@ const openBucketTagsModal = ref(false);
 const selectedBucketForTags = ref<Bucket | null>(null);
 const openBucketNotificationsModal = ref(false);
 const selectedBucketForNotifications = ref<Bucket | null>(null);
+const openBucketReplicationModal = ref(false);
+const selectedBucketForReplication = ref<Bucket | null>(null);
 const openShareModal = ref(false);
 const shareObject = ref<BrowserItem | null>(null);
 
@@ -383,6 +385,18 @@ const columns: TableColumn<BrowserItem>[] = [
                             openBucketNotificationsModal.value = true;
                         },
                     }),
+                    h(resolveComponent("UButton"), {
+                        label: "Replication",
+                        variant: "subtle",
+                        color: "neutral",
+                        size: "sm",
+                        icon: "i-lucide-repeat",
+                        onClick: (e: Event) => {
+                            e.stopPropagation();
+                            selectedBucketForReplication.value = bucket;
+                            openBucketReplicationModal.value = true;
+                        },
+                    }),
                 ]);
             }
 
@@ -620,6 +634,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
     <BucketPolicyModal v-if="selectedBucketForPolicy && openBucketPolicyModal" v-model:open="openBucketPolicyModal" :bucket="selectedBucketForPolicy" @saved="refreshBuckets" />
     <BucketTagsModal v-if="selectedBucketForTags && openBucketTagsModal" v-model:open="openBucketTagsModal" :bucket="selectedBucketForTags" @saved="refreshBuckets" />
     <BucketNotificationsModal v-if="selectedBucketForNotifications && openBucketNotificationsModal" v-model:open="openBucketNotificationsModal" :bucket="selectedBucketForNotifications" @saved="refreshBuckets" />
+    <BucketReplicationModal v-if="selectedBucketForReplication && openBucketReplicationModal" v-model:open="openBucketReplicationModal" :bucket="selectedBucketForReplication" @saved="refreshBuckets" />
     <ShareFileModal v-if="shareObject && openShareModal" v-model:open="openShareModal" :bucket="currentBucket" :item="shareObject" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
     <UploadProgressSlideover />

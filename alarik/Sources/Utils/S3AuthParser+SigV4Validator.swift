@@ -318,6 +318,28 @@ struct SigV4Validator {
                 status: .badRequest, code: "InvalidArgument", message: "Invalid date format")
         }
 
+        // Region check: the credential scope's region must match this deployment's configured
+        // region (`ALARIK_REGION`, default "us-east-1"). Verified against real S3 behavior: a
+        // region mismatch is a 400 (a malformed request), not a 403 - distinct codes for header
+        // vs. query auth, matching AWS's own `AuthorizationHeaderMalformed` /
+        // `AuthorizationQueryParametersError` responses.
+        let expectedRegion = AlarikRegion.resolve()
+        guard authInfo.region == expectedRegion else {
+            if authInfo.expires == nil {
+                throw S3Error(
+                    status: .badRequest, code: "AuthorizationHeaderMalformed",
+                    message:
+                        "The authorization header is malformed; the region '\(authInfo.region)' is wrong; expecting '\(expectedRegion)'."
+                )
+            } else {
+                throw S3Error(
+                    status: .badRequest, code: "AuthorizationQueryParametersError",
+                    message:
+                        "Error parsing the X-Amz-Credential parameter; the region '\(authInfo.region)' is wrong; expecting '\(expectedRegion)'."
+                )
+            }
+        }
+
         // Time skew check
         guard let requestDate = authInfo.fullDate.toAWSDate() else {
             throw S3Error(

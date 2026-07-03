@@ -178,7 +178,130 @@ struct S3ControllerTests {
                     #expect(res.status == .ok)
                     #expect(res.headers.contentType == .xml)
                     let bodyString = res.body.string
-                    #expect(bodyString.contains("us-east-1"))
+                    // Real S3's us-east-1 quirk: LocationConstraint is empty for that region,
+                    // not the literal string "us-east-1" (verified against the
+                    // GetBucketLocation API reference).
+                    #expect(bodyString.contains("<LocationConstraint"))
+                    #expect(bodyString.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>"))
+                })
+        }
+    }
+
+    /// Overrides the process-wide `ALARIK_REGION` for the duration of `body`, restoring
+    /// whatever was there before. Safe under `swift test --no-parallel` (this suite is already
+    /// `.serialized`), same reasoning as `AlarikRegionTests`.
+    private func withRegion(_ region: String, _ body: () async throws -> Void) async throws {
+        let original = ProcessInfo.processInfo.environment["ALARIK_REGION"]
+        setenv("ALARIK_REGION", region, 1)
+        defer {
+            if let original {
+                setenv("ALARIK_REGION", original, 1)
+            } else {
+                unsetenv("ALARIK_REGION")
+            }
+        }
+        try await body()
+    }
+
+    @Test("HeadBucket reports the configured region via x-amz-bucket-region")
+    func testHeadBucketReportsRegion() async throws {
+        let bucketName = "region-head-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let signed = signedHeaders(for: .HEAD, path: "/\(bucketName)")
+            try await app.test(
+                .HEAD, "/\(bucketName)",
+                beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.first(name: "x-amz-bucket-region") == "us-east-1")
+                })
+        }
+    }
+
+    @Test("GetBucketLocation reports a non-default configured region as element text")
+    func testGetBucketLocationNonDefaultRegion() async throws {
+        let bucketName = "region-location-bucket"
+        try await withRegion("eu-central-1") {
+            try await withApp { app in
+                let signer = AWSSigner(
+                    credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                    name: "s3", region: "eu-central-1")
+                let createURL = URL(string: "http://\(host)/\(bucketName)")!
+                let createSigned = signer.signHeaders(
+                    url: createURL, method: .PUT, headers: HTTPHeaders([("host", host)]))
+                try await app.test(
+                    .PUT, "/\(bucketName)",
+                    beforeRequest: { req in req.headers.add(contentsOf: createSigned) },
+                    afterResponse: { res in #expect(res.status == .ok) })
+
+                let locationURL = URL(string: "http://\(host)/\(bucketName)?location")!
+                let locationSigned = signer.signHeaders(
+                    url: locationURL, method: .GET, headers: HTTPHeaders([("host", host)]))
+                try await app.test(
+                    .GET, "/\(bucketName)?location",
+                    beforeRequest: { req in req.headers.add(contentsOf: locationSigned) },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        let bodyString = res.body.string
+                        #expect(bodyString.contains("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">eu-central-1</LocationConstraint>"))
+                    })
+            }
+        }
+    }
+
+    @Test("re-creating your own bucket is idempotent (200) only in us-east-1; other regions return 409 BucketAlreadyOwnedByYou")
+    func testCreateBucketIdempotencyIsRegionSpecific() async throws {
+        let bucketName = "region-recreate-bucket"
+        try await withRegion("eu-central-1") {
+            try await withApp { app in
+                let signer = AWSSigner(
+                    credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                    name: "s3", region: "eu-central-1")
+                let url = URL(string: "http://\(host)/\(bucketName)")!
+
+                let firstSigned = signer.signHeaders(
+                    url: url, method: .PUT, headers: HTTPHeaders([("host", host)]))
+                try await app.test(
+                    .PUT, "/\(bucketName)",
+                    beforeRequest: { req in req.headers.add(contentsOf: firstSigned) },
+                    afterResponse: { res in #expect(res.status == .ok) })
+
+                let secondSigned = signer.signHeaders(
+                    url: url, method: .PUT, headers: HTTPHeaders([("host", host)]))
+                try await app.test(
+                    .PUT, "/\(bucketName)",
+                    beforeRequest: { req in req.headers.add(contentsOf: secondSigned) },
+                    afterResponse: { res async throws in
+                        #expect(res.status == .conflict)
+                        let body = res.body.string
+                        #expect(body.contains("BucketAlreadyOwnedByYou"))
+                    })
+            }
+        }
+    }
+
+    @Test("a request signed for the wrong region is rejected end-to-end")
+    func testRequestWrongRegionRejectedEndToEnd() async throws {
+        let bucketName = "region-mismatch-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            // Server is configured for the default region (us-east-1, ALARIK_REGION unset) -
+            // sign this request for a different region entirely.
+            let signer = AWSSigner(
+                credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                name: "s3", region: "ap-southeast-2")
+            let url = URL(string: "http://\(host)/\(bucketName)")!
+            let signed = signer.signHeaders(
+                url: url, method: .HEAD, headers: HTTPHeaders([("host", host)]))
+
+            try await app.test(
+                .HEAD, "/\(bucketName)",
+                beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
                 })
         }
     }

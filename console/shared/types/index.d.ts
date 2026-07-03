@@ -69,6 +69,40 @@ declare global {
         enabled: boolean;
     }
 
+    export interface ReplicationTarget {
+        id: string;
+        endpoint: string;
+        targetBucket: string;
+        accessKeyId: string;
+        secretAccessKey: string;
+        region: string;
+        enabled: boolean;
+    }
+
+    export interface ReplicationRule {
+        id: string;
+        targetId: string;
+        prefix?: string;
+        replicateDeletes: boolean;
+        replicateExisting: boolean;
+        enabled: boolean;
+    }
+
+    export interface ReplicationTask {
+        id: string;
+        ruleId: string;
+        targetId: string;
+        endpoint: string;
+        key: string;
+        versionId?: string;
+        operation: "put" | "delete";
+        state: "pending" | "failed";
+        attempts: number;
+        nextAttemptAt: string;
+        lastError?: string;
+        createdAt: string;
+    }
+
     export interface Bucket {
         name: string;
         creationDate: string;

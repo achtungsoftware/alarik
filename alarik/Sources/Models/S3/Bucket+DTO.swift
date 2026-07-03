@@ -69,6 +69,11 @@ final class Bucket: Content, Model, @unchecked Sendable {
     @Field(key: "notification_config")
     var notificationConfig: String?
 
+    /// JSON-encoded `ReplicationConfiguration` (remote targets + rules), or nil if none
+    /// configured.
+    @Field(key: "replication_config")
+    var replicationConfig: String?
+
     init() {
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false

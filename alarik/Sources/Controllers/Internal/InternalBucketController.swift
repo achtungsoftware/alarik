@@ -77,6 +77,48 @@ struct InternalBucketController: RouteCollection {
         let deliveries: [DeliveryDTO]
     }
 
+    struct ReplicationTargetsDTO: Content {
+        let targets: [ReplicationTarget]
+    }
+
+    struct ReplicationRulesDTO: Content {
+        let rules: [ReplicationRule]
+    }
+
+    struct ReplicationTaskDTO: Content {
+        let id: UUID
+        let ruleId: UUID
+        let targetId: UUID
+        let endpoint: String
+        let key: String
+        let versionId: String?
+        let operation: String
+        let state: String
+        let attempts: Int
+        let nextAttemptAt: Date
+        let lastError: String?
+        let createdAt: Date
+
+        init(from task: ReplicationTask) {
+            self.id = task.id!
+            self.ruleId = task.ruleId
+            self.targetId = task.targetId
+            self.endpoint = task.endpoint
+            self.key = task.key
+            self.versionId = task.versionId
+            self.operation = task.operation
+            self.state = task.state
+            self.attempts = task.attempts
+            self.nextAttemptAt = task.nextAttemptAt
+            self.lastError = task.lastError
+            self.createdAt = task.createdAt
+        }
+    }
+
+    struct ReplicationTasksDTO: Content {
+        let tasks: [ReplicationTaskDTO]
+    }
+
     struct ShareRequestDTO: Content {
         let bucket: String
         let key: String
@@ -119,6 +161,22 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
             .grouped("deliveries").grouped(":deliveryId").grouped("retry")
             .post(use: self.retryBucketNotificationDelivery)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("targets").get(use: self.getReplicationTargets)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("targets").put(use: self.setReplicationTargets)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("rules").get(use: self.getReplicationRules)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("rules").put(use: self.setReplicationRules)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("rules").grouped(":ruleId").grouped("resync")
+            .post(use: self.resyncReplicationRule)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("tasks").get(use: self.listReplicationTasks)
+        routes.grouped("buckets").grouped(":bucketName").grouped("replication")
+            .grouped("tasks").grouped(":taskId").grouped("retry")
+            .post(use: self.retryReplicationTask)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
         routes.grouped("objects").post(use: self.uploadObject)
@@ -451,6 +509,8 @@ struct InternalBucketController: RouteCollection {
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: meta.size, etag: etag, versionId: meta.versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        await ReplicationService.enqueuePut(
+            bucketName: bucketName, key: keyPath, versionId: meta.versionId, on: req.db)
 
         return ObjectMeta.ResponseDTO(from: meta)
     }
@@ -481,6 +541,8 @@ struct InternalBucketController: RouteCollection {
                     event: .objectRemovedDelete, bucketName: bucketName, key: deletedKey,
                     size: nil, etag: nil, versionId: nil,
                     requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                await ReplicationService.enqueueDelete(
+                    bucketName: bucketName, key: deletedKey, versionId: nil, on: req.db)
             }
         } else if versioningStatus == .enabled {
             // Versioning enabled - create delete marker instead of permanent delete
@@ -489,6 +551,8 @@ struct InternalBucketController: RouteCollection {
                 event: .objectRemovedDeleteMarkerCreated, bucketName: bucketName, key: key,
                 size: nil, etag: nil, versionId: marker.versionId,
                 requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            await ReplicationService.enqueueDelete(
+                bucketName: bucketName, key: key, versionId: marker.versionId, on: req.db)
         } else {
             // Versioning disabled or suspended - permanent delete
             // Check versioned storage first
@@ -513,6 +577,8 @@ struct InternalBucketController: RouteCollection {
                 event: .objectRemovedDelete, bucketName: bucketName, key: key,
                 size: nil, etag: nil, versionId: nil,
                 requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            await ReplicationService.enqueueDelete(
+                bucketName: bucketName, key: key, versionId: nil, on: req.db)
         }
 
         return .noContent
@@ -1087,6 +1153,307 @@ struct InternalBucketController: RouteCollection {
         return DeliveryDTO(from: delivery)
     }
 
+    // MARK: - Bucket replication
+
+    @Sendable
+    func getReplicationTargets(req: Request) async throws -> ReplicationTargetsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard let raw = bucket.replicationConfig else {
+            return ReplicationTargetsDTO(targets: [])
+        }
+        return ReplicationTargetsDTO(targets: ReplicationConfiguration.fromJSON(raw).targets)
+    }
+
+    /// Replaces the bucket's replication targets wholesale. Validates every target's endpoint
+    /// and gates private-address targets to admins (SSRF), same as webhook URLs. Removing a
+    /// target that's still referenced by a rule auto-disables that rule rather than leaving it
+    /// pointing at a target that no longer exists.
+    @Sendable
+    func setReplicationTargets(req: Request) async throws -> ReplicationTargetsDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(ReplicationTargetsDTO.self)
+
+        guard input.targets.count <= ReplicationConfiguration.maxTargetCount else {
+            throw Abort(
+                .badRequest,
+                reason:
+                    "A bucket may have at most \(ReplicationConfiguration.maxTargetCount) replication targets."
+            )
+        }
+
+        let normalizedTargets = try input.targets.map { target -> ReplicationTarget in
+            try WebhookURLValidator.validateStructure(target.endpoint)
+            if WebhookURLValidator.isInternalHost(target.endpoint) && !auth.isAdmin {
+                throw Abort(
+                    .forbidden,
+                    reason:
+                        "Only administrators can configure replication targets pointing at private or loopback addresses."
+                )
+            }
+            guard !target.targetBucket.isEmpty else {
+                throw Abort(
+                    .badRequest, reason: "Each replication target requires a destination bucket.")
+            }
+            guard !target.accessKeyId.isEmpty, !target.secretAccessKey.isEmpty else {
+                throw Abort(.badRequest, reason: "Each replication target requires credentials.")
+            }
+
+            var normalized = target
+            if normalized.id == ReplicationTarget.zeroUUID {
+                normalized.id = UUID()
+            }
+            return normalized
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        let existingRules =
+            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0).rules } ?? []
+        let keptTargetIds = Set(normalizedTargets.map(\.id))
+        // A rule referencing a target that no longer exists is disabled, never left dangling -
+        // same "clean up, don't leave a dangling reference" precedent used when a webhook rule
+        // is removed.
+        let adjustedRules = existingRules.map { rule -> ReplicationRule in
+            guard keptTargetIds.contains(rule.targetId) else {
+                var disabled = rule
+                disabled.enabled = false
+                return disabled
+            }
+            return rule
+        }
+
+        let config = ReplicationConfiguration(targets: normalizedTargets, rules: adjustedRules)
+        bucket.replicationConfig =
+            (normalizedTargets.isEmpty && adjustedRules.isEmpty) ? nil : config.toJSON()
+        try await bucket.save(on: req.db)
+
+        await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+
+        return ReplicationTargetsDTO(targets: normalizedTargets)
+    }
+
+    @Sendable
+    func getReplicationRules(req: Request) async throws -> ReplicationRulesDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard let raw = bucket.replicationConfig else {
+            return ReplicationRulesDTO(rules: [])
+        }
+        return ReplicationRulesDTO(rules: ReplicationConfiguration.fromJSON(raw).rules)
+    }
+
+    /// Replaces the bucket's replication rules wholesale. A non-empty rule set requires the
+    /// bucket's versioning to be `Enabled` (without it, `versionId` can't unambiguously
+    /// identify what to replicate), and every rule's `targetId` must resolve to a target
+    /// already configured on this bucket.
+    @Sendable
+    func setReplicationRules(req: Request) async throws -> ReplicationRulesDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(ReplicationRulesDTO.self)
+
+        guard input.rules.count <= ReplicationConfiguration.maxRuleCount else {
+            throw Abort(
+                .badRequest,
+                reason:
+                    "A bucket may have at most \(ReplicationConfiguration.maxRuleCount) replication rules."
+            )
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard input.rules.isEmpty || bucket.isVersioningEnabled else {
+            throw Abort(
+                .badRequest,
+                reason: "Replication rules require the bucket's versioning to be Enabled.")
+        }
+
+        let existingTargets =
+            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0).targets } ?? []
+        let targetIds = Set(existingTargets.map(\.id))
+
+        let normalizedRules = try input.rules.map { rule -> ReplicationRule in
+            guard targetIds.contains(rule.targetId) else {
+                throw Abort(.badRequest, reason: "Rule references an unknown replication target.")
+            }
+
+            var normalized = rule
+            if normalized.id == ReplicationRule.zeroUUID {
+                normalized.id = UUID()
+            }
+            return normalized
+        }
+
+        let config = ReplicationConfiguration(targets: existingTargets, rules: normalizedRules)
+        bucket.replicationConfig =
+            (existingTargets.isEmpty && normalizedRules.isEmpty) ? nil : config.toJSON()
+        try await bucket.save(on: req.db)
+
+        await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+
+        // Stop delivering already-queued tasks for rules that were just removed - same
+        // reasoning as the equivalent webhook-delivery purge above.
+        let keptIds = normalizedRules.map(\.id)
+        let purge = ReplicationTask.query(on: req.db)
+            .filter(\.$bucketName == bucketName)
+        if !keptIds.isEmpty {
+            purge.filter(\.$ruleId !~ keptIds)
+        }
+        try await purge.delete()
+
+        return ReplicationRulesDTO(rules: normalizedRules)
+    }
+
+    /// Triggers a walk of the bucket's current objects under `rule.prefix`, enqueueing a `put`
+    /// replication task for each - the explicit "do it now" trigger for a rule that already
+    /// opted into `replicateExisting`, a manual action, never automatic.
+    ///
+    /// The walk itself runs in the background (`ReplicationService.resync`), not inline in this
+    /// request: a bucket with hundreds of thousands of objects could otherwise hold the HTTP
+    /// request open for minutes, well past any reasonable client/proxy timeout. This returns
+    /// `202 Accepted` as soon as the rule/target have been validated - progress is only
+    /// observable via the replication tasks list, same as any other asynchronously-delivered
+    /// replication work.
+    @Sendable
+    func resyncReplicationRule(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+        guard let ruleId = req.parameters.get("ruleId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid rule id")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        guard let raw = bucket.replicationConfig else {
+            throw Abort(.notFound, reason: "Replication rule not found")
+        }
+        let config = ReplicationConfiguration.fromJSON(raw)
+        guard let rule = config.rules.first(where: { $0.id == ruleId }) else {
+            throw Abort(.notFound, reason: "Replication rule not found")
+        }
+        guard rule.enabled else {
+            throw Abort(.badRequest, reason: "Cannot resync a disabled replication rule.")
+        }
+        guard rule.replicateExisting else {
+            throw Abort(
+                .badRequest,
+                reason:
+                    "This rule has not opted into existing-object replication (replicateExisting)."
+            )
+        }
+        guard let target = config.target(for: rule.targetId), target.enabled else {
+            throw Abort(
+                .badRequest, reason: "This rule's replication target is missing or disabled.")
+        }
+
+        // Scoped to the Application, not the Request - this must keep running after the
+        // response below has been sent and `req` may have gone away.
+        let db = req.application.db
+        let logger = req.application.logger
+        Task {
+            do {
+                let enqueued = try await ReplicationService.resync(
+                    bucketName: bucketName, rule: rule, target: target, on: db)
+                logger.info(
+                    "Replication resync for bucket '\(bucketName)' rule '\(rule.id)' enqueued \(enqueued) object(s)"
+                )
+            } catch {
+                logger.error(
+                    "Replication resync failed for bucket '\(bucketName)' rule '\(rule.id)': \(error)"
+                )
+            }
+        }
+
+        return .accepted
+    }
+
+    /// Lists the bucket's most recent replication outbox rows (pending and dead-lettered),
+    /// most-recent first - the replication equivalent of `listBucketNotificationDeliveries`.
+    @Sendable
+    func listReplicationTasks(req: Request) async throws -> ReplicationTasksDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        let tasks = try await ReplicationTask.query(on: req.db)
+            .filter(\.$bucketName == bucketName)
+            .sort(\.$createdAt, .descending)
+            .limit(100)
+            .all()
+
+        return ReplicationTasksDTO(tasks: tasks.map(ReplicationTaskDTO.init))
+    }
+
+    /// Requeues a dead-lettered (or still-pending) replication task for immediate retry -
+    /// resets the retry backoff and attempt count, then wakes the dispatcher.
+    @Sendable
+    func retryReplicationTask(req: Request) async throws -> ReplicationTaskDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+        guard let taskId = req.parameters.get("taskId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid task id")
+        }
+
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+
+        // Scope the lookup to this bucket too, not just the id - a task id alone doesn't prove
+        // the caller owns the bucket it belongs to.
+        guard
+            let task = try await ReplicationTask.query(on: req.db)
+                .filter(\.$id == taskId)
+                .filter(\.$bucketName == bucketName)
+                .first()
+        else {
+            throw Abort(.notFound, reason: "Replication task not found")
+        }
+
+        task.state = ReplicationTask.State.pending.rawValue
+        task.attempts = 0
+        task.nextAttemptAt = Date()
+        try await task.save(on: req.db)
+
+        ReplicationDispatcher.shared.wake()
+
+        return ReplicationTaskDTO(from: task)
+    }
+
     /// Returns the tags of the *current* version of an object. Internal API doesn't expose
     /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
     @Sendable
@@ -1293,6 +1660,9 @@ struct InternalBucketController: RouteCollection {
             event: .objectRemovedDelete, bucketName: bucketName, key: key,
             size: nil, etag: nil, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        // Not replicated: this permanently prunes one specific historical version, which has
+        // no meaningful equivalent on the replication target (see
+        // ReplicationClient.replicateDelete).
 
         return .noContent
     }

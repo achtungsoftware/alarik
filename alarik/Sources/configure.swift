@@ -59,6 +59,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddBucketNotificationConfig())
     app.migrations.add(CreateNotificationDelivery())
     app.migrations.add(AddNotificationDeliveryLastError())
+    app.migrations.add(AddBucketReplicationConfig())
+    app.migrations.add(CreateReplicationTask())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -106,6 +108,7 @@ public func configure(_ app: Application) async throws {
     // environment so tests can drive drains manually (only the periodic tick below is
     // gated to non-testing)
     await NotificationDispatcher.shared.configure(app: app)
+    await ReplicationDispatcher.shared.configure(app: app)
 
     try routes(app)
 
@@ -171,6 +174,19 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Replication outbox tick - same reasoning as the webhook tick above: fresh writes
+        // are replicated near-instantly via the explicit wake() in ReplicationService, this
+        // tick exists to pick up retries whose backoff has elapsed (and anything left over
+        // from before a restart).
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .seconds(2),
+            delay: .seconds(2)
+        ) { task in
+            Task {
+                await ReplicationDispatcher.shared.drain()
+            }
+        }
+
         // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
         // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
         // the way short-lived access keys/share links are. Matches real S3, which evaluates
@@ -190,6 +206,12 @@ public func configure(_ app: Application) async throws {
                     try await NotificationDispatcher.purgeExpiredFailures(on: app.db)
                 } catch {
                     app.logger.error("Failed to purge expired webhook failures: \(error)")
+                }
+
+                do {
+                    try await ReplicationDispatcher.purgeExpiredFailures(on: app.db)
+                } catch {
+                    app.logger.error("Failed to purge expired replication failures: \(error)")
                 }
             }
         }

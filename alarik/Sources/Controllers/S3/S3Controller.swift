@@ -167,7 +167,12 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-        return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+        let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+        // Real S3 always reports the bucket's region via this header on HeadBucket, regardless
+        // of the LocationConstraint XML quirk for us-east-1 (verified against the
+        // HeadBucket/GetBucketLocation API references).
+        response.headers.replaceOrAdd(name: "x-amz-bucket-region", value: AlarikRegion.resolve())
+        return response
     }
 
     @Sendable
@@ -277,6 +282,19 @@ struct S3Controller: RouteCollection {
                 requestId: req.id)
         }
 
+        // PUT ?replication - AWS's ReplicationConfiguration XML has no field for target
+        // credentials, which Alarik's model requires (see ReplicationTarget) - so there's
+        // nothing meaningful an S3 client could PUT here. Managed via the console / internal
+        // API instead (GET ?replication still works).
+        if query.lowercased().contains("replication") {
+            _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+            throw S3Error(
+                status: .notImplemented, code: "NotImplemented",
+                message:
+                    "Configuring bucket replication via the S3 API is not supported. Manage replication through the Alarik console or internal API.",
+                requestId: req.id)
+        }
+
         if Validator.bucketName.validate(bucketName).isFailure {
             throw S3Error(
                 status: .badRequest,
@@ -291,10 +309,18 @@ struct S3Controller: RouteCollection {
 
         if let existing = try await Bucket.query(on: req.db).filter(\.$name == bucketName).first()
         {
-            // us-east-1 semantics (the region Alarik reports): re-creating a bucket you
-            // already own is a 200 OK no-op; only someone else's bucket is a 409
-            // (verified against the CreateBucket API reference)
             if existing.$user.id == key.user.id {
+                // Real S3 only no-ops re-creating your own bucket as a 200 OK in us-east-1,
+                // for legacy compatibility - every other region returns 409
+                // BucketAlreadyOwnedByYou instead (verified against the CreateBucket API
+                // reference).
+                guard AlarikRegion.resolve() == AlarikRegion.default else {
+                    throw S3Error(
+                        status: .conflict,
+                        code: "BucketAlreadyOwnedByYou",
+                        message: "Your previous request to create the named bucket succeeded and you already own it."
+                    )
+                }
                 let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
                 response.headers.replaceOrAdd(name: "Location", value: "/\(bucketName)")
                 return response
@@ -492,6 +518,26 @@ struct S3Controller: RouteCollection {
         return .noContent
     }
 
+    /// Handles DELETE /:bucketName?replication - clears the bucket's whole replication
+    /// configuration (targets and rules). Unlike PUT ?replication, this needs no target
+    /// credentials, so - matching real S3's DeleteBucketReplication - it's fully supported, not
+    /// a 501.
+    @Sendable
+    private func handleReplicationDelete(req: Request, bucketName: String) async throws
+        -> HTTPStatus
+    {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
+
+        bucket.replicationConfig = nil
+        try await bucket.save(on: req.db)
+
+        await ReplicationConfigCache.shared.removeBucket(bucketName)
+
+        return .noContent
+    }
+
     // DELETE /:bucketName
     @Sendable
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
@@ -516,6 +562,11 @@ struct S3Controller: RouteCollection {
         // Handle DELETE ?policy
         if query.lowercased().contains("policy") {
             return try await handleBucketPolicyDelete(req: req, bucketName: bucketName)
+        }
+
+        // Handle DELETE ?replication
+        if query.lowercased().contains("replication") {
+            return try await handleReplicationDelete(req: req, bucketName: bucketName)
         }
 
         guard
@@ -703,6 +754,8 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: dataToWrite.count, etag: etag, versionId: writtenVersionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        await ReplicationService.enqueuePut(
+            bucketName: bucketName, key: keyPath, versionId: writtenVersionId, on: req.db)
 
         return Response(status: .ok, headers: headers)
     }
@@ -896,6 +949,8 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
             size: destinationMeta.size, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        await ReplicationService.enqueuePut(
+            bucketName: destinationBucket, key: destinationKey, versionId: versionId, on: req.db)
 
         // Build copy result response (S3 returns XML for copy operations)
         let copyResult = """
@@ -1128,6 +1183,13 @@ struct S3Controller: RouteCollection {
             bucketName: bucketName, key: keyPath, size: nil, etag: nil,
             versionId: outcome.versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        // A client-specified versionId permanently prunes one historical version - there's no
+        // matching version on the replication target to remove (see ReplicationClient.replicateDelete),
+        // so only replicate when this deleted the *current* object.
+        if versionId == nil {
+            await ReplicationService.enqueueDelete(
+                bucketName: bucketName, key: keyPath, versionId: outcome.versionId, on: req.db)
+        }
 
         return Response(status: .noContent, headers: headers)
     }
@@ -1193,6 +1255,13 @@ struct S3Controller: RouteCollection {
                     bucketName: bucketName, key: object.key, size: nil, etag: nil,
                     versionId: outcome.versionId,
                     requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                // See the single-object DELETE handler: a client-specified versionId prunes one
+                // historical version, which has no replicable equivalent on the target.
+                if object.versionId == nil {
+                    await ReplicationService.enqueueDelete(
+                        bucketName: bucketName, key: object.key, versionId: outcome.versionId,
+                        on: req.db)
+                }
             } catch {
                 errors.append(
                     DeleteErrorEntry(
@@ -1393,6 +1462,8 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
             size: finalSize, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+        await ReplicationService.enqueuePut(
+            bucketName: bucketName, key: key, versionId: versionId, on: req.db)
 
         // Build response headers
         var headers = HTTPHeaders()

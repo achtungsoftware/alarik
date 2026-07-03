@@ -18,8 +18,7 @@ import Foundation
 import Vapor
 
 /// One webhook rule of a bucket's notification configuration. Unlike AWS (which can only
-/// target SNS/SQS/Lambda ARNs), Alarik delivers events straight to an HTTP(S) endpoint -
-/// the same model MinIO uses for self-hosted deployments.
+/// target SNS/SQS/Lambda ARNs), Alarik delivers events straight to an HTTP(S) endpoint.
 struct NotificationRule: Codable, Equatable {
     var id: UUID
     /// Delivery endpoint. http/https only; private-range targets require an admin owner
@@ -104,8 +103,8 @@ struct NotificationConfiguration: Codable, Equatable {
 
     /// Builds the S3 `GET ?notification` response. Webhook rules are surfaced as
     /// QueueConfigurations with an `arn:alarik:webhook:::{id}` ARN - S3's XML shape has no
-    /// URL field, so the ARN carries the rule identity (same indirection MinIO uses with
-    /// `arn:minio:sqs:...`). An empty configuration is an empty root element, per the spec.
+    /// URL field, so the ARN carries the rule identity. An empty configuration is an empty
+    /// root element, per the spec.
     func toXML() -> String {
         // Explicit `String` typing throughout: SQLKit's SQLQueryString is (transitively)
         // ExpressibleByStringInterpolation and visible in this module, so unannotated string

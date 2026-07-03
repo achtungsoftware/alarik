@@ -75,6 +75,8 @@ struct LifecycleService {
                     ? .lifecycleExpirationDeleteMarkerCreated : .lifecycleExpirationDelete,
                 bucketName: bucketName, key: object.key, size: nil, etag: nil,
                 versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, on: db)
+            await ReplicationService.enqueueDelete(
+                bucketName: bucketName, key: object.key, versionId: outcome.versionId, on: db)
         }
     }
 
@@ -110,6 +112,9 @@ struct LifecycleService {
                     event: .lifecycleExpirationDelete, bucketName: bucketName, key: key,
                     size: nil, etag: nil, versionId: versionId,
                     requestId: UUID().uuidString, sourceIP: nil, on: db)
+                // Not replicated: NoncurrentVersionExpiration permanently prunes one specific
+                // historical version, which has no meaningful equivalent on the replication
+                // target (see ReplicationClient.replicateDelete).
             }
         }
     }
