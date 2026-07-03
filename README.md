@@ -33,20 +33,62 @@ Developers and organizations need an S3-compatible store that is fast, simple to
 
 The goal: a self-hosted, high-speed S3 system built for today’s workloads, without the enterprise upsell.
 
+## Features
+
+### S3-Compatible API
+
+| Feature | Notes |
+| --- | --- |
+| Core object operations | Put, Get, Head, Delete, Copy, multi-object delete |
+| Multipart uploads | Create, upload part, complete, abort, list parts/uploads |
+| Bucket versioning | Enabled/suspended, version listing, delete markers |
+| Conditional requests | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` |
+| Range reads | Including suffix ranges, correct `416` semantics |
+| Presigned URLs | Query-string (SigV4) auth, up to 7-day expiry |
+| Object tagging | Bucket and object-level tag-sets |
+| Bucket policies | JSON policy documents, public access block |
+| Lifecycle rules | Expiration, noncurrent version expiration, incomplete multipart cleanup |
+| Bucket webhooks | AWS-event-shaped notifications over HTTP (see below) |
+| SigV4 authentication | Header and query auth, chunked (streaming) payloads |
+
+### Web Console
+
+| Feature | Notes |
+| --- | --- |
+| Object browser | Upload, download, delete, folder navigation |
+| Drag-and-drop upload | Files and whole folders, with progress tracking |
+| Recursive search | Find objects by name across nested folders |
+| Bucket & folder stats | On-demand size and object count |
+| Metadata editing | Content-Type and custom metadata, in place, without re-uploading |
+| Object versioning UI | Browse, preview, download, and delete individual versions |
+| Shared links | Time-limited, unauthenticated public links to an object |
+| Admin dashboard | Live CPU/RAM/traffic charts, storage stats, user & bucket management |
+
+### Authentication & Access Control
+
+| Feature | Notes |
+| --- | --- |
+| Local accounts | Username/password, optional open self-registration |
+| OIDC SSO | Admin-managed, multiple simultaneous identity providers, optional auto-provisioning |
+| S3 access keys | Per-user, with optional expiration |
+| Bucket policies | Fine-grained, S3-compatible JSON policies |
+| Public access block | Bucket-level override to block public access regardless of policy |
+
+### Webhooks (Event Notifications)
+
+| Feature | Notes |
+| --- | --- |
+| AWS-compatible payloads | Same event structure (v2.4) as S3 Event Notifications |
+| HMAC-signed deliveries | Verify authenticity with a per-rule shared secret |
+| Reliable delivery | Persistent outbox, survives restarts, exponential backoff retries |
+| Delivery health | Inspect pending/failed deliveries and retry on demand, from the console or API |
+| Event & key filtering | Subscribe by event type, key prefix, and/or suffix |
+
+See the [documentation](https://alarik.io/docs) for the full API reference.
+
 ## Installation
 
 Please see [Documentation](https://alarik.io/docs/installation)
-
-## Why Swift?
-
-Swift brings a rare combination of **performance**, **safety**, and **developer ergonomics**:
-
--   **Fast**: Compiles to highly optimized native code with performance comparable to Rust or Go.
--   **Safe**: Memory-safe by design, eliminating entire classes of vulnerabilities common in C/C++ ecosystems.
--   **Modern tooling**: Clear syntax, excellent async/await model, first-class concurrency, and mature package management.
--   **Great for systems programming**: SwiftNIO and related libraries provide extremely efficient networking and I/O foundations.
-
-Swift is an ideal fit for a new generation of cloud-native storage software.
 
 ## Future of Alarik
 
