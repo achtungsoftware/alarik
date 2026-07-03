@@ -50,8 +50,8 @@ const retryingId = ref<string | null>(null);
 
 const targetOptions = computed(() =>
     targets.value
-        .filter((t) => t.id !== ZERO_UUID)
-        .map((t) => ({ label: `${t.endpoint} → ${t.targetBucket}`, value: t.id }))
+        .filter((t: any) => t.id !== ZERO_UUID)
+        .map((t: any) => ({ label: `${t.endpoint} → ${t.targetBucket}`, value: t.id }))
 );
 
 watch(
@@ -111,7 +111,7 @@ async function saveTargets() {
         error.value = "";
 
         const payload = {
-            targets: targets.value.map((t) => ({
+            targets: targets.value.map((t: any) => ({
                 id: t.id,
                 endpoint: t.endpoint.trim(),
                 targetBucket: t.targetBucket.trim(),
@@ -157,6 +157,7 @@ function addRule() {
         prefix: "",
         replicateDeletes: false,
         replicateExisting: false,
+        synchronous: false,
         enabled: true,
     });
 }
@@ -171,12 +172,13 @@ async function saveRules() {
         error.value = "";
 
         const payload = {
-            rules: rules.value.map((r) => ({
+            rules: rules.value.map((r: any) => ({
                 id: r.id,
                 targetId: r.targetId,
                 prefix: r.prefix?.trim() ? r.prefix.trim() : undefined,
                 replicateDeletes: r.replicateDeletes,
                 replicateExisting: r.replicateExisting,
+                synchronous: r.synchronous,
                 enabled: r.enabled,
             })),
         };
@@ -285,7 +287,7 @@ async function retryTask(task: ReplicationTask) {
 }
 
 function targetLabel(targetId: string): string {
-    const target = targets.value.find((t) => t.id === targetId);
+    const target = targets.value.find((t: any) => t.id === targetId);
     return target ? `${target.endpoint} → ${target.targetBucket}` : "Unknown target";
 }
 
@@ -388,6 +390,7 @@ function relativeTime(iso: string): string {
                                     placeholder="Select target"
                                     variant="subtle"
                                     class="w-full"
+                                    size="lg"
                                 />
 
                                 <UInput v-model="rule.prefix" placeholder="Prefix filter (optional)" variant="subtle" class="w-full" />
@@ -401,7 +404,14 @@ function relativeTime(iso: string): string {
                                         <USwitch v-model="rule.replicateExisting" />
                                         Replicate existing objects
                                     </label>
+                                    <label class="flex items-center gap-2 text-sm">
+                                        <USwitch v-model="rule.synchronous" />
+                                        Synchronous
+                                    </label>
                                 </div>
+                                <p v-if="rule.synchronous" class="text-xs text-muted">
+                                    Writes to this bucket wait for delivery to this target (up to 20s) before completing, falling back to background retry on failure or timeout.
+                                </p>
                             </div>
                         </UCard>
 

@@ -190,7 +190,7 @@ struct ReplicationTests {
     private func configureReplication(
         _ app: Application, token: String, sourceBucket: String, endpoint: String,
         destBucket: String, replicateDeletes: Bool = false, replicateExisting: Bool = false,
-        prefix: String? = nil
+        synchronous: Bool = false, prefix: String? = nil
     ) async throws -> (target: ReplicationTarget, rule: ReplicationRule) {
         let target = ReplicationTarget(
             id: ReplicationTarget.zeroUUID, endpoint: endpoint, targetBucket: destBucket,
@@ -201,7 +201,8 @@ struct ReplicationTests {
 
         let rule = ReplicationRule(
             id: ReplicationRule.zeroUUID, targetId: savedTarget.id, prefix: prefix,
-            replicateDeletes: replicateDeletes, replicateExisting: replicateExisting, enabled: true)
+            replicateDeletes: replicateDeletes, replicateExisting: replicateExisting,
+            synchronous: synchronous, enabled: true)
         let savedRules = try await saveRules(app, token: token, bucketName: sourceBucket, rules: [rule])
         let savedRule = try #require(savedRules.first)
 
@@ -993,6 +994,71 @@ struct ReplicationTests {
             }
             #expect(readObject(bucketName: "repl-dst-order", key: "race.txt") == finalContent)
             #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+        }
+    }
+
+    // MARK: - Synchronous replication
+
+    @Test("a synchronous rule delivers before the triggering PUT response returns")
+    func synchronousRuleDeliversInline() async throws {
+        try await withApp { app, baseURL in
+            let token = try await loginDefaultAdminUser(app)
+            try await createBucket(app, bucketName: "repl-src-sync")
+            try await createBucket(app, bucketName: "repl-dst-sync")
+            try await enableVersioning(app, bucketName: "repl-src-sync")
+            try await enableVersioning(app, bucketName: "repl-dst-sync")
+
+            _ = try await configureReplication(
+                app, token: token, sourceBucket: "repl-src-sync", endpoint: baseURL,
+                destBucket: "repl-dst-sync", synchronous: true)
+
+            let content = Data("delivered before the response".utf8)
+            _ = try await putObject(app, bucketName: "repl-src-sync", key: "sync.txt", data: content)
+
+            // No drain, no wait - the PUT handler already awaited delivery inline (that's what
+            // "synchronous" means), so the object must already be on the target by now.
+            #expect(readObject(bucketName: "repl-dst-sync", key: "sync.txt") == content)
+            // Delivered inline - nothing was ever enqueued to the outbox for it.
+            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+        }
+    }
+
+    @Test(
+        "a synchronous rule with an unreachable target falls back to async retry without failing the client's write"
+    )
+    func synchronousRuleFallsBackOnFailure() async throws {
+        try await withApp { app, baseURL in
+            let token = try await loginDefaultAdminUser(app)
+            try await createBucket(app, bucketName: "repl-src-syncfail")
+            try await enableVersioning(app, bucketName: "repl-src-syncfail")
+
+            // Destination bucket deliberately does not exist - the inline attempt must fail
+            _ = try await configureReplication(
+                app, token: token, sourceBucket: "repl-src-syncfail", endpoint: baseURL,
+                destBucket: "repl-dst-syncfail-missing", synchronous: true)
+
+            let content = Data("still written locally".utf8)
+            // The client's PUT must succeed regardless of the synchronous target being down -
+            // putObject already asserts res.status == .ok.
+            _ = try await putObject(
+                app, bucketName: "repl-src-syncfail", key: "e.txt", data: content)
+
+            // The failed inline attempt must have fallen back to the normal async outbox
+            // rather than silently losing the replication.
+            let task = try #require(try await ReplicationTask.query(on: app.db).first())
+            #expect(task.key == "e.txt")
+            #expect(task.state == ReplicationTask.State.pending.rawValue)
+
+            // Fix the destination and confirm the fallback eventually delivers.
+            try await createBucket(app, bucketName: "repl-dst-syncfail-missing")
+            try await enableVersioning(app, bucketName: "repl-dst-syncfail-missing")
+            task.nextAttemptAt = Date().addingTimeInterval(-1)
+            try await task.save(on: app.db)
+
+            let replicated = try await waitUntil {
+                readObject(bucketName: "repl-dst-syncfail-missing", key: "e.txt") == content
+            }
+            #expect(replicated)
         }
     }
 }

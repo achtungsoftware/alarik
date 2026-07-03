@@ -61,9 +61,48 @@ struct ReplicationRule: Codable, Equatable {
     /// replicated. Doesn't happen automatically even when true - see the resync endpoint,
     /// which is the explicit "do it now" trigger.
     var replicateExisting: Bool
+    /// Whether the triggering PUT/DELETE waits for this rule's delivery before responding to
+    /// the client (up to `ReplicationService.synchronousTimeout`), falling back to the normal
+    /// async outbox on failure or timeout - see `ReplicationService.enqueue`. The local write
+    /// itself is never blocked or failed by this, only delayed; a slow/unreachable target costs
+    /// latency here, never correctness. Defaults to `false` (async), matching MinIO's own
+    /// default and every rule saved before this field existed.
+    var synchronous: Bool
     var enabled: Bool
 
     static let zeroUUID = ReplicationTarget.zeroUUID
+
+    init(
+        id: UUID, targetId: UUID, prefix: String?, replicateDeletes: Bool,
+        replicateExisting: Bool, synchronous: Bool = false, enabled: Bool
+    ) {
+        self.id = id
+        self.targetId = targetId
+        self.prefix = prefix
+        self.replicateDeletes = replicateDeletes
+        self.replicateExisting = replicateExisting
+        self.synchronous = synchronous
+        self.enabled = enabled
+    }
+
+    // Custom Decodable: `synchronous` must tolerate being absent from JSON saved by an older
+    // version of this struct (Swift's synthesized Decodable only does that for Optional
+    // properties - see ObjectMeta.tags for the same constraint) rather than failing the whole
+    // bucket's replication config to decode.
+    enum CodingKeys: String, CodingKey {
+        case id, targetId, prefix, replicateDeletes, replicateExisting, synchronous, enabled
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        targetId = try container.decode(UUID.self, forKey: .targetId)
+        prefix = try container.decodeIfPresent(String.self, forKey: .prefix)
+        replicateDeletes = try container.decode(Bool.self, forKey: .replicateDeletes)
+        replicateExisting = try container.decode(Bool.self, forKey: .replicateExisting)
+        synchronous = try container.decodeIfPresent(Bool.self, forKey: .synchronous) ?? false
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+    }
 
     /// Whether this rule wants replication for `key` - prefix-only (no event-type filtering
     /// like webhook rules have; replication cares whether the key was touched, not why).

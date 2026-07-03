@@ -97,6 +97,14 @@ struct ReplicationService {
         return enqueued
     }
 
+    /// How long a synchronous rule's inline delivery attempt is allowed to run before this
+    /// falls back to the normal async outbox. Bounded deliberately: this blocks a live
+    /// client-facing request (unlike the background dispatcher, where an unbounded wait only
+    /// delays other queued work), so one unreachable target must never be able to hang a
+    /// client's connection indefinitely. 20s leaves headroom under most reverse-proxy/client
+    /// timeouts while still being long enough for a real multipart transfer of a large object.
+    static let synchronousTimeout: Duration = .seconds(20)
+
     private static func enqueue(
         operation: ReplicationTask.Operation,
         bucketName: String,
@@ -115,9 +123,48 @@ struct ReplicationService {
         }
         guard !matching.isEmpty else { return }
 
-        for rule in matching {
-            guard let target = config.target(for: rule.targetId), target.enabled else { continue }
+        let resolved: [(rule: ReplicationRule, target: ReplicationTarget)] = matching.compactMap {
+            rule in
+            guard let target = config.target(for: rule.targetId), target.enabled else {
+                return nil
+            }
+            return (rule, target)
+        }
+        guard !resolved.isEmpty else { return }
 
+        let synchronousRules = resolved.filter { $0.rule.synchronous }
+        var needsOutbox = resolved.filter { !$0.rule.synchronous }
+
+        // Synchronous rules are attempted inline, concurrently, before this function returns -
+        // every caller already awaits `enqueuePut`/`enqueueDelete` within the request path, so
+        // holding the response here for the duration of this task group is exactly what makes
+        // a rule "synchronous". A rule that fails or times out falls back to the same async
+        // outbox path as any other rule below - the write that triggered this already
+        // succeeded unconditionally before this function was ever called, so a slow or
+        // unreachable target only ever costs latency here, never correctness.
+        if !synchronousRules.isEmpty {
+            let deliveries = await withTaskGroup(
+                of: (rule: ReplicationRule, target: ReplicationTarget, delivered: Bool).self
+            ) { group in
+                for (rule, target) in synchronousRules {
+                    group.addTask {
+                        let delivered = await attemptImmediateDelivery(
+                            operation: operation, target: target, bucketName: bucketName,
+                            key: key, versionId: versionId, logger: db.logger)
+                        return (rule, target, delivered)
+                    }
+                }
+                var results: [(rule: ReplicationRule, target: ReplicationTarget, delivered: Bool)] =
+                    []
+                for await outcome in group { results.append(outcome) }
+                return results
+            }
+            needsOutbox += deliveries.filter { !$0.delivered }.map { ($0.rule, $0.target) }
+        }
+
+        guard !needsOutbox.isEmpty else { return }
+
+        for (rule, target) in needsOutbox {
             let task = ReplicationTask(
                 bucketName: bucketName,
                 ruleId: rule.id,
@@ -136,4 +183,59 @@ struct ReplicationService {
 
         ReplicationDispatcher.shared.wake()
     }
+
+    /// Attempts one delivery directly against `target` (bypassing the outbox entirely), bounded
+    /// by `synchronousTimeout`. Returns whether it succeeded; never throws - a failure here just
+    /// means the caller falls back to the normal async outbox.
+    private static func attemptImmediateDelivery(
+        operation: ReplicationTask.Operation,
+        target: ReplicationTarget,
+        bucketName: String,
+        key: String,
+        versionId: String?,
+        logger: Logger
+    ) async -> Bool {
+        do {
+            try await withTimeout(synchronousTimeout) {
+                switch operation {
+                case .put:
+                    try await ReplicationClient.replicatePut(
+                        target: target, bucketName: bucketName, key: key, versionId: versionId)
+                case .delete:
+                    try await ReplicationClient.replicateDelete(target: target, key: key)
+                }
+            }
+            return true
+        } catch {
+            logger.warning(
+                "Synchronous replication of '\(key)' to \(target.endpoint) failed or timed out - falling back to async retry: \(error)"
+            )
+            return false
+        }
+    }
+
+    /// Races `operation` against a `timeout`-second sleep, cancelling whichever loses.
+    private static func withTimeout<T: Sendable>(
+        _ timeout: Duration,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw ReplicationTimeoutError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw ReplicationTimeoutError.timedOut
+            }
+            return result
+        }
+    }
+}
+
+enum ReplicationTimeoutError: Error, CustomStringConvertible {
+    case timedOut
+
+    var description: String { "Synchronous replication attempt timed out" }
 }

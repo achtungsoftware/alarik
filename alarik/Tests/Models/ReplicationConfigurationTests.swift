@@ -33,11 +33,11 @@ struct ReplicationConfigurationTests {
 
     private func rule(
         targetId: UUID, prefix: String? = nil, replicateDeletes: Bool = false,
-        replicateExisting: Bool = false, enabled: Bool = true
+        replicateExisting: Bool = false, synchronous: Bool = false, enabled: Bool = true
     ) -> ReplicationRule {
         ReplicationRule(
             id: UUID(), targetId: targetId, prefix: prefix, replicateDeletes: replicateDeletes,
-            replicateExisting: replicateExisting, enabled: enabled)
+            replicateExisting: replicateExisting, synchronous: synchronous, enabled: enabled)
     }
 
     // MARK: - JSON round-trip
@@ -57,6 +57,32 @@ struct ReplicationConfigurationTests {
         #expect(ReplicationConfiguration.fromJSON("not json").targets.isEmpty)
         #expect(ReplicationConfiguration.fromJSON("not json").rules.isEmpty)
         #expect(ReplicationConfiguration.fromJSON("").rules.isEmpty)
+    }
+
+    @Test("JSON round-trip preserves synchronous: true")
+    func jsonRoundTripPreservesSynchronous() throws {
+        let t = target()
+        let r = rule(targetId: t.id, synchronous: true)
+        let config = ReplicationConfiguration(targets: [t], rules: [r])
+
+        let restored = ReplicationConfiguration.fromJSON(config.toJSON())
+        #expect(restored.rules.first?.synchronous == true)
+    }
+
+    @Test("a rule saved before `synchronous` existed decodes as async (false), not a decode failure")
+    func missingSynchronousKeyDecodesAsFalse() throws {
+        let targetId = UUID()
+        let ruleId = UUID()
+        // Deliberately omits "synchronous" - the exact shape a config saved by an older
+        // version of this struct would have on disk.
+        let json = """
+            {"targets":[],"rules":[{"id":"\(ruleId.uuidString)","targetId":"\(targetId.uuidString)","prefix":null,"replicateDeletes":false,"replicateExisting":false,"enabled":true}]}
+            """
+        let config = ReplicationConfiguration.fromJSON(json)
+        // A real decode failure falls back to `.empty` - asserting a non-empty rule set here
+        // proves the whole config decoded successfully despite the missing key.
+        #expect(config.rules.count == 1)
+        #expect(config.rules.first?.synchronous == false)
     }
 
     // MARK: - Target resolution

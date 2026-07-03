@@ -92,6 +92,7 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Real S3 protocol | SigV4-signed `PutObject`/multipart/`DeleteObject` requests, works against any S3-compatible target |
 | Target + rule model | Reusable remote targets (endpoint, credentials), referenced by prefix-filtered rules |
 | Reliable delivery | Persistent outbox, survives restarts, exponential backoff retries |
+| Sync or async per rule | Async by default; a rule can opt into holding the client's write until delivery completes |
 | Opt-in delete & existing-object replication | Deletes and pre-existing objects are never replicated unless a rule opts in |
 | Resync | On-demand replication of a bucket's existing objects for a rule |
 | Task health | Inspect pending/failed replication tasks and retry on demand, from the console or API |

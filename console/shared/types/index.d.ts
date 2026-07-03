@@ -85,6 +85,7 @@ declare global {
         prefix?: string;
         replicateDeletes: boolean;
         replicateExisting: boolean;
+        synchronous: boolean;
         enabled: boolean;
     }
 

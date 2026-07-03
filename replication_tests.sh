@@ -97,10 +97,10 @@ login() {
         -d '{"username":"alarik","password":"alarik"}' | jq -r '.token'
 }
 
-# configure_replication <sourceBucket> <destBucket> <destEndpoint> <destRegion> <replicateDeletes> <replicateExisting> [prefix]
+# configure_replication <sourceBucket> <destBucket> <destEndpoint> <destRegion> <replicateDeletes> <replicateExisting> [prefix] [synchronous]
 # -> prints "<targetId> <ruleId>"
 configure_replication() {
-    local src="$1" dst="$2" endpoint="$3" region="$4" repl_deletes="$5" repl_existing="$6" prefix="${7:-}"
+    local src="$1" dst="$2" endpoint="$3" region="$4" repl_deletes="$5" repl_existing="$6" prefix="${7:-}" sync="${8:-false}"
 
     local prefix_json="null"
     [ -n "$prefix" ] && prefix_json="\"$prefix\""
@@ -114,7 +114,7 @@ configure_replication() {
     local rule_resp rule_id
     rule_resp=$(curl -s -X PUT "$SOURCE_ENDPOINT/api/v1/buckets/$src/replication/rules" \
         -H "Authorization: Bearer $SOURCE_TOKEN" -H "Content-Type: application/json" \
-        -d "{\"rules\":[{\"id\":\"00000000-0000-0000-0000-000000000000\",\"targetId\":\"$target_id\",\"prefix\":$prefix_json,\"replicateDeletes\":$repl_deletes,\"replicateExisting\":$repl_existing,\"enabled\":true}]}")
+        -d "{\"rules\":[{\"id\":\"00000000-0000-0000-0000-000000000000\",\"targetId\":\"$target_id\",\"prefix\":$prefix_json,\"replicateDeletes\":$repl_deletes,\"replicateExisting\":$repl_existing,\"synchronous\":$sync,\"enabled\":true}]}")
     rule_id=$(echo "$rule_resp" | jq -r '.rules[0].id')
 
     echo "$target_id $rule_id"
@@ -382,6 +382,27 @@ if aws_target s3api head-object --bucket repl-badregion-dst --key d.txt >/dev/nu
     fail "Object was unexpectedly replicated despite the region mismatch."
 else
     pass "Object was correctly never replicated due to the region mismatch."
+fi
+
+# ── Test 8: synchronous replication delivers before the PUT call returns ───────
+echo ""
+echo "=== Test: synchronous replication ==="
+aws_source s3api create-bucket --bucket repl-sync-src >/dev/null 2>&1
+aws_target s3api create-bucket --bucket repl-sync-dst --create-bucket-configuration LocationConstraint="$TARGET_REGION" >/dev/null 2>&1
+aws_source s3api put-bucket-versioning --bucket repl-sync-src --versioning-configuration Status=Enabled
+aws_target s3api put-bucket-versioning --bucket repl-sync-dst --versioning-configuration Status=Enabled
+# Last arg (synchronous) = true
+configure_replication repl-sync-src repl-sync-dst "$TARGET_ENDPOINT" "$TARGET_REGION" false false "" true >/dev/null
+
+echo "delivered before the PUT call returned" >"$CONTENT_FILE"
+aws_source s3 cp "$CONTENT_FILE" s3://repl-sync-src/sync.txt >/dev/null
+
+# No sleep, no polling - a synchronous rule's PUT handler already waited for delivery, so
+# the object must already exist on the target the instant the CLI call above returns.
+if aws_target s3 cp s3://repl-sync-dst/sync.txt - 2>/dev/null | cmp -s - "$CONTENT_FILE"; then
+    pass "Synchronous rule delivers to the target before the PUT call returns (no polling needed)."
+else
+    fail "Synchronous rule's object was not immediately present on the target."
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
