@@ -623,7 +623,7 @@ const taskColumns: TableColumn<ReplicationTask>[] = [
     {
         accessorKey: "operation",
         header: "Operation",
-        cell: ({ row }) => h(resolveComponent("UBadge"), { color: "neutral", variant: "subtle", size: "xs" }, () => row.original.operation),
+        cell: ({ row }) => h(resolveComponent("UBadge"), { color: "neutral", variant: "subtle", size: "sm" }, () => row.original.operation),
     },
     {
         accessorKey: "key",
