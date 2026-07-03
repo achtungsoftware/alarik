@@ -115,7 +115,7 @@ function bucketTime(t: string | number): string {
 const history = computed(() => metrics.value?.history ?? []);
 
 const trafficData = computed(() =>
-    history.value.map((b) => ({
+    history.value.map((b: MetricsMinuteBucket) => ({
         time: bucketTime(b.timestamp),
         in: b.bytesIn,
         out: b.bytesOut,
@@ -123,7 +123,7 @@ const trafficData = computed(() =>
 );
 
 const requestData = computed(() =>
-    history.value.map((b) => ({
+    history.value.map((b: MetricsMinuteBucket) => ({
         time: bucketTime(b.timestamp),
         requests: b.requests,
         errors: b.errors,
@@ -131,14 +131,14 @@ const requestData = computed(() =>
 );
 
 const cpuData = computed(() =>
-    history.value.map((b) => ({
+    history.value.map((b: MetricsMinuteBucket) => ({
         time: bucketTime(b.timestamp),
         cpu: b.cpuPercent ?? 0,
     }))
 );
 
 const memoryData = computed(() =>
-    history.value.map((b) => ({
+    history.value.map((b: MetricsMinuteBucket) => ({
         time: bucketTime(b.timestamp),
         memory: b.memoryBytes ?? 0,
     }))

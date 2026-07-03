@@ -50,6 +50,18 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 active: route.path.startsWith("/console/sharedLinks"),
             },
             {
+                label: "Bucket Replication",
+                icon: "i-lucide-repeat",
+                to: "/console/replication",
+                active: route.path.startsWith("/console/replication"),
+            },
+            {
+                label: "Webhooks",
+                icon: "i-lucide-webhook",
+                to: "/console/webhooks",
+                active: route.path.startsWith("/console/webhooks"),
+            },
+            {
                 label: "Administrator",
                 type: "label",
             },

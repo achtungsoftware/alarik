@@ -123,6 +123,65 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("List buckets - ?search filters by name (case-insensitive substring)")
+    func testListBucketsSearch() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await createBucket(app, token: token, name: "photos-archive")
+            try await createBucket(app, token: token, name: "video-archive")
+            try await createBucket(app, token: token, name: "logs")
+
+            try await app.test(
+                .GET, "/api/v1/buckets?search=archive",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<Bucket>.self)
+                    let names = Set(page.items.map { $0.name })
+                    #expect(names == ["photos-archive", "video-archive"])
+                })
+
+            // Case-insensitive
+            try await app.test(
+                .GET, "/api/v1/buckets?search=ARCHIVE",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<Bucket>.self)
+                    #expect(page.items.count == 2)
+                })
+
+            // No match
+            try await app.test(
+                .GET, "/api/v1/buckets?search=nonexistent",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<Bucket>.self)
+                    #expect(page.items.isEmpty)
+                })
+
+            // Empty/absent search returns everything, same as not passing the param at all
+            try await app.test(
+                .GET, "/api/v1/buckets?search=",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<Bucket>.self)
+                    #expect(page.items.count == 3)
+                })
+        }
+    }
+
     @Test("List buckets - Empty list for new user")
     func testListBucketsEmpty() async throws {
         try await withApp { app in

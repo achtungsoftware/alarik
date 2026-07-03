@@ -219,13 +219,23 @@ struct InternalBucketController: RouteCollection {
         _ = try await requireOwnedBucket(req: req, bucketName: bucketName, userId: userId)
     }
 
+    /// Lists the caller's own buckets. An optional `?search=` narrows to names containing that
+    /// substring (case-insensitive, server-side) - needed so UI like a bucket picker can search
+    /// as the user types instead of ever having to load every bucket up front.
     @Sendable
     func listBuckets(req: Request) async throws -> Page<Bucket> {
         let auth = try req.auth.require(AuthenticatedUser.self)
-        return try await Bucket.query(on: req.db)
+        let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
+
+        let query = Bucket.query(on: req.db)
             .filter(\.$user.$id == auth.userId)
             .sort(\.$creationDate, .descending)
-            .paginate(for: req)
+
+        if let search, !search.isEmpty {
+            query.filter(\.$name ~~ search)
+        }
+
+        return try await query.paginate(for: req)
     }
 
     @Sendable
