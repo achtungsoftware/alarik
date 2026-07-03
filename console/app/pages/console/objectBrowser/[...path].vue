@@ -311,7 +311,27 @@ const columns: TableColumn<BrowserItem>[] = [
             const iconColorClass = item.isBucket ? "text-primary" : item.isFolder ? "text-green-500" : "text-secondary-500";
             const bgColorClass = item.isBucket ? "bg-primary/20" : item.isFolder ? "bg-green-500/20" : "bg-secondary-500/20";
 
-            return h("div", { class: "flex items-center gap-3" }, [h("div", { class: `flex items-center justify-center w-9 h-9 rounded-lg ${bgColorClass}` }, [h(resolveComponent("UIcon"), { name: icon, class: `w-5 h-5 ${iconColorClass}` })]), h("div", { class: "flex flex-col" }, [h("span", { class: "font-medium text-highlighted" }, displayName), item.isBucket ? h("span", { class: "text-xs text-muted" }, "Bucket") : item.isFolder ? h("span", { class: "text-xs text-muted" }, "Folder") : h("span", { class: "text-xs text-muted" }, item.contentType || "File")])]);
+            let subtitle;
+            if (item.isBucket) {
+                const bucket = bucketsResponse.value?.items?.find((b: Bucket) => b.name === item.key);
+                subtitle = h("div", { class: "flex items-center gap-1.5" }, [
+                    h("span", { class: "text-xs text-muted" }, "Bucket"),
+                    bucket
+                        ? h(resolveComponent("UBadge"), {
+                              label: `Versioning ${bucket.versioningStatus}`,
+                              size: "xs",
+                              variant: bucket.versioningStatus === "Enabled" ? "solid" : "subtle",
+                              color: bucket.versioningStatus === "Enabled" ? "primary" : bucket.versioningStatus === "Suspended" ? "warning" : "neutral",
+                          })
+                        : null,
+                ]);
+            } else if (item.isFolder) {
+                subtitle = h("span", { class: "text-xs text-muted" }, "Folder");
+            } else {
+                subtitle = h("span", { class: "text-xs text-muted" }, item.contentType || "File");
+            }
+
+            return h("div", { class: "flex items-center gap-3" }, [h("div", { class: `flex items-center justify-center w-9 h-9 rounded-lg ${bgColorClass}` }, [h(resolveComponent("UIcon"), { name: icon, class: `w-5 h-5 ${iconColorClass}` })]), h("div", { class: "flex flex-col" }, [h("span", { class: "font-medium text-highlighted" }, displayName), subtitle])]);
         },
     },
     {

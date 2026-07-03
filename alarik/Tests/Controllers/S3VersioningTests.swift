@@ -786,6 +786,50 @@ struct S3VersioningTests {
         }
     }
 
+    @Test("Versioning - PUT ?versioning with Status other than Enabled/Suspended is rejected")
+    func testVersioningRejectsInvalidStatus() async throws {
+        let bucketName = "test-versioning-invalid-status"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            // Real S3's VersioningConfiguration.Status schema only ever accepts "Enabled" or
+            // "Suspended" - there is no way to PUT your way to "Disabled".
+            let body = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <Status>Disabled</Status>
+                </VersioningConfiguration>
+                """
+            let bodyData = body.data(using: .utf8)!
+            let signed = signedHeaders(
+                for: .PUT, path: "/\(bucketName)", query: "versioning", body: bodyData)
+
+            try await app.test(
+                .PUT, "/\(bucketName)?versioning",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("<Code>MalformedXML</Code>"))
+                })
+
+            // Once genuinely enabled, only Enabled/Suspended remain reachable - the same
+            // request still can't force it back to Disabled.
+            try await enableVersioning(app, bucketName: bucketName)
+            try await app.test(
+                .PUT, "/\(bucketName)?versioning",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: bodyData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
     @Test("Versioning - Version IDs are valid format")
     func testVersionIdFormat() async throws {
         let bucketName = "test-version-id-format"

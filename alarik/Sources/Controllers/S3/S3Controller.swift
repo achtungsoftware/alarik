@@ -339,30 +339,36 @@ struct S3Controller: RouteCollection {
         return response
     }
 
-    /// Handles PUT /:bucketName?versioning - set bucket versioning configuration
+    /// Handles PUT /:bucketName?versioning - set bucket versioning configuration. Real S3's
+    /// `VersioningConfiguration.Status` schema only ever accepts `Enabled` or `Suspended` -
+    /// there is no way to PUT your way back to `Disabled` (verified against the
+    /// PutBucketVersioning API reference); `Disabled` only ever describes a bucket that has
+    /// never had this operation called on it. Any other value, including a well-formed but
+    /// unrecognized one, is the same `MalformedXML` 400 real S3 returns.
     @Sendable
     private func handleVersioningPut(req: Request, bucketName: String) async throws -> Response {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
-        // Parse XML body for versioning configuration
         let bodyString = try await S3Service.collectBodyString(req: req)
 
-        // Simple XML parsing for versioning status
-        var newStatus = VersioningStatus.disabled
-
+        let newStatus: VersioningStatus
         if bodyString.contains("<Status>Enabled</Status>") {
             newStatus = .enabled
         } else if bodyString.contains("<Status>Suspended</Status>") {
             newStatus = .suspended
+        } else {
+            throw S3Error(
+                status: .badRequest, code: "MalformedXML",
+                message:
+                    "The XML you provided was not well-formed or did not validate against our published schema.",
+                requestId: req.id)
         }
 
-        // Update bucket versioning status in database
         bucket.versioningStatus = newStatus.rawValue
         try await bucket.save(on: req.db)
 
-        // Update cache
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)

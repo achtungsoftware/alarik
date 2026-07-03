@@ -269,6 +269,50 @@ struct InternalVersioningTests {
         }
     }
 
+    @Test("Set versioning - Disabled is rejected, matching real S3 (only Enabled/Suspended are settable)")
+    func testSetVersioningDisabledRejected() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-bucket")
+
+            struct VersioningDTO: Content {
+                let status: String
+            }
+
+            // "Disabled" only ever describes a bucket that's never had versioning touched -
+            // real S3's PutBucketVersioning never accepts it as a request value, even for a
+            // bucket that's already Disabled.
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(VersioningDTO(status: "Disabled"))
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                })
+
+            // Once enabled, "Disabled" is still never a legal target - only Suspended is.
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(VersioningDTO(status: "Enabled"))
+                },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/test-bucket/versioning",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(VersioningDTO(status: "Disabled"))
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                })
+        }
+    }
+
     @Test("Set versioning - Without auth fails")
     func testSetVersioningUnauthorized() async throws {
         try await withApp { app in

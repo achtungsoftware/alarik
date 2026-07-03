@@ -793,6 +793,10 @@ struct InternalBucketController: RouteCollection {
         return VersioningStatusDTO(status: bucket.versioningStatus)
     }
 
+    /// Real S3 never lets a client set `Disabled` via PutBucketVersioning - only `Enabled` or
+    /// `Suspended` are valid request values (verified against the API reference); `Disabled`
+    /// only ever describes a bucket that has never had versioning touched at all. Once
+    /// versioning has been enabled, the only way "off" is `Suspended`.
     @Sendable
     func setVersioning(req: Request) async throws -> VersioningStatusDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
@@ -803,10 +807,12 @@ struct InternalBucketController: RouteCollection {
 
         let input = try req.content.decode(VersioningStatusDTO.self)
 
-        guard let newStatus = VersioningStatus(rawValue: input.status) else {
+        guard let newStatus = VersioningStatus(rawValue: input.status),
+            newStatus != .disabled
+        else {
             throw Abort(
                 .badRequest,
-                reason: "Invalid versioning status. Use 'Enabled', 'Suspended', or 'Disabled'")
+                reason: "Invalid versioning status. Use 'Enabled' or 'Suspended'.")
         }
 
         let bucket = try await requireOwnedBucket(
