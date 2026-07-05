@@ -116,6 +116,34 @@ struct SharedLinkControllerTests {
         }
     }
 
+    @Test("Serve - Non-expiring link (nil expiresAt) works and survives the cleanup filter")
+    func testServeNonExpiringLink() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+            try writeObject(bucketName: "shared-bucket", key: "forever.txt", content: "no expiry")
+
+            let link = SharedLink(
+                userId: userId, bucketName: "shared-bucket", key: "forever.txt", expiresAt: nil)
+            try await link.save(on: app.db)
+
+            try await app.test(
+                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "no expiry")
+                })
+
+            // The hourly cleanup deletes rows where expires_at <= now - a NULL expiry must
+            // never match that filter, or non-expiring links would silently vanish within an
+            // hour of creation.
+            let expired = try await SharedLink.query(on: app.db)
+                .filter(\.$expiresAt <= Date.now)
+                .all()
+            #expect(expired.isEmpty)
+            #expect(try await SharedLink.query(on: app.db).count() == 1)
+        }
+    }
+
     @Test("Serve - Expired link fails")
     func testServeExpiredLink() async throws {
         try await withApp { app in

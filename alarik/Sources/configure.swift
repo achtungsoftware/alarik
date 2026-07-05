@@ -61,6 +61,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddNotificationDeliveryLastError())
     app.migrations.add(AddBucketReplicationConfig())
     app.migrations.add(CreateReplicationTask())
+    app.migrations.add(MakeSharedLinkExpiryOptional())
 
     app.migrations.add(CreateDefaultUser())
 

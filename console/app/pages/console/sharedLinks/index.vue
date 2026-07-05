@@ -112,7 +112,10 @@ const columns: TableColumn<SharedLink>[] = [
     {
         accessorKey: "expiresAt",
         header: "Expires",
-        cell: ({ row }) => new Date(row.original.expiresAt).toLocaleString(),
+        cell: ({ row }) =>
+            row.original.expiresAt
+                ? new Date(row.original.expiresAt).toLocaleString()
+                : h(resolveComponent("UBadge"), { label: "Never", size: "md", color: "neutral", variant: "subtle" }),
     },
     {
         accessorKey: "createdAt",

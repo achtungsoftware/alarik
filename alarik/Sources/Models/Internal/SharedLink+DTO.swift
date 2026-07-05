@@ -23,7 +23,8 @@ extension SharedLink {
         var bucketName: String
         var key: String
         var url: String
-        var expiresAt: Date
+        /// Nil for a link that never expires.
+        var expiresAt: Date?
         var createdAt: Date
     }
 

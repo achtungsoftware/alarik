@@ -122,12 +122,15 @@ struct InternalBucketController: RouteCollection {
     struct ShareRequestDTO: Content {
         let bucket: String
         let key: String
-        let expiresInSeconds: Int
+        /// Omit (or send null) for a link that never expires - it then works until explicitly
+        /// revoked.
+        let expiresInSeconds: Int?
     }
 
     struct ShareResponseDTO: Content {
         let url: String
-        let expiresAt: Date
+        /// Nil for a link that never expires.
+        let expiresAt: Date?
     }
 
     func boot(routes: any RoutesBuilder) throws {
@@ -382,10 +385,12 @@ struct InternalBucketController: RouteCollection {
     /// a SigV4 constraint, since shared links don't use SigV4 at all.
     static let maxShareExpirySeconds = 604_800
 
-    /// Creates a time-limited public link to an object you own. Nothing about your account or
-    /// credentials is exposed - the link is just an opaque, unguessable token (the new row's own
-    /// id) that `SharedLinkController` looks up. Revoking access just means deleting the row,
-    /// which happens automatically once it expires (see the cleanup task in configure.swift).
+    /// Creates a public link to an object you own - time-limited when `expiresInSeconds` is
+    /// given, or non-expiring when it's omitted (working until explicitly revoked). Nothing
+    /// about your account or credentials is exposed - the link is just an opaque, unguessable
+    /// token (the new row's own id) that `SharedLinkController` looks up. Revoking access just
+    /// means deleting the row, which happens automatically for expired links (see the cleanup
+    /// task in configure.swift); non-expiring links are never auto-deleted.
     @Sendable
     func shareObject(req: Request) async throws -> ShareResponseDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
@@ -402,17 +407,20 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        guard input.expiresInSeconds > 0,
-            input.expiresInSeconds <= Self.maxShareExpirySeconds
-        else {
-            throw Abort(
-                .badRequest,
-                reason:
-                    "expiresInSeconds must be between 1 and \(Self.maxShareExpirySeconds) (7 days)"
-            )
+        let expiresAt: Date?
+        if let expiresInSeconds = input.expiresInSeconds {
+            guard expiresInSeconds > 0, expiresInSeconds <= Self.maxShareExpirySeconds else {
+                throw Abort(
+                    .badRequest,
+                    reason:
+                        "expiresInSeconds must be between 1 and \(Self.maxShareExpirySeconds) (7 days), or omitted for a link that never expires"
+                )
+            }
+            expiresAt = Date().addingTimeInterval(TimeInterval(expiresInSeconds))
+        } else {
+            expiresAt = nil
         }
 
-        let expiresAt = Date().addingTimeInterval(TimeInterval(input.expiresInSeconds))
         let link = SharedLink(
             userId: auth.userId, bucketName: input.bucket, key: input.key, expiresAt: expiresAt)
         try await link.save(on: req.db)

@@ -3652,6 +3652,53 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("Share object - Omitted expiresInSeconds creates a never-expiring link that works")
+    func testShareObjectWithoutExpiry() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "share-forever@example.com")
+            try await createBucket(app, token: token, name: "share-bucket")
+            try await putObject(
+                app, bucketName: "share-bucket", key: "file.txt", content: "shared forever")
+
+            var shareURL = ""
+            try await app.test(
+                .POST, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ShareRequestDTO(
+                            bucket: "share-bucket", key: "file.txt", expiresInSeconds: nil))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(
+                        InternalBucketController.ShareResponseDTO.self)
+                    #expect(dto.expiresAt == nil)
+                    shareURL = dto.url
+                })
+
+            try await app.test(
+                .GET, pathAndQuery(fromShareURL: shareURL),
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "shared forever")
+                })
+
+            // The list endpoint reports the missing expiry, so the console can render "Never"
+            try await app.test(
+                .GET, "/api/v1/objects/share",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<SharedLink.ResponseDTO>.self)
+                    #expect(page.items.count == 1)
+                    #expect(page.items.first?.expiresAt == nil)
+                })
+        }
+    }
+
     @Test("Share object - expiresInSeconds beyond 7 days is rejected")
     func testShareObjectExpiresInSecondsTooLarge() async throws {
         try await withApp { app in

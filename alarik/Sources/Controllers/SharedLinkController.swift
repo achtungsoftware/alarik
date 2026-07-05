@@ -35,9 +35,11 @@ struct SharedLinkController: RouteCollection {
             throw Abort(.notFound)
         }
 
+        // A nil expiresAt means the link never expires - only an elapsed explicit expiry
+        // rejects.
         guard
             let link = try await SharedLink.find(token, on: req.db),
-            link.expiresAt > Date()
+            link.expiresAt.map({ $0 > Date() }) ?? true
         else {
             throw Abort(.notFound)
         }

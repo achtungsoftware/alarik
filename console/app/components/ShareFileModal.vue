@@ -33,15 +33,17 @@ const open = ref(props.open);
 const jwtCookie = useJWTCookie();
 const toast = useToast();
 
-const expiresInSeconds = ref(3600);
+// null = never expires
+const expiresInSeconds = ref<number | null>(3600);
 const generatedURL = ref("");
 const expiresAt = ref<Date | null>(null);
 
-const presets = [
+const presets: { label: string; seconds: number | null }[] = [
     { label: "1 hour", seconds: 3600 },
     { label: "1 day", seconds: 86400 },
     { label: "3 days", seconds: 259200 },
     { label: "7 days", seconds: 604800 },
+    { label: "Never", seconds: null },
 ];
 
 const fileName = computed(() => props.item?.key.split("/").filter(Boolean).pop() ?? "");
@@ -71,12 +73,13 @@ async function generateLink() {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ url: string; expiresAt: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share`, {
+        const response = await $fetch<{ url: string; expiresAt?: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share`, {
             method: "POST",
             body: JSON.stringify({
                 bucket: props.bucket,
                 key: props.item.key,
-                expiresInSeconds: expiresInSeconds.value,
+                // Omitted entirely for a never-expiring link
+                expiresInSeconds: expiresInSeconds.value ?? undefined,
             }),
             headers: {
                 "Content-Type": "application/json",
@@ -85,7 +88,7 @@ async function generateLink() {
         });
 
         generatedURL.value = response.url;
-        expiresAt.value = new Date(response.expiresAt);
+        expiresAt.value = response.expiresAt ? new Date(response.expiresAt) : null;
     } catch (err: any) {
         error.value = err.response?._data?.reason ?? "Unknown error";
     } finally {
@@ -112,12 +115,12 @@ async function copyLink() {
             <div class="space-y-4">
                 <UAlert v-if="error != ''" title="Error" :description="error" color="error" variant="subtle" />
 
-                <p class="text-sm text-muted">Generate a temporary public link to <span class="font-medium text-highlighted">{{ fileName }}</span>. Anyone with the link can download the file until it expires - no account needed.</p>
+                <p class="text-sm text-muted">Generate a public link to <span class="font-medium text-highlighted">{{ fileName }}</span>. Anyone with the link can download the file until it expires or is revoked - no account needed.</p>
 
                 <div v-if="!generatedURL">
                     <p class="text-sm font-medium mb-2">Expires in</p>
                     <div class="flex gap-2">
-                        <UButton v-for="preset in presets" :key="preset.seconds" :label="preset.label" :variant="expiresInSeconds === preset.seconds ? 'solid' : 'subtle'" :color="expiresInSeconds === preset.seconds ? 'primary' : 'neutral'" size="sm" @click="expiresInSeconds = preset.seconds" />
+                        <UButton v-for="preset in presets" :key="preset.label" :label="preset.label" :variant="expiresInSeconds === preset.seconds ? 'solid' : 'subtle'" :color="expiresInSeconds === preset.seconds ? 'primary' : 'neutral'" size="sm" @click="expiresInSeconds = preset.seconds" />
                     </div>
                 </div>
 
@@ -127,7 +130,7 @@ async function copyLink() {
                         <UInput :model-value="generatedURL" readonly class="w-full" variant="subtle" />
                         <UButton icon="i-lucide-copy" color="neutral" variant="subtle" aria-label="Copy link" @click="copyLink" />
                     </div>
-                    <p v-if="expiresAt" class="text-xs text-muted">Expires {{ expiresAt.toLocaleString() }}</p>
+                    <p class="text-xs text-muted">{{ expiresAt ? `Expires ${expiresAt.toLocaleString()}` : "Never expires - works until you revoke it under Shared Links." }}</p>
                 </div>
             </div>
         </template>

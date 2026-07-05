@@ -17,9 +17,9 @@ limitations under the License.
 import Fluent
 import Foundation
 
-/// A time-limited public link to a single object. The row's own id is used directly as the
-/// opaque, unguessable public token - no credential of any kind is exposed, and revoking a
-/// link is just deleting (or letting expire) this row.
+/// A public link to a single object, optionally time-limited. The row's own id is used
+/// directly as the opaque, unguessable public token - no credential of any kind is exposed,
+/// and revoking a link is just deleting (or letting expire) this row.
 final class SharedLink: Model, @unchecked Sendable {
     static let schema = "shared_links"
 
@@ -35,8 +35,11 @@ final class SharedLink: Model, @unchecked Sendable {
     @Field(key: "key")
     var key: String
 
-    @Field(key: "expires_at")
-    var expiresAt: Date
+    /// When the link stops working, or nil for a link that never expires. Non-expiring links
+    /// live until explicitly revoked - the hourly cleanup task's `expires_at <= now` filter
+    /// naturally never matches a NULL.
+    @OptionalField(key: "expires_at")
+    var expiresAt: Date?
 
     @Field(key: "created_at")
     var createdAt: Date
@@ -48,7 +51,7 @@ final class SharedLink: Model, @unchecked Sendable {
         userId: UUID,
         bucketName: String,
         key: String,
-        expiresAt: Date,
+        expiresAt: Date?,
         createdAt: Date = Date()
     ) {
         self.id = id

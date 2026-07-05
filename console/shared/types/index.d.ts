@@ -138,7 +138,7 @@ declare global {
         bucketName: string;
         key: string;
         url: string;
-        expiresAt: string;
+        expiresAt?: string;
         createdAt: string;
     }
 
