@@ -17,7 +17,7 @@ limitations under the License.
 import Vapor
 
 /// Alarik version string (updated by publish.sh)
-public let alarikVersion = "1.0.0-beta-3"
+public let alarikVersion = "1.0.0-beta-4"
 
 /// The externally-reachable base URL of this instance's S3 API (no trailing slash), used to
 /// build absolute URLs such as presigned share links. The incoming request's Host header isn't
