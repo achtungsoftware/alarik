@@ -222,7 +222,7 @@ struct InternalUserController: RouteCollection {
     func createUser(req: Request) async throws -> User.ResponseDTO {
         #if DEBUG
         #else
-            if let allowAccountCreation = Environment.get("ALLOW_ACCOUNT_CREATION") {
+            if let allowAccountCreation = Environment.sanitizedGet("ALLOW_ACCOUNT_CREATION") {
                 if allowAccountCreation != "true" {
 
                     throw Abort(

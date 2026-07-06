@@ -23,7 +23,7 @@ enum ConsoleBaseURL {
         #if DEBUG
             return "http://localhost:3000"
         #else
-            return Environment.get("CONSOLE_BASE_URL") ?? "http://localhost:3000"
+            return Environment.sanitizedGet("CONSOLE_BASE_URL") ?? "http://localhost:3000"
         #endif
     }
 }

@@ -35,6 +35,6 @@ enum AlarikRegion {
     /// validation, `GetBucketLocation`, event payloads) without threading `Application` through
     /// call sites that don't otherwise need it.
     static func resolve() -> String {
-        Environment.get("ALARIK_REGION") ?? `default`
+        Environment.sanitizedGet("ALARIK_REGION") ?? `default`
     }
 }

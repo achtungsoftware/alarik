@@ -45,8 +45,8 @@ struct CreateDefaultUser: AsyncMigration {
                 let user = User(
                     id: UUID(),
                     name: "Admin User",
-                    username: Environment.get("ADMIN_USERNAME") ?? "alarik",
-                    passwordHash: try Bcrypt.hash(Environment.get("ADMIN_PASSWORD") ?? "alarik"),
+                    username: Environment.sanitizedGet("ADMIN_USERNAME") ?? "alarik",
+                    passwordHash: try Bcrypt.hash(Environment.sanitizedGet("ADMIN_PASSWORD") ?? "alarik"),
                     isAdmin: true
                 )
 
@@ -54,8 +54,8 @@ struct CreateDefaultUser: AsyncMigration {
 
                 // The user can provide default keys via .env
                 // this is optional
-                if let accessKey = Environment.get("DEFAULT_ACCESS_KEY"),
-                    let secretKey = Environment.get("DEFAULT_SECRET_KEY")
+                if let accessKey = Environment.sanitizedGet("DEFAULT_ACCESS_KEY"),
+                    let secretKey = Environment.sanitizedGet("DEFAULT_SECRET_KEY")
                 {
                     let accessKey = AccessKey(
                         id: UUID(),

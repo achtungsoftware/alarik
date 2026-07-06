@@ -87,7 +87,7 @@ public func configure(_ app: Application) async throws {
     app.middleware.use(cors)
     app.middleware.use(S3ErrorMiddleware())
 
-    if let jwt = Environment.get("JWT") {
+    if let jwt = Environment.sanitizedGet("JWT") {
         await app.jwt.keys.add(hmac: HMACKey(from: jwt), digestAlgorithm: .sha256)
     } else {
         app.logger.error(

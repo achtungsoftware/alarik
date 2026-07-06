@@ -221,7 +221,7 @@ struct InternalAuthOIDCController: RouteCollection {
                 existingByUsername.oidcSubject = idToken.sub.value
                 try await existingByUsername.save(on: req.db)
                 user = existingByUsername
-            } else if Environment.get("ALLOW_ACCOUNT_CREATION") == "true" {
+            } else if Environment.sanitizedGet("ALLOW_ACCOUNT_CREATION") == "true" {
                 // Auto-provision, gated by the same env switch as the console's local signup
                 // form. Deliberately a strict string comparison with no DEBUG bypass - an
                 // account springing into existence from an SSO login is exactly the kind of
