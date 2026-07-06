@@ -319,7 +319,7 @@ struct SigV4Validator {
         }
 
         // Region check: the credential scope's region must match this deployment's configured
-        // region (`ALARIK_REGION`, default "us-east-1"). Verified against real S3 behavior: a
+        // region (`ALARIK_REGION`, default "us-east-1"). Verified against S3 behavior: a
         // region mismatch is a 400 (a malformed request), not a 403 - distinct codes for header
         // vs. query auth, matching AWS's own `AuthorizationHeaderMalformed` /
         // `AuthorizationQueryParametersError` responses.
@@ -348,7 +348,7 @@ struct SigV4Validator {
 
         let skew = abs(Date().timeIntervalSince(requestDate))
 
-        // Query auth is bounded by its own X-Amz-Expires window (like real S3, where a
+        // Query auth is bounded by its own X-Amz-Expires window (like S3, where a
         // presigned URL can be valid for up to 7 days); the 15-minute skew rule applies
         // only to header auth - imposing it on presigned URLs would silently cap every
         // URL's usable lifetime at 15 minutes regardless of the requested expiry.
@@ -634,13 +634,12 @@ struct SigV4Validator {
                 status: .badRequest, code: "InvalidArgument",
                 message: "Missing or invalid x-amz-decoded-content-length")
         }
-        let encodings = getRequestValues(for: "content-encoding", request: request).joined(
-            separator: ",")
-        guard encodings.contains("aws-chunked") else {
-            throw S3Error(
-                status: .badRequest, code: "InvalidArgument",
-                message: "Missing aws-chunked in content-encoding for streaming payload")
-        }
+        // Deliberately NOT requiring `Content-Encoding: aws-chunked` here: AWS's docs show it,
+        // but S3 accepts streaming payloads without it, and real clients rely on that -
+        // minio-go (mc) omits the header entirely. The reliable streaming discriminator is the
+        // STREAMING-AWS4-HMAC-SHA256-PAYLOAD content hash (which routed us here) plus the
+        // signed x-amz-decoded-content-length above; the chunk framing itself is then fully
+        // self-describing. `S3Service.collectBodyData` makes the same call for body decoding.
         guard let buffer = request.body.data else {
             throw S3Error(
                 status: .internalServerError, code: "InternalError", message: "Body not buffered")

@@ -190,7 +190,7 @@ public func configure(_ app: Application) async throws {
 
         // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
         // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
-        // the way short-lived access keys/share links are. Matches real S3, which evaluates
+        // the way short-lived access keys/share links are. Matches S3, which evaluates
         // lifecycle rules roughly once a day.
         app.eventLoopGroup.next().scheduleRepeatedTask(
             initialDelay: .zero,

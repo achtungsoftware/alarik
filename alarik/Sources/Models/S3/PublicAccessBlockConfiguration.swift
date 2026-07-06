@@ -29,7 +29,7 @@ struct PublicAccessBlockConfiguration: Equatable {
 
     /// Parses a `PutPublicAccessBlock` request body. Matches the simple substring-based style
     /// already used for VersioningConfiguration - a missing element defaults to false, matching
-    /// real S3 behavior.
+    /// S3 behavior.
     static func parse(xml: String) -> PublicAccessBlockConfiguration {
         func flag(_ tag: String) -> Bool {
             xml.contains("<\(tag)>true</\(tag)>")

@@ -20,7 +20,7 @@ import XMLCoder
 struct S3ErrorMiddleware: Middleware {
     func respond(to request: Request, chainingTo next: any Responder) -> EventLoopFuture<Response> {
         next.respond(to: request).map { response in
-            // Real S3 stamps every response (success or error) with request IDs - clients
+            // S3 stamps every response (success or error) with request IDs - clients
             // and support tooling rely on them for correlation
             Self.addRequestIdHeaders(to: response, requestId: request.id)
             return response

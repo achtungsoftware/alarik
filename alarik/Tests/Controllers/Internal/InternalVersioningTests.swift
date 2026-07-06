@@ -269,7 +269,7 @@ struct InternalVersioningTests {
         }
     }
 
-    @Test("Set versioning - Disabled is rejected, matching real S3 (only Enabled/Suspended are settable)")
+    @Test("Set versioning - Disabled is rejected, matching S3 (only Enabled/Suspended are settable)")
     func testSetVersioningDisabledRejected() async throws {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
@@ -280,7 +280,7 @@ struct InternalVersioningTests {
             }
 
             // "Disabled" only ever describes a bucket that's never had versioning touched -
-            // real S3's PutBucketVersioning never accepts it as a request value, even for a
+            // S3's PutBucketVersioning never accepts it as a request value, even for a
             // bucket that's already Disabled.
             try await app.test(
                 .PUT, "/api/v1/buckets/test-bucket/versioning",

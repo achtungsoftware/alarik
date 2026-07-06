@@ -792,7 +792,7 @@ struct S3VersioningTests {
         try await withApp { app in
             try await createBucket(app, bucketName: bucketName)
 
-            // Real S3's VersioningConfiguration.Status schema only ever accepts "Enabled" or
+            // S3's VersioningConfiguration.Status schema only ever accepts "Enabled" or
             // "Suspended" - there is no way to PUT your way to "Disabled".
             let body = """
                 <?xml version="1.0" encoding="UTF-8"?>

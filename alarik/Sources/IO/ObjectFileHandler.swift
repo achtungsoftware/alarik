@@ -174,7 +174,12 @@ struct ObjectFileHandler {
         return true
     }
 
-    /// Checks if a bucket contains any objects (including versioned objects).
+    /// Checks if a bucket contains any objects (including versioned objects and delete
+    /// markers). Deliberately does NOT skip hidden entries: versioned objects live under
+    /// hidden `.versions` directories, and skipping those would report a bucket that still
+    /// holds versions as "empty" - S3 refuses to delete a bucket while any version or
+    /// delete marker remains. Empty directory skeletons (left behind after deleting a nested
+    /// key) don't count: S3 has no directories, only keys.
     static func hasBucketObjects(bucketName: String) -> Bool {
         let bucketURL = BucketHandler.bucketURL(for: bucketName)
 
@@ -185,8 +190,7 @@ struct ObjectFileHandler {
         guard
             let enumerator = FileManager.default.enumerator(
                 at: bucketURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
+                includingPropertiesForKeys: [.isDirectoryKey]
             )
         else {
             return false
@@ -930,6 +934,19 @@ struct ObjectFileHandler {
         let path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
         guard FileManager.default.fileExists(atPath: path) else {
+            // The "null" version of a key that was never written under versioning lives at
+            // the plain non-versioned path, not in the .versions directory - but listings
+            // still (correctly, matching S3) report it as VersionId "null", and clients
+            // like mc echo that id back in versioned deletes. Deleting versionId "null" must
+            // therefore remove the plain file too, or `mc rb --force` style flows leave the
+            // object behind while believing the delete succeeded.
+            if versionId == "null" {
+                let plainPath = storagePath(for: bucketName, key: key)
+                if FileManager.default.fileExists(atPath: plainPath) {
+                    try FileManager.default.removeItem(atPath: plainPath)
+                    return
+                }
+            }
             throw NSError(
                 domain: "ObjectNotFound", code: 404,
                 userInfo: [NSLocalizedDescriptionKey: "Version does not exist"])

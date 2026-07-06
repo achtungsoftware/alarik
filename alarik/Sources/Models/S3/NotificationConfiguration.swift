@@ -77,7 +77,7 @@ struct NotificationRule: Codable, Equatable {
 struct NotificationConfiguration: Codable, Equatable {
     var rules: [NotificationRule]
 
-    /// Real S3 caps notification configurations at 100 rules; Alarik uses a tighter,
+    /// S3 caps notification configurations at 100 rules; Alarik uses a tighter,
     /// self-hosting-appropriate limit.
     static let maxRuleCount = 16
 

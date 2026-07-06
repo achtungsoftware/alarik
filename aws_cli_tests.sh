@@ -1609,6 +1609,385 @@ echo ""
 echo "=== Bucket Notification Tests Complete ==="
 echo ""
 
+# ── Conditional reads (If-Match / If-None-Match / If-(Un)Modified-Since) ──────
+echo "=== Conditional Read Tests ==="
+
+CONDREAD_BUCKET="cond-read-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$CONDREAD_BUCKET" > /dev/null 2>&1
+echo "conditional read body" | aws_s3 s3 cp - "s3://$CONDREAD_BUCKET/cond.txt" > /dev/null 2>&1
+CONDREAD_ETAG=$(aws_s3 s3api head-object --bucket "$CONDREAD_BUCKET" --key cond.txt | jq -r '.ETag' | tr -d '"')
+
+# If-Match with the correct ETag succeeds
+if aws_s3 s3api get-object --bucket "$CONDREAD_BUCKET" --key cond.txt --if-match "$CONDREAD_ETAG" /dev/null > /dev/null 2>&1; then
+    pass "GET with matching If-Match succeeds."
+else
+    fail "GET with matching If-Match failed."
+fi
+
+# If-Match with a wrong ETag → 412 PreconditionFailed
+IFMATCH_ERR=$(aws_s3 s3api get-object --bucket "$CONDREAD_BUCKET" --key cond.txt --if-match "deadbeefdeadbeefdeadbeefdeadbeef" /dev/null 2>&1)
+if echo "$IFMATCH_ERR" | grep -qiE "PreconditionFailed|412"; then
+    pass "GET with wrong If-Match is rejected with PreconditionFailed."
+else
+    fail "GET with wrong If-Match was not rejected: $IFMATCH_ERR"
+fi
+
+# If-None-Match with the current ETag → 304 Not Modified
+IFNONE_ERR=$(aws_s3 s3api get-object --bucket "$CONDREAD_BUCKET" --key cond.txt --if-none-match "$CONDREAD_ETAG" /dev/null 2>&1)
+if echo "$IFNONE_ERR" | grep -qiE "Not Modified|304"; then
+    pass "GET with matching If-None-Match returns 304 Not Modified."
+else
+    fail "GET with matching If-None-Match did not return 304: $IFNONE_ERR"
+fi
+
+# If-Modified-Since in the future → 304 (nothing modified since then)
+IFMOD_ERR=$(aws_s3 s3api get-object --bucket "$CONDREAD_BUCKET" --key cond.txt --if-modified-since "2035-01-01T00:00:00Z" /dev/null 2>&1)
+if echo "$IFMOD_ERR" | grep -qiE "Not Modified|304"; then
+    pass "GET with future If-Modified-Since returns 304."
+else
+    fail "GET with future If-Modified-Since did not return 304: $IFMOD_ERR"
+fi
+
+# If-Unmodified-Since in the past → 412 (it *was* modified since then)
+IFUNMOD_ERR=$(aws_s3 s3api get-object --bucket "$CONDREAD_BUCKET" --key cond.txt --if-unmodified-since "2000-01-01T00:00:00Z" /dev/null 2>&1)
+if echo "$IFUNMOD_ERR" | grep -qiE "PreconditionFailed|412"; then
+    pass "GET with past If-Unmodified-Since is rejected with PreconditionFailed."
+else
+    fail "GET with past If-Unmodified-Since was not rejected: $IFUNMOD_ERR"
+fi
+
+aws_s3 s3 rm "s3://$CONDREAD_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$CONDREAD_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Conditional Read Tests Complete ==="
+echo ""
+
+# ── ListObjects V1 (marker) & V2 start-after ──────────────────────────────────
+echo "=== ListObjects V1 & StartAfter Tests ==="
+
+LISTV1_BUCKET="listv1-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$LISTV1_BUCKET" > /dev/null 2>&1
+for k in a.txt b.txt c.txt d.txt; do
+    echo "$k" | aws_s3 s3 cp - "s3://$LISTV1_BUCKET/$k" > /dev/null 2>&1
+done
+
+# V1 first page
+V1_PAGE1=$(aws_s3 s3api list-objects --bucket "$LISTV1_BUCKET" --max-keys 2 --no-paginate)
+V1_COUNT1=$(echo "$V1_PAGE1" | jq '.Contents | length')
+V1_TRUNC1=$(echo "$V1_PAGE1" | jq -r '.IsTruncated')
+if [ "$V1_COUNT1" == "2" ] && [ "$V1_TRUNC1" == "true" ]; then
+    pass "ListObjects V1 first page: 2 keys, IsTruncated=true."
+else
+    fail "ListObjects V1 first page unexpected (count=$V1_COUNT1, truncated=$V1_TRUNC1)."
+fi
+
+# V1 second page via marker = last key of page 1
+V1_MARKER=$(echo "$V1_PAGE1" | jq -r '.Contents[-1].Key')
+V1_PAGE2=$(aws_s3 s3api list-objects --bucket "$LISTV1_BUCKET" --max-keys 2 --marker "$V1_MARKER" --no-paginate)
+V1_KEYS2=$(echo "$V1_PAGE2" | jq -r '[.Contents[].Key] | join(",")')
+if [ "$V1_KEYS2" == "c.txt,d.txt" ]; then
+    pass "ListObjects V1 marker continuation returns the remaining keys in order."
+else
+    fail "ListObjects V1 marker continuation wrong (got: $V1_KEYS2)."
+fi
+
+# V2 start-after skips everything up to and including the given key
+V2_AFTER=$(aws_s3 s3api list-objects-v2 --bucket "$LISTV1_BUCKET" --start-after b.txt --no-paginate | jq -r '[.Contents[].Key] | join(",")')
+if [ "$V2_AFTER" == "c.txt,d.txt" ]; then
+    pass "ListObjectsV2 start-after skips keys <= the marker."
+else
+    fail "ListObjectsV2 start-after wrong (got: $V2_AFTER)."
+fi
+
+aws_s3 s3 rm "s3://$LISTV1_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$LISTV1_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== ListObjects V1 & StartAfter Tests Complete ==="
+echo ""
+
+# ── Bucket location & recreate semantics ──────────────────────────────────────
+echo "=== Bucket Location & Recreate Tests ==="
+
+LOC_BUCKET="location-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$LOC_BUCKET" > /dev/null 2>&1
+
+# us-east-1's documented quirk: LocationConstraint is null/empty, not the literal region
+LOC=$(aws_s3 s3api get-bucket-location --bucket "$LOC_BUCKET" | jq -r '.LocationConstraint')
+if [ "$LOC" == "null" ] || [ -z "$LOC" ]; then
+    pass "GetBucketLocation reports empty LocationConstraint for us-east-1."
+else
+    fail "GetBucketLocation unexpected LocationConstraint: $LOC"
+fi
+
+# Re-creating a bucket you already own is a 200 no-op in us-east-1
+if aws_s3 s3api create-bucket --bucket "$LOC_BUCKET" > /dev/null 2>&1; then
+    pass "Re-creating an owned bucket succeeds (us-east-1 idempotency)."
+else
+    fail "Re-creating an owned bucket failed."
+fi
+
+aws_s3 s3api delete-bucket --bucket "$LOC_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Bucket Location & Recreate Tests Complete ==="
+echo ""
+
+# ── Versioning semantics (enabled → suspended, delete markers, restore) ──────
+echo "=== Versioning Semantics Tests ==="
+
+VERSEM_BUCKET="versem-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$VERSEM_BUCKET" > /dev/null 2>&1
+aws_s3 s3api put-bucket-versioning --bucket "$VERSEM_BUCKET" --versioning-configuration Status=Enabled
+
+echo "version one" | aws_s3 s3 cp - "s3://$VERSEM_BUCKET/doc.txt" > /dev/null 2>&1
+echo "version two" | aws_s3 s3 cp - "s3://$VERSEM_BUCKET/doc.txt" > /dev/null 2>&1
+
+VERSEM_LIST=$(aws_s3 s3api list-object-versions --bucket "$VERSEM_BUCKET" --prefix doc.txt)
+VERSEM_V1=$(echo "$VERSEM_LIST" | jq -r '.Versions[] | select(.IsLatest == false) | .VersionId')
+VERSEM_LATEST_COUNT=$(echo "$VERSEM_LIST" | jq '[.Versions[] | select(.IsLatest == true)] | length')
+if [ "$VERSEM_LATEST_COUNT" == "1" ]; then
+    pass "Exactly one version is IsLatest after an overwrite."
+else
+    fail "Expected exactly 1 IsLatest version, got $VERSEM_LATEST_COUNT."
+fi
+
+# Fetch the noncurrent version explicitly
+VERSEM_OLD_FILE=$(mktemp)
+aws_s3 s3api get-object --bucket "$VERSEM_BUCKET" --key doc.txt --version-id "$VERSEM_V1" "$VERSEM_OLD_FILE" > /dev/null 2>&1
+if [ "$(cat "$VERSEM_OLD_FILE")" == "version one" ]; then
+    pass "GET with --version-id returns the exact old version's bytes."
+else
+    fail "GET with --version-id returned wrong content: $(cat "$VERSEM_OLD_FILE")"
+fi
+
+# Plain delete creates a delete marker; the object 404s but versions survive
+aws_s3 s3api delete-object --bucket "$VERSEM_BUCKET" --key doc.txt > /dev/null 2>&1
+if aws_s3 s3api head-object --bucket "$VERSEM_BUCKET" --key doc.txt > /dev/null 2>&1; then
+    fail "Object still readable after delete-marker creation."
+else
+    pass "Object 404s while behind a delete marker."
+fi
+VERSEM_MARKER=$(aws_s3 s3api list-object-versions --bucket "$VERSEM_BUCKET" --prefix doc.txt | jq -r '.DeleteMarkers[0].VersionId')
+if [ -n "$VERSEM_MARKER" ] && [ "$VERSEM_MARKER" != "null" ]; then
+    pass "Delete marker appears in list-object-versions."
+else
+    fail "No delete marker found after plain delete."
+fi
+
+# Deleting the delete marker restores the object
+aws_s3 s3api delete-object --bucket "$VERSEM_BUCKET" --key doc.txt --version-id "$VERSEM_MARKER" > /dev/null 2>&1
+VERSEM_RESTORED=$(aws_s3 s3 cp "s3://$VERSEM_BUCKET/doc.txt" - 2>/dev/null)
+if [ "$VERSEM_RESTORED" == "version two" ]; then
+    pass "Deleting the delete marker restores the previous current version."
+else
+    fail "Object not restored after removing delete marker (got: $VERSEM_RESTORED)."
+fi
+
+# Suspend versioning: new writes take the "null" version id and overwrite in place
+aws_s3 s3api put-bucket-versioning --bucket "$VERSEM_BUCKET" --versioning-configuration Status=Suspended
+echo "suspended one" | aws_s3 s3 cp - "s3://$VERSEM_BUCKET/doc.txt" > /dev/null 2>&1
+echo "suspended two" | aws_s3 s3 cp - "s3://$VERSEM_BUCKET/doc.txt" > /dev/null 2>&1
+VERSEM_NULLS=$(aws_s3 s3api list-object-versions --bucket "$VERSEM_BUCKET" --prefix doc.txt | jq '[.Versions[] | select(.VersionId == "null")] | length')
+if [ "$VERSEM_NULLS" == "1" ]; then
+    pass "Suspended writes share a single 'null' version (overwritten in place)."
+else
+    fail "Expected exactly 1 null version under suspension, got $VERSEM_NULLS."
+fi
+VERSEM_CURRENT=$(aws_s3 s3 cp "s3://$VERSEM_BUCKET/doc.txt" - 2>/dev/null)
+if [ "$VERSEM_CURRENT" == "suspended two" ]; then
+    pass "Current object under suspension is the newest write."
+else
+    fail "Current object under suspension wrong (got: $VERSEM_CURRENT)."
+fi
+
+# Permanently delete a specific old version - remaining versions unaffected
+aws_s3 s3api delete-object --bucket "$VERSEM_BUCKET" --key doc.txt --version-id "$VERSEM_V1" > /dev/null 2>&1
+VERSEM_V1_GONE=$(aws_s3 s3api list-object-versions --bucket "$VERSEM_BUCKET" --prefix doc.txt | jq --arg v "$VERSEM_V1" '[.Versions[]? | select(.VersionId == $v)] | length')
+if [ "$VERSEM_V1_GONE" == "0" ]; then
+    pass "Deleting a specific --version-id permanently removes only that version."
+else
+    fail "Old version still present after versioned delete."
+fi
+
+aws_s3 s3 rm "s3://$VERSEM_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$VERSEM_BUCKET" > /dev/null 2>&1 || true
+
+echo ""
+echo "=== Versioning Semantics Tests Complete ==="
+echo ""
+
+# ── CopyObject metadata directive ─────────────────────────────────────────────
+echo "=== Copy Metadata Directive Tests ==="
+
+COPYMD_BUCKET="copymd-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$COPYMD_BUCKET" > /dev/null 2>&1
+COPYMD_FILE=$(mktemp)
+echo "copy directive body" > "$COPYMD_FILE"
+aws_s3 s3api put-object --bucket "$COPYMD_BUCKET" --key src.txt --body "$COPYMD_FILE" \
+    --content-type "text/plain" --metadata "origin=source" > /dev/null 2>&1
+
+# Default directive (COPY): metadata and content-type carry over
+aws_s3 s3api copy-object --bucket "$COPYMD_BUCKET" --key copied.txt \
+    --copy-source "$COPYMD_BUCKET/src.txt" > /dev/null 2>&1
+COPYMD_HEAD=$(aws_s3 s3api head-object --bucket "$COPYMD_BUCKET" --key copied.txt)
+if [ "$(echo "$COPYMD_HEAD" | jq -r '.Metadata.origin')" == "source" ] \
+    && [ "$(echo "$COPYMD_HEAD" | jq -r '.ContentType')" == "text/plain" ]; then
+    pass "Copy with default directive preserves metadata and Content-Type."
+else
+    fail "Copy default directive lost metadata/content-type: $COPYMD_HEAD"
+fi
+
+# REPLACE directive: only the new metadata/content-type survive
+aws_s3 s3api copy-object --bucket "$COPYMD_BUCKET" --key replaced.txt \
+    --copy-source "$COPYMD_BUCKET/src.txt" \
+    --metadata-directive REPLACE --metadata "fresh=new" --content-type "application/json" > /dev/null 2>&1
+REPLACED_HEAD=$(aws_s3 s3api head-object --bucket "$COPYMD_BUCKET" --key replaced.txt)
+if [ "$(echo "$REPLACED_HEAD" | jq -r '.Metadata.fresh')" == "new" ] \
+    && [ "$(echo "$REPLACED_HEAD" | jq -r '.Metadata.origin')" == "null" ] \
+    && [ "$(echo "$REPLACED_HEAD" | jq -r '.ContentType')" == "application/json" ]; then
+    pass "Copy with REPLACE directive swaps metadata and Content-Type."
+else
+    fail "Copy REPLACE directive wrong result: $REPLACED_HEAD"
+fi
+
+# Body must be identical either way
+REPLACED_BODY=$(aws_s3 s3 cp "s3://$COPYMD_BUCKET/replaced.txt" - 2>/dev/null)
+if [ "$REPLACED_BODY" == "copy directive body" ]; then
+    pass "REPLACE-directive copy keeps the body byte-identical."
+else
+    fail "REPLACE-directive copy corrupted the body."
+fi
+
+aws_s3 s3 rm "s3://$COPYMD_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$COPYMD_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Copy Metadata Directive Tests Complete ==="
+echo ""
+
+# ── Bucket replication subresource ────────────────────────────────────────────
+echo "=== Bucket Replication Subresource Tests ==="
+
+REPLSUB_BUCKET="replsub-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$REPLSUB_BUCKET" > /dev/null 2>&1
+
+# GET ?replication on an unconfigured bucket is a 404 with S3's dedicated code
+REPLSUB_GET=$(aws_s3 s3api get-bucket-replication --bucket "$REPLSUB_BUCKET" 2>&1)
+if echo "$REPLSUB_GET" | grep -q "ReplicationConfigurationNotFound"; then
+    pass "GET replication on an unconfigured bucket returns ReplicationConfigurationNotFoundError."
+else
+    fail "GET replication error wrong: $REPLSUB_GET"
+fi
+
+# PUT ?replication via the S3 API is deliberately NotImplemented (targets need credentials
+# the AWS XML shape cannot carry)
+REPLSUB_PUT=$(aws_s3 s3api put-bucket-replication --bucket "$REPLSUB_BUCKET" \
+    --replication-configuration '{"Role":"arn:aws:iam::123456789012:role/none","Rules":[{"Status":"Enabled","Prefix":"","Destination":{"Bucket":"arn:aws:s3:::other"}}]}' 2>&1)
+if echo "$REPLSUB_PUT" | grep -qiE "NotImplemented|501"; then
+    pass "PUT replication via S3 API is correctly rejected as NotImplemented."
+else
+    fail "PUT replication was not rejected as NotImplemented: $REPLSUB_PUT"
+fi
+
+# DELETE ?replication succeeds (clears configuration), mirroring S3
+if aws_s3 s3api delete-bucket-replication --bucket "$REPLSUB_BUCKET" > /dev/null 2>&1; then
+    pass "DELETE replication succeeds."
+else
+    fail "DELETE replication failed."
+fi
+
+aws_s3 s3api delete-bucket --bucket "$REPLSUB_BUCKET" > /dev/null 2>&1
+
+echo ""
+echo "=== Bucket Replication Subresource Tests Complete ==="
+echo ""
+
+# ── aws s3 sync ───────────────────────────────────────────────────────────────
+echo "=== Sync Tests ==="
+
+SYNC_BUCKET="sync-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$SYNC_BUCKET" > /dev/null 2>&1
+SYNC_SRC=$(mktemp -d)
+SYNC_DST=$(mktemp -d)
+echo "alpha" > "$SYNC_SRC/alpha.txt"
+echo "beta" > "$SYNC_SRC/beta.txt"
+mkdir -p "$SYNC_SRC/nested"
+echo "gamma" > "$SYNC_SRC/nested/gamma.txt"
+
+# Initial sync uploads everything
+aws_s3 s3 sync "$SYNC_SRC" "s3://$SYNC_BUCKET" > /dev/null 2>&1
+SYNC_COUNT=$(aws_s3 s3api list-objects-v2 --bucket "$SYNC_BUCKET" --no-paginate --query 'KeyCount' --output text)
+if [ "$SYNC_COUNT" == "3" ]; then
+    pass "Initial sync uploads all 3 files (including nested)."
+else
+    fail "Initial sync uploaded $SYNC_COUNT files, expected 3."
+fi
+
+# A second sync with one changed file re-uploads only that file
+sleep 1
+echo "alpha v2 - now with more bytes" > "$SYNC_SRC/alpha.txt"
+SYNC_OUT=$(aws_s3 s3 sync "$SYNC_SRC" "s3://$SYNC_BUCKET" 2>&1)
+SYNC_UPLOADS=$(echo "$SYNC_OUT" | grep -c "upload:")
+if [ "$SYNC_UPLOADS" == "1" ]; then
+    pass "Incremental sync re-uploads only the 1 changed file."
+else
+    fail "Incremental sync uploaded $SYNC_UPLOADS files, expected 1: $SYNC_OUT"
+fi
+
+# Sync down reproduces the tree byte-identically
+aws_s3 s3 sync "s3://$SYNC_BUCKET" "$SYNC_DST" > /dev/null 2>&1
+if diff -r "$SYNC_SRC" "$SYNC_DST" > /dev/null 2>&1; then
+    pass "Sync down reproduces the local tree byte-identically."
+else
+    fail "Sync down differs from the source tree."
+fi
+
+aws_s3 s3 rm "s3://$SYNC_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$SYNC_BUCKET" > /dev/null 2>&1
+rm -rf "$SYNC_SRC" "$SYNC_DST"
+
+echo ""
+echo "=== Sync Tests Complete ==="
+echo ""
+
+# ── Per-version object tagging ────────────────────────────────────────────────
+echo "=== Per-Version Tagging Tests ==="
+
+VERTAG_BUCKET="vertag-bucket-$$"
+aws_s3 s3api create-bucket --bucket "$VERTAG_BUCKET" > /dev/null 2>&1
+aws_s3 s3api put-bucket-versioning --bucket "$VERTAG_BUCKET" --versioning-configuration Status=Enabled
+
+echo "tag v1" | aws_s3 s3 cp - "s3://$VERTAG_BUCKET/tagged.txt" > /dev/null 2>&1
+echo "tag v2" | aws_s3 s3 cp - "s3://$VERTAG_BUCKET/tagged.txt" > /dev/null 2>&1
+VERTAG_OLD=$(aws_s3 s3api list-object-versions --bucket "$VERTAG_BUCKET" --prefix tagged.txt | jq -r '.Versions[] | select(.IsLatest == false) | .VersionId')
+
+# Tag only the old version
+aws_s3 s3api put-object-tagging --bucket "$VERTAG_BUCKET" --key tagged.txt --version-id "$VERTAG_OLD" \
+    --tagging 'TagSet=[{Key=generation,Value=old}]' > /dev/null 2>&1
+VERTAG_OLD_TAGS=$(aws_s3 s3api get-object-tagging --bucket "$VERTAG_BUCKET" --key tagged.txt --version-id "$VERTAG_OLD" | jq -r '.TagSet[0].Value')
+if [ "$VERTAG_OLD_TAGS" == "old" ]; then
+    pass "Tagging a specific --version-id round-trips on that version."
+else
+    fail "Per-version tag round-trip failed (got: $VERTAG_OLD_TAGS)."
+fi
+
+# The current version must be unaffected
+VERTAG_CUR_COUNT=$(aws_s3 s3api get-object-tagging --bucket "$VERTAG_BUCKET" --key tagged.txt | jq '.TagSet | length')
+if [ "$VERTAG_CUR_COUNT" == "0" ]; then
+    pass "Tagging an old version leaves the current version untagged."
+else
+    fail "Current version unexpectedly has $VERTAG_CUR_COUNT tags."
+fi
+
+aws_s3 s3 rm "s3://$VERTAG_BUCKET" --recursive > /dev/null 2>&1
+aws_s3 s3api delete-bucket --bucket "$VERTAG_BUCKET" > /dev/null 2>&1 || true
+
+echo ""
+echo "=== Per-Version Tagging Tests Complete ==="
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "=== Results: $PASS_COUNT passed, $FAIL_COUNT failed ==="
 [ "$FAIL_COUNT" -eq 0 ] && exit 0 || exit 1

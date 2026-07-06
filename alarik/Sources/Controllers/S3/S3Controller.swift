@@ -168,7 +168,7 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
         let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
-        // Real S3 always reports the bucket's region via this header on HeadBucket, regardless
+        // S3 always reports the bucket's region via this header on HeadBucket, regardless
         // of the LocationConstraint XML quirk for us-east-1 (verified against the
         // HeadBucket/GetBucketLocation API references).
         response.headers.replaceOrAdd(name: "x-amz-bucket-region", value: AlarikRegion.resolve())
@@ -310,7 +310,7 @@ struct S3Controller: RouteCollection {
         if let existing = try await Bucket.query(on: req.db).filter(\.$name == bucketName).first()
         {
             if existing.$user.id == key.user.id {
-                // Real S3 only no-ops re-creating your own bucket as a 200 OK in us-east-1,
+                // S3 only no-ops re-creating your own bucket as a 200 OK in us-east-1,
                 // for legacy compatibility - every other region returns 409
                 // BucketAlreadyOwnedByYou instead (verified against the CreateBucket API
                 // reference).
@@ -339,12 +339,12 @@ struct S3Controller: RouteCollection {
         return response
     }
 
-    /// Handles PUT /:bucketName?versioning - set bucket versioning configuration. Real S3's
+    /// Handles PUT /:bucketName?versioning - set bucket versioning configuration. S3's
     /// `VersioningConfiguration.Status` schema only ever accepts `Enabled` or `Suspended` -
     /// there is no way to PUT your way back to `Disabled` (verified against the
     /// PutBucketVersioning API reference); `Disabled` only ever describes a bucket that has
     /// never had this operation called on it. Any other value, including a well-formed but
-    /// unrecognized one, is the same `MalformedXML` 400 real S3 returns.
+    /// unrecognized one, is the same `MalformedXML` 400 S3 returns.
     @Sendable
     private func handleVersioningPut(req: Request, bucketName: String) async throws -> Response {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
@@ -434,7 +434,7 @@ struct S3Controller: RouteCollection {
     }
 
     /// Handles DELETE /:bucketName?publicAccessBlock - removes the bucket's Public Access Block
-    /// configuration (resetting all 4 flags to false). Real S3 returns 204 No Content.
+    /// configuration (resetting all 4 flags to false). S3 returns 204 No Content.
     @Sendable
     private func handlePublicAccessBlockDelete(req: Request, bucketName: String) async throws
         -> HTTPStatus
@@ -455,8 +455,8 @@ struct S3Controller: RouteCollection {
     }
 
     /// Handles PUT /:bucketName?tagging - sets the bucket's tag-set, overwriting any existing
-    /// tags entirely (real S3 does not merge - verified against the PutBucketTagging API
-    /// reference). Real S3 returns 204 No Content.
+    /// tags entirely (S3 does not merge - verified against the PutBucketTagging API
+    /// reference). S3 returns 204 No Content.
     @Sendable
     private func handleBucketTaggingPut(req: Request, bucketName: String) async throws
         -> Response
@@ -474,7 +474,7 @@ struct S3Controller: RouteCollection {
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
 
-    /// Handles DELETE /:bucketName?tagging - removes all of the bucket's tags. Real S3 returns
+    /// Handles DELETE /:bucketName?tagging - removes all of the bucket's tags. S3 returns
     /// 204 No Content.
     @Sendable
     private func handleBucketTaggingDelete(req: Request, bucketName: String) async throws
@@ -491,7 +491,7 @@ struct S3Controller: RouteCollection {
     }
 
     /// Handles PUT /:bucketName?lifecycle - sets the bucket's lifecycle configuration,
-    /// overwriting any existing configuration entirely. Real S3 returns 200 OK with an empty
+    /// overwriting any existing configuration entirely. S3 returns 200 OK with an empty
     /// body (verified against the PutBucketLifecycleConfiguration API reference).
     @Sendable
     private func handleLifecyclePut(req: Request, bucketName: String) async throws -> Response {
@@ -509,7 +509,7 @@ struct S3Controller: RouteCollection {
     }
 
     /// Handles DELETE /:bucketName?lifecycle - removes the bucket's lifecycle configuration.
-    /// Real S3 returns 204 No Content.
+    /// S3 returns 204 No Content.
     @Sendable
     private func handleLifecycleDelete(req: Request, bucketName: String) async throws
         -> HTTPStatus
@@ -526,7 +526,7 @@ struct S3Controller: RouteCollection {
 
     /// Handles DELETE /:bucketName?replication - clears the bucket's whole replication
     /// configuration (targets and rules). Unlike PUT ?replication, this needs no target
-    /// credentials, so - matching real S3's DeleteBucketReplication - it's fully supported, not
+    /// credentials, so - matching S3's DeleteBucketReplication - it's fully supported, not
     /// a 501.
     @Sendable
     private func handleReplicationDelete(req: Request, bucketName: String) async throws
@@ -768,7 +768,7 @@ struct S3Controller: RouteCollection {
 
     /// Handles PUT /:bucket/:key?tagging - sets the tag-set of a specific object version (or
     /// the current one if no `versionId` is given). Modifies the existing version's metadata in
-    /// place - does not create a new version. Real S3 returns 200 with x-amz-version-id
+    /// place - does not create a new version. S3 returns 200 with x-amz-version-id
     /// (verified against the PutObjectTagging API reference). Auth is already done by the
     /// caller (`handleObjectPut`) before dispatching here.
     @Sendable
@@ -836,7 +836,7 @@ struct S3Controller: RouteCollection {
     }
 
     /// Handles DELETE /:bucket/:key?tagging - removes all tags from a specific object version
-    /// (or the current one). Real S3 returns 204 No Content. Auth is already done by the
+    /// (or the current one). S3 returns 204 No Content. Auth is already done by the
     /// caller (`handleObjectDelete`) before dispatching here.
     @Sendable
     private func handleObjectTaggingDelete(req: Request, bucketName: String, key: String)
@@ -905,15 +905,44 @@ struct S3Controller: RouteCollection {
         // Validate copy conditions (if-match, if-none-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
 
-        // Determine metadata handling
+        // Determine metadata handling. x-amz-metadata-directive COPY (the default) carries
+        // the source's Content-Type AND user metadata over; REPLACE takes both from this
+        // request's headers instead (verified against the CopyObject API reference - metadata
+        // is all-or-nothing per directive, never merged).
         let replaceMetadata = S3Service.shouldReplaceMetadata(req: req)
 
-        // Create destination metadata
         let contentType: String
+        var userMetadata: [String: String]
         if replaceMetadata {
             contentType = req.headers.contentType?.description ?? sourceMeta.contentType
+            userMetadata = [:]
+            for (name, value) in req.headers {
+                if name.lowercased().hasPrefix("x-amz-meta-") {
+                    let metaKey = String(name.dropFirst("x-amz-meta-".count)).lowercased()
+                    userMetadata[metaKey] = value
+                }
+            }
         } else {
             contentType = sourceMeta.contentType
+            userMetadata = sourceMeta.metadata
+        }
+
+        // Tags follow their own directive: x-amz-tagging-directive COPY (the default) carries
+        // the source's tag-set over; REPLACE takes it from this request's x-amz-tagging header
+        // (verified against the CopyObject API reference).
+        let tags: [String: String]?
+        if req.headers.first(name: "x-amz-tagging-directive")?.uppercased() == "REPLACE" {
+            let tagging = Tagging.parseHeaderValue(
+                req.headers.first(name: "x-amz-tagging") ?? "")
+            guard tagging.tags.count <= Tagging.maxTagCount else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidTag",
+                    message: "Object tags cannot be greater than \(Tagging.maxTagCount).",
+                    requestId: req.id)
+            }
+            tags = tagging.tags.isEmpty ? nil : tagging.tags
+        } else {
+            tags = sourceMeta.tags
         }
 
         let etag = S3Service.computeETag(data)
@@ -923,7 +952,9 @@ struct S3Controller: RouteCollection {
             size: data.count,
             contentType: contentType,
             etag: etag,
-            updatedAt: Date()
+            metadata: userMetadata,
+            updatedAt: Date(),
+            tags: tags
         )
 
         var headers = HTTPHeaders()
@@ -990,7 +1021,7 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        // GetObjectTagging - a different permission than GetObject in real S3, not covered by
+        // GetObjectTagging - a different permission than GetObject in S3, not covered by
         // the bucket-policy public-access whitelist, so it always requires strict auth.
         if req.url.query?.lowercased().contains("tagging") == true {
             return try await handleObjectTaggingGet(req: req, bucketName: bucketName, key: keyPath)

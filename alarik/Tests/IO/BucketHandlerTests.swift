@@ -126,11 +126,16 @@ struct BucketHandlerTests {
         try await withApp { _ in
             try StorageHelper.cleanStorage()
 
-            // Create bucket with file
+            // Create bucket with a real object (only .obj files count as bucket contents -
+            // that's the only thing an object write can ever produce)
             try BucketHandler.create(name: "testbucket")
             let bucketURL = BucketHandler.bucketURL(for: "testbucket")
-            let file = bucketURL.appendingPathComponent("test.txt")
-            try "content".write(to: file, atomically: true, encoding: .utf8)
+            let meta = ObjectMeta(
+                bucketName: "testbucket", key: "test.txt", size: 7, contentType: "text/plain",
+                etag: "abc", updatedAt: Date())
+            try ObjectFileHandler.write(
+                metadata: meta, data: Data("content".utf8),
+                to: ObjectFileHandler.storagePath(for: "testbucket", key: "test.txt"))
 
             // Regular delete should fail
             #expect(throws: S3Error.self) {
@@ -142,6 +147,50 @@ struct BucketHandlerTests {
 
             // Clean up with force delete
             try BucketHandler.forceDelete(name: "testbucket")
+        }
+    }
+
+    @Test("Regular delete succeeds when only empty directory skeletons remain")
+    func testDeleteSucceedsWithEmptyDirectorySkeletons() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Deleting a nested key leaves its empty parent directories behind - S3 has no
+            // directories, so those leftovers must never block deleting the bucket (found
+            // via `mc rb --force`, which deletes every object and then expects DeleteBucket
+            // to succeed).
+            try BucketHandler.create(name: "skeleton-bucket")
+            let bucketURL = BucketHandler.bucketURL(for: "skeleton-bucket")
+            let nested = bucketURL.appendingPathComponent("deep/nested/path")
+            try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+            try BucketHandler.delete(name: "skeleton-bucket", force: false)
+            #expect(!FileManager.default.fileExists(atPath: bucketURL.path))
+        }
+    }
+
+    @Test("Regular delete fails while versioned objects remain (hidden .versions dir)")
+    func testDeleteFailsWithVersionedObjects() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+
+            // Versioned objects live under hidden .versions directories - a bucket holding
+            // only those must still count as non-empty (S3 refuses to delete a bucket
+            // while any version or delete marker remains).
+            try BucketHandler.create(name: "versioned-remains")
+            let meta = ObjectMeta(
+                bucketName: "versioned-remains", key: "v.txt", size: 1, contentType: "text/plain",
+                etag: "abc", updatedAt: Date())
+            _ = try ObjectFileHandler.writeVersioned(
+                metadata: meta, data: Data("x".utf8), bucketName: "versioned-remains",
+                key: "v.txt", versioningStatus: .enabled)
+
+            #expect(ObjectFileHandler.hasBucketObjects(bucketName: "versioned-remains"))
+            #expect(throws: S3Error.self) {
+                try BucketHandler.delete(name: "versioned-remains", force: false)
+            }
+
+            try BucketHandler.forceDelete(name: "versioned-remains")
         }
     }
 

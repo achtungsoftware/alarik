@@ -56,7 +56,7 @@ struct LifecycleService {
 
     /// Expiration - deletes current objects whose last-modified date is at least `days` old.
     /// In a versioned bucket this creates a delete marker; otherwise it's a permanent delete -
-    /// identical to a normal DELETE request, matching real S3's lifecycle Expiration behavior.
+    /// identical to a normal DELETE request, matching S3's lifecycle Expiration behavior.
     private static func expireCurrentObjects(
         bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus,
         on db: any Database

@@ -380,7 +380,7 @@ struct InternalBucketController: RouteCollection {
         return StatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
     }
 
-    /// Cap on how long a shared link can stay valid. Kept at the same 7 days as a real S3
+    /// Cap on how long a shared link can stay valid. Kept at the same 7 days as a S3
     /// presigned URL would allow, for familiarity - but this is an Alarik-specific limit, not
     /// a SigV4 constraint, since shared links don't use SigV4 at all.
     static let maxShareExpirySeconds = 604_800
@@ -811,7 +811,7 @@ struct InternalBucketController: RouteCollection {
         return VersioningStatusDTO(status: bucket.versioningStatus)
     }
 
-    /// Real S3 never lets a client set `Disabled` via PutBucketVersioning - only `Enabled` or
+    /// S3 never lets a client set `Disabled` via PutBucketVersioning - only `Enabled` or
     /// `Suspended` are valid request values (verified against the API reference); `Disabled`
     /// only ever describes a bucket that has never had versioning touched at all. Once
     /// versioning has been enabled, the only way "off" is `Suspended`.
@@ -1567,7 +1567,7 @@ struct InternalBucketController: RouteCollection {
 
     /// Updates the Content-Type and custom (`x-amz-meta-*`) metadata of the *current* version
     /// of an object, in place - same shape as `setObjectTags`: no new version, no re-upload of
-    /// the body, and (also matching real S3's PutObjectTagging/metadata-only semantics) no
+    /// the body, and (also matching S3's PutObjectTagging/metadata-only semantics) no
     /// webhook notification, since the object's data hasn't changed.
     @Sendable
     func setObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {

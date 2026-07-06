@@ -458,7 +458,7 @@ struct S3Service {
         }
     }
 
-    /// Handles GET ?location. Matches real S3's `us-east-1` quirk: that region reports an
+    /// Handles GET ?location. Matches S3's `us-east-1` quirk: that region reports an
     /// *empty* `LocationConstraint` element (a bucket's `LocationConstraint` is null/absent
     /// specifically when it's in us-east-1 - verified against the GetBucketLocation API
     /// reference); every other configured region reports its name as element text.
@@ -472,7 +472,7 @@ struct S3Service {
         return buildXMLResponse(data: Data(xml.utf8))
     }
 
-    /// Handles GET ?policy - returns the bucket's policy as raw JSON, matching real S3
+    /// Handles GET ?policy - returns the bucket's policy as raw JSON, matching S3
     /// (GetBucketPolicy is the one bucket subresource that responds with JSON, not XML)
     static func handlePolicyQuery(bucket: Bucket?, requestId: String) throws -> Response {
         guard let rawPolicy = bucket?.policy else {
@@ -543,7 +543,7 @@ struct S3Service {
         return nil
     }
 
-    /// Handles GET ?notification on a bucket. Unlike ?lifecycle/?tagging, real S3 returns an
+    /// Handles GET ?notification on a bucket. Unlike ?lifecycle/?tagging, S3 returns an
     /// empty `<NotificationConfiguration/>` (200) rather than a 404 when none is set (verified
     /// against the GetBucketNotificationConfiguration API reference).
     static func handleNotificationGet(bucket: Bucket?) -> Response {
@@ -552,7 +552,7 @@ struct S3Service {
         return buildXMLResponse(data: Data(config.toXML().utf8))
     }
 
-    /// Handles GET ?replication on a bucket. Matches real S3: a 404
+    /// Handles GET ?replication on a bucket. Matches S3: a 404
     /// ReplicationConfigurationNotFoundError if none has ever been set (verified against the
     /// GetBucketReplication API reference - unlike ?notification, which returns an empty 200).
     static func handleReplicationGet(bucket: Bucket?, requestId: String) throws -> Response {
@@ -564,7 +564,7 @@ struct S3Service {
         return buildXMLResponse(data: Data(ReplicationConfiguration.fromJSON(raw).toXML().utf8))
     }
 
-    /// Handles GET ?lifecycle on a bucket. Matches real S3: a 404 NoSuchLifecycleConfiguration
+    /// Handles GET ?lifecycle on a bucket. Matches S3: a 404 NoSuchLifecycleConfiguration
     /// if none has ever been set (verified against the GetBucketLifecycleConfiguration API
     /// reference).
     static func handleLifecycleGet(bucket: Bucket?, requestId: String) throws -> Response {
@@ -576,7 +576,7 @@ struct S3Service {
         return buildXMLResponse(data: Data(LifecycleConfiguration.fromJSON(rawRules).toXML().utf8))
     }
 
-    /// Handles GET ?tagging on a bucket. Matches real S3: a 404 NoSuchTagSet if no tag set has
+    /// Handles GET ?tagging on a bucket. Matches S3: a 404 NoSuchTagSet if no tag set has
     /// ever been configured (verified against the GetBucketTagging API reference) - unlike
     /// object tagging, which always returns 200 with a possibly-empty TagSet.
     static func handleBucketTaggingGet(bucket: Bucket?, requestId: String) throws -> Response {
@@ -590,7 +590,7 @@ struct S3Service {
     }
 
     /// Handles GET ?publicAccessBlock - returns the bucket's Public Access Block configuration.
-    /// Matches real S3: a 404 NoSuchPublicAccessBlockConfiguration if none has ever been set,
+    /// Matches S3: a 404 NoSuchPublicAccessBlockConfiguration if none has ever been set,
     /// same shape as GetBucketPolicy's NoSuchBucketPolicy.
     static func handlePublicAccessBlockGet(bucket: Bucket?, requestId: String) throws -> Response
     {
@@ -794,7 +794,7 @@ struct S3Service {
 
     /// Deletes a single object, honoring versionId (permanent delete of a specific version)
     /// and bucket versioning status (delete marker vs. permanent delete), matching S3 semantics.
-    /// Deleting a key that doesn't exist is treated as success, like real S3.
+    /// Deleting a key that doesn't exist is treated as success, like S3.
     static func deleteObject(
         bucketName: String,
         key: String,

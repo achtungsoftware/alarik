@@ -99,7 +99,7 @@ struct S3RangeParser {
 
         if startStr.isEmpty {
             // Suffix range: "bytes=-500" means last 500 bytes. A suffix larger than the
-            // object clamps to the whole object (RFC 7233, matches real S3) - it is only
+            // object clamps to the whole object (RFC 7233, matches S3) - it is only
             // unsatisfiable when the object is empty.
             guard let suffixLength = Int(endStr), suffixLength > 0 else {
                 return .noRange

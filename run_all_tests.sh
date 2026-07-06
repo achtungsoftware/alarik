@@ -5,7 +5,8 @@
 #   1. Swift unit tests          (swift test --no-parallel)
 #   2. AWS CLI S3 tests          (aws_cli_tests.sh)
 #   3. rclone S3 tests           (rclone_tests.sh)
-#   4. Bucket replication tests  (replication_tests.sh - 2 real server instances)
+#   4. MinIO client (mc) tests   (mc_tests.sh)
+#   5. Bucket replication tests  (replication_tests.sh - 2 real server instances)
 #
 # The S3 test suites run against a freshly built server that is started with a
 # clean, temporary state directory (empty database + storage) per suite, so
@@ -78,6 +79,7 @@ MISSING=""
 command -v swift >/dev/null || MISSING="$MISSING swift"
 command -v aws >/dev/null || MISSING="$MISSING aws"
 command -v rclone >/dev/null || MISSING="$MISSING rclone"
+command -v mc >/dev/null || MISSING="$MISSING mc"
 command -v jq >/dev/null || MISSING="$MISSING jq"
 if [ -n "$MISSING" ]; then
     echo "ERROR: missing required tools:$MISSING"
@@ -160,7 +162,28 @@ fi
 stop_server
 echo ""
 
-# ── 5. Bucket replication tests ─────────────────────────────────────────────────
+# ── 5. MinIO client (mc) tests ──────────────────────────────────────────────────
+echo "--- MinIO client (mc) S3 tests ---"
+if start_fresh_server "mc"; then
+    if (cd "$ROOT" && bash mc_tests.sh) > "$LOG_DIR/mc-tests.log" 2>&1; then
+        MC_RESULT="PASS"
+    else
+        MC_RESULT="FAIL"
+    fi
+    MC_PASSES=$(grep -c "^PASS:" "$LOG_DIR/mc-tests.log")
+    MC_FAILS=$(grep -c "^FAIL:" "$LOG_DIR/mc-tests.log")
+    echo "$MC_RESULT: $MC_PASSES passed, $MC_FAILS failed"
+    if [ "$MC_FAILS" -gt 0 ]; then
+        grep "^FAIL:" "$LOG_DIR/mc-tests.log" | sed 's/^/  /'
+    fi
+    record "MinIO client (mc) tests" "$MC_RESULT" "$MC_PASSES passed, $MC_FAILS failed"
+else
+    record "MinIO client (mc) tests" "FAIL" "server did not start"
+fi
+stop_server
+echo ""
+
+# ── 6. Bucket replication tests ─────────────────────────────────────────────────
 # Unlike the suites above, this one manages its own two server processes (a real
 # source + target instance, on ports 8081/8082)
 echo "--- Bucket replication tests (2 real instances) ---"

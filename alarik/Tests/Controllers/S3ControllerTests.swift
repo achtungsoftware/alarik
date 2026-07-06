@@ -178,7 +178,7 @@ struct S3ControllerTests {
                     #expect(res.status == .ok)
                     #expect(res.headers.contentType == .xml)
                     let bodyString = res.body.string
-                    // Real S3's us-east-1 quirk: LocationConstraint is empty for that region,
+                    // S3's us-east-1 quirk: LocationConstraint is empty for that region,
                     // not the literal string "us-east-1" (verified against the
                     // GetBucketLocation API reference).
                     #expect(bodyString.contains("<LocationConstraint"))
@@ -1507,6 +1507,140 @@ struct S3ControllerTests {
                     #expect(res.status == .ok)
                     #expect(res.headers.first(name: "Content-Type") == "application/json")
                 })
+        }
+    }
+
+    @Test("Copy Object - Default directive carries user metadata and tags to the destination")
+    func testCopyObjectDefaultDirectiveCarriesMetadataAndTags() async throws {
+        let bucketName = "test-copy-carry-meta"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            // Upload with user metadata and inline tags
+            let putData = Data("carry me".utf8)
+            let putSigned = signedHeaders(
+                for: .PUT,
+                path: "/\(bucketName)/source.txt",
+                body: putData,
+                additionalHeaders: [
+                    "content-type": "text/plain",
+                    "x-amz-meta-origin": "the-source",
+                    "x-amz-tagging": "team=storage",
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/source.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(data: putData)
+                },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            // Plain copy - no directive headers - must carry metadata + tags over (S3's
+            // default COPY behavior, verified against the CopyObject API reference)
+            let copySigned = signedHeaders(
+                for: .PUT,
+                path: "/\(bucketName)/copied.txt",
+                additionalHeaders: ["x-amz-copy-source": "/\(bucketName)/source.txt"]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/copied.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: copySigned) },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            let headSigned = signedHeaders(for: .HEAD, path: "/\(bucketName)/copied.txt")
+            try await app.test(
+                .HEAD, "/\(bucketName)/copied.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: headSigned) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.first(name: "x-amz-meta-origin") == "the-source")
+                    #expect(res.headers.first(name: "Content-Type") == "text/plain")
+                })
+
+            let tagSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/copied.txt", query: "tagging")
+            try await app.test(
+                .GET, "/\(bucketName)/copied.txt?tagging",
+                beforeRequest: { req in req.headers.add(contentsOf: tagSigned) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Key>team</Key>"))
+                    #expect(res.body.string.contains("<Value>storage</Value>"))
+                })
+        }
+    }
+
+    @Test("Copy Object - REPLACE directive takes metadata from the request, dropping the source's")
+    func testCopyObjectReplaceDirectiveTakesRequestMetadata() async throws {
+        let bucketName = "test-copy-replace-usermeta"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let putData = Data("replace me".utf8)
+            let putSigned = signedHeaders(
+                for: .PUT,
+                path: "/\(bucketName)/source.txt",
+                body: putData,
+                additionalHeaders: ["x-amz-meta-origin": "the-source"]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/source.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(data: putData)
+                },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            let copySigned = signedHeaders(
+                for: .PUT,
+                path: "/\(bucketName)/replaced.txt",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(bucketName)/source.txt",
+                    "x-amz-metadata-directive": "REPLACE",
+                    "x-amz-meta-fresh": "brand-new",
+                ]
+            )
+            try await app.test(
+                .PUT, "/\(bucketName)/replaced.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: copySigned) },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            let headSigned = signedHeaders(for: .HEAD, path: "/\(bucketName)/replaced.txt")
+            try await app.test(
+                .HEAD, "/\(bucketName)/replaced.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: headSigned) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.first(name: "x-amz-meta-fresh") == "brand-new")
+                    // Metadata is all-or-nothing per directive, never merged
+                    #expect(res.headers.first(name: "x-amz-meta-origin") == nil)
+                })
+        }
+    }
+
+    @Test("Delete Object - versionId 'null' removes a never-versioned key's plain object")
+    func testDeleteNullVersionRemovesPlainObject() async throws {
+        let bucketName = "test-delete-null-version"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "plain.txt", content: "bytes")
+
+            // Versions listings report never-versioned objects as VersionId "null" (matching
+            // S3), and clients like mc echo that id back in versioned deletes - which
+            // must remove the plain object, not silently no-op.
+            let deleteSigned = signedHeaders(
+                for: .DELETE, path: "/\(bucketName)/plain.txt", query: "versionId=null")
+            try await app.test(
+                .DELETE, "/\(bucketName)/plain.txt?versionId=null",
+                beforeRequest: { req in req.headers.add(contentsOf: deleteSigned) },
+                afterResponse: { res in #expect(res.status == .noContent) })
+
+            let headSigned = signedHeaders(for: .HEAD, path: "/\(bucketName)/plain.txt")
+            try await app.test(
+                .HEAD, "/\(bucketName)/plain.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: headSigned) },
+                afterResponse: { res in #expect(res.status == .notFound) })
         }
     }
 

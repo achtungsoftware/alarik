@@ -23,7 +23,7 @@ import Vapor
 struct Tagging: Equatable {
     let tags: [String: String]
 
-    /// Real S3 limits objects to 10 tags - verified against the PutObjectTagging API reference.
+    /// S3 limits objects to 10 tags - verified against the PutObjectTagging API reference.
     static let maxTagCount = 10
 
     /// Parses a `Tagging` request body, matching the block-regex-extraction style already used

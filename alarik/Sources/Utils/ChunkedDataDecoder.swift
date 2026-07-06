@@ -66,7 +66,7 @@ struct ChunkedDataDecoder {
                 if offset == bytes.count { break }
                 // CRITICAL: Consume all remaining bytes (trailer headers + final CRLF)
                 // Since this decoder only extracts the data payload, we just discard the rest.
-                // In a real S3 implementation, you might want to parse the trailer headers (e.g., if needed for SigV4)
+                // In a S3 implementation, you might want to parse the trailer headers (e.g., if needed for SigV4)
                 // Advance offset to the end of the buffer
                 offset = bytes.count
                 break

@@ -33,7 +33,7 @@ struct LifecycleRule: Codable, Equatable {
 struct LifecycleConfiguration: Equatable {
     var rules: [LifecycleRule]
 
-    /// Real S3 elements this system doesn't support - rejected explicitly at parse time rather
+    /// S3 elements this system doesn't support - rejected explicitly at parse time rather
     /// than silently accepted and ignored, mirroring `BucketPolicy.parseAndValidate`'s philosophy.
     private static let unsupportedElementNames = [
         "Transition", "NoncurrentVersionTransition", "Tag", "And",

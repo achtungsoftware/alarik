@@ -36,8 +36,11 @@ struct BucketHandler {
     static func delete(name: String, force: Bool) throws {
         let fm = FileManager.default
         let dataURL = bucketURL(for: name)
-        let contents = try fm.contentsOfDirectory(atPath: dataURL.path)
-        if !contents.isEmpty && !force {
+        // "Empty" means no objects (no .obj file anywhere, versioned or not) - NOT "no
+        // directory entries". Deleting a nested key leaves its empty parent-directory
+        // skeleton behind, and S3 has no concept of directories, so those leftovers must
+        // never block deleting a bucket whose objects are all gone.
+        if !force && ObjectFileHandler.hasBucketObjects(bucketName: name) {
             throw S3Error(
                 status: .conflict,
                 code: "BucketNotEmpty",
