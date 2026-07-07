@@ -630,63 +630,48 @@ struct InternalBucketController: RouteCollection {
     ) async throws
         -> Response
     {
-        // Try versioned storage first, then fall back to non-versioned
-        let meta: ObjectMeta
-        let fileData: Data
-
-        do {
-            let (m, data) = try ObjectFileHandler.readVersion(
-                bucketName: bucketName,
-                key: key,
-                versionId: versionId,
-                loadData: true
-            )
-
-            // Check if latest version is a delete marker
-            if m.isDeleteMarker {
-                throw Abort(.notFound, reason: "Object not found")
+        // Resolve to the on-disk file so large objects can stream straight from it - a
+        // console download of a multi-GB object must not buffer it in memory (same pattern
+        // as SharedLinkController and the S3 GET handler).
+        var path = try? ObjectFileHandler.resolvePath(
+            bucketName: bucketName, key: key, versionId: versionId)
+        if path == nil, versionId == "null" {
+            // The "null" version of a never-versioned key lives at the plain path
+            let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
+                path = plainPath
             }
-
-            guard let d = data else {
-                throw Abort(.internalServerError, reason: "Failed to read object data")
-            }
-
-            meta = m
-            fileData = d
-        } catch let error as Abort {
-            throw error
-        } catch {
-            // Fall back to non-versioned path
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-
-            guard FileManager.default.fileExists(atPath: path) else {
-                throw Abort(.notFound, reason: "Object not found")
-            }
-
-            let (m, data) = try ObjectFileHandler.read(from: path, loadData: true)
-
-            guard let d = data else {
-                throw Abort(.internalServerError, reason: "Failed to read object data")
-            }
-
-            meta = m
-            fileData = d
+        }
+        guard let path else {
+            throw Abort(.notFound, reason: "Object not found")
         }
 
-        let response = Response(status: .ok, body: .init(data: fileData))
-        response.headers.contentType = HTTPMediaType(
-            type: meta.contentType.split(separator: "/").first.map(String.init) ?? "application",
-            subType: meta.contentType.split(separator: "/").last.map(String.init)
-                ?? "octet-stream"
-        )
+        guard let location = try? ObjectFileHandler.payloadLocation(path: path),
+            !location.meta.isDeleteMarker
+        else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+        let meta = location.meta
+
+        let response: Response
+        if location.payloadSize > Constants.streamingThreshold {
+            response = S3Service.buildStreamingObjectResponse(
+                req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
+        } else {
+            // Headers and body from the same read - one consistent snapshot of the file
+            guard let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                let data
+            else {
+                throw Abort(.internalServerError, reason: "Failed to read object data")
+            }
+            response = S3Service.buildVersionedObjectMetadataResponse(
+                meta: freshMeta, includeBody: true, data: data)
+        }
+
         let fileName = String(key.split(separator: "/").last ?? "download")
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
-        )
-        response.headers.replaceOrAdd(
-            name: .contentLength,
-            value: String(fileData.count)
         )
 
         return response

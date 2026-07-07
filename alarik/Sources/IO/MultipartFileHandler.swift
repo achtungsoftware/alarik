@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import Crypto
 import Foundation
 
 struct MultipartFileHandler {
@@ -119,18 +120,154 @@ struct MultipartFileHandler {
         let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         try data.write(to: URL(fileURLWithPath: partPath))
 
-        // Write part metadata
+        try writePartMeta(
+            bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
+            etag: etag, size: data.count)
+
+        return etag
+    }
+
+    /// `writePart` for a body already spooled to disk: the spool file is renamed into place
+    /// (same filesystem - Storage/spool and Storage/multipart share a root), so part uploads
+    /// of any size never pass through memory. `etag` is the payload MD5 computed while
+    /// spooling. Consumes the spool file on success.
+    static func writePartStreamed(
+        bucketName: String,
+        uploadId: String,
+        partNumber: Int,
+        spoolPath: String,
+        etag: String,
+        size: Int
+    ) throws -> String {
+        guard partNumber >= 1 && partNumber <= 10000 else {
+            throw NSError(
+                domain: "InvalidPartNumber", code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
+        }
+        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        guard FileManager.default.fileExists(atPath: metaPath) else {
+            throw NSError(
+                domain: "NoSuchUpload", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+        }
+
+        let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+
+        // Same durability contract as object writes: flush the part before acknowledging it,
+        // otherwise a crash between UploadPart's 200 and CompleteMultipartUpload could lose
+        // bytes the client believes are stored.
+        if Durability.fsyncEnabled {
+            let fd = POSIXFile.open(spoolPath, O_RDONLY)
+            guard fd >= 0 else {
+                throw NSError(
+                    domain: "FileError", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "Could not open spooled part"])
+            }
+            let flushed = Durability.flush(fd)
+            _ = POSIXFile.close(fd)
+            guard flushed == 0 else {
+                throw NSError(
+                    domain: "FileError", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "Could not flush part to disk"])
+            }
+        }
+        if POSIXFile.rename(spoolPath, partPath) != 0 {
+            // EXDEV: Storage/spool and Storage/multipart live on different filesystems
+            // (unusual, but possible with per-directory mounts) - fall back to a copy
+            guard errno == EXDEV else {
+                throw NSError(
+                    domain: "FileError", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "Could not move part into place"])
+            }
+            try? FileManager.default.removeItem(atPath: partPath)
+            try FileManager.default.copyItem(atPath: spoolPath, toPath: partPath)
+        }
+
+        try writePartMeta(
+            bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
+            etag: etag, size: size)
+
+        return etag
+    }
+
+    /// `writePart` where the payload is a region of an existing file (UploadPartCopy):
+    /// window-copies the region into the part file, computing the part's MD5 on the way.
+    static func writePartFromFile(
+        bucketName: String,
+        uploadId: String,
+        partNumber: Int,
+        sourcePath: String,
+        sourceOffset: Int,
+        sourceSize: Int
+    ) throws -> String {
+        guard partNumber >= 1 && partNumber <= 10000 else {
+            throw NSError(
+                domain: "InvalidPartNumber", code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
+        }
+        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        guard FileManager.default.fileExists(atPath: metaPath) else {
+            throw NSError(
+                domain: "NoSuchUpload", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+        }
+
+        let sourceFd = POSIXFile.open(sourcePath, O_RDONLY)
+        guard sourceFd >= 0 else {
+            throw NSError(
+                domain: "FileError", code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open copy source"])
+        }
+        defer { _ = POSIXFile.close(sourceFd) }
+        _ = POSIXFile.lseek(sourceFd, off_t(sourceOffset), SEEK_SET)
+
+        let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+        var writer = try AtomicObjectWriter(finalPath: partPath)
+        var md5 = Insecure.MD5()
+        do {
+            let windowSize = Constants.fileCopyWindowSize
+            var window = [UInt8](repeating: 0, count: windowSize)
+            var remaining = sourceSize
+            while remaining > 0 {
+                let toRead = Swift.min(windowSize, remaining)
+                let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
+                guard bytesRead > 0 else {
+                    throw NSError(
+                        domain: "InvalidFile", code: 0,
+                        userInfo: [NSLocalizedDescriptionKey: "Copy source ended early"])
+                }
+                try window.withUnsafeBytes { raw in
+                    let slice = UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead))
+                    md5.update(bufferPointer: slice)
+                    try writer.writeRaw(slice)
+                }
+                remaining -= bytesRead
+            }
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
+        }
+
+        let etag = md5.finalize().hexString()
+        try writePartMeta(
+            bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
+            etag: etag, size: sourceSize)
+        return etag
+    }
+
+    private static func writePartMeta(
+        bucketName: String, uploadId: String, partNumber: Int, etag: String, size: Int
+    ) throws {
         let partMeta = MultipartPartMeta(
             partNumber: partNumber,
             etag: etag,
-            size: data.count,
+            size: size,
             lastModified: Date()
         )
         let partMetaData = try jsonEncoder.encode(partMeta)
         let partMetaPath = partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         try partMetaData.write(to: URL(fileURLWithPath: partMetaPath))
-
-        return etag
     }
 
     /// Completes the multipart upload by concatenating parts and returns the final ETag
@@ -169,9 +306,12 @@ struct MultipartFileHandler {
             seenPartNumbers.insert(part.partNumber)
         }
 
-        // Concatenate all parts
-        var finalData = Data()
+        // Collect part file regions - the final object is assembled by streaming these
+        // straight into the .obj, never concatenated in memory (a 5 GiB upload used to need
+        // 5+ GiB of RAM right here)
+        var payloadSources: [(path: String, offset: Int, size: Int)] = []
         var partEtags: [String] = []
+        var totalSize = 0
 
         for part in sortedParts {
             let partFilePath = partPath(
@@ -188,6 +328,7 @@ struct MultipartFileHandler {
             // Read and verify part metadata
             let partMetaFilePath = partMetaPath(
                 for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
+            let partSize: Int
             if FileManager.default.fileExists(atPath: partMetaFilePath) {
                 let partMetaData = try Data(contentsOf: URL(fileURLWithPath: partMetaFilePath))
                 let partMeta = try jsonDecoder.decode(MultipartPartMeta.self, from: partMetaData)
@@ -201,11 +342,15 @@ struct MultipartFileHandler {
                                 "ETag mismatch for part \(part.partNumber)"
                         ])
                 }
+                partSize = partMeta.size
+            } else {
+                // No part meta (legacy upload dir): size straight from the file
+                let attrs = try FileManager.default.attributesOfItem(atPath: partFilePath)
+                partSize = (attrs[.size] as? Int) ?? 0
             }
 
-            // Read part data
-            let partData = try Data(contentsOf: URL(fileURLWithPath: partFilePath))
-            finalData.append(partData)
+            payloadSources.append((path: partFilePath, offset: 0, size: partSize))
+            totalSize += partSize
             partEtags.append(S3Service.normalizeETag(part.etag))
         }
 
@@ -233,33 +378,35 @@ struct MultipartFileHandler {
         let objectMeta = ObjectMeta(
             bucketName: bucketName,
             key: uploadMeta.key,
-            size: finalData.count,
+            size: totalSize,
             contentType: uploadMeta.contentType,
             etag: finalEtag,
             metadata: uploadMeta.metadata,
             updatedAt: Date()
         )
 
-        // Write object with versioning support
+        // Write object with versioning support - parts are stream-concatenated into the
+        // final .obj in fixed-size windows
         var versionId: String? = nil
 
         if versioningStatus != .disabled {
-            versionId = try ObjectFileHandler.writeVersioned(
+            versionId = try ObjectFileHandler.writeVersionedStreamed(
                 metadata: objectMeta,
-                data: finalData,
+                payloadSources: payloadSources,
                 bucketName: bucketName,
                 key: uploadMeta.key,
                 versioningStatus: versioningStatus
             )
         } else {
             let objectPath = ObjectFileHandler.storagePath(for: bucketName, key: uploadMeta.key)
-            try ObjectFileHandler.write(metadata: objectMeta, data: finalData, to: objectPath)
+            try ObjectFileHandler.writeStreamed(
+                metadata: objectMeta, payloadSources: payloadSources, to: objectPath)
         }
 
         // Clean up multipart upload directory
         try abortUpload(bucketName: bucketName, uploadId: uploadId)
 
-        return (finalEtag, finalData.count, versionId)
+        return (finalEtag, totalSize, versionId)
     }
 
     /// Aborts (deletes) a multipart upload and all its parts

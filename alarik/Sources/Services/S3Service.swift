@@ -17,6 +17,7 @@ limitations under the License.
 import Crypto
 import Fluent
 import Foundation
+import NIOCore
 import Vapor
 import XMLCoder
 
@@ -74,6 +75,88 @@ struct S3Service {
         if let requestId = requestId {
             response.headers.add(name: "x-amz-request-id", value: requestId)
         }
+        return response
+    }
+
+    /// Builds a GET response whose body is streamed straight from the object file - memory
+    /// stays bounded no matter how large the object is. Everything else (headers, status,
+    /// 206 handling) matches `buildObjectMetadataResponse` exactly.
+    ///
+    /// The stream opens its own file descriptor and re-parses the `.obj` header from it, so
+    /// the entire body comes from one consistent snapshot of the file: if the object is
+    /// overwritten mid-download, the open fd keeps the original inode (the overwrite is a
+    /// rename), and an overwrite that lands between the handler's metadata read and the
+    /// stream's open is caught by the ETag check below before any payload byte is sent.
+    static func buildStreamingObjectResponse(
+        req: Request,
+        meta: ObjectMeta,
+        path: String,
+        payloadOffset: Int,
+        range: ByteRange? = nil
+    ) -> Response {
+        let start = range?.start ?? 0
+        let length = range?.length ?? meta.size
+        let expectedETag = meta.etag
+
+        let response = buildObjectMetadataResponse(
+            meta: meta, includeBody: false, data: nil, range: range)
+
+        response.headers.replaceOrAdd(name: .contentLength, value: String(length))
+        addVersionHeaders(to: response, meta: meta)
+        if let tagCount = meta.tags?.count, tagCount > 0 {
+            response.headers.add(name: "x-amz-tagging-count", value: String(tagCount))
+        }
+
+        let threadPool = req.application.threadPool
+        response.body = Response.Body(
+            managedAsyncStream: { writer in
+                let snapshot = try await threadPool.runIfActive {
+                    try ObjectFileHandler.openPayloadSnapshot(path: path)
+                }
+                let fd = snapshot.fd
+                do {
+                    guard
+                        snapshot.meta.etag == expectedETag,
+                        start + length <= snapshot.payloadSize
+                    else {
+                        throw S3Error(
+                            status: .internalServerError, code: "InternalError",
+                            message: "The object changed while the response was being prepared")
+                    }
+
+                    let allocator = ByteBufferAllocator()
+                    var position = snapshot.payloadOffset + start
+                    var remaining = length
+                    while remaining > 0 {
+                        let toRead = Swift.min(Constants.streamingReadChunkSize, remaining)
+                        let readPosition = position
+                        let chunk = try await threadPool.runIfActive { () -> ByteBuffer in
+                            var buffer = allocator.buffer(capacity: toRead)
+                            _ = try buffer.writeWithUnsafeMutableBytes(
+                                minimumWritableBytes: toRead
+                            ) { raw in
+                                let bytesRead = POSIXFile.pread(
+                                    fd, raw.baseAddress!, toRead, off_t(readPosition))
+                                guard bytesRead > 0 else {
+                                    throw S3Error(
+                                        status: .internalServerError, code: "InternalError",
+                                        message: "Object payload ended early")
+                                }
+                                return bytesRead
+                            }
+                            return buffer
+                        }
+                        position += chunk.readableBytes
+                        remaining -= chunk.readableBytes
+                        try await writer.writeBuffer(chunk)
+                    }
+                    _ = POSIXFile.close(fd)
+                } catch {
+                    _ = POSIXFile.close(fd)
+                    throw error
+                }
+            }, count: length)
+
         return response
     }
 
@@ -437,18 +520,14 @@ struct S3Service {
         }
     }
 
-    /// Validates Content-MD5 header if present
-    /// Throws S3Error if the MD5 doesn't match the data
-    static func validateContentMD5(req: Request, data: Data) throws {
+    /// Validates the Content-MD5 header (if present) against the digest that was computed
+    /// while the body streamed in. Throws BadDigest on mismatch.
+    static func validateContentMD5(req: Request, spooled: SpooledBody) throws {
         guard let contentMD5 = req.headers.first(name: "Content-MD5") else {
             return
         }
 
-        // Compute MD5 hash of the data
-        let computedMD5 = Insecure.MD5.hash(data: data)
-        let computedBase64 = Data(computedMD5).base64EncodedString()
-
-        if contentMD5 != computedBase64 {
+        if contentMD5 != spooled.md5Base64 {
             throw S3Error(
                 status: .badRequest,
                 code: "BadDigest",
@@ -882,7 +961,9 @@ struct S3Service {
 
     /// Collects the request body as a `String`.
     static func collectBodyString(req: Request) async throws -> String {
-        let buffer = try await req.body.collect().get() ?? ByteBuffer()
+        let maxBodySize = req.application.routes.defaultMaxBodySize.value
+        let buffer = try await req.body.collect(max: maxBodySize).get() ?? ByteBuffer()
+        try verifyDeferredPayloadHash(req: req, bodyView: buffer.readableBytesView)
         return String(buffer: buffer)
     }
 
@@ -893,14 +974,58 @@ struct S3Service {
         let maxBodySize = req.application.routes.defaultMaxBodySize.value
         let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
         var buffer = bodyBuffer ?? ByteBuffer()
-        let isChunked =
-            req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") ?? false
-        let hasChunkedHeader =
-            req.headers.first(name: "x-amz-content-sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        if isChunked || hasChunkedHeader {
+
+        if req.headers.first(name: "x-amz-content-sha256")
+            == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        {
+            // Signed streaming body: decode the framing AND verify every chunk signature.
+            // Under a `body: .stream` route the SigV4 validator couldn't do this at auth time
+            // (the bytes hadn't arrived), so this is where the deferred check lands; under a
+            // buffered route it's a re-verification, which is cheap for these small bodies.
+            guard req.headers.first(name: "authorization") != nil else {
+                throw S3Error(
+                    status: .forbidden, code: "AccessDenied", message: "Access Denied",
+                    requestId: req.id)
+            }
+            let authInfo = try S3AuthParser.parse(request: req)
+            let decoder = StreamingChunkDecoder(
+                signatureValidator: try await SigV4Validator.chunkSignatureValidator(
+                    for: authInfo))
+            var decoded = Data()
+            try decoder.feed(buffer) { decoded.append(contentsOf: $0) }
+            try decoder.verifyComplete(
+                declaredDecodedLength: req.headers
+                    .first(name: "x-amz-decoded-content-length")
+                    .flatMap(Int.init))
+            return decoded
+        }
+
+        if req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") == true {
             return try ChunkedDataDecoder.decode(buffer: &buffer)
         }
+
+        try verifyDeferredPayloadHash(req: req, bodyView: buffer.readableBytesView)
         return Data(buffer.readableBytesView)
+    }
+
+    /// The deferred counterpart of the SigV4 validator's payload-hash check for routes
+    /// registered with `body: .stream`: at auth time the body hadn't arrived, so the validator
+    /// only proved the client *signed* the declared x-amz-content-sha256 - whoever collects
+    /// the body must confirm the bytes match it. Mirrors the validator's conditions exactly
+    /// (header auth only, skips UNSIGNED-PAYLOAD; streaming payloads are verified per-chunk
+    /// elsewhere). On buffered routes this re-checks what the validator already verified.
+    private static func verifyDeferredPayloadHash(req: Request, bodyView: ByteBufferView) throws {
+        guard req.headers.first(name: "authorization") != nil,
+            let declared = req.headers.first(name: "x-amz-content-sha256"),
+            declared != "UNSIGNED-PAYLOAD",
+            declared != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        else { return }
+        let computed = Crypto.SHA256.hash(data: bodyView).hexString()
+        guard computed == declared.lowercased() else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidDigest", message: "Payload hash mismatch",
+                requestId: req.id)
+        }
     }
 
     // MARK: – Multipart XML parsing
@@ -979,5 +1104,38 @@ struct S3Service {
         }
 
         return (meta, data)
+    }
+
+    /// Path-based counterpart of `readVersionedObjectForCopy` for streaming copies: resolves
+    /// the source object to its on-disk file plus payload offset/size, so CopyObject and
+    /// UploadPartCopy can window-copy the payload without ever buffering it. Same NoSuchKey
+    /// semantics (missing key, or latest-is-delete-marker without an explicit versionId).
+    static func resolveObjectForCopy(
+        bucketName: String,
+        key: String,
+        versionId: String?,
+        requestId: String
+    ) throws -> (meta: ObjectMeta, path: String, payloadOffset: Int, payloadSize: Int) {
+        var path = try? ObjectFileHandler.resolvePath(
+            bucketName: bucketName, key: key, versionId: versionId)
+        if path == nil, versionId == "null" {
+            // The "null" version of a never-versioned key lives at the plain path
+            let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
+                path = plainPath
+            }
+        }
+        guard let path else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: requestId)
+        }
+        let location = try ObjectFileHandler.payloadLocation(path: path)
+        if location.meta.isDeleteMarker && versionId == nil {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: requestId)
+        }
+        return (location.meta, path, location.payloadOffset, location.payloadSize)
     }
 }

@@ -260,6 +260,23 @@ struct SigV4Validator {
     private static let emptyPayloadHash =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+    /// True when the request carries a body that Vapor hasn't buffered - i.e. the route was
+    /// registered with `body: .stream` and the bytes will only arrive in the handler's own
+    /// consumer. Detected via the declared length headers (both signed under SigV4, so a
+    /// client can't forge "no body" for a request that has one without breaking its own
+    /// signature).
+    static func hasUnbufferedBody(_ request: Request) -> Bool {
+        guard request.body.data == nil else { return false }
+        if let lengthStr = request.headers.first(name: .contentLength),
+            let length = Int(lengthStr), length > 0
+        {
+            return true
+        }
+        return request.headers.first(name: "x-amz-decoded-content-length") != nil
+            || request.headers.first(name: .transferEncoding)?.lowercased()
+                .contains("chunked") == true
+    }
+
     static func authenticateRequest(for req: Request) async throws -> S3AuthInfo {
         let authInfo: S3AuthInfo = try S3AuthParser.parse(request: req)
 
@@ -594,6 +611,11 @@ struct SigV4Validator {
                         status: .badRequest, code: "InvalidDigest", message: "Payload hash mismatch"
                     )
                 }
+            } else if Self.hasUnbufferedBody(request) {
+                // The route uses `body: .stream`, so the payload hasn't arrived yet - the
+                // signature over the *declared* hash is still fully verified here; the body
+                // consumer (StreamingBodySpooler / S3Service.collectBodyData) is responsible
+                // for hashing the actual bytes and rejecting on mismatch. Deferral, not a skip.
             } else {
                 // No body: must match empty payload hash
                 guard payloadHash == Self.emptyPayloadHash else {
@@ -635,12 +657,14 @@ struct SigV4Validator {
                 message: "Missing or invalid x-amz-decoded-content-length")
         }
         // Deliberately NOT requiring `Content-Encoding: aws-chunked` here: AWS's docs show it,
-        // but S3 accepts streaming payloads without it, and real clients rely on that -
-        // minio-go (mc) omits the header entirely. The reliable streaming discriminator is the
-        // STREAMING-AWS4-HMAC-SHA256-PAYLOAD content hash (which routed us here) plus the
-        // signed x-amz-decoded-content-length above; the chunk framing itself is then fully
-        // self-describing. `S3Service.collectBodyData` makes the same call for body decoding.
+        // but S3 accepts streaming payloads without it
         guard let buffer = request.body.data else {
+            if Self.hasUnbufferedBody(request) {
+                // Streaming route: the seed signature is already verified at this point; the
+                // per-chunk signature chain is verified incrementally by the body consumer
+                // (StreamingChunkDecoder seeded via `SigV4Validator.chunkSignatureValidator`).
+                return
+            }
             throw S3Error(
                 status: .internalServerError, code: "InternalError", message: "Body not buffered")
         }
@@ -724,6 +748,75 @@ struct SigV4Validator {
     private func hmacSHA256(key: Data, data: Data) throws -> Data {
         let symmetricKey = SymmetricKey(data: key)
         return Data(HMAC<SHA256>.authenticationCode(for: data, using: symmetricKey))
+    }
+
+    /// Builds the per-chunk signature verifier a streaming body consumer needs to validate a
+    /// STREAMING-AWS4-HMAC-SHA256-PAYLOAD upload chunk-by-chunk (the deferred counterpart of
+    /// `validateChunked`, which handles the buffered case). The seed signature in `authInfo`
+    /// has already been verified against the request headers by `authenticateRequest`.
+    static func chunkSignatureValidator(for authInfo: S3AuthInfo) async throws
+        -> ChunkSignatureValidator
+    {
+        guard
+            let secretKey = await AccessKeySecretKeyMapCache.shared.secretKey(
+                for: authInfo.accessKey)
+        else {
+            throw S3Error(
+                status: .forbidden, code: "InvalidAccessKeyId",
+                message: "The access key ID you provided does not exist in our records.")
+        }
+        let validator = SigV4Validator(secretKey: secretKey)
+        let signingKey = try validator.deriveSigningKey(
+            date: authInfo.date, region: authInfo.region, service: authInfo.service)
+        return ChunkSignatureValidator(
+            signingKey: signingKey,
+            fullDate: authInfo.fullDate,
+            credentialScope:
+                "\(authInfo.date)/\(authInfo.region)/\(authInfo.service)/aws4_request",
+            seedSignature: authInfo.signature
+        )
+    }
+}
+
+/// Verifies the SigV4 chunk-signature chain of a streaming upload one chunk at a time.
+/// Each chunk's signature covers the previous signature (seeded from the verified request
+/// signature) and the SHA256 of that chunk's payload, so chunks can't be reordered, dropped,
+/// or tampered with without breaking the chain.
+struct ChunkSignatureValidator {
+    private let signingKey: SymmetricKey
+    private let fullDate: String
+    private let credentialScope: String
+    private var previousSignature: String
+
+    private static let emptyHash =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    init(signingKey: Data, fullDate: String, credentialScope: String, seedSignature: String) {
+        self.signingKey = SymmetricKey(data: signingKey)
+        self.fullDate = fullDate
+        self.credentialScope = credentialScope
+        self.previousSignature = seedSignature
+    }
+
+    /// Verifies one chunk given the hex SHA256 of its (decoded) payload and the signature
+    /// declared in its size line. Throws SignatureDoesNotMatch on any break in the chain.
+    mutating func verify(chunkPayloadHashHex: String, declaredSignature: String) throws {
+        let stringToSign = """
+            AWS4-HMAC-SHA256-PAYLOAD
+            \(fullDate)
+            \(credentialScope)
+            \(previousSignature)
+            \(Self.emptyHash)
+            \(chunkPayloadHashHex)
+            """
+        let computed = Data(
+            HMAC<SHA256>.authenticationCode(for: Data(stringToSign.utf8), using: signingKey))
+        guard computed.constantTimeCompare(to: declaredSignature) else {
+            throw S3Error(
+                status: .forbidden, code: "SignatureDoesNotMatch",
+                message: "Chunk signature mismatch")
+        }
+        previousSignature = computed.hexString()
     }
 }
 

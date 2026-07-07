@@ -65,8 +65,7 @@ struct ReplicationRule: Codable, Equatable {
     /// the client (up to `ReplicationService.synchronousTimeout`), falling back to the normal
     /// async outbox on failure or timeout - see `ReplicationService.enqueue`. The local write
     /// itself is never blocked or failed by this, only delayed; a slow/unreachable target costs
-    /// latency here, never correctness. Defaults to `false` (async), matching MinIO's own
-    /// default and every rule saved before this field existed.
+    /// latency here, never correctness. Defaults to `false` (async)
     var synchronous: Bool
     var enabled: Bool
 

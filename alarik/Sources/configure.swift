@@ -46,6 +46,10 @@ public func configure(_ app: Application) async throws {
             DatabaseConfigurationFactory.sqlite(.file("Storage/db.sqlite")), as: .sqlite)
     #endif
 
+    // Spool files are per-request transients; anything still here is an orphan from an
+    // unclean shutdown mid-upload.
+    StreamingBodySpooler.cleanupOrphans()
+
     app.migrations.add(CreateUser())
     app.migrations.add(CreateAccessKey())
     app.migrations.add(CreateBucket())

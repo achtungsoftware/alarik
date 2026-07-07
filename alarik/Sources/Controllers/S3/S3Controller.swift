@@ -34,7 +34,11 @@ struct S3Controller: RouteCollection {
 
         bucketRoute.on(.HEAD, "**", use: self.handleObjectHead)
         bucketRoute.get("**", use: self.handleObjectGet)
-        bucketRoute.put("**", use: self.handleObjectPut)
+        // `body: .stream`: object payloads are spooled to disk by StreamingBodySpooler with
+        // bounded memory instead of being buffered whole by Vapor. Subresource PUTs routed
+        // through the same handler (tagging etc.) still buffer via collectBody*, which also
+        // performs the payload-hash check the SigV4 validator defers for unbuffered bodies.
+        bucketRoute.on(.PUT, "**", body: .stream, use: self.handleObjectPut)
         bucketRoute.post("**", use: self.handleObjectPost)
         bucketRoute.delete("**", use: self.handleObjectDelete)
     }
@@ -641,7 +645,7 @@ struct S3Controller: RouteCollection {
                 message: "Invalid argument", requestId: req.id)
         }
 
-        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+        let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // Check if this is an UploadPart request (PUT with partNumber & uploadId)
         if let partNumberStr = req.query[String.self, at: "partNumber"],
@@ -664,7 +668,8 @@ struct S3Controller: RouteCollection {
                 bucketName: bucketName,
                 key: keyPath,
                 uploadId: uploadId,
-                partNumber: partNumber
+                partNumber: partNumber,
+                authInfo: authInfo
             )
         }
 
@@ -699,17 +704,21 @@ struct S3Controller: RouteCollection {
             try S3Service.validateConditionalPutHeaders(req: req, existingMeta: existing?.meta)
         }
 
-        // S3 allows zero-byte objects; collectBodyData returns empty Data for a missing body.
-        let dataToWrite = try await S3Service.collectBodyData(req: req)
+        // Stream the body to a spool file with bounded memory - never buffered whole. The
+        // spooler decodes aws-chunked framing (verifying every chunk signature), computes
+        // MD5/SHA256 incrementally, and enforces the declared x-amz-content-sha256. S3 allows
+        // zero-byte objects; a missing body spools to an empty file.
+        let spooled = try await StreamingBodySpooler.spool(req: req, authInfo: authInfo)
+        defer { spooled.cleanup() }
 
         // Validate Content-MD5 if provided
-        try S3Service.validateContentMD5(req: req, data: dataToWrite)
+        try S3Service.validateContentMD5(req: req, spooled: spooled)
 
-        let etag = S3Service.computeETag(dataToWrite)
+        let etag = spooled.md5Hex
         var meta = ObjectMeta(
             bucketName: bucketName,
             key: keyPath,
-            size: dataToWrite.count,
+            size: spooled.size,
             contentType: req.headers.contentType?.description ?? "application/octet-stream",
             etag: etag,
             updatedAt: Date()
@@ -738,27 +747,48 @@ struct S3Controller: RouteCollection {
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
 
-        // Write with versioning support
+        // Write with versioning support. Small bodies arrive in memory and take the direct
+        // write; large ones were spooled to disk and are copied into the final .obj in fixed
+        // windows. Both are fsynced by AtomicObjectWriter before the PUT is acknowledged.
         var writtenVersionId: String? = nil
-        if versioningStatus != .disabled {
-            let versionId = try ObjectFileHandler.writeVersioned(
-                metadata: meta,
-                data: dataToWrite,
-                bucketName: bucketName,
-                key: keyPath,
-                versioningStatus: versioningStatus
-            )
-            headers.add(name: "x-amz-version-id", value: versionId)
-            writtenVersionId = versionId
-        } else {
-            // Non-versioned write
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            try ObjectFileHandler.write(metadata: meta, data: dataToWrite, to: path)
+        switch spooled.storage {
+        case .memory(let data):
+            if versioningStatus != .disabled {
+                let versionId = try ObjectFileHandler.writeVersioned(
+                    metadata: meta,
+                    data: data,
+                    bucketName: bucketName,
+                    key: keyPath,
+                    versioningStatus: versioningStatus
+                )
+                headers.add(name: "x-amz-version-id", value: versionId)
+                writtenVersionId = versionId
+            } else {
+                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                try ObjectFileHandler.write(metadata: meta, data: data, to: path)
+            }
+        case .file(let spoolPath):
+            let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
+            if versioningStatus != .disabled {
+                let versionId = try ObjectFileHandler.writeVersionedStreamed(
+                    metadata: meta,
+                    payloadSources: spoolSource,
+                    bucketName: bucketName,
+                    key: keyPath,
+                    versioningStatus: versioningStatus
+                )
+                headers.add(name: "x-amz-version-id", value: versionId)
+                writtenVersionId = versionId
+            } else {
+                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                try ObjectFileHandler.writeStreamed(
+                    metadata: meta, payloadSources: spoolSource, to: path)
+            }
         }
 
         await NotificationService.emit(
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
-            size: dataToWrite.count, etag: etag, versionId: writtenVersionId,
+            size: spooled.size, etag: etag, versionId: writtenVersionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: bucketName, key: keyPath, versionId: writtenVersionId, on: req.db)
@@ -884,23 +914,15 @@ struct S3Controller: RouteCollection {
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Read source object metadata and data, resolving the requested version (or the
-        // latest one) and falling back to the legacy non-versioned path where applicable
-        let (sourceMeta, sourceData) = try S3Service.readVersionedObjectForCopy(
-            bucketName: copySource.bucketName,
-            key: copySource.key,
-            versionId: copySource.versionId,
-            loadData: true,
-            requestId: req.id
-        )
-        guard let data = sourceData else {
-            throw S3Error(
-                status: .internalServerError,
-                code: "InternalError",
-                message: "Could not read source object",
+        // Resolve the source straight to its on-disk file - the payload is streamed
+        // file-to-file in fixed windows, never buffered whole
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
+            try S3Service.resolveObjectForCopy(
+                bucketName: copySource.bucketName,
+                key: copySource.key,
+                versionId: copySource.versionId,
                 requestId: req.id
             )
-        }
 
         // Validate copy conditions (if-match, if-none-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -945,11 +967,21 @@ struct S3Controller: RouteCollection {
             tags = sourceMeta.tags
         }
 
-        let etag = S3Service.computeETag(data)
+        // The destination's ETag is the plain MD5 of the copied bytes. A single-part source's
+        // ETag already is exactly that; a multipart source ("-N" suffix) needs one streaming
+        // hash pass over the payload.
+        let etag: String
+        if sourceMeta.etag.contains("-") {
+            etag = try ObjectFileHandler.md5HexOfFileRegion(
+                path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+        } else {
+            etag = sourceMeta.etag
+        }
+
         let destinationMeta = ObjectMeta(
             bucketName: destinationBucket,
             key: destinationKey,
-            size: data.count,
+            size: sourcePayloadSize,
             contentType: contentType,
             etag: etag,
             metadata: userMetadata,
@@ -960,12 +992,15 @@ struct S3Controller: RouteCollection {
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/xml")
 
-        // Write with versioning support
+        // Write with versioning support - payload window-copied from the source file
+        let copySources = [
+            (path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+        ]
         var versionId: String? = nil
         if versioningStatus != .disabled {
-            versionId = try ObjectFileHandler.writeVersioned(
+            versionId = try ObjectFileHandler.writeVersionedStreamed(
                 metadata: destinationMeta,
-                data: data,
+                payloadSources: copySources,
                 bucketName: destinationBucket,
                 key: destinationKey,
                 versioningStatus: versioningStatus
@@ -974,7 +1009,8 @@ struct S3Controller: RouteCollection {
         } else {
             let destinationPath = ObjectFileHandler.storagePath(
                 for: destinationBucket, key: destinationKey)
-            try ObjectFileHandler.write(metadata: destinationMeta, data: data, to: destinationPath)
+            try ObjectFileHandler.writeStreamed(
+                metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
         }
 
         // Add source version ID if present
@@ -1034,141 +1070,63 @@ struct S3Controller: RouteCollection {
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
 
-        let meta: ObjectMeta
-        let objectData: Data
-
-        // Check if Range header is present
-        let hasRangeHeader = req.headers.first(name: .range) != nil
-
-        do {
-            if !hasRangeHeader {
-                // Full read
-                let (m, fullData) = try ObjectFileHandler.readVersion(
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versionId: versionId,
-                    loadData: true
-                )
-                meta = m
-
-                // Check if latest version is a delete marker
-                if meta.isDeleteMarker && versionId == nil {
-                    throw S3Error(
-                        status: .notFound, code: "NoSuchKey",
-                        message: "The specified key does not exist.", requestId: req.id)
-                }
-
-                // Validate conditional request headers
-                try S3Service.validateConditionalHeaders(req: req, meta: meta)
-
-                guard let data = fullData else {
-                    throw S3Error(
-                        status: .internalServerError, code: "InternalError",
-                        message: "We encountered an internal error. Please try again.",
-                        requestId: req.id)
-                }
-
-                return S3Service.buildVersionedObjectMetadataResponse(
-                    meta: meta, includeBody: true, data: data, range: nil)
+        // Resolve to a single on-disk path up front - the meta, conditional checks, range
+        // math, and body all come off that one file, and large payloads stream from it
+        // directly instead of ever being buffered whole in memory.
+        var path = try ObjectFileHandler.resolvePath(
+            bucketName: bucketName, key: keyPath, versionId: versionId)
+        if path == nil, versionId == "null" {
+            // The "null" version of a never-versioned key lives at the plain path (mirrors
+            // the same fallback in deleteVersion - listings report it as VersionId "null")
+            let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+            if ObjectFileHandler.keyExists(for: bucketName, key: keyPath, path: plainPath) {
+                path = plainPath
             }
-
-            // For range requests, read metadata first
-            let (m, _) = try ObjectFileHandler.readVersion(
-                bucketName: bucketName,
-                key: keyPath,
-                versionId: versionId,
-                loadData: false
-            )
-            meta = m
-
-            // Check if latest version is a delete marker
-            if meta.isDeleteMarker && versionId == nil {
-                throw S3Error(
-                    status: .notFound, code: "NoSuchKey",
-                    message: "The specified key does not exist.", requestId: req.id)
-            }
-
-            // Validate conditional request headers
-            try S3Service.validateConditionalHeaders(req: req, meta: meta)
-
-            // Parse range header
-            let byteRange = try S3RangeParser.parseRange(from: req, fileSize: meta.size)
-
-            if let range = byteRange {
-                let (_, rangeData) = try ObjectFileHandler.readVersion(
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versionId: versionId,
-                    loadData: true,
-                    range: (range.start, range.end)
-                )
-                guard let data = rangeData else {
-                    throw S3Error(
-                        status: .internalServerError, code: "InternalError",
-                        message: "We encountered an internal error. Please try again.",
-                        requestId: req.id)
-                }
-                objectData = data
-            } else {
-                let (_, fullData) = try ObjectFileHandler.readVersion(
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versionId: versionId,
-                    loadData: true
-                )
-                guard let data = fullData else {
-                    throw S3Error(
-                        status: .internalServerError, code: "InternalError",
-                        message: "We encountered an internal error. Please try again.",
-                        requestId: req.id)
-                }
-                objectData = data
-            }
-
-            return S3Service.buildVersionedObjectMetadataResponse(
-                meta: meta, includeBody: true, data: objectData, range: byteRange)
-
-        } catch let error as S3Error {
-            throw error
-        } catch {
-            // Fallback to non-versioned path for backwards compatibility
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            guard ObjectFileHandler.keyExists(for: bucketName, key: keyPath, path: path) else {
-                throw S3Error(
-                    status: .notFound, code: "NoSuchKey",
-                    message: "The specified key does not exist.", requestId: req.id)
-            }
-
-            if !hasRangeHeader {
-                let (m, fullData) = try ObjectFileHandler.read(from: path, loadData: true)
-                try S3Service.validateConditionalHeaders(req: req, meta: m)
-                guard let data = fullData else {
-                    throw S3Error(
-                        status: .internalServerError, code: "InternalError",
-                        message: "We encountered an internal error. Please try again.",
-                        requestId: req.id)
-                }
-                return S3Service.buildVersionedObjectMetadataResponse(
-                    meta: m, includeBody: true, data: data, range: nil)
-            }
-
-            let (m, _) = try ObjectFileHandler.read(from: path, loadData: false)
-            try S3Service.validateConditionalHeaders(req: req, meta: m)
-            let byteRange = try S3RangeParser.parseRange(from: req, fileSize: m.size)
-
-            let data: Data
-            if let range = byteRange {
-                let (_, rangeData) = try ObjectFileHandler.read(
-                    from: path, loadData: true, range: (range.start, range.end))
-                data = rangeData!
-            } else {
-                let (_, fullData) = try ObjectFileHandler.read(from: path)
-                data = fullData!
-            }
-
-            return S3Service.buildVersionedObjectMetadataResponse(
-                meta: m, includeBody: true, data: data, range: byteRange)
         }
+        guard let path else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        let (meta, payloadOffset, payloadSize) = try ObjectFileHandler.payloadLocation(path: path)
+
+        // A latest-version delete marker means "deleted" (resolvePath already nils this for
+        // versionId == nil - kept as a belt-and-suspenders check)
+        if meta.isDeleteMarker && versionId == nil {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        try S3Service.validateConditionalHeaders(req: req, meta: meta)
+
+        let byteRange: ByteRange? =
+            req.headers.first(name: .range) != nil
+            ? try S3RangeParser.parseRange(from: req, fileSize: meta.size)
+            : nil
+        let bodyLength = byteRange?.length ?? payloadSize
+
+        if bodyLength > Constants.streamingThreshold {
+            return S3Service.buildStreamingObjectResponse(
+                req: req, meta: meta, path: path, payloadOffset: payloadOffset, range: byteRange)
+        }
+
+        // Small payloads: one buffered read is cheaper than a threadpool round trip. The
+        // response is built from THIS read's metadata (not the earlier lookup's), so headers
+        // and body always describe the same snapshot of the file even under a concurrent
+        // overwrite - the streaming branch gets the same guarantee from its ETag check.
+        let (freshMeta, data) = try ObjectFileHandler.read(
+            from: path, loadData: true,
+            range: byteRange.map { ($0.start, $0.end) })
+        guard let data else {
+            throw S3Error(
+                status: .internalServerError, code: "InternalError",
+                message: "We encountered an internal error. Please try again.",
+                requestId: req.id)
+        }
+        return S3Service.buildVersionedObjectMetadataResponse(
+            meta: freshMeta, includeBody: true, data: data, range: byteRange)
     }
 
     // DELETE /:bucketName/*key
@@ -1532,7 +1490,8 @@ struct S3Controller: RouteCollection {
         bucketName: String,
         key: String,
         uploadId: String,
-        partNumber: Int
+        partNumber: Int,
+        authInfo: S3AuthInfo
     ) async throws -> Response {
         // Verify upload exists
         guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
@@ -1548,24 +1507,42 @@ struct S3Controller: RouteCollection {
                 message: "Part number must be between 1 and 10000.", requestId: req.id)
         }
 
-        // Read part data (unlike PutObject, an empty UploadPart is always an error)
-        let partData = try await S3Service.collectBodyData(req: req)
-        guard !partData.isEmpty else {
+        // Stream the part body to a spool file (bounded memory, incremental digests and
+        // chunk-signature verification - same treatment as a plain PutObject body)
+        let spooled = try await StreamingBodySpooler.spool(req: req, authInfo: authInfo)
+        defer { spooled.cleanup() }
+
+        // Unlike PutObject, an empty UploadPart is always an error
+        guard spooled.size > 0 else {
             throw S3Error(
                 status: .badRequest, code: "MissingRequestBodyError",
                 message: "Request body is empty.", requestId: req.id)
         }
 
         // Validate Content-MD5 if provided
-        try S3Service.validateContentMD5(req: req, data: partData)
+        try S3Service.validateContentMD5(req: req, spooled: spooled)
 
-        // Write the part
-        let etag = try MultipartFileHandler.writePart(
-            bucketName: bucketName,
-            uploadId: uploadId,
-            partNumber: partNumber,
-            data: partData
-        )
+        // Small parts write directly from memory; large ones were spooled to disk and the
+        // spool file becomes the part file via rename - no copy at all
+        let etag: String
+        switch spooled.storage {
+        case .memory(let data):
+            etag = try MultipartFileHandler.writePart(
+                bucketName: bucketName,
+                uploadId: uploadId,
+                partNumber: partNumber,
+                data: data
+            )
+        case .file(let spoolPath):
+            etag = try MultipartFileHandler.writePartStreamed(
+                bucketName: bucketName,
+                uploadId: uploadId,
+                partNumber: partNumber,
+                spoolPath: spoolPath,
+                etag: spooled.md5Hex,
+                size: spooled.size
+            )
+        }
 
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
@@ -1601,21 +1578,22 @@ struct S3Controller: RouteCollection {
         // Authenticate access to the source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Resolve source metadata first, preferring the requested/latest version and
-        // falling back to the legacy non-versioned path where applicable
-        let (sourceMeta, _) = try S3Service.readVersionedObjectForCopy(
-            bucketName: copySource.bucketName,
-            key: copySource.key,
-            versionId: copySource.versionId,
-            loadData: false,
-            requestId: req.id
-        )
+        // Resolve the source straight to its on-disk file - the copied region is streamed
+        // file-to-file in fixed windows, never buffered whole
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
+            try S3Service.resolveObjectForCopy(
+                bucketName: copySource.bucketName,
+                key: copySource.key,
+                versionId: copySource.versionId,
+                requestId: req.id
+            )
 
         // Validate copy conditions (x-amz-copy-source-if-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
 
         // Optional partial copy via x-amz-copy-source-range: "bytes=start-end"
-        let partData: Data
+        let copyOffset: Int
+        let copySize: Int
         if let rangeHeader = req.headers.first(name: "x-amz-copy-source-range") {
             guard
                 let range = S3RangeParser.parseRangeHeader(rangeHeader, fileSize: sourceMeta.size)
@@ -1624,41 +1602,20 @@ struct S3Controller: RouteCollection {
                     status: .badRequest, code: "InvalidArgument",
                     message: "The x-amz-copy-source-range value is invalid.", requestId: req.id)
             }
-            let (_, rangeData) = try S3Service.readVersionedObjectForCopy(
-                bucketName: copySource.bucketName,
-                key: copySource.key,
-                versionId: copySource.versionId,
-                loadData: true,
-                range: (range.start, range.end),
-                requestId: req.id
-            )
-            guard let data = rangeData else {
-                throw S3Error(
-                    status: .internalServerError, code: "InternalError",
-                    message: "Could not read source object", requestId: req.id)
-            }
-            partData = data
+            copyOffset = sourcePayloadOffset + range.start
+            copySize = range.length
         } else {
-            let (_, fullData) = try S3Service.readVersionedObjectForCopy(
-                bucketName: copySource.bucketName,
-                key: copySource.key,
-                versionId: copySource.versionId,
-                loadData: true,
-                requestId: req.id
-            )
-            guard let data = fullData else {
-                throw S3Error(
-                    status: .internalServerError, code: "InternalError",
-                    message: "Could not read source object", requestId: req.id)
-            }
-            partData = data
+            copyOffset = sourcePayloadOffset
+            copySize = sourcePayloadSize
         }
 
-        let etag = try MultipartFileHandler.writePart(
+        let etag = try MultipartFileHandler.writePartFromFile(
             bucketName: destinationBucket,
             uploadId: uploadId,
             partNumber: partNumber,
-            data: partData
+            sourcePath: sourcePath,
+            sourceOffset: copyOffset,
+            sourceSize: copySize
         )
 
         let xml = """

@@ -44,24 +44,46 @@ struct SharedLinkController: RouteCollection {
             throw Abort(.notFound)
         }
 
-        let result: (meta: ObjectMeta, data: Data?)
+        // Resolve the object's on-disk path so the body can stream straight from the file -
+        // a shared link to a multi-GB object must not buffer it in memory per download.
+        let path: String?
         do {
-            result = try ObjectFileHandler.readVersion(
-                bucketName: link.bucketName, key: link.key, versionId: nil, loadData: true)
+            path = try ObjectFileHandler.resolvePath(
+                bucketName: link.bucketName, key: link.key, versionId: nil)
         } catch {
             // Object was deleted (or its bucket was) after the link was created
             throw Abort(.notFound)
         }
-
-        // The latest version may be a delete marker (object deleted from a versioned bucket
-        // after the link was created) - it reads successfully with empty data, so this must be
-        // checked explicitly, matching every other GetObject-style read in this codebase.
-        guard !result.meta.isDeleteMarker, let data = result.data else {
+        // resolvePath also nils delete markers (object deleted from a versioned bucket after
+        // the link was created), matching every other GetObject-style read in this codebase.
+        guard let path else {
             throw Abort(.notFound)
         }
 
-        let response = S3Service.buildVersionedObjectMetadataResponse(
-            meta: result.meta, includeBody: true, data: data)
+        let meta: ObjectMeta
+        let payloadOffset: Int
+        let payloadSize: Int
+        do {
+            (meta, payloadOffset, payloadSize) = try ObjectFileHandler.payloadLocation(path: path)
+        } catch {
+            throw Abort(.notFound)
+        }
+
+        let response: Response
+        if payloadSize > Constants.streamingThreshold {
+            response = S3Service.buildStreamingObjectResponse(
+                req: req, meta: meta, path: path, payloadOffset: payloadOffset)
+        } else {
+            // Headers and body from the same read, so they always describe one snapshot of
+            // the file (the streaming branch gets the same guarantee from its ETag check)
+            guard let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                let data
+            else {
+                throw Abort(.notFound)
+            }
+            response = S3Service.buildVersionedObjectMetadataResponse(
+                meta: freshMeta, includeBody: true, data: data)
+        }
 
         // The share URL itself is an opaque token with no filename in it (by design, so it
         // doesn't leak the bucket/key) - without this, browsers fall back to naming the download

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import Crypto
 import Foundation
 
 struct ObjectFileHandler {
@@ -27,33 +28,191 @@ struct ObjectFileHandler {
         return decoder
     }()
 
-    /// Writes metadata + data to a single file.
+    /// Writes metadata + data to a single file - atomically (temp file + rename, so readers
+    /// never see a partial object) and durably (fsync of both the file and its directory
+    /// before acknowledging, unless `ALARIK_FSYNC=false`; see `AtomicObjectWriter`).
     static func write(metadata: ObjectMeta, data: Data, to path: String) throws {
-        let fileURL = URL(fileURLWithPath: path)
-        let fileManager = FileManager.default
-
-        // Create directory only if it doesn't exist
-        let folderURL = fileURL.deletingLastPathComponent()
-        if !fileManager.fileExists(atPath: folderURL.path) {
-            try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        var writer = try AtomicObjectWriter(finalPath: path)
+        do {
+            try writeHeader(metadata: metadata, to: writer)
+            try writer.write(data)
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
         }
+    }
 
-        // Serialize metadata to JSON
+    /// Writes the `.obj` header (4-byte big-endian JSON length + metadata JSON) to a writer.
+    private static func writeHeader(metadata: ObjectMeta, to writer: AtomicObjectWriter) throws {
         let jsonData = try jsonEncoder.encode(metadata)
-        let metadataLength = UInt32(jsonData.count)
-
-        // Pre-allocate total size to avoid multiple reallocations
-        var fileData = Data(capacity: 4 + jsonData.count + data.count)
-
-        // Append 4-byte length (big-endian)
-        withUnsafeBytes(of: metadataLength.bigEndian) {
-            fileData.append(contentsOf: $0)
+        var header = Data(capacity: 4 + jsonData.count)
+        withUnsafeBytes(of: UInt32(jsonData.count).bigEndian) {
+            header.append(contentsOf: $0)
         }
-        fileData.append(jsonData)
-        fileData.append(data)
+        header.append(jsonData)
+        try writer.write(header)
+    }
 
-        // Write atomically
-        try fileData.write(to: fileURL, options: .atomic)
+    /// Like `write(metadata:data:to:)`, but the payload comes from an existing file on disk
+    /// instead of memory - copied across in fixed-size windows, so the object is never fully
+    /// buffered. `payloadOffset`/`payloadSize` select the source region (0 / file size for a
+    /// raw spool file; the header offset for another `.obj`).
+    static func writeStreamed(
+        metadata: ObjectMeta,
+        payloadFile sourcePath: String,
+        payloadOffset: Int,
+        payloadSize: Int,
+        to path: String
+    ) throws {
+        try writeStreamed(
+            metadata: metadata,
+            payloadSources: [(path: sourcePath, offset: payloadOffset, size: payloadSize)],
+            to: path)
+    }
+
+    /// Multi-source variant: concatenates several file regions into one `.obj` payload -
+    /// this is how CompleteMultipartUpload assembles parts without ever holding more than
+    /// one copy window in memory.
+    static func writeStreamed(
+        metadata: ObjectMeta,
+        payloadSources: [(path: String, offset: Int, size: Int)],
+        to path: String
+    ) throws {
+        var writer = try AtomicObjectWriter(finalPath: path)
+        do {
+            try writeHeader(metadata: metadata, to: writer)
+
+            let windowSize = Constants.fileCopyWindowSize
+            var window = [UInt8](repeating: 0, count: windowSize)
+
+            for source in payloadSources {
+                let sourceFd = POSIXFile.open(source.path, O_RDONLY)
+                guard sourceFd >= 0 else {
+                    throw NSError(
+                        domain: "FileError", code: Int(errno),
+                        userInfo: [NSLocalizedDescriptionKey: "Could not open payload source"])
+                }
+                defer { _ = POSIXFile.close(sourceFd) }
+                _ = POSIXFile.lseek(sourceFd, off_t(source.offset), SEEK_SET)
+
+                var remaining = source.size
+                while remaining > 0 {
+                    let toRead = Swift.min(windowSize, remaining)
+                    let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
+                    guard bytesRead > 0 else {
+                        throw NSError(
+                            domain: "InvalidFile", code: 0,
+                            userInfo: [NSLocalizedDescriptionKey: "Payload source ended early"])
+                    }
+                    try window.withUnsafeBytes { raw in
+                        try writer.writeRaw(
+                            UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
+                    }
+                    remaining -= bytesRead
+                }
+            }
+
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
+        }
+    }
+
+    /// MD5 of a file region, computed in fixed-size windows (bounded memory). Used by
+    /// CopyObject when the source's own ETag isn't a plain MD5 (multipart "-N" ETags) and the
+    /// destination needs one without buffering the payload.
+    static func md5HexOfFileRegion(path: String, offset: Int, size: Int) throws -> String {
+        let fd = POSIXFile.open(path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "FileError", code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
+        }
+        defer { _ = POSIXFile.close(fd) }
+        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
+
+        var md5 = Insecure.MD5()
+        let windowSize = Constants.fileCopyWindowSize
+        var window = [UInt8](repeating: 0, count: windowSize)
+        var remaining = size
+        while remaining > 0 {
+            let toRead = Swift.min(windowSize, remaining)
+            let bytesRead = POSIXFile.read(fd, &window, toRead)
+            guard bytesRead > 0 else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "File region ended early"])
+            }
+            window.withUnsafeBytes { raw in
+                md5.update(bufferPointer: UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
+            }
+            remaining -= bytesRead
+        }
+        return md5.finalize().hexString()
+    }
+
+    /// Reads an object file's metadata plus where its payload starts and how long it is -
+    /// everything a streaming GET needs to serve the body straight off disk without ever
+    /// buffering it.
+    static func payloadLocation(path: String) throws -> (
+        meta: ObjectMeta, payloadOffset: Int, payloadSize: Int
+    ) {
+        let snapshot = try openPayloadSnapshot(path: path)
+        _ = POSIXFile.close(snapshot.fd)
+        return (snapshot.meta, snapshot.payloadOffset, snapshot.payloadSize)
+    }
+
+    /// Like `payloadLocation`, but hands back the open file descriptor the header was parsed
+    /// from. Streaming reads that continue on this fd see a consistent snapshot of the file
+    /// even if the object is concurrently overwritten (the rename swaps the directory entry;
+    /// the open fd keeps the original inode). The caller owns the fd and must close it.
+    static func openPayloadSnapshot(path: String) throws -> (
+        fd: Int32, meta: ObjectMeta, payloadOffset: Int, payloadSize: Int
+    ) {
+        let fd = POSIXFile.open(path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "FileError", code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
+        }
+
+        do {
+            var lengthBytes = [UInt8](repeating: 0, count: 4)
+            guard POSIXFile.read(fd, &lengthBytes, 4) == 4 else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing length prefix"])
+            }
+            let metadataLength = UInt32(
+                bigEndian: lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self) })
+
+            var jsonBytes = [UInt8](repeating: 0, count: Int(metadataLength))
+            guard POSIXFile.read(fd, &jsonBytes, Int(metadataLength)) == Int(metadataLength)
+            else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Incomplete metadata"])
+            }
+            let meta = try jsonBytes.withUnsafeBufferPointer { buffer in
+                try jsonDecoder.decode(ObjectMeta.self, from: Data(buffer))
+            }
+
+            var statInfo = stat()
+            guard POSIXFile.fstat(fd, &statInfo) == 0 else {
+                throw NSError(
+                    domain: "FileError", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "Could not stat file"])
+            }
+
+            let payloadOffset = 4 + Int(metadataLength)
+            let payloadSize = Int(statInfo.st_size) - payloadOffset
+            return (fd, meta, payloadOffset, Swift.max(0, payloadSize))
+        } catch {
+            _ = POSIXFile.close(fd)
+            throw error
+        }
     }
 
     /// Reads metadata + data from file. Set `loadData` to false for HEAD (metadata only).
@@ -524,6 +683,50 @@ struct ObjectFileHandler {
         key: String,
         versioningStatus: VersioningStatus
     ) throws -> String {
+        let (versionId, path, versionedMeta) = try prepareVersionedWrite(
+            metadata: metadata, bucketName: bucketName, key: key,
+            versioningStatus: versioningStatus)
+
+        try write(metadata: versionedMeta, data: data, to: path)
+
+        if versioningStatus != .disabled {
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+        }
+
+        return versionId
+    }
+
+    /// `writeVersioned` with the payload coming from files on disk instead of memory (spool
+    /// file for streamed PUTs, part files for CompleteMultipartUpload, a source `.obj` for
+    /// CopyObject). Returns the new version ID.
+    static func writeVersionedStreamed(
+        metadata: ObjectMeta,
+        payloadSources: [(path: String, offset: Int, size: Int)],
+        bucketName: String,
+        key: String,
+        versioningStatus: VersioningStatus
+    ) throws -> String {
+        let (versionId, path, versionedMeta) = try prepareVersionedWrite(
+            metadata: metadata, bucketName: bucketName, key: key,
+            versioningStatus: versioningStatus)
+
+        try writeStreamed(metadata: versionedMeta, payloadSources: payloadSources, to: path)
+
+        if versioningStatus != .disabled {
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+        }
+
+        return versionId
+    }
+
+    /// Shared setup for both versioned-write flavors: picks the version ID and target path
+    /// for the bucket's versioning state, demotes existing versions, and stamps the metadata.
+    private static func prepareVersionedWrite(
+        metadata: ObjectMeta,
+        bucketName: String,
+        key: String,
+        versioningStatus: VersioningStatus
+    ) throws -> (versionId: String, path: String, meta: ObjectMeta) {
         let versionId: String
         let path: String
 
@@ -552,21 +755,12 @@ struct ObjectFileHandler {
             path = storagePath(for: bucketName, key: key)
         }
 
-        // Create metadata with version info
         var versionedMeta = metadata
         versionedMeta.versionId = versionId
         versionedMeta.isLatest = true
         versionedMeta.isDeleteMarker = false
 
-        // Write the object
-        try write(metadata: versionedMeta, data: data, to: path)
-
-        // Update the .latest pointer (only for versioned objects)
-        if versioningStatus != .disabled {
-            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
-        }
-
-        return versionId
+        return (versionId, path, versionedMeta)
     }
 
     /// Reads a specific version of an object, or the latest if versionId is nil
