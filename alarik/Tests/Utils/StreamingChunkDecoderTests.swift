@@ -79,21 +79,23 @@ struct StreamingChunkDecoderTests {
 
     /// Feeds `wire` to a fresh decoder in `pieceSize`-byte buffers, returning the decoded
     /// payload.
-    private func decode(_ wire: Data, pieceSize: Int) throws -> (data: Data, decoder: StreamingChunkDecoder) {
+    private func decode(_ wire: Data, pieceSize: Int) async throws -> (
+        data: Data, decoder: StreamingChunkDecoder
+    ) {
         let decoder = makeDecoder()
         var decoded = Data()
         var offset = 0
         while offset < wire.count {
             let end = Swift.min(offset + pieceSize, wire.count)
             let buffer = ByteBuffer(data: wire.subdata(in: offset..<end))
-            try decoder.feed(buffer) { decoded.append(contentsOf: $0) }
+            try await decoder.feed(buffer) { decoded.append(contentsOf: $0) }
             offset = end
         }
         return (decoded, decoder)
     }
 
     @Test("valid multi-chunk stream decodes and verifies at any buffer split size")
-    func validStreamAllSplitSizes() throws {
+    func validStreamAllSplitSizes() async throws {
         let chunkA = Data((0..<70000).map { UInt8($0 % 251) })
         let chunkB = Data((0..<1234).map { UInt8(($0 * 3) % 256) })
         let (wire, payload) = makeWireBody(chunks: [chunkA, chunkB])
@@ -101,7 +103,7 @@ struct StreamingChunkDecoderTests {
         // Whole-buffer, mid-size, and pathological 1-byte deliveries must all agree -
         // the state machine can be split at literally any byte boundary
         for pieceSize in [wire.count, 8192, 3, 1] {
-            let (decoded, decoder) = try decode(wire, pieceSize: pieceSize)
+            let (decoded, decoder) = try await decode(wire, pieceSize: pieceSize)
             #expect(decoded == payload)
             #expect(decoder.decodedLength == payload.count)
             try decoder.verifyComplete(declaredDecodedLength: payload.count)
@@ -109,20 +111,20 @@ struct StreamingChunkDecoderTests {
     }
 
     @Test("tampered chunk payload breaks the signature chain")
-    func tamperedPayloadRejected() throws {
+    func tamperedPayloadRejected() async throws {
         let chunk = Data(repeating: 0xAB, count: 5000)
         var (wire, _) = makeWireBody(chunks: [chunk])
         // Flip one payload byte (past the size line, before the trailing CRLF)
         let sizeLineEnd = wire.range(of: Data("\r\n".utf8))!.upperBound
         wire[sizeLineEnd + 100] ^= 0xFF
 
-        #expect(throws: (any Error).self) {
-            _ = try decode(wire, pieceSize: 4096)
+        await #expect(throws: (any Error).self) {
+            _ = try await decode(wire, pieceSize: 4096)
         }
     }
 
     @Test("tampered chunk signature is rejected")
-    func tamperedSignatureRejected() throws {
+    func tamperedSignatureRejected() async throws {
         let chunk = Data(repeating: 0x11, count: 300)
         let (wire, _) = makeWireBody(chunks: [chunk])
         var wireString = String(data: wire, encoding: .isoLatin1)!
@@ -132,55 +134,55 @@ struct StreamingChunkDecoderTests {
             with: "chunk-signature=\(String(chunkSignature(previous: seedSignature, payload: chunk).dropLast()))0")
         let tampered = wireString.data(using: .isoLatin1)!
 
-        #expect(throws: (any Error).self) {
-            _ = try decode(tampered, pieceSize: 4096)
+        await #expect(throws: (any Error).self) {
+            _ = try await decode(tampered, pieceSize: 4096)
         }
     }
 
     @Test("missing terminating zero chunk fails verifyComplete")
-    func missingZeroChunkRejected() throws {
+    func missingZeroChunkRejected() async throws {
         let chunk = Data(repeating: 0x22, count: 100)
         var (wire, _) = makeWireBody(chunks: [chunk])
         // Drop the zero-chunk terminator entirely
         let zeroStart = wire.range(of: Data("0;chunk-signature=".utf8))!.lowerBound
         wire = wire.prefix(upTo: zeroStart)
 
-        let (_, decoder) = try decode(wire, pieceSize: 4096)
+        let (_, decoder) = try await decode(wire, pieceSize: 4096)
         #expect(throws: (any Error).self) {
             try decoder.verifyComplete(declaredDecodedLength: 100)
         }
     }
 
     @Test("declared decoded length mismatch is rejected")
-    func decodedLengthMismatchRejected() throws {
+    func decodedLengthMismatchRejected() async throws {
         let chunk = Data(repeating: 0x33, count: 100)
         let (wire, _) = makeWireBody(chunks: [chunk])
-        let (_, decoder) = try decode(wire, pieceSize: 4096)
+        let (_, decoder) = try await decode(wire, pieceSize: 4096)
         #expect(throws: (any Error).self) {
             try decoder.verifyComplete(declaredDecodedLength: 99)
         }
-        #expect(throws: (any Error).self) {
-            let (_, decoder2) = try decode(wire, pieceSize: 4096)
+        await #expect(throws: (any Error).self) {
+            let (_, decoder2) = try await decode(wire, pieceSize: 4096)
             try decoder2.verifyComplete(declaredDecodedLength: nil)
         }
     }
 
     @Test("trailer bytes after the zero chunk are ignored")
-    func trailerBytesIgnored() throws {
+    func trailerBytesIgnored() async throws {
         let chunk = Data(repeating: 0x44, count: 64)
         var (wire, payload) = makeWireBody(chunks: [chunk])
         wire.append(Data("x-amz-checksum-crc32:AAAAAA==\r\n\r\n".utf8))
 
-        let (decoded, decoder) = try decode(wire, pieceSize: 7)
+        let (decoded, decoder) = try await decode(wire, pieceSize: 7)
         #expect(decoded == payload)
         try decoder.verifyComplete(declaredDecodedLength: payload.count)
     }
 
     @Test("missing chunk-signature in size line is rejected")
-    func missingSignatureRejected() throws {
+    func missingSignatureRejected() async throws {
         let wire = Data("40\r\n".utf8) + Data(repeating: 0x55, count: 64) + Data("\r\n0\r\n\r\n".utf8)
-        #expect(throws: (any Error).self) {
-            _ = try decode(wire, pieceSize: 4096)
+        await #expect(throws: (any Error).self) {
+            _ = try await decode(wire, pieceSize: 4096)
         }
     }
 }

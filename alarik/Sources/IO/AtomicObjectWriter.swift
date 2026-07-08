@@ -77,14 +77,21 @@ struct AtomicObjectWriter {
     init(finalPath: String) throws {
         let fileURL = URL(fileURLWithPath: finalPath)
         let folderURL = fileURL.deletingLastPathComponent()
-        if !FileManager.default.fileExists(atPath: folderURL.path) {
-            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-        }
 
         self.finalPath = finalPath
         self.tempPath = folderURL.path + "/.tmp-" + UUID().uuidString
 
-        let fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // Optimistically open first instead of always stat-ing the parent directory before
+        // every write - the directory already exists for the overwhelming majority of writes
+        // (another object going into an already-established bucket/prefix), so this turns
+        // the common case from two syscalls into one. Only the rare first-write-into-a-new-
+        // prefix case pays for the extra round trip (open fails ENOENT, create, reopen).
+        var fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        if fd < 0 && errno == ENOENT {
+            try FileManager.default.createDirectory(
+                at: folderURL, withIntermediateDirectories: true)
+            fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        }
         guard fd >= 0 else {
             throw WriteError.openFailed(path: tempPath, errno: errno)
         }

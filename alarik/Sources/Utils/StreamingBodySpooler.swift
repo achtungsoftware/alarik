@@ -61,6 +61,22 @@ enum StreamingBodySpooler {
     private static let streamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
     private static let unsignedPayloadHash = "UNSIGNED-PAYLOAD"
 
+    /// Whether the whole-body SHA256 needs to be computed at all - it exists purely to be
+    /// checked against `declaredSha`, so this must be false in every case where that check
+    /// would be skipped anyway: aws-chunked bodies (verified per-chunk instead, by
+    /// `StreamingChunkDecoder`), query-auth requests (presigned URLs don't sign the payload),
+    /// and requests that didn't declare a real hash to check. Getting this wrong in either
+    /// direction is a real bug, not just style: too eager skips a security check, too
+    /// conservative burns CPU hashing bytes nobody will ever compare (this function exists
+    /// because a production CPU profile caught exactly that mistake - the chunked path was
+    /// unconditionally hashing the whole body a second time, on top of the per-chunk hashing
+    /// already required for signature verification).
+    static func needsWholeBodyHashVerification(
+        isChunked: Bool, isQueryAuth: Bool, declaredSha: String?
+    ) -> Bool {
+        !isChunked && !isQueryAuth && declaredSha != nil && declaredSha != unsignedPayloadHash
+    }
+
     /// Deletes leftover spool files from a previous unclean shutdown. Safe to call at boot:
     /// nothing references a spool file across process lifetimes.
     static func cleanupOrphans() {
@@ -93,17 +109,31 @@ enum StreamingBodySpooler {
                     for: authInfo))
         }
 
-        var sink = SpoolSink(requestId: req.id)
+        var sink = SpoolSink(requestId: req.id, threadPool: req.application.threadPool)
         defer { sink.discardOnError() }
 
+        // The whole-body SHA256 is only meaningful when something will actually check it
+        // against the client's declared hash. When the body is aws-chunked, that check is
+        // moot - StreamingChunkDecoder already verifies every chunk's own SHA256 against its
+        // SigV4 signature, so a second whole-body pass over the same bytes would just be
+        // hashing them twice for no reason (this is precisely what a CPU time profile of a
+        // PUT-heavy benchmark flagged: SHA256/MD5 compute dominated CPU time, and the
+        // whole-body SHA256 in the chunked path was pure waste - it's discarded a few lines
+        // below without ever being compared to anything).
+        let isQueryAuth =
+            req.headers.first(name: "authorization") == nil
+            && req.query[String.self, at: "X-Amz-Algorithm"] != nil
+        let needsWholeBodySha256 = needsWholeBodyHashVerification(
+            isChunked: isChunked, isQueryAuth: isQueryAuth, declaredSha: declaredSha)
+
         var md5 = Insecure.MD5()
-        var sha256 = Crypto.SHA256()
+        var sha256 = needsWholeBodySha256 ? Crypto.SHA256() : nil
         var size = 0
         let maxBodySize = req.application.routes.defaultMaxBodySize.value
 
-        func consume(_ payload: ByteBufferView) throws {
+        func consume(_ payload: ByteBufferView) async throws {
             md5.update(data: payload)
-            sha256.update(data: payload)
+            sha256?.update(data: payload)
             size += payload.count
             guard size <= maxBodySize else {
                 throw S3Error(
@@ -111,14 +141,14 @@ enum StreamingBodySpooler {
                     message: "Your proposed upload exceeds the maximum allowed size",
                     requestId: req.id)
             }
-            try sink.write(payload)
+            try await sink.write(payload)
         }
 
         for try await buffer in req.body {
             if let decoder {
-                try decoder.feed(buffer, emit: consume)
+                try await decoder.feed(buffer, emit: consume)
             } else {
-                try consume(buffer.readableBytesView)
+                try await consume(buffer.readableBytesView)
             }
         }
 
@@ -129,19 +159,13 @@ enum StreamingBodySpooler {
             try decoder.verifyComplete(declaredDecodedLength: declaredLength)
         }
 
-        let sha256Hex = sha256.finalize().hexString()
-
         // The deferred counterpart of the payload-hash check the SigV4 validator does for
         // buffered bodies: the signature proved the client *declared* this hash; now the bytes
-        // have actually arrived, they must match it. Skipped for query auth (presigned URLs
-        // don't sign the payload) exactly like the buffered path.
-        let isQueryAuth =
-            req.headers.first(name: "authorization") == nil
-            && req.query[String.self, at: "X-Amz-Algorithm"] != nil
-        if !isChunked, !isQueryAuth, let declaredSha,
-            declaredSha != unsignedPayloadHash
-        {
-            guard sha256Hex == declaredSha.lowercased() else {
+        // have actually arrived, they must match it.
+        var sha256Hex = ""
+        if let sha256 {
+            sha256Hex = sha256.finalize().hexString()
+            guard let declaredSha, sha256Hex == declaredSha.lowercased() else {
                 throw S3Error(
                     status: .badRequest, code: "InvalidDigest",
                     message: "Payload hash mismatch", requestId: req.id)
@@ -149,8 +173,9 @@ enum StreamingBodySpooler {
         }
 
         let md5Digest = md5.finalize()
+        let storage = await sink.finish()
         return SpooledBody(
-            storage: sink.finish(),
+            storage: storage,
             size: size,
             md5Hex: md5Digest.hexString(),
             md5Base64: Data(md5Digest).base64EncodedString(),
@@ -163,36 +188,45 @@ enum StreamingBodySpooler {
 /// spool file (the buffered prefix is flushed to it on spill). Owns the file descriptor; one
 /// of `finish()` / `discardOnError()` must run - the spooler pairs a `defer`red discard with
 /// an explicit finish, so error paths never leak an fd or a file.
+///
+/// The memory path does a plain in-process append - no syscall, so no reason to leave the
+/// calling executor. The disk path is real blocking IO (open/write, and directory creation
+/// the first time), so every disk-touching operation here hops onto `threadPool` instead of
+/// running on whatever executor is driving the request's body stream (Swift's shared
+/// concurrent executor, which every other async task in the process also depends on).
 private struct SpoolSink {
     private let requestId: String
+    private let threadPool: NIOThreadPool
     private var memory = Data()
     private var fd: Int32 = -1
     private var filePath: String? = nil
     private var finished = false
 
-    init(requestId: String) {
+    init(requestId: String, threadPool: NIOThreadPool) {
         self.requestId = requestId
+        self.threadPool = threadPool
     }
 
-    mutating func write(_ payload: ByteBufferView) throws {
+    mutating func write(_ payload: ByteBufferView) async throws {
         if fd < 0 {
             if memory.count + payload.count <= Constants.streamingThreshold {
                 memory.append(contentsOf: payload)
                 return
             }
-            try spillToDisk()
+            try await spillToDisk()
         }
-        try writeToFile(payload)
+        try await writeToFile(payload)
     }
 
     /// Seals the sink and returns where the payload ended up.
-    mutating func finish() -> SpooledBody.Storage {
+    mutating func finish() async -> SpooledBody.Storage {
         finished = true
         guard fd >= 0, let filePath else {
             return .memory(memory)
         }
-        _ = POSIXFile.close(fd)
+        let closingFd = fd
         fd = -1
+        _ = try? await threadPool.runIfActive { POSIXFile.close(closingFd) }
         return .file(path: filePath)
     }
 
@@ -208,53 +242,51 @@ private struct SpoolSink {
         }
     }
 
-    private mutating func spillToDisk() throws {
-        if !FileManager.default.fileExists(atPath: Constants.spoolDirectory) {
-            try FileManager.default.createDirectory(
-                atPath: Constants.spoolDirectory, withIntermediateDirectories: true)
-        }
+    private mutating func spillToDisk() async throws {
         let path = Constants.spoolDirectory + ".spool-" + UUID().uuidString
-        let newFd = POSIXFile.openWrite(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        guard newFd >= 0 else {
-            throw S3Error(
-                status: .internalServerError, code: "InternalError",
-                message: "We encountered an internal error. Please try again.",
-                requestId: requestId)
+        let requestId = requestId
+        let memorySnapshot = memory
+        let newFd = try await threadPool.runIfActive { () -> Int32 in
+            // Optimistic open first (see AtomicObjectWriter.init for the same pattern) - the
+            // spool directory exists after the first large upload of the process's lifetime,
+            // so this only pays for a stat+mkdir on the rare cold-start case.
+            var newFd = POSIXFile.openWrite(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            if newFd < 0 && errno == ENOENT {
+                try FileManager.default.createDirectory(
+                    atPath: Constants.spoolDirectory, withIntermediateDirectories: true)
+                newFd = POSIXFile.openWrite(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            }
+            guard newFd >= 0 else {
+                throw S3Error(
+                    status: .internalServerError, code: "InternalError",
+                    message: "We encountered an internal error. Please try again.",
+                    requestId: requestId)
+            }
+            // Flush the in-memory prefix so the file holds the payload from byte 0
+            try memorySnapshot.withUnsafeBytes { raw in
+                try Self.writeFully(fd: newFd, raw, requestId: requestId)
+            }
+            return newFd
         }
         fd = newFd
         filePath = path
-
-        // Flush the in-memory prefix so the file holds the payload from byte 0
-        try memory.withUnsafeBytes { raw in
-            try writeFully(raw)
-        }
         memory.removeAll(keepingCapacity: false)
     }
 
-    private mutating func writeToFile(_ payload: ByteBufferView) throws {
+    private func writeToFile(_ payload: ByteBufferView) async throws {
         guard !payload.isEmpty else { return }
-        var writeError: (any Error)? = nil
-        let ran = payload.withContiguousStorageIfAvailable { bytes in
-            do {
-                try writeFully(UnsafeRawBufferPointer(bytes))
-            } catch {
-                writeError = error
+        let fd = fd
+        let requestId = requestId
+        try await threadPool.runIfActive {
+            try payload.withUnsafeBytes { raw in
+                try Self.writeFully(fd: fd, raw, requestId: requestId)
             }
-        }
-        if let writeError {
-            throw writeError
-        }
-        // ByteBufferView is always contiguous, so the fallback path is unreachable in
-        // practice - kept as a hard error rather than a silent copy.
-        guard ran != nil else {
-            throw S3Error(
-                status: .internalServerError, code: "InternalError",
-                message: "We encountered an internal error. Please try again.",
-                requestId: requestId)
         }
     }
 
-    private func writeFully(_ raw: UnsafeRawBufferPointer) throws {
+    private static func writeFully(
+        fd: Int32, _ raw: UnsafeRawBufferPointer, requestId: String
+    ) throws {
         guard let base = raw.baseAddress, raw.count > 0 else { return }
         var offset = 0
         while offset < raw.count {
@@ -304,7 +336,7 @@ final class StreamingChunkDecoder {
 
     /// Feeds one arriving buffer through the state machine. `emit` receives each decoded
     /// payload slice exactly once, in order.
-    func feed(_ buffer: ByteBuffer, emit: (ByteBufferView) throws -> Void) throws {
+    func feed(_ buffer: ByteBuffer, emit: (ByteBufferView) async throws -> Void) async throws {
         let view = buffer.readableBytesView
         var pos = view.startIndex
 
@@ -341,7 +373,7 @@ final class StreamingChunkDecoder {
                 let end = view.index(pos, offsetBy: take)
                 let slice = view[pos..<end]
                 chunkHasher.update(data: slice)
-                try emit(slice)
+                try await emit(slice)
                 pos = end
                 if take == remaining {
                     try finishChunk()

@@ -37,18 +37,18 @@ struct LifecycleService {
                 if let expirationDays = rule.expirationDays {
                     try await expireCurrentObjects(
                         bucketName: bucket.name, prefix: rule.prefix, days: expirationDays,
-                        versioningStatus: versioningStatus, on: app.db)
+                        versioningStatus: versioningStatus, on: app.db, app: app)
                 }
 
                 if let noncurrentDays = rule.noncurrentVersionExpirationDays {
                     try await expireNoncurrentVersions(
                         bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays,
-                        on: app.db)
+                        on: app.db, app: app)
                 }
 
                 if let abortDays = rule.abortIncompleteMultipartUploadDays {
-                    try abortStaleMultipartUploads(
-                        bucketName: bucket.name, prefix: rule.prefix, days: abortDays)
+                    try await abortStaleMultipartUploads(
+                        bucketName: bucket.name, prefix: rule.prefix, days: abortDays, app: app)
                 }
             }
         }
@@ -59,16 +59,18 @@ struct LifecycleService {
     /// identical to a normal DELETE request, matching S3's lifecycle Expiration behavior.
     private static func expireCurrentObjects(
         bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus,
-        on db: any Database
+        on db: any Database, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(
             bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
         for object in objects where object.updatedAt <= cutoff {
-            let outcome = try S3Service.deleteObject(
-                bucketName: bucketName, key: object.key, versionId: nil,
-                versioningStatus: versioningStatus)
+            let outcome = try await S3Service.offloadBlockingIO(app) {
+                try S3Service.deleteObject(
+                    bucketName: bucketName, key: object.key, versionId: nil,
+                    versioningStatus: versioningStatus)
+            }
 
             await NotificationService.emit(
                 event: outcome.isDeleteMarker
@@ -86,7 +88,7 @@ struct LifecycleService {
     /// the chain (the version that superseded them) - the closest equivalent derivable from the
     /// existing storage format.
     private static func expireNoncurrentVersions(
-        bucketName: String, prefix: String, days: Int, on db: any Database
+        bucketName: String, prefix: String, days: Int, on db: any Database, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (versions, deleteMarkers, _, _, _, _) = try ObjectFileHandler.listAllVersions(
@@ -105,8 +107,10 @@ struct LifecycleService {
                 let becameNoncurrentAt = chain[i - 1].updatedAt
                 guard becameNoncurrentAt <= cutoff else { continue }
 
-                try ObjectFileHandler.deleteVersion(
-                    bucketName: bucketName, key: key, versionId: versionId)
+                try await S3Service.offloadBlockingIO(app) {
+                    try ObjectFileHandler.deleteVersion(
+                        bucketName: bucketName, key: key, versionId: versionId)
+                }
 
                 await NotificationService.emit(
                     event: .lifecycleExpirationDelete, bucketName: bucketName, key: key,
@@ -121,15 +125,18 @@ struct LifecycleService {
 
     /// AbortIncompleteMultipartUpload - aborts in-progress multipart uploads initiated at least
     /// `days` ago.
-    private static func abortStaleMultipartUploads(bucketName: String, prefix: String, days: Int)
-        throws
-    {
+    private static func abortStaleMultipartUploads(
+        bucketName: String, prefix: String, days: Int, app: Application
+    ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (uploads, _, _, _) = try MultipartFileHandler.listUploads(
             bucketName: bucketName, prefix: prefix, maxUploads: 10000)
 
         for upload in uploads where upload.initiated <= cutoff {
-            try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: upload.uploadId)
+            try await S3Service.offloadBlockingIO(app) {
+                try MultipartFileHandler.abortUpload(
+                    bucketName: bucketName, uploadId: upload.uploadId)
+            }
         }
     }
 }

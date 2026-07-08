@@ -749,41 +749,47 @@ struct S3Controller: RouteCollection {
 
         // Write with versioning support. Small bodies arrive in memory and take the direct
         // write; large ones were spooled to disk and are copied into the final .obj in fixed
-        // windows. Both are fsynced by AtomicObjectWriter before the PUT is acknowledged.
-        var writtenVersionId: String? = nil
-        switch spooled.storage {
-        case .memory(let data):
-            if versioningStatus != .disabled {
-                let versionId = try ObjectFileHandler.writeVersioned(
-                    metadata: meta,
-                    data: data,
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versioningStatus: versioningStatus
-                )
-                headers.add(name: "x-amz-version-id", value: versionId)
-                writtenVersionId = versionId
-            } else {
-                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                try ObjectFileHandler.write(metadata: meta, data: data, to: path)
+        // windows. Both are fsynced by AtomicObjectWriter before the PUT is acknowledged -
+        // real blocking syscalls, so the whole write+fsync+rename sequence is offloaded to
+        // the blocking-IO thread pool rather than tying up the async executor.
+        let storage = spooled.storage
+        let finalMeta = meta
+        let writtenVersionId: String? = try await S3Service.offloadBlockingIO(req) {
+            switch storage {
+            case .memory(let data):
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersioned(
+                        metadata: finalMeta,
+                        data: data,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.write(metadata: finalMeta, data: data, to: path)
+                    return nil
+                }
+            case .file(let spoolPath):
+                let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersionedStreamed(
+                        metadata: finalMeta,
+                        payloadSources: spoolSource,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.writeStreamed(
+                        metadata: finalMeta, payloadSources: spoolSource, to: path)
+                    return nil
+                }
             }
-        case .file(let spoolPath):
-            let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
-            if versioningStatus != .disabled {
-                let versionId = try ObjectFileHandler.writeVersionedStreamed(
-                    metadata: meta,
-                    payloadSources: spoolSource,
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versioningStatus: versioningStatus
-                )
-                headers.add(name: "x-amz-version-id", value: versionId)
-                writtenVersionId = versionId
-            } else {
-                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                try ObjectFileHandler.writeStreamed(
-                    metadata: meta, payloadSources: spoolSource, to: path)
-            }
+        }
+        if let writtenVersionId {
+            headers.add(name: "x-amz-version-id", value: writtenVersionId)
         }
 
         await NotificationService.emit(
@@ -815,22 +821,17 @@ struct S3Controller: RouteCollection {
                 message: "The specified key does not exist.", requestId: req.id)
         }
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
-        guard let data = data else {
-            throw S3Error(
-                status: .internalServerError, code: "InternalError",
-                message: "Could not read object data", requestId: req.id)
-        }
-
         let xml = try await S3Service.collectBodyString(req: req)
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
-        var updatedMeta = meta
-        updatedMeta.tags = tagging.tags
-        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+        // Metadata-only rewrite - the payload is window-copied from the file to itself, never
+        // buffered, so this doesn't cost a full read+rewrite of a potentially huge object.
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = tagging.tags }
+        }
 
         var headers = HTTPHeaders()
-        if let versionId = meta.versionId {
+        if let versionId = updatedMeta.versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
         }
         return Response(status: .ok, headers: headers)
@@ -882,19 +883,12 @@ struct S3Controller: RouteCollection {
                 message: "The specified key does not exist.", requestId: req.id)
         }
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
-        guard let data = data else {
-            throw S3Error(
-                status: .internalServerError, code: "InternalError",
-                message: "Could not read object data", requestId: req.id)
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
 
-        var updatedMeta = meta
-        updatedMeta.tags = nil
-        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
-
         var headers = HTTPHeaders()
-        if let versionId = meta.versionId {
+        if let versionId = updatedMeta.versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
         }
         return Response(status: .noContent, headers: headers)
@@ -917,12 +911,14 @@ struct S3Controller: RouteCollection {
         // Resolve the source straight to its on-disk file - the payload is streamed
         // file-to-file in fixed windows, never buffered whole
         let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try S3Service.resolveObjectForCopy(
-                bucketName: copySource.bucketName,
-                key: copySource.key,
-                versionId: copySource.versionId,
-                requestId: req.id
-            )
+            try await S3Service.offloadBlockingIO(req) {
+                try S3Service.resolveObjectForCopy(
+                    bucketName: copySource.bucketName,
+                    key: copySource.key,
+                    versionId: copySource.versionId,
+                    requestId: req.id
+                )
+            }
 
         // Validate copy conditions (if-match, if-none-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -972,8 +968,10 @@ struct S3Controller: RouteCollection {
         // hash pass over the payload.
         let etag: String
         if sourceMeta.etag.contains("-") {
-            etag = try ObjectFileHandler.md5HexOfFileRegion(
-                path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+            etag = try await S3Service.offloadBlockingIO(req) {
+                try ObjectFileHandler.md5HexOfFileRegion(
+                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+            }
         } else {
             etag = sourceMeta.etag
         }
@@ -992,25 +990,31 @@ struct S3Controller: RouteCollection {
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/xml")
 
-        // Write with versioning support - payload window-copied from the source file
+        // Write with versioning support - payload window-copied from the source file. Real
+        // blocking file IO (open/read/write/fsync/rename), so it's offloaded rather than
+        // tying up the async executor for the whole copy.
         let copySources = [
             (path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
         ]
-        var versionId: String? = nil
-        if versioningStatus != .disabled {
-            versionId = try ObjectFileHandler.writeVersionedStreamed(
-                metadata: destinationMeta,
-                payloadSources: copySources,
-                bucketName: destinationBucket,
-                key: destinationKey,
-                versioningStatus: versioningStatus
-            )
-            headers.add(name: "x-amz-version-id", value: versionId!)
-        } else {
-            let destinationPath = ObjectFileHandler.storagePath(
-                for: destinationBucket, key: destinationKey)
-            try ObjectFileHandler.writeStreamed(
-                metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
+        let versionId: String? = try await S3Service.offloadBlockingIO(req) {
+            if versioningStatus != .disabled {
+                return try ObjectFileHandler.writeVersionedStreamed(
+                    metadata: destinationMeta,
+                    payloadSources: copySources,
+                    bucketName: destinationBucket,
+                    key: destinationKey,
+                    versioningStatus: versioningStatus
+                )
+            } else {
+                let destinationPath = ObjectFileHandler.storagePath(
+                    for: destinationBucket, key: destinationKey)
+                try ObjectFileHandler.writeStreamed(
+                    metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
+                return nil
+            }
+        }
+        if let versionId {
+            headers.add(name: "x-amz-version-id", value: versionId)
         }
 
         // Add source version ID if present
@@ -1141,7 +1145,7 @@ struct S3Controller: RouteCollection {
         if let uploadId = req.query[String.self, at: "uploadId"],
             req.query[String.self, at: "versionId"] == nil
         {
-            return try handleAbortMultipartUpload(
+            return try await handleAbortMultipartUpload(
                 req: req,
                 bucketName: bucketName,
                 key: keyPath,
@@ -1158,12 +1162,14 @@ struct S3Controller: RouteCollection {
         let versionId = req.query[String.self, at: "versionId"]
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        let outcome = try S3Service.deleteObject(
-            bucketName: bucketName,
-            key: keyPath,
-            versionId: versionId,
-            versioningStatus: versioningStatus
-        )
+        let outcome = try await S3Service.offloadBlockingIO(req) {
+            try S3Service.deleteObject(
+                bucketName: bucketName,
+                key: keyPath,
+                versionId: versionId,
+                versioningStatus: versioningStatus
+            )
+        }
 
         var headers = HTTPHeaders()
         if let resultVersionId = outcome.versionId {
@@ -1229,12 +1235,14 @@ struct S3Controller: RouteCollection {
             }
 
             do {
-                let outcome = try S3Service.deleteObject(
-                    bucketName: bucketName,
-                    key: object.key,
-                    versionId: object.versionId,
-                    versioningStatus: versioningStatus
-                )
+                let outcome = try await S3Service.offloadBlockingIO(req) {
+                    try S3Service.deleteObject(
+                        bucketName: bucketName,
+                        key: object.key,
+                        versionId: object.versionId,
+                        versioningStatus: versioningStatus
+                    )
+                }
 
                 deleted.append(
                     DeletedEntry(
@@ -1431,17 +1439,22 @@ struct S3Controller: RouteCollection {
         // Get versioning status
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        // Complete the upload
+        // Complete the upload - streams every part into the final .obj in fixed windows and
+        // fsyncs before returning, all real blocking file IO, so it's offloaded to the
+        // blocking-IO thread pool rather than tying up the async executor for the whole
+        // (potentially multi-gigabyte) assembly.
         let etag: String
         let versionId: String?
         let finalSize: Int
         do {
-            let result = try MultipartFileHandler.completeUpload(
-                bucketName: bucketName,
-                uploadId: uploadId,
-                parts: parts,
-                versioningStatus: versioningStatus
-            )
+            let result = try await S3Service.offloadBlockingIO(req) {
+                try MultipartFileHandler.completeUpload(
+                    bucketName: bucketName,
+                    uploadId: uploadId,
+                    parts: parts,
+                    versioningStatus: versioningStatus
+                )
+            }
             etag = result.etag
             versionId = result.versionId
             finalSize = result.size
@@ -1523,25 +1536,28 @@ struct S3Controller: RouteCollection {
         try S3Service.validateContentMD5(req: req, spooled: spooled)
 
         // Small parts write directly from memory; large ones were spooled to disk and the
-        // spool file becomes the part file via rename - no copy at all
-        let etag: String
-        switch spooled.storage {
-        case .memory(let data):
-            etag = try MultipartFileHandler.writePart(
-                bucketName: bucketName,
-                uploadId: uploadId,
-                partNumber: partNumber,
-                data: data
-            )
-        case .file(let spoolPath):
-            etag = try MultipartFileHandler.writePartStreamed(
-                bucketName: bucketName,
-                uploadId: uploadId,
-                partNumber: partNumber,
-                spoolPath: spoolPath,
-                etag: spooled.md5Hex,
-                size: spooled.size
-            )
+        // spool file becomes the part file via rename - no copy at all. Real blocking file
+        // IO either way, so it's offloaded to the blocking-IO thread pool.
+        let storage = spooled.storage
+        let etag: String = try await S3Service.offloadBlockingIO(req) {
+            switch storage {
+            case .memory(let data):
+                return try MultipartFileHandler.writePart(
+                    bucketName: bucketName,
+                    uploadId: uploadId,
+                    partNumber: partNumber,
+                    data: data
+                )
+            case .file(let spoolPath):
+                return try MultipartFileHandler.writePartStreamed(
+                    bucketName: bucketName,
+                    uploadId: uploadId,
+                    partNumber: partNumber,
+                    spoolPath: spoolPath,
+                    etag: spooled.md5Hex,
+                    size: spooled.size
+                )
+            }
         }
 
         var headers = HTTPHeaders()
@@ -1581,12 +1597,14 @@ struct S3Controller: RouteCollection {
         // Resolve the source straight to its on-disk file - the copied region is streamed
         // file-to-file in fixed windows, never buffered whole
         let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try S3Service.resolveObjectForCopy(
-                bucketName: copySource.bucketName,
-                key: copySource.key,
-                versionId: copySource.versionId,
-                requestId: req.id
-            )
+            try await S3Service.offloadBlockingIO(req) {
+                try S3Service.resolveObjectForCopy(
+                    bucketName: copySource.bucketName,
+                    key: copySource.key,
+                    versionId: copySource.versionId,
+                    requestId: req.id
+                )
+            }
 
         // Validate copy conditions (x-amz-copy-source-if-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -1609,14 +1627,16 @@ struct S3Controller: RouteCollection {
             copySize = sourcePayloadSize
         }
 
-        let etag = try MultipartFileHandler.writePartFromFile(
-            bucketName: destinationBucket,
-            uploadId: uploadId,
-            partNumber: partNumber,
-            sourcePath: sourcePath,
-            sourceOffset: copyOffset,
-            sourceSize: copySize
-        )
+        let etag = try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.writePartFromFile(
+                bucketName: destinationBucket,
+                uploadId: uploadId,
+                partNumber: partNumber,
+                sourcePath: sourcePath,
+                sourceOffset: copyOffset,
+                sourceSize: copySize
+            )
+        }
 
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -1640,7 +1660,7 @@ struct S3Controller: RouteCollection {
         bucketName: String,
         key: String,
         uploadId: String
-    ) throws -> Response {
+    ) async throws -> Response {
         // Verify upload exists
         guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
             throw S3Error(
@@ -1648,7 +1668,11 @@ struct S3Controller: RouteCollection {
                 message: "The specified upload does not exist.", requestId: req.id)
         }
 
-        try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
+        // Deletes every part file in the upload directory - a real (if usually small) batch
+        // of unlink syscalls, offloaded like every other write/delete path here.
+        try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
+        }
 
         return Response(status: .noContent)
     }

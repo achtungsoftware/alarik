@@ -192,6 +192,43 @@ struct ObjectFileHandlerStreamingTests {
         #expect(readData == payload)
     }
 
+    @Test("AtomicObjectWriter creates missing parent directories on first write (cold-start path)")
+    func writerCreatesMissingNestedDirectory() throws {
+        let dir = createTempDir()
+        defer { cleanup(dir: dir) }
+
+        // Several levels deep, none of which exist yet - AtomicObjectWriter must create the
+        // whole chain via the ENOENT fallback, not just the immediate parent.
+        let objPath = dir + "a/b/c/object.obj"
+        #expect(!FileManager.default.fileExists(atPath: dir + "a"))
+
+        let payload = makePayload(size: 4096)
+        try ObjectFileHandler.write(
+            metadata: makeMeta(size: payload.count, etag: "nested"), data: payload, to: objPath)
+
+        let (_, readData) = try ObjectFileHandler.read(from: objPath)
+        #expect(readData == payload)
+    }
+
+    @Test("AtomicObjectWriter reuses an already-existing parent directory (warm path)")
+    func writerReusesExistingDirectory() throws {
+        let dir = createTempDir()
+        defer { cleanup(dir: dir) }
+
+        // First write establishes the directory; subsequent writes into the same directory
+        // must succeed without needing to (re)create it - this is the common-case path the
+        // optimistic-open optimization targets.
+        for i in 0..<3 {
+            let payload = makePayload(size: 512, seed: UInt8(i + 1))
+            let objPath = dir + "object-\(i).obj"
+            try ObjectFileHandler.write(
+                metadata: makeMeta(size: payload.count, etag: "warm-\(i)"), data: payload,
+                to: objPath)
+            let (_, readData) = try ObjectFileHandler.read(from: objPath)
+            #expect(readData == payload)
+        }
+    }
+
     @Test("fsync is enabled by default")
     func fsyncDefaultOn() throws {
         let original = ProcessInfo.processInfo.environment["ALARIK_FSYNC"]

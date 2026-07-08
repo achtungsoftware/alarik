@@ -39,6 +39,29 @@ struct ListObjectsParams {
 }
 
 struct S3Service {
+    /// Runs synchronous, disk-blocking work (open/write/fsync/rename/unlink - everything
+    /// `AtomicObjectWriter` and its callers in `ObjectFileHandler`/`MultipartFileHandler` do)
+    /// on Vapor's dedicated blocking-IO thread pool instead of the calling Task's executor.
+    ///
+    /// Without this, that work runs on Swift's default global concurrent executor - the pool
+    /// every async route handler in the process shares, sized to the CPU core count. A CPU
+    /// profile of a PUT-heavy benchmark caught this directly: `F_FULLFSYNC` alone costs
+    /// several milliseconds, and a dozen concurrent PUTs was enough to keep every executor
+    /// thread parked in-kernel doing disk flushes, which doesn't just slow down other PUTs -
+    /// it stalls *any* async work anywhere in the process waiting for that same executor.
+    /// `NIOThreadPool` exists precisely so blocking calls have somewhere to go that isn't it.
+    static func offloadBlockingIO<T: Sendable>(
+        _ app: Application, _ work: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await app.threadPool.runIfActive(work)
+    }
+
+    static func offloadBlockingIO<T: Sendable>(
+        _ req: Request, _ work: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await offloadBlockingIO(req.application, work)
+    }
+
     static func extractBucketName(from req: Request) throws -> String {
         guard let bucketName = req.parameters.get("bucketName") else {
             throw S3Error(
@@ -992,7 +1015,7 @@ struct S3Service {
                 signatureValidator: try await SigV4Validator.chunkSignatureValidator(
                     for: authInfo))
             var decoded = Data()
-            try decoder.feed(buffer) { decoded.append(contentsOf: $0) }
+            try await decoder.feed(buffer) { decoded.append(contentsOf: $0) }
             try decoder.verifyComplete(
                 declaredDecodedLength: req.headers
                     .first(name: "x-amz-decoded-content-length")

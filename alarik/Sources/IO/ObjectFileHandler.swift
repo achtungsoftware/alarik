@@ -120,6 +120,27 @@ struct ObjectFileHandler {
         }
     }
 
+    /// Updates an object's metadata in place without ever buffering its payload - used by
+    /// tagging/metadata-only endpoints (PutObjectTagging, DeleteObjectTagging, the console's
+    /// metadata editor) so changing a small JSON blob doesn't cost a full read+rewrite of a
+    /// payload that could be gigabytes. The payload is window-copied from the file to itself
+    /// (safe: `AtomicObjectWriter` writes to a distinct temp file and only renames over the
+    /// original once the copy is fully done - same reasoning as `markAllVersionsNotLatest`).
+    static func rewriteMetadata(
+        at path: String, transform: (inout ObjectMeta) -> Void
+    ) throws -> ObjectMeta {
+        let location = try payloadLocation(path: path)
+        var updatedMeta = location.meta
+        transform(&updatedMeta)
+        try writeStreamed(
+            metadata: updatedMeta,
+            payloadFile: path,
+            payloadOffset: location.payloadOffset,
+            payloadSize: location.payloadSize,
+            to: path)
+        return updatedMeta
+    }
+
     /// MD5 of a file region, computed in fixed-size windows (bounded memory). Used by
     /// CopyObject when the source's own ETag isn't a plain MD5 (multipart "-N" ETags) and the
     /// destination needs one without buffering the payload.
@@ -864,21 +885,30 @@ struct ObjectFileHandler {
         return versionId.isEmpty ? nil : versionId
     }
 
-    /// Updates the .latest pointer file
+    /// Updates the .latest pointer file. Runs on every write to a versioned bucket, so the
+    /// common case (directory already exists) is optimistic: try the write first, and only
+    /// pay for stat-ing + creating the parent directory on the rare miss (same pattern as
+    /// `AtomicObjectWriter.init` and `SpoolSink.spillToDisk`).
     static func updateLatestPointer(bucketName: String, key: String, versionId: String) throws {
         let pointerPath = latestPointerPath(for: bucketName, key: key)
-        let pointerURL = URL(fileURLWithPath: pointerPath)
-
-        // Ensure directory exists
-        let dirURL = pointerURL.deletingLastPathComponent()
-        if !FileManager.default.fileExists(atPath: dirURL.path) {
+        do {
+            try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
+        } catch {
+            let dirURL = URL(fileURLWithPath: pointerPath).deletingLastPathComponent()
             try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
         }
-
-        try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
     }
 
     /// Marks all versions of an object as not latest
+    /// Runs on every write to a versioned (or suspended-versioning) bucket, over every prior
+    /// version of the key. Only the metadata's `isLatest` flag ever needs changing here, so
+    /// this is header-only for every file it merely checks (`payloadLocation`, not `read`),
+    /// and window-copies the payload back into place (self-rewrite, safe per
+    /// `AtomicObjectWriter`'s temp-file-then-rename design: the source stays open and intact
+    /// until the atomic rename at the very end) rather than buffering it as `Data` - a
+    /// multi-gigabyte object's every subsequent version write used to also mean a full extra
+    /// read+copy of that same multi-gigabyte payload here, just to flip one boolean.
     static func markAllVersionsNotLatest(bucketName: String, key: String) throws {
         let basePath = versionedBasePath(for: bucketName, key: key)
         let baseURL = URL(fileURLWithPath: basePath)
@@ -892,12 +922,17 @@ struct ObjectFileHandler {
 
         for fileURL in contents where fileURL.pathExtension == "obj" {
             do {
-                let (meta, data) = try read(from: fileURL.path, loadData: true)
-                if meta.isLatest {
-                    var updatedMeta = meta
-                    updatedMeta.isLatest = false
-                    try write(metadata: updatedMeta, data: data ?? Data(), to: fileURL.path)
-                }
+                let location = try payloadLocation(path: fileURL.path)
+                guard location.meta.isLatest else { continue }
+
+                var updatedMeta = location.meta
+                updatedMeta.isLatest = false
+                try writeStreamed(
+                    metadata: updatedMeta,
+                    payloadFile: fileURL.path,
+                    payloadOffset: location.payloadOffset,
+                    payloadSize: location.payloadSize,
+                    to: fileURL.path)
             } catch {
                 // Skip files we can't read
                 continue
@@ -1199,13 +1234,19 @@ struct ObjectFileHandler {
         if let mostRecent = versions.first {
             try updateLatestPointer(bucketName: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
 
-            // Update the metadata to mark it as latest
+            // Update the metadata to mark it as latest - header-only read + self window-copy
+            // (see markAllVersionsNotLatest) rather than buffering the whole payload just to
+            // flip one boolean.
             let path = versionedPath(for: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
-            if FileManager.default.fileExists(atPath: path) {
-                let (meta, data) = try read(from: path, loadData: true)
-                var updatedMeta = meta
+            if let location = try? payloadLocation(path: path) {
+                var updatedMeta = location.meta
                 updatedMeta.isLatest = true
-                try write(metadata: updatedMeta, data: data ?? Data(), to: path)
+                try writeStreamed(
+                    metadata: updatedMeta,
+                    payloadFile: path,
+                    payloadOffset: location.payloadOffset,
+                    payloadSize: location.payloadSize,
+                    to: path)
             }
         } else {
             // No versions left, remove the .latest pointer

@@ -631,4 +631,62 @@ struct S3StreamingTests {
                 })
         }
     }
+
+    /// Object writes (spool -> hash -> fsync -> rename) are offloaded to Vapor's blocking-IO
+    /// thread pool instead of running on Swift's shared concurrent executor - a CPU profile of
+    /// a PUT-heavy benchmark found the opposite (blocking disk syscalls tying up that shared
+    /// executor) starving throughput under concurrency. This doesn't assert on timing (that
+    /// would be flaky), but it does prove many concurrent PUTs against the refactored async
+    /// spool/write pipeline all complete correctly and with distinct, byte-correct payloads -
+    /// exactly the scenario a data race or an incorrect Sendable capture in that refactor
+    /// would corrupt.
+    @Test("many concurrent PUTs against distinct keys all complete correctly")
+    func concurrentPutsCompleteCorrectly() async throws {
+        let bucketName = "streaming-concurrent-bucket"
+        let concurrency = 24
+
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for i in 0..<concurrency {
+                    group.addTask {
+                        let key = "concurrent-\(i).bin"
+                        let payload = self.makePayload(size: 200_000 + i * 37, seed: UInt8(i))
+                        let expectedETag = Insecure.MD5.hash(data: payload).hex
+
+                        let putSigned = self.signedHeaders(
+                            for: .PUT, path: "/\(bucketName)/\(key)", body: payload)
+                        try await app.test(
+                            .PUT, "/\(bucketName)/\(key)",
+                            beforeRequest: { req in
+                                req.headers.add(contentsOf: putSigned)
+                                req.body = ByteBuffer(data: payload)
+                            },
+                            afterResponse: { res in
+                                #expect(res.status == .ok)
+                                #expect(res.headers.first(name: "ETag") == "\"\(expectedETag)\"")
+                            })
+
+                        let getSigned = self.signedHeaders(
+                            for: .GET, path: "/\(bucketName)/\(key)")
+                        try await app.test(
+                            .GET, "/\(bucketName)/\(key)",
+                            beforeRequest: { req in req.headers.add(contentsOf: getSigned) },
+                            afterResponse: { res in
+                                #expect(res.status == .ok)
+                                #expect(Data(res.body.readableBytesView) == payload)
+                            })
+                    }
+                }
+                try await group.waitForAll()
+            }
+
+            // No leftover spool files after every request has completed
+            let spoolLeftovers =
+                (try? FileManager.default.contentsOfDirectory(atPath: Constants.spoolDirectory))
+                ?? []
+            #expect(spoolLeftovers.isEmpty)
+        }
+    }
 }

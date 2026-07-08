@@ -16,3 +16,6 @@ Storage/buckets/*
 
 Storage/multipart/*
 !Storage/multipart/.gitkeep
+
+Storage/spool/*
+!Storage/spool/.gitkeep

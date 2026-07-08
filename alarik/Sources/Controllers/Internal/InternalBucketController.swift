@@ -507,20 +507,27 @@ struct InternalBucketController: RouteCollection {
         // Get bucket versioning status from cache
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        // Write object with versioning support
-        if versioningStatus != .disabled {
-            let versionId = try ObjectFileHandler.writeVersioned(
-                metadata: meta,
-                data: fileData,
-                bucketName: bucketName,
-                key: keyPath,
-                versioningStatus: versioningStatus
-            )
-            meta.versionId = versionId
+        // Write object with versioning support - real blocking file IO, offloaded to the
+        // blocking-IO thread pool rather than tying up the async executor.
+        let initialMeta = meta
+        let writtenVersionId: String? = try await S3Service.offloadBlockingIO(req) {
+            if versioningStatus != .disabled {
+                return try ObjectFileHandler.writeVersioned(
+                    metadata: initialMeta,
+                    data: fileData,
+                    bucketName: bucketName,
+                    key: keyPath,
+                    versioningStatus: versioningStatus
+                )
+            } else {
+                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                try ObjectFileHandler.write(metadata: initialMeta, data: fileData, to: path)
+                return nil
+            }
+        }
+        if let writtenVersionId {
+            meta.versionId = writtenVersionId
             meta.isLatest = true
-        } else {
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            try ObjectFileHandler.write(metadata: meta, data: fileData, to: path)
         }
 
         await NotificationService.emit(
@@ -1516,14 +1523,9 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
-        guard let data = data else {
-            throw Abort(.internalServerError, reason: "Could not read object data")
+        _ = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = input.tags }
         }
-
-        var updatedMeta = meta
-        updatedMeta.tags = input.tags
-        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
 
         return TagsDTO(tags: input.tags)
     }
@@ -1578,19 +1580,16 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
-        guard let data = data else {
-            throw Abort(.internalServerError, reason: "Could not read object data")
-        }
-
         // Lowercase keys, same normalization handleObjectPut applies to x-amz-meta-* headers
         let normalizedMetadata = Dictionary(
             uniqueKeysWithValues: input.metadata.map { ($0.key.lowercased(), $0.value) })
 
-        var updatedMeta = meta
-        updatedMeta.contentType = input.contentType
-        updatedMeta.metadata = normalizedMetadata
-        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
+        _ = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path) {
+                $0.contentType = input.contentType
+                $0.metadata = normalizedMetadata
+            }
+        }
 
         return ObjectMetadataDTO(contentType: input.contentType, metadata: normalizedMetadata)
     }
@@ -1614,14 +1613,9 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        let (meta, data) = try ObjectFileHandler.read(from: path, loadData: true)
-        guard let data = data else {
-            throw Abort(.internalServerError, reason: "Could not read object data")
+        _ = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
-
-        var updatedMeta = meta
-        updatedMeta.tags = nil
-        try ObjectFileHandler.write(metadata: updatedMeta, data: data, to: path)
 
         return .noContent
     }
