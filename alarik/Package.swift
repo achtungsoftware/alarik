@@ -10,6 +10,8 @@ let package = Package(
         .package(url: "https://github.com/juliangerhards/vapor.git", branch: "main"),
         .package(url: "https://github.com/vapor/fluent.git", from: "4.9.0"),
         .package(url: "https://github.com/vapor/fluent-sqlite-driver.git", from: "4.6.0"),
+        .package(url: "https://github.com/vapor/fluent-postgres-driver.git", from: "2.12.0"),
+        .package(url: "https://github.com/vapor/postgres-kit.git", from: "2.15.1"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/CoreOffice/XMLCoder.git", from: "0.17.1"),
         .package(url: "https://github.com/vapor/jwt.git", from: "5.0.0"),
@@ -22,6 +24,8 @@ let package = Package(
             dependencies: [
                 .product(name: "Fluent", package: "fluent"),
                 .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
+                .product(name: "FluentPostgresDriver", package: "fluent-postgres-driver"),
+                .product(name: "PostgresKit", package: "postgres-kit"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
@@ -39,6 +43,7 @@ let package = Package(
             dependencies: [
                 .target(name: "Alarik"),
                 .product(name: "VaporTesting", package: "vapor"),
+                .product(name: "PostgresKit", package: "postgres-kit"),
             ],
             resources: [
                 .process("Files")

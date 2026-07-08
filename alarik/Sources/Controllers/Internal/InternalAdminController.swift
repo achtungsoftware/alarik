@@ -302,6 +302,8 @@ struct InternalAdminController: RouteCollection {
         for bucket in buckets {
             try BucketHandler.forceDelete(name: bucket.name)
             await BucketVersioningCache.shared.removeBucket(bucket.name)
+            CacheInvalidationService.notify(
+                on: req.db, cache: "bucketVersioning", op: .remove, key: bucket.name)
         }
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -

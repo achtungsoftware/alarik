@@ -832,6 +832,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return VersioningStatusDTO(status: newStatus.rawValue)
     }
@@ -923,6 +924,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return PolicyDTO(policy: rawJSON)
     }
@@ -932,6 +934,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
     }
 
     @Sendable
@@ -1065,6 +1068,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "notificationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued events for rules that were just removed - if a rule
         // is deleted because its endpoint is wrong or compromised, in-flight deliveries to the
@@ -1258,6 +1262,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
 
         return ReplicationTargetsDTO(targets: normalizedTargets)
     }
@@ -1332,6 +1337,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued tasks for rules that were just removed - same
         // reasoning as the equivalent webhook-delivery purge above.

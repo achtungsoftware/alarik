@@ -44,16 +44,21 @@ struct BucketService {
             // Get all access keys for this user
             let userAccessKeys = await AccessKeyUserMapCache.shared.accessKeys(for: userId)
 
-            // Map the bucket to ALL of the user's access keys
+            // Map the bucket to ALL of the user's access keys - each key's set gets its own
+            // notify (not one per bucket), since each iteration here touches a different key.
             for accessKey in userAccessKeys {
                 await AccessKeyBucketMapCache.shared.add(
                     accessKey: accessKey,
                     bucketName: bucketName
                 )
+                CacheInvalidationService.notify(
+                    on: database, cache: "accessKeyBucket", op: .upsert, key: accessKey)
             }
 
             await BucketVersioningCache.shared.addBucket(
                 bucketName, versioningStatus: versioningEnabled ? .enabled : .disabled)
+            CacheInvalidationService.notify(
+                on: database, cache: "bucketVersioning", op: .upsert, key: bucketName)
         } catch {
             // Best-effort: each step rolls back independently, so a failure in one (e.g. the
             // directory was never created) doesn't prevent the others from running, and the
@@ -61,6 +66,8 @@ struct BucketService {
             try? await bucket.delete(on: database)
             try? BucketHandler.delete(name: bucketName, force: true)
             await BucketVersioningCache.shared.removeBucket(bucketName)
+            CacheInvalidationService.notify(
+                on: database, cache: "bucketVersioning", op: .remove, key: bucketName)
             throw error
         }
     }
@@ -79,11 +86,22 @@ struct BucketService {
             .delete()
 
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
+        CacheInvalidationService.notify(
+            on: database, cache: "accessKeyBucket", op: .removeBucket, key: bucketName)
         await BucketVersioningCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(
+            on: database, cache: "bucketVersioning", op: .remove, key: bucketName)
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        CacheInvalidationService.notify(on: database, cache: "bucketPolicy", op: .remove, key: bucketName)
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+        CacheInvalidationService.notify(
+            on: database, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
         await NotificationConfigCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(
+            on: database, cache: "notificationConfig", op: .remove, key: bucketName)
         await ReplicationConfigCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(
+            on: database, cache: "replicationConfig", op: .remove, key: bucketName)
 
         // Drop any queued webhook deliveries / replication tasks for the deleted bucket -
         // retrying them would announce or push objects for a bucket that no longer exists

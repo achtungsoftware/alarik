@@ -121,10 +121,14 @@ struct InternalUserController: RouteCollection {
             accessKey: create.accessKey,
             secretKey: create.secretKey
         )
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeySecret", op: .upsert, key: create.accessKey)
         await AccessKeyUserMapCache.shared.add(
             accessKey: create.accessKey,
             userId: auth.userId
         )
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeyUser", op: .upsert, key: create.accessKey)
 
         // Map the new access key to all existing buckets for this user
         let userBuckets = try await Bucket.query(on: req.db)
@@ -137,6 +141,10 @@ struct InternalUserController: RouteCollection {
                 bucketName: bucket.name
             )
         }
+        // One notify for the whole key, not per bucket - accessKeyBucket/upsert reloads this
+        // key's entire bucket set from the DB in one shot on the receiving end.
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
 
         return accessKey.toResponseDTO()
     }
@@ -200,6 +208,8 @@ struct InternalUserController: RouteCollection {
         for bucket in buckets {
             try BucketHandler.forceDelete(name: bucket.name)
             await BucketVersioningCache.shared.removeBucket(bucket.name)
+            CacheInvalidationService.notify(
+                on: req.db, cache: "bucketVersioning", op: .remove, key: bucket.name)
         }
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -

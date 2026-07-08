@@ -374,6 +374,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -408,6 +409,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
@@ -433,6 +435,8 @@ struct S3Controller: RouteCollection {
 
         await BucketPolicyCache.shared.setPublicAccessBlock(
             for: bucketName, configuration: configuration)
+        CacheInvalidationService.notify(
+            on: req.db, cache: "bucketPublicAccessBlock", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -454,6 +458,8 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+        CacheInvalidationService.notify(
+            on: req.db, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -544,6 +550,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -629,6 +636,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
 
         return .noContent
     }

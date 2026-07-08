@@ -70,8 +70,9 @@ struct InternalAuthOIDCController: RouteCollection {
         let codeVerifier = OIDCPKCE.randomURLSafeString()
         let codeChallenge = OIDCPKCE.codeChallenge(forVerifier: codeVerifier)
 
-        await OIDCStateCache.shared.store(
-            state: state, providerId: providerId, nonce: nonce, codeVerifier: codeVerifier)
+        try await OIDCStateCache.shared.store(
+            on: req.db, state: state, providerId: providerId, nonce: nonce,
+            codeVerifier: codeVerifier)
 
         var components = URLComponents(string: discovery.authorizationEndpoint)
         components?.queryItems = [
@@ -132,7 +133,8 @@ struct InternalAuthOIDCController: RouteCollection {
             return errorRedirect("missing_code_or_state")
         }
 
-        guard let stateEntry = await OIDCStateCache.shared.consume(state: state) else {
+        guard let stateEntry = try await OIDCStateCache.shared.consume(on: req.db, state: state)
+        else {
             return errorRedirect("invalid_or_expired_state")
         }
 
