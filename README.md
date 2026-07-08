@@ -133,14 +133,12 @@ We use MinIO’s own benchmarking tool, `warp`, to measure performance. Both the
 
 We welcome contributions of any size. Please:
 
--   Use `dev` branch as your base branch - not master
+-   Fork Alarik and create a new branch e.g. feature/my-new-feature
 -   Use clear, descriptive commit messages
 -   Open an issue before starting larger work
 -   Follow Swift best practices
 -   Add tests for new functionality where appropriate
 -   Keep pull requests focused and incremental
-
-More detailed contributing guidelines will be added soon.
 
 ---
 
