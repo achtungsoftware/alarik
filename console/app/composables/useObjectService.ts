@@ -106,44 +106,113 @@ export function useObjectService() {
         }
     }
 
+    /// Fetches `url` and reports live progress as bytes arrive, instead of the browser giving
+    /// no feedback at all until `response.blob()` resolves - which for a large object could be
+    /// minutes of the UI looking completely idle. `total` is null when the response has no
+    /// Content-Length (e.g. the ZIP multi-file download, whose size isn't known upfront).
+    async function fetchWithProgress(
+        url: string,
+        options: RequestInit,
+        onProgress: (loaded: number, total: number | null) => void
+    ): Promise<{ blob: Blob; response: Response }> {
+        const response = await fetch(url, options);
+        if (!response.ok) {
+            throw new Error(`Download failed: ${response.statusText}`);
+        }
+
+        const contentLength = response.headers.get("Content-Length");
+        const total = contentLength ? parseInt(contentLength, 10) : null;
+
+        if (!response.body) {
+            // Streaming reads aren't available in this environment - fall back to a single
+            // await with no progress reporting, rather than failing the download entirely.
+            const blob = await response.blob();
+            onProgress(blob.size, total);
+            return { blob, response };
+        }
+
+        const reader = response.body.getReader();
+        const chunks: BlobPart[] = [];
+        let loaded = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+                chunks.push(value as BlobPart);
+                loaded += value.length;
+                onProgress(loaded, total);
+            }
+        }
+
+        return { blob: new Blob(chunks), response };
+    }
+
+    /// One line of human-readable progress, shown live in the download toast - a percentage
+    /// when the total size is known, otherwise just the running byte count.
+    function formatProgress(loaded: number, total: number | null): string {
+        if (total && total > 0) {
+            const percent = Math.min(100, Math.round((loaded / total) * 100));
+            return `${percent}% • ${formatBytes(loaded)} / ${formatBytes(total)}`;
+        }
+        return `${formatBytes(loaded)} downloaded`;
+    }
+
     async function downloadObjects(bucket: string, keys: string[]): Promise<boolean> {
         if (keys.length === 0) return false;
 
         isDownloading.value = true;
 
+        const label = keys.length === 1 ? (keys[0]?.split("/").pop() ?? keys[0]!) : `${keys.length} items`;
+        const toastId = toast.add({
+            title: `Downloading ${label}`,
+            description: "Starting…",
+            icon: "i-lucide-download",
+            color: "primary",
+            duration: 0,
+        }).id;
+        let lastUpdate = 0;
+
         try {
-            const response = await fetch(`${apiBaseUrl}/api/v1/objects/download`, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${jwtCookie.value}`,
-                    "Content-Type": "application/json",
+            const { blob, response } = await fetchWithProgress(
+                `${apiBaseUrl}/api/v1/objects/download`,
+                {
+                    method: "POST",
+                    headers: {
+                        Authorization: `Bearer ${jwtCookie.value}`,
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ bucket, keys }),
                 },
-                body: JSON.stringify({ bucket, keys }),
-            });
+                (loaded, total) => {
+                    // Progress arrives in a tight loop on fast connections - updating the
+                    // toast on every chunk would just churn re-renders for no visible benefit.
+                    const now = Date.now();
+                    if (now - lastUpdate < 150 && loaded !== total) return;
+                    lastUpdate = now;
+                    toast.update(toastId, { description: formatProgress(loaded, total) });
+                }
+            );
 
-            if (!response.ok) {
-                throw new Error(`Download failed: ${response.statusText}`);
-            }
-
-            const blob = await response.blob();
             const filename = extractFilename(response) || "download";
-
             triggerBrowserDownload(blob, filename);
 
-            toast.add({
-                title: "Download Started",
-                description: `Downloading ${keys.length} item${keys.length !== 1 ? "s" : ""}`,
-                icon: "i-lucide-download",
+            toast.update(toastId, {
+                title: "Download Complete",
+                description: `${keys.length} item${keys.length !== 1 ? "s" : ""} downloaded successfully`,
+                icon: "i-lucide-circle-check",
                 color: "success",
+                duration: undefined,
             });
 
             return true;
         } catch (err: any) {
-            toast.add({
+            toast.update(toastId, {
                 title: "Download Failed",
                 description: err.data?.reason ?? err.message ?? "Unknown error",
                 icon: "i-lucide-circle-x",
                 color: "error",
+                duration: undefined,
             });
             return false;
         } finally {
@@ -154,39 +223,54 @@ export function useObjectService() {
     async function downloadSingleObject(bucket: string, key: string): Promise<boolean> {
         isDownloading.value = true;
 
+        const displayName = key.split("/").pop() || key;
+        const toastId = toast.add({
+            title: `Downloading ${displayName}`,
+            description: "Starting…",
+            icon: "i-lucide-download",
+            color: "primary",
+            duration: 0,
+        }).id;
+        let lastUpdate = 0;
+
         try {
-            const response = await fetch(`${apiBaseUrl}/api/v1/objects/download`, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${jwtCookie.value}`,
-                    "Content-Type": "application/json",
+            const { blob, response } = await fetchWithProgress(
+                `${apiBaseUrl}/api/v1/objects/download`,
+                {
+                    method: "POST",
+                    headers: {
+                        Authorization: `Bearer ${jwtCookie.value}`,
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ bucket, keys: [key] }),
                 },
-                body: JSON.stringify({ bucket, keys: [key] }),
-            });
+                (loaded, total) => {
+                    const now = Date.now();
+                    if (now - lastUpdate < 150 && loaded !== total) return;
+                    lastUpdate = now;
+                    toast.update(toastId, { description: formatProgress(loaded, total) });
+                }
+            );
 
-            if (!response.ok) {
-                throw new Error(`Download failed: ${response.statusText}`);
-            }
-
-            const blob = await response.blob();
-            const filename = extractFilename(response) || key.split("/").pop() || "download";
-
+            const filename = extractFilename(response) || displayName;
             triggerBrowserDownload(blob, filename);
 
-            toast.add({
-                title: "Download Started",
-                description: `Downloading ${filename}`,
-                icon: "i-lucide-download",
+            toast.update(toastId, {
+                title: "Download Complete",
+                description: filename,
+                icon: "i-lucide-circle-check",
                 color: "success",
+                duration: undefined,
             });
 
             return true;
         } catch (err: any) {
-            toast.add({
+            toast.update(toastId, {
                 title: "Download Failed",
                 description: err.data?.reason ?? err.message ?? "Unknown error",
                 icon: "i-lucide-circle-x",
                 color: "error",
+                duration: undefined,
             });
             return false;
         } finally {

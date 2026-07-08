@@ -63,6 +63,10 @@ const { isDeleting, isDownloading, deleteObjects, downloadObjects, downloadSingl
 const { addToQueue, addFolderToQueue, isUploading, openSlideover, onBatchComplete } = useUploadQueue();
 const { filesFromDataTransfer } = useDragDropFiles();
 
+// Tracks which row's Download button is mid-download - the request can take a while for a
+// large object, and without this the button gives no sign anything is happening.
+const downloadingKey = ref<string | null>(null);
+
 // Refresh the list when uploads complete
 onBatchComplete(() => {
     refresh();
@@ -437,9 +441,16 @@ const columns: TableColumn<BrowserItem>[] = [
                     color: "neutral",
                     size: "sm",
                     icon: "i-lucide-download",
+                    loading: downloadingKey.value === item.key,
+                    disabled: downloadingKey.value !== null && downloadingKey.value !== item.key,
                     onClick: async (e: Event) => {
                         e.stopPropagation();
-                        await downloadSingleObject(currentBucket.value, item.key);
+                        downloadingKey.value = item.key;
+                        try {
+                            await downloadSingleObject(currentBucket.value, item.key);
+                        } finally {
+                            downloadingKey.value = null;
+                        }
                     },
                 }),
                 h(resolveComponent("UButton"), {
