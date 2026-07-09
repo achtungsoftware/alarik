@@ -21,11 +21,10 @@ import Vapor
 
 @testable import Alarik
 
-/// Tier 1 (see Phase 1 plan): no Postgres, no LISTEN - exercises the whole
 /// `CacheInvalidationMessage` -> `CacheReloadDispatch.apply` reload path directly against a real
 /// SQLite test `app.db`, since the reload queries themselves are backend-agnostic. This is the
 /// bulk of the invalidation logic's test coverage; only the actual NOTIFY delivery and the
-/// OIDCStateCache DB-table mode need a real Postgres (Tier 2/3, local-only for now).
+/// OIDCStateCache DB-table mode need a real Postgres (local-only for now).
 @Suite("CacheInvalidationService / CacheReloadDispatch tests", .serialized)
 struct CacheInvalidationServiceTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -79,8 +78,7 @@ struct CacheInvalidationServiceTests {
         try await withApp { app in
             // Nothing to assert beyond "this returns promptly and doesn't crash" - on SQLite
             // the guard in `notify` fails before any Task is even spawned, so there is no
-            // async side effect to observe. Real NOTIFY delivery is a Postgres-only concern,
-            // covered in Tier 2.
+            // async side effect to observe. Real NOTIFY delivery is a Postgres-only concern
             CacheInvalidationService.notify(
                 on: app.db, cache: "bucketVersioning", op: .upsert, key: "does-not-matter")
         }

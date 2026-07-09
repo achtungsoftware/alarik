@@ -72,7 +72,7 @@ struct S3Controller: RouteCollection {
         // public-access whitelist)
         if lowerQuery.contains("uploads") && !lowerQuery.contains("uploadid") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-            return try handleListMultipartUploads(req: req, bucketName: bucketName)
+            return try await handleListMultipartUploads(req: req, bucketName: bucketName)
         }
 
         // Handle ?versions - list object versions (always requires strict auth)
@@ -80,7 +80,7 @@ struct S3Controller: RouteCollection {
         let isListVersions = lowerQuery.contains("versions") && !lowerQuery.contains("versioning")
         if isListVersions {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-            return try handleListVersions(req: req, bucketName: bucketName)
+            return try await handleListVersions(req: req, bucketName: bucketName)
         }
 
         // Handle subresource queries (location, policy, versioning config) - always requires
@@ -107,13 +107,15 @@ struct S3Controller: RouteCollection {
 
         let params = S3Service.parseListObjectsParams(from: req, bucketName: bucketName)
 
-        let (objects, commonPrefixes, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
-            bucketName: params.bucketName,
-            prefix: params.prefix,
-            delimiter: params.delimiter,
-            maxKeys: params.maxKeys,
-            marker: params.marker
-        )
+        let (objects, commonPrefixes, isTruncated, nextMarker) =
+            try await ClusterListingService.listObjects(
+                req: req,
+                bucketName: params.bucketName,
+                prefix: params.prefix,
+                delimiter: params.delimiter,
+                maxKeys: params.maxKeys,
+                marker: params.marker
+            )
 
         // listObjects already returns the latest version of each object and filters delete markers
         let xmlData = try S3Service.buildListObjectsResponse(
@@ -129,7 +131,7 @@ struct S3Controller: RouteCollection {
 
     /// Handles GET /:bucketName?versions - list all object versions
     @Sendable
-    private func handleListVersions(req: Request, bucketName: String) throws -> Response {
+    private func handleListVersions(req: Request, bucketName: String) async throws -> Response {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
         let keyMarker = req.query[String.self, at: "key-marker"]
@@ -139,7 +141,8 @@ struct S3Controller: RouteCollection {
         let (
             versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker
         ) =
-            try ObjectFileHandler.listAllVersions(
+            try await ClusterListingService.listAllVersions(
+                req: req,
                 bucketName: bucketName,
                 prefix: prefix,
                 delimiter: delimiter,
@@ -179,6 +182,22 @@ struct S3Controller: RouteCollection {
         return response
     }
 
+    /// Read-only cluster routing check for handlers that only ever need the forward-or-not
+    /// answer (no local write, so no `peers` to carry forward for replication) - HEAD, tagging
+    /// GET, and plain object GET. Returns the forwarded response when this node isn't
+    /// responsible for `key`; `nil` means serve locally.
+    private func forwardIfNeeded(req: Request, bucketName: String, key: String) async throws
+        -> Response?
+    {
+        guard
+            case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+                req: req, bucketName: bucketName, key: key)
+        else {
+            return nil
+        }
+        return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+    }
+
     @Sendable
     func handleObjectHead(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
@@ -192,6 +211,10 @@ struct S3Controller: RouteCollection {
         _ = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+            return forwarded
+        }
 
         // Read object (versioned or non-versioned)
         let (meta, _): (ObjectMeta, Data?)
@@ -609,7 +632,19 @@ struct S3Controller: RouteCollection {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 
-        if ObjectFileHandler.hasBucketObjects(bucketName: bucketName) {
+        let notEmpty: Bool
+        do {
+            notEmpty = try await ClusterListingService.hasBucketObjects(
+                req: req, bucketName: bucketName)
+        } catch {
+            throw S3Error(
+                status: .serviceUnavailable,
+                code: "ServiceUnavailable",
+                message:
+                    "Could not verify the bucket is empty across every cluster node; refusing to delete."
+            )
+        }
+        if notEmpty {
             throw S3Error(
                 status: .conflict,
                 code: "BucketNotEmpty",
@@ -617,7 +652,11 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        try await BucketService.delete(on: req.db, bucketName: bucketName, userId: bucket.user.id!)
+        // force: true - the cluster-wide emptiness check above already ran authoritatively, so
+        // BucketHandler.delete's own redundant *local-only* re-check is skipped rather than left
+        // in as a second, incomplete gate.
+        try await BucketService.delete(
+            on: req.db, bucketName: bucketName, userId: bucket.user.id!, force: true)
 
         return .noContent
     }
@@ -654,6 +693,17 @@ struct S3Controller: RouteCollection {
         }
 
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        // Cluster routing: one check covers this whole handler's dispatch tree (UploadPart,
+        // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
+        // (bucketName, keyPath).
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
 
         // Check if this is an UploadPart request (PUT with partNumber & uploadId)
         if let partNumberStr = req.query[String.self, at: "partNumber"],
@@ -696,7 +746,8 @@ struct S3Controller: RouteCollection {
                 destinationBucket: bucketName,
                 destinationKey: keyPath,
                 copySource: copySource,
-                versioningStatus: versioningStatus
+                versioningStatus: versioningStatus,
+                peers: peers
             )
         }
 
@@ -806,6 +857,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: bucketName, key: keyPath, versionId: writtenVersionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: keyPath,
+            versionId: writtenVersionId, operation: .put, peers: peers)
 
         return Response(status: .ok, headers: headers)
     }
@@ -853,6 +907,10 @@ struct S3Controller: RouteCollection {
         async throws -> Response
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: key) {
+            return forwarded
+        }
 
         let versionId = req.query[String.self, at: "versionId"]
         guard
@@ -904,29 +962,55 @@ struct S3Controller: RouteCollection {
 
     // Helper method to handle copy operations
     @Sendable
+    /// Resolves a CopyObject/UploadPartCopy source - locally if this node holds it, otherwise
+    /// fetches it from a responsible peer into a local temp file first. Source and destination
+    /// of a copy can be arbitrary, unrelated buckets/keys with no placement relationship to each
+    /// other, so the source may live elsewhere even though this node is already correctly
+    /// responsible for the destination (that's what the caller's own top-level routing check
+    /// already established). Returns the same shape `S3Service.resolveObjectForCopy` does
+    /// either way; callers must call `cleanup` once done reading (a no-op when the source was
+    /// local - that path never allocates a temp file).
+    private func resolveCopySource(
+        req: Request, bucketName: String, key: String, versionId: String?
+    ) async throws -> (
+        meta: ObjectMeta, path: String, payloadOffset: Int, payloadSize: Int, cleanup: () -> Void
+    ) {
+        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+            req: req, bucketName: bucketName, key: key)
+        if isLocal {
+            let (meta, path, offset, size) = try await S3Service.offloadBlockingIO(req) {
+                try S3Service.resolveObjectForCopy(
+                    bucketName: bucketName, key: key, versionId: versionId, requestId: req.id)
+            }
+            return (meta, path, offset, size, {})
+        }
+        let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
+            app: req.application, candidates: candidates, bucketName: bucketName, key: key,
+            versionId: versionId, requestId: req.id)
+        return (meta, tempPath, 0, meta.size, { _ = POSIXFile.unlink(tempPath) })
+    }
+
     private func handleCopyObject(
         req: Request,
         destinationBucket: String,
         destinationKey: String,
         copySource: CopySource,
-        versioningStatus: VersioningStatus
+        versioningStatus: VersioningStatus,
+        peers: [ClusterNodeInfo] = []
     ) async throws -> Response {
         try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
 
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Resolve the source straight to its on-disk file - the payload is streamed
-        // file-to-file in fixed windows, never buffered whole
-        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try await S3Service.offloadBlockingIO(req) {
-                try S3Service.resolveObjectForCopy(
-                    bucketName: copySource.bucketName,
-                    key: copySource.key,
-                    versionId: copySource.versionId,
-                    requestId: req.id
-                )
-            }
+        // Resolve the source straight to its on-disk file (fetching it from a peer first if
+        // this node doesn't hold it) - the payload is streamed file-to-file in fixed windows,
+        // never buffered whole.
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
+            try await resolveCopySource(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId)
+        defer { cleanupSource() }
 
         // Validate copy conditions (if-match, if-none-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -1036,6 +1120,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: destinationBucket, key: destinationKey, versionId: versionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: destinationBucket, key: destinationKey,
+            versionId: versionId, operation: .put, peers: peers)
 
         // Build copy result response (S3 returns XML for copy operations)
         let copyResult = """
@@ -1061,6 +1148,11 @@ struct S3Controller: RouteCollection {
         // public-access whitelist, so it's checked before any anonymous-access decision.
         if let uploadId = req.query[String.self, at: "uploadId"] {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+            if let forwarded = try await forwardIfNeeded(
+                req: req, bucketName: bucketName, key: keyPath)
+            {
+                return forwarded
+            }
             return try handleListParts(
                 req: req,
                 bucketName: bucketName,
@@ -1081,6 +1173,10 @@ struct S3Controller: RouteCollection {
         _ = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+            return forwarded
+        }
 
         // Resolve to a single on-disk path up front - the meta, conditional checks, range
         // math, and body all come off that one file, and large payloads stream from it
@@ -1149,6 +1245,16 @@ struct S3Controller: RouteCollection {
 
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // Cluster routing: one check covers this handler's dispatch tree (AbortMultipartUpload,
+        // tagging DELETE, plain object DELETE) - all key off this same (bucketName, keyPath).
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         // Check if this is AbortMultipartUpload (DELETE with uploadId, no versionId)
         if let uploadId = req.query[String.self, at: "uploadId"],
             req.query[String.self, at: "versionId"] == nil
@@ -1170,14 +1276,12 @@ struct S3Controller: RouteCollection {
         let versionId = req.query[String.self, at: "versionId"]
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        let outcome = try await S3Service.offloadBlockingIO(req) {
-            try S3Service.deleteObject(
-                bucketName: bucketName,
-                key: keyPath,
-                versionId: versionId,
-                versioningStatus: versioningStatus
-            )
-        }
+        // Unlike external replication (below), cluster peers physically hold the exact same
+        // version files as this node, so an explicit historical-version delete DOES need to
+        // propagate - always fan out, not just for current-object deletes.
+        let outcome = try await ClusterReplicationService.coordinateDelete(
+            app: req.application, bucketName: bucketName, key: keyPath, versionId: versionId,
+            versioningStatus: versioningStatus, peers: peers)
 
         var headers = HTTPHeaders()
         if let resultVersionId = outcome.versionId {
@@ -1243,14 +1347,9 @@ struct S3Controller: RouteCollection {
             }
 
             do {
-                let outcome = try await S3Service.offloadBlockingIO(req) {
-                    try S3Service.deleteObject(
-                        bucketName: bucketName,
-                        key: object.key,
-                        versionId: object.versionId,
-                        versioningStatus: versioningStatus
-                    )
-                }
+                let outcome = try await deleteOneObjectInBatch(
+                    req: req, bucketName: bucketName, key: object.key,
+                    versionId: object.versionId, versioningStatus: versioningStatus)
 
                 deleted.append(
                     DeletedEntry(
@@ -1284,6 +1383,41 @@ struct S3Controller: RouteCollection {
         let xmlData = try S3Service.buildDeleteObjectsResponse(
             deleted: quiet ? [] : deleted, errors: errors)
         return S3Service.buildXMLResponse(data: xmlData)
+    }
+
+    /// Per-key cluster routing for Multi-Object-Delete: each key in the batch can have a
+    /// different responsible node set, so (unlike a single-object DELETE) there's no one
+    /// whole-request forward decision. `authenticateWithCache` already validated the client once
+    /// for the entire batch in `handleBucketPost`, so a key this node isn't responsible for is
+    /// delegated straight to a responsible peer over the internal, secret-only replication
+    /// protocol rather than requiring a second per-key client signature. Tries peers in order
+    /// (only one becomes the delegate coordinator - never all of them, which would mint a
+    /// separate delete marker id per peer).
+    private func deleteOneObjectInBatch(
+        req: Request, bucketName: String, key: String, versionId: String?,
+        versioningStatus: VersioningStatus
+    ) async throws -> S3Service.ObjectDeleteOutcome {
+        let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
+            req: req, bucketName: bucketName, key: key)
+
+        if isLocal {
+            return try await ClusterReplicationService.coordinateDelete(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+                versioningStatus: versioningStatus, peers: peers)
+        }
+
+        var lastError: any Error = ClusterProxyError.objectNotFound
+        for node in responsible {
+            do {
+                return try await ClusterReplicationClient.deleteObject(
+                    app: req.application, to: node, bucketName: bucketName, key: key,
+                    versionId: versionId, coordinate: true)
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        throw lastError
     }
 
     /// Parses the Multi-Object Delete request XML body:
@@ -1365,6 +1499,19 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // Cluster routing: multipart create/complete both key off the same (bucketName,
+        // keyPath) as any other write to this object, so one check here covers both -
+        // forwarding a create/uploadPart/complete/abort sequence anywhere else would split a
+        // single upload's parts across nodes with no way to reassemble them, so the whole
+        // lifecycle must land on the same responsible node.
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         // POST ?uploads → CreateMultipartUpload
         if query.lowercased().contains("uploads") && !query.contains("uploadId") {
             return try handleCreateMultipartUpload(req: req, bucketName: bucketName, key: keyPath)
@@ -1373,7 +1520,7 @@ struct S3Controller: RouteCollection {
         // POST ?uploadId=X → CompleteMultipartUpload
         if let uploadId = req.query[String.self, at: "uploadId"] {
             return try await handleCompleteMultipartUpload(
-                req: req, bucketName: bucketName, key: keyPath, uploadId: uploadId)
+                req: req, bucketName: bucketName, key: keyPath, uploadId: uploadId, peers: peers)
         }
 
         throw S3Error(
@@ -1430,7 +1577,8 @@ struct S3Controller: RouteCollection {
         req: Request,
         bucketName: String,
         key: String,
-        uploadId: String
+        uploadId: String,
+        peers: [ClusterNodeInfo] = []
     ) async throws -> Response {
         // Verify upload exists
         guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
@@ -1480,6 +1628,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: bucketName, key: key, versionId: versionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+            operation: .put, peers: peers)
 
         // Build response headers
         var headers = HTTPHeaders()
@@ -1602,17 +1753,14 @@ struct S3Controller: RouteCollection {
         // Authenticate access to the source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Resolve the source straight to its on-disk file - the copied region is streamed
-        // file-to-file in fixed windows, never buffered whole
-        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try await S3Service.offloadBlockingIO(req) {
-                try S3Service.resolveObjectForCopy(
-                    bucketName: copySource.bucketName,
-                    key: copySource.key,
-                    versionId: copySource.versionId,
-                    requestId: req.id
-                )
-            }
+        // Resolve the source straight to its on-disk file (fetching it from a peer first if
+        // this node doesn't hold it) - the copied region is streamed file-to-file in fixed
+        // windows, never buffered whole.
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
+            try await resolveCopySource(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId)
+        defer { cleanupSource() }
 
         // Validate copy conditions (x-amz-copy-source-if-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -1743,14 +1891,17 @@ struct S3Controller: RouteCollection {
 
     /// ListMultipartUploads - GET /:bucket?uploads
     @Sendable
-    private func handleListMultipartUploads(req: Request, bucketName: String) throws -> Response {
+    private func handleListMultipartUploads(req: Request, bucketName: String) async throws
+        -> Response
+    {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let keyMarker = req.query[String.self, at: "key-marker"]
         let uploadIdMarker = req.query[String.self, at: "upload-id-marker"]
         let maxUploads = req.query[Int.self, at: "max-uploads"] ?? 1000
 
         let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
-            try MultipartFileHandler.listUploads(
+            try await ClusterListingService.listUploads(
+                req: req,
                 bucketName: bucketName,
                 prefix: prefix,
                 keyMarker: keyMarker,

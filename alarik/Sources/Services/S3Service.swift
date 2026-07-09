@@ -147,33 +147,18 @@ struct S3Service {
                             message: "The object changed while the response was being prepared")
                     }
 
-                    let allocator = ByteBufferAllocator()
-                    var position = snapshot.payloadOffset + start
-                    var remaining = length
-                    while remaining > 0 {
-                        let toRead = Swift.min(Constants.streamingReadChunkSize, remaining)
-                        let readPosition = position
-                        let chunk = try await threadPool.runIfActive { () -> ByteBuffer in
-                            var buffer = allocator.buffer(capacity: toRead)
-                            _ = try buffer.writeWithUnsafeMutableBytes(
-                                minimumWritableBytes: toRead
-                            ) { raw in
-                                let bytesRead = POSIXFile.pread(
-                                    fd, raw.baseAddress!, toRead, off_t(readPosition))
-                                guard bytesRead > 0 else {
-                                    throw S3Error(
-                                        status: .internalServerError, code: "InternalError",
-                                        message: "Object payload ended early")
-                                }
-                                return bytesRead
-                            }
-                            return buffer
-                        }
-                        position += chunk.readableBytes
-                        remaining -= chunk.readableBytes
+                    try await StreamingIOLoops.readWindowed(
+                        threadPool: threadPool, fd: fd, offset: snapshot.payloadOffset + start,
+                        length: length, chunkSize: Constants.streamingReadChunkSize
+                    ) { chunk in
                         try await writer.writeBuffer(chunk)
                     }
                     _ = POSIXFile.close(fd)
+                } catch is IOLoopError {
+                    _ = POSIXFile.close(fd)
+                    throw S3Error(
+                        status: .internalServerError, code: "InternalError",
+                        message: "Object payload ended early")
                 } catch {
                     _ = POSIXFile.close(fd)
                     throw error
@@ -889,7 +874,7 @@ struct S3Service {
 
     /// Outcome of deleting a single object, used to build both the single-object
     /// DELETE response headers and the multi-object DeleteResult XML entries.
-    struct ObjectDeleteOutcome {
+    struct ObjectDeleteOutcome: Codable {
         let versionId: String?
         let isDeleteMarker: Bool
     }

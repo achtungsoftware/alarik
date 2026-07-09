@@ -21,7 +21,7 @@ import Vapor
 /// Applies an incoming `CacheInvalidationMessage` (received over the Postgres LISTEN channel
 /// by `CacheInvalidationListener`) to this node's own in-memory caches. A flat switch over
 /// `(cache, op)` rather than a registry/protocol abstraction - the set of caches is small and
-/// fixed for this phase, so a registry would be indirection with no payoff.
+/// fixed, so a registry would be indirection with no payoff.
 ///
 /// Every `upsert` re-reads the relevant row from this node's own DB via
 /// `LoadCacheLifecycle`'s shared mapper helpers - the exact same parsing `LoadCacheLifecycle`
@@ -140,6 +140,28 @@ enum CacheReloadDispatch {
             }
         case ("replicationConfig", .remove):
             await ReplicationConfigCache.shared.removeBucket(bucketName)
+
+        case ("clusterNode", .upsert):
+            let nodeId = message.key
+            guard let uuid = UUID(uuidString: nodeId) else { break }
+            if let node = try await ClusterNode.find(uuid, on: app.db) {
+                await ClusterNodeCache.shared.upsert(
+                    ClusterNodeInfo(
+                        id: uuid, address: node.address,
+                        status: ClusterNode.Status(rawValue: node.status) ?? .active,
+                        lastHeartbeatAt: node.lastHeartbeatAt))
+            } else {
+                await ClusterNodeCache.shared.remove(id: uuid)
+            }
+            // Membership genuinely changed (join, status flip, or a heartbeat refresh) - kick
+            // off a rebalance walk. Cheap no-op when nothing actually needs to move: the walk
+            // only enqueues tasks for objects whose responsible set changed.
+            await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+        case ("clusterNode", .remove):
+            if let uuid = UUID(uuidString: message.key) {
+                await ClusterNodeCache.shared.remove(id: uuid)
+                await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+            }
 
         default:
             app.logger.error("Unknown cache invalidation message: \(message)")

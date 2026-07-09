@@ -1,0 +1,185 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=alarik
+      - POSTGRES_PASSWORD=alarik
+      - POSTGRES_DB=alarik
+    volumes:
+      - alarik-postgres-dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alarik"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - alarik-network
+
+  alarik-build:
+    build:
+      context: ./alarik
+      dockerfile: Dockerfile.dev
+    image: alarik-cluster-dev:latest
+    container_name: alarik-cluster-dev-build
+    command: ["swift", "build"]
+    volumes:
+      - ./alarik:/app
+      - alarik-build:/app/.build
+
+
+  alarik-1:
+    image: alarik-cluster-dev:latest
+    container_name: alarik-cluster-dev-1
+    restart: unless-stopped
+    command: [".build/debug/Alarik", "serve", "--env", "development", "--hostname", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8081:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - API_BASE_URL=http://localhost:8081
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
+      - JWT=dev-cluster-jwt-secret
+      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-1:8080
+      - CLUSTER_SECRET=dev-cluster-secret
+      # Providing default keys is optional but necessary for testing
+      - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+      - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    volumes:
+      - ./alarik:/app
+      - alarik-build:/app/.build:ro
+      - alarik-1-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      alarik-build:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - alarik-network
+
+  alarik-2:
+    image: alarik-cluster-dev:latest
+    container_name: alarik-cluster-dev-2
+    restart: unless-stopped
+    command: [".build/debug/Alarik", "serve", "--env", "development", "--hostname", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8082:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - API_BASE_URL=http://localhost:8082
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
+      - JWT=dev-cluster-jwt-secret
+      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-2:8080
+      - CLUSTER_SECRET=dev-cluster-secret
+      - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+      - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    volumes:
+      - ./alarik:/app
+      - alarik-build:/app/.build:ro
+      - alarik-2-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      alarik-build:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      alarik-1:
+        condition: service_healthy
+    networks:
+      - alarik-network
+
+  alarik-3:
+    image: alarik-cluster-dev:latest
+    container_name: alarik-cluster-dev-3
+    restart: unless-stopped
+    command: [".build/debug/Alarik", "serve", "--env", "development", "--hostname", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8083:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - API_BASE_URL=http://localhost:8083
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
+      - JWT=dev-cluster-jwt-secret
+      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-3:8080
+      - CLUSTER_SECRET=dev-cluster-secret
+      - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+      - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    volumes:
+      - ./alarik:/app
+      - alarik-build:/app/.build:ro
+      - alarik-3-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      alarik-build:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      alarik-1:
+        condition: service_healthy
+    networks:
+      - alarik-network
+
+  # Point this at any one node - or, in production, at a load balancer in front of all three.
+  # Any node can serve any request, so there's no "primary" to pick.
+  console:
+    build:
+      context: ./console
+      dockerfile: Dockerfile.dev
+    container_name: console-cluster-dev
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "24678:24678" # Nuxt dev server HMR
+    environment:
+      - NODE_ENV=development
+      # Nuxt's runtimeConfig.public only auto-reads env vars with the NUXT_PUBLIC_ prefix (see
+      # console/nuxt.config.ts) - a bare API_BASE_URL is silently ignored and the console falls
+      # back to its hardcoded default (localhost:8080), which no node in this cluster listens on.
+      - NUXT_PUBLIC_API_BASE_URL=http://localhost:8081
+      - NUXT_PUBLIC_CONSOLE_BASE_URL=http://localhost:3000
+    volumes:
+      - ./console:/app
+      - /app/node_modules
+      - /app/.nuxt
+    depends_on:
+      - alarik-1
+      - alarik-2
+      - alarik-3
+    networks:
+      - alarik-network
+
+networks:
+  alarik-network:
+    driver: bridge
+
+volumes:
+  alarik-postgres-dev:
+  alarik-build:
+  alarik-1-storage:
+  alarik-2-storage:
+  alarik-3-storage:

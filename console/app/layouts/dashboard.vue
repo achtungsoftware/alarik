@@ -92,6 +92,13 @@ const items = computed<NavigationMenuItem[][]>(() => {
                 to: "/console/admin/oidcProviders",
                 active: route.path.startsWith("/console/admin/oidcProviders"),
                 disabled: !user.value.isAdmin,
+            },
+            {
+                label: "Cluster",
+                icon: "i-lucide-network",
+                to: "/console/admin/cluster",
+                active: route.path.startsWith("/console/admin/cluster"),
+                disabled: !user.value.isAdmin,
             }
         ],
         [

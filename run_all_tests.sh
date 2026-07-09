@@ -7,6 +7,7 @@
 #   3. rclone S3 tests           (rclone_tests.sh)
 #   4. MinIO client (mc) tests   (mc_tests.sh)
 #   5. Bucket replication tests  (replication_tests.sh - 2 real server instances)
+#   6. Cluster tests             (cluster_tests.sh - 4 real instances + Postgres)
 #
 # The S3 test suites run against a freshly built server that is started with a
 # clean, temporary state directory (empty database + storage) per suite, so
@@ -81,8 +82,14 @@ command -v aws >/dev/null || MISSING="$MISSING aws"
 command -v rclone >/dev/null || MISSING="$MISSING rclone"
 command -v mc >/dev/null || MISSING="$MISSING mc"
 command -v jq >/dev/null || MISSING="$MISSING jq"
+command -v docker >/dev/null || MISSING="$MISSING docker"
 if [ -n "$MISSING" ]; then
     echo "ERROR: missing required tools:$MISSING"
+    exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker daemon is not running - required for the cluster test suite's Postgres container."
     exit 1
 fi
 
@@ -199,6 +206,24 @@ if [ "$REPLICATION_FAILS" -gt 0 ]; then
     grep "^FAIL:" "$LOG_DIR/replication-tests.log" | sed 's/^/  /'
 fi
 record "Bucket replication tests" "$REPLICATION_RESULT" "$REPLICATION_PASSES passed, $REPLICATION_FAILS failed"
+echo ""
+
+# ── 7. Cluster tests ─────────────────────────────────────────────────────────────
+# Manages its own 4 server processes + a throwaway Postgres container - object-data
+# clustering requires the Postgres control plane, unlike every suite above.
+echo "--- Cluster tests (4 real instances + Postgres) ---"
+if (cd "$ROOT" && bash cluster_tests.sh) > "$LOG_DIR/cluster-tests.log" 2>&1; then
+    CLUSTER_RESULT="PASS"
+else
+    CLUSTER_RESULT="FAIL"
+fi
+CLUSTER_PASSES=$(grep -c "^PASS:" "$LOG_DIR/cluster-tests.log")
+CLUSTER_FAILS=$(grep -c "^FAIL:" "$LOG_DIR/cluster-tests.log")
+echo "$CLUSTER_RESULT: $CLUSTER_PASSES passed, $CLUSTER_FAILS failed"
+if [ "$CLUSTER_FAILS" -gt 0 ]; then
+    grep "^FAIL:" "$LOG_DIR/cluster-tests.log" | sed 's/^/  /'
+fi
+record "Cluster tests" "$CLUSTER_RESULT" "$CLUSTER_PASSES passed, $CLUSTER_FAILS failed"
 echo ""
 
 # ── Scoreboard ─────────────────────────────────────────────────────────────────

@@ -157,6 +157,34 @@ declare global {
         enabled: boolean;
     }
 
+    export interface ClusterNode {
+        id: string;
+        address: string;
+        status: "active" | "draining" | "removed";
+        joinedAt: string;
+        lastHeartbeatAt: string;
+        isHealthy: boolean;
+    }
+
+    export interface ClusterRebalanceStatus {
+        pendingCount: number;
+        failedCount: number;
+        pendingByReason: Record<string, number>;
+        replicationFactor: number;
+    }
+
+    export interface ClusterPlacementEntry {
+        key: string;
+        nodeIds: string[];
+        size: number;
+    }
+
+    export interface ClusterNodeStorage {
+        nodeId: string;
+        sizeBytes: number;
+        objectCount: number;
+    }
+
     // Fluent Page
     export interface Page<T> {
         items: T[];

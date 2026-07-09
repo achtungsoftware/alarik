@@ -132,6 +132,18 @@ final class LoadCacheLifecycle: LifecycleHandler {
                 return (bucketName: bucket.name, config: config)
             }
         await ReplicationConfigCache.shared.load(initialData: replicationData)
+
+        // Load cluster membership cache - harmless empty load when
+        // cluster mode is off, since no node ever registers itself into `cluster_nodes` then.
+        let clusterNodes = try await ClusterNode.query(on: app.db).all()
+        let clusterNodeData = clusterNodes.compactMap { node -> ClusterNodeInfo? in
+            guard let id = node.id else { return nil }
+            return ClusterNodeInfo(
+                id: id, address: node.address,
+                status: ClusterNode.Status(rawValue: node.status) ?? .active,
+                lastHeartbeatAt: node.lastHeartbeatAt)
+        }
+        await ClusterNodeCache.shared.load(initialData: clusterNodeData)
     }
 
     // MARK: - Per-bucket mappers

@@ -307,11 +307,13 @@ struct InternalBucketController: RouteCollection {
         let isSearching = search?.isEmpty == false
         let delimiter = isSearching ? "" : (req.query[String.self, at: "delimiter"] ?? "/")
 
-        let (objects, commonPrefixes, _, _) = try ObjectFileHandler.listObjects(
+        let (objects, commonPrefixes, _, _) = try await ClusterListingService.listObjects(
+            req: req,
             bucketName: bucketName,
             prefix: prefix,
             delimiter: delimiter,
-            maxKeys: 10000
+            maxKeys: 10000,
+            marker: nil
         )
 
         // Convert objects to DTOs
@@ -375,8 +377,8 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let (sizeBytes, objectCount) = BucketHandler.calculateStats(
-            bucketName: bucketName, prefix: prefix)
+        let (sizeBytes, objectCount) = try await ClusterListingService.calculateStats(
+            req: req, bucketName: bucketName, prefix: prefix)
         return StatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
     }
 
@@ -702,32 +704,49 @@ struct InternalBucketController: RouteCollection {
 
         var addedFiles = 0
 
-        // Helper function to read object data (versioned or non-versioned)
-        func readObjectData(bucketName: String, key: String) -> Data? {
-            guard
-                let (_, data) = try? ObjectFileHandler.readCurrentObject(
-                    bucketName: bucketName, key: key, loadData: true)
-            else {
-                return nil
+        // Reads object data (versioned or non-versioned), falling back to a cross-node fetch
+        // (the same ObjectRoutingService.isResponsible + ClusterReplicationClient
+        // .fetchObjectToTempFile primitive CopyObject's cross-node source fetch already uses)
+        // when the object isn't physically on this node - without this, a bucket-wide ZIP
+        // download would silently omit any object this node isn't itself responsible for.
+        func readObjectData(bucketName: String, key: String) async -> Data? {
+            if let (_, data) = try? ObjectFileHandler.readCurrentObject(
+                bucketName: bucketName, key: key, loadData: true)
+            {
+                return data
             }
-            return data
+
+            let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+                req: req, bucketName: bucketName, key: key)
+            guard !isLocal, !candidates.isEmpty else { return nil }
+
+            guard
+                let (tempPath, _) = try? await ClusterReplicationClient.fetchObjectToTempFile(
+                    app: req.application, candidates: candidates, bucketName: bucketName,
+                    key: key, versionId: nil, requestId: req.id)
+            else { return nil }
+            defer { _ = POSIXFile.unlink(tempPath) }
+
+            return try? Data(contentsOf: URL(fileURLWithPath: tempPath))
         }
 
         for key in keys {
             if key.hasSuffix("/") {
                 // It's a folder - add all files with this prefix
-                let (objects, _, _, _) = try ObjectFileHandler.listObjects(
+                let (objects, _, _, _) = try await ClusterListingService.listObjects(
+                    req: req,
                     bucketName: bucketName,
                     prefix: key,
                     delimiter: nil,  // No delimiter to get all nested files
-                    maxKeys: 10000
+                    maxKeys: 10000,
+                    marker: nil
                 )
 
                 for object in objects {
                     // Skip delete markers
                     if object.isDeleteMarker { continue }
 
-                    if let fileData = readObjectData(bucketName: bucketName, key: object.key) {
+                    if let fileData = await readObjectData(bucketName: bucketName, key: object.key) {
                         // Use relative path from the folder prefix
                         let relativePath = String(object.key.dropFirst(key.count))
                         let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
@@ -746,7 +765,7 @@ struct InternalBucketController: RouteCollection {
                 }
             } else {
                 // Single file - use just the filename without path
-                if let fileData = readObjectData(bucketName: bucketName, key: key) {
+                if let fileData = await readObjectData(bucketName: bucketName, key: key) {
                     // Extract just the filename from the full key path
                     let filename = key.split(separator: "/").last.map(String.init) ?? key
 
@@ -1626,8 +1645,11 @@ struct InternalBucketController: RouteCollection {
         return .noContent
     }
 
+    /// Per-key (not bucket-wide), so unlike `listObjects`/`getObjectStats` this doesn't need the
+    /// fan-out/merge machinery - it just needs to land on whichever node actually holds `key`,
+    /// the same single-key `ObjectRoutingService` forwarding `ListParts` already uses.
     @Sendable
-    func listObjectVersions(req: Request) async throws -> [ObjectMeta.ResponseDTO] {
+    func listObjectVersions(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"] else {
@@ -1640,9 +1662,18 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
 
-        return versions.map { ObjectMeta.ResponseDTO(from: $0) }
+        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        let dtos = versions.map { ObjectMeta.ResponseDTO(from: $0) }
+        // Uses Vapor's own Content encoding (not a hand-rolled JSONEncoder) so the response is
+        // byte-identical to what this route returned before routing was added - the console
+        // frontend depends on the app-wide date format Content encoding applies.
+        return try await dtos.encodeResponse(for: req)
     }
 
     @Sendable

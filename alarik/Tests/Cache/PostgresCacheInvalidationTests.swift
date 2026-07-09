@@ -22,16 +22,9 @@ import Vapor
 
 @testable import Alarik
 
-/// Tier 2 + Tier 3 (see Phase 1 plan): the parts of the cache-invalidation design that only a
-/// real Postgres can exercise - actual `NOTIFY` delivery, `OIDCStateCache`'s DB-table mode, and
-/// genuine cross-node propagation via two independent LISTEN connections. Local/manual only per
-/// the plan's CI decision: the whole suite is skipped (not failed) unless `DATABASE_URL` is set
-/// in the process environment, so the default `swift test` run (SQLite, no Postgres) is
-/// unaffected. Point `DATABASE_URL` at a scratch Postgres database before running this suite -
-/// every test migrates and reverts its own schema, but they all share that one database and run
-/// `.serialized`, so nothing here is safe to run concurrently against the same database.
+
 @Suite(
-    "Postgres cache invalidation integration tests (Tier 2/3)",
+    "Postgres cache invalidation integration tests",
     .serialized,
     .enabled(if: ProcessInfo.processInfo.environment["DATABASE_URL"] != nil)
 )
@@ -85,8 +78,6 @@ struct PostgresCacheInvalidationTests {
         return provider.id!
     }
 
-    // MARK: - Tier 2: notify() sends a real pg_notify
-
     @Test("notify(on:) delivers a real pg_notify to an independently LISTEN-ing connection")
     func notifySendsRealNotify() async throws {
         try await withApp { app in
@@ -131,8 +122,6 @@ struct PostgresCacheInvalidationTests {
             #expect(message.key == "notify-test-bucket")
         }
     }
-
-    // MARK: - Tier 2: OIDCStateCache Postgres mode, end-to-end
 
     @Test("OIDCStateCache Postgres mode: store, consume once, then nil on replay")
     func oidcStateCachePostgresStoreConsume() async throws {
@@ -214,8 +203,6 @@ struct PostgresCacheInvalidationTests {
             #expect(results.filter { $0 == nil }.count == 1)
         }
     }
-
-    // MARK: - Tier 3: two independent, non-`.shared` cache instances, real cross-node propagation
 
     @Test("cross-node propagation: node A's write + notify reaches node B's independent cache")
     func crossNodePropagationBucketVersioning() async throws {
