@@ -123,15 +123,20 @@ enum ClusterReplicationService {
     /// looking for the filename, by which point forwarding the original request is no longer
     /// possible. Unlike `replicateWrite`, this node's local write does NOT count toward quorum
     /// (it isn't one of `responsible`'s real replicas), so every one of `responsible` needs its
-    /// own ack, not `responsible.count - 1`. The stray local copy this leaves behind on a node
-    /// that was never actually responsible is harmless and temporary - the next
-    /// `ClusterRebalanceService` walk reclaims it automatically via its existing "holds a copy
-    /// it's not responsible for" logic, the same as any other over-replicated straggler.
+    /// own ack, not `responsible.count - 1`.
+    ///
+    /// Returns `true` once a quorum of `responsible` nodes durably hold the exact version
+    /// (synchronously delivered, with any remainder guaranteed by the outbox) - the signal the
+    /// caller uses to decide it's now safe to reclaim its own stray local copy, since the object
+    /// is durable on the nodes that actually own it. Returns `false` when quorum couldn't be
+    /// reached synchronously (peers slow/down); the caller must then keep its local copy as the
+    /// durability backstop until the outbox catches the responsible nodes up.
+    @discardableResult
     static func pushToResponsibleNodes(
         app: Application, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo]
-    ) async {
-        guard !responsible.isEmpty else { return }
+    ) async -> Bool {
+        guard !responsible.isEmpty else { return false }
         let quorum = PlacementService.quorumThreshold(replicaCount: responsible.count)
 
         var delivered: Set<UUID> = []
@@ -151,10 +156,12 @@ enum ClusterReplicationService {
         }
 
         let undelivered = responsible.filter { !delivered.contains($0.id) }
-        guard !undelivered.isEmpty else { return }
-        await enqueueOutbox(
-            app: app, nodes: undelivered, bucketName: bucketName, key: key, versionId: versionId,
-            operation: .put)
+        if !undelivered.isEmpty {
+            await enqueueOutbox(
+                app: app, nodes: undelivered, bucketName: bucketName, key: key,
+                versionId: versionId, operation: .put)
+        }
+        return delivered.count >= quorum
     }
 
     /// Deletes `key` correctly regardless of whether this node is one of its responsible nodes -

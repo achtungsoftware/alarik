@@ -65,6 +65,11 @@ struct LifecycleService {
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(
             bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
+        // Membership is read once for the whole sweep, not per object - the active set doesn't
+        // meaningfully change within a single pass, and re-reading it per key would both add
+        // thousands of redundant actor hops and let placement decisions drift mid-sweep.
+        let clusterContext = await clusterContext(app: app)
+
         for object in objects where object.updatedAt <= cutoff {
             // Every replica of this bucket runs its own sweep independently and would otherwise
             // all race to expire the same object - gating on "am I the primary (rank-0)
@@ -73,8 +78,8 @@ struct LifecycleService {
             // holding a local replica, so this node's own local listing above is already
             // sufficient to find every key it's primary for - no cluster-wide fan-out listing
             // needed here.
-            let (isPrimary, peers) = await clusterWriteAuthority(
-                app: app, bucketName: bucketName, key: object.key)
+            let (isPrimary, peers) = primaryAuthority(
+                context: clusterContext, bucketName: bucketName, key: object.key)
             guard isPrimary else { continue }
 
             let outcome = try await ClusterReplicationService.coordinateDelete(
@@ -105,10 +110,13 @@ struct LifecycleService {
 
         let keys = Set(versions.map(\.key) + deleteMarkers.map(\.key))
 
+        // Read membership once for the whole sweep - see expireCurrentObjects.
+        let clusterContext = await clusterContext(app: app)
+
         for key in keys {
             // See expireCurrentObjects - same primary-only gating, for the same reason.
-            let (isPrimary, peers) = await clusterWriteAuthority(
-                app: app, bucketName: bucketName, key: key)
+            let (isPrimary, peers) = primaryAuthority(
+                context: clusterContext, bucketName: bucketName, key: key)
             guard isPrimary else { continue }
 
             let chain = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
@@ -138,28 +146,35 @@ struct LifecycleService {
         }
     }
 
-    /// Cluster-aware write authority for a key, for background sweeps that have no `Request` to
-    /// drive `ObjectRoutingService`'s per-request routing decision. Not clustered (or no peers
-    /// registered yet) always answers "yes, alone" - the same inert-when-not-clustered guarantee
-    /// every other cluster feature holds. Returns the other responsible nodes as `peers` so a
-    /// caller that gets `isPrimary: true` can replicate its write without a second placement
-    /// lookup.
-    private static func clusterWriteAuthority(
-        app: Application, bucketName: String, key: String
-    ) async -> (isPrimary: Bool, peers: [ClusterNodeInfo]) {
-        guard let config = app.storage[ClusterConfigurationKey.self] else {
-            return (true, [])
-        }
+    /// One-time-per-sweep membership snapshot: `nil` means not clustered (or no peers registered
+    /// yet), the "act alone" case every other cluster feature treats as inert. Read once and
+    /// threaded into `primaryAuthority` per object so a single sweep sees one consistent
+    /// membership view.
+    private static func clusterContext(app: Application) async -> (
+        config: ClusterConfiguration, active: [ClusterNodeInfo]
+    )? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
         let active = await ClusterNodeCache.shared.activeNodes()
-        guard !active.isEmpty else {
-            return (true, [])
-        }
+        guard !active.isEmpty else { return nil }
+        return (config, active)
+    }
+
+    /// Pure cluster-aware write authority for a key, for background sweeps that have no `Request`
+    /// to drive `ObjectRoutingService`'s per-request routing decision. A `nil` context (not
+    /// clustered) always answers "yes, alone". Returns the other responsible nodes as `peers` so
+    /// a caller that gets `isPrimary: true` can replicate its write without a second placement
+    /// lookup.
+    private static func primaryAuthority(
+        context: (config: ClusterConfiguration, active: [ClusterNodeInfo])?,
+        bucketName: String, key: String
+    ) -> (isPrimary: Bool, peers: [ClusterNodeInfo]) {
+        guard let context else { return (true, []) }
         let responsible = PlacementService.responsibleNodes(
-            bucketName: bucketName, key: key, activeNodes: active)
-        guard let primary = responsible.first, primary.id == config.nodeId else {
+            bucketName: bucketName, key: key, activeNodes: context.active)
+        guard let primary = responsible.first, primary.id == context.config.nodeId else {
             return (false, [])
         }
-        let peers = responsible.filter { $0.id != config.nodeId }
+        let peers = responsible.filter { $0.id != context.config.nodeId }
         return (true, peers)
     }
 

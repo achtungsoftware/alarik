@@ -536,10 +536,7 @@ struct InternalBucketController: RouteCollection {
         // every other cluster-routed write this can't forward the *original* request (the body
         // stream is already consumed) - instead it always writes locally (as above) and, if this
         // node isn't actually one of the key's responsible nodes, pushes the freshly written
-        // version out to whichever nodes are. The local copy is a harmless, temporary stray in
-        // that case - ClusterRebalanceService's existing reclaim logic cleans it up automatically
-        // once the real owners are confirmed to have it, same as any other "holds a copy it's
-        // not responsible for" situation.
+        // version out to whichever nodes are, then reclaims its own now-redundant local copy.
         let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
             req: req, bucketName: bucketName, key: keyPath)
         if isLocal {
@@ -547,9 +544,22 @@ struct InternalBucketController: RouteCollection {
                 app: req.application, bucketName: bucketName, key: keyPath,
                 versionId: meta.versionId, operation: .put, peers: peers)
         } else if !responsible.isEmpty {
-            await ClusterReplicationService.pushToResponsibleNodes(
+            let reachedQuorum = await ClusterReplicationService.pushToResponsibleNodes(
                 app: req.application, bucketName: bucketName, key: keyPath,
                 versionId: meta.versionId, responsible: responsible)
+            // This node isn't one of the object's replicas - once a quorum of the nodes that
+            // actually are hold the exact version durably, the local copy written above is a
+            // stray that violates the placement invariant and leaks disk, so drop it eagerly
+            // (a local-only delete - the responsible nodes keep theirs). If quorum wasn't
+            // reached synchronously it's kept as the sole durability backstop until the outbox
+            // catches the responsible nodes up; a later rebalance walk reclaims it then.
+            if reachedQuorum {
+                try? await S3Service.offloadBlockingIO(req) {
+                    _ = try? S3Service.deleteObject(
+                        bucketName: bucketName, key: keyPath, versionId: nil,
+                        versioningStatus: .disabled)
+                }
+            }
         }
 
         await NotificationService.emit(
@@ -610,16 +620,28 @@ struct InternalBucketController: RouteCollection {
             }
 
             var marker: String? = nil
+            var failedKeys = 0
             repeat {
                 let (objects, _, isTruncated, nextMarker) = try await ClusterListingService.listObjects(
                     req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
                     maxKeys: 1000, marker: marker)
                 for object in objects {
-                    guard
-                        let outcome = try? await ClusterReplicationService.deleteObjectClusterWide(
+                    // A per-key delete can fail (a responsible peer being unreachable) - unlike
+                    // the local-disk-only deletePrefix this replaced, whose only failure mode was
+                    // a local IO error. Rather than silently reporting the whole folder deleted
+                    // when some objects survived, count the failures and surface them below.
+                    let outcome: S3Service.ObjectDeleteOutcome
+                    do {
+                        outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                             req: req, bucketName: bucketName, key: object.key, versionId: nil,
                             versioningStatus: .disabled)
-                    else { continue }
+                    } catch {
+                        failedKeys += 1
+                        req.logger.warning(
+                            "Folder delete: failed to delete '\(object.key)' under '\(sanitizedPrefix)': \(error)"
+                        )
+                        continue
+                    }
                     await NotificationService.emit(
                         event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
                         size: nil, etag: nil, versionId: outcome.versionId,
@@ -629,6 +651,14 @@ struct InternalBucketController: RouteCollection {
                 }
                 marker = isTruncated ? nextMarker : nil
             } while marker != nil
+
+            if failedKeys > 0 {
+                throw Abort(
+                    .internalServerError,
+                    reason:
+                        "Failed to delete \(failedKeys) object(s) under the prefix; some may remain. Please retry."
+                )
+            }
         } else {
             let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                 req: req, bucketName: bucketName, key: key, versionId: nil,
@@ -712,10 +742,10 @@ struct InternalBucketController: RouteCollection {
         // Not physically on this node - the object may still exist cluster-wide (any
         // responsible node could have served the console's list/browse request while a
         // *different* node happens to hold the actual bytes). Fetch it from a responsible peer
-        // the same way CopyObject's cross-node source resolution and downloadAsZip's per-file
-        // fallback already do. Buffered fully in memory, matching downloadAsZip's existing
-        // cross-node fallback - not worth adding a new raw-file streaming primitive for what's
-        // expected to be the rare case where a single-file download lands on the wrong node.
+        // into a local temp file the same way CopyObject's cross-node source resolution and
+        // downloadAsZip's per-file fallback already do, then stream that temp file straight to
+        // the client (windowed, never buffering the whole object in memory - a console download
+        // of a multi-GB object that lands on the wrong node must not OOM this node).
         let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
             req: req, bucketName: bucketName, key: key)
         guard !isLocal, !candidates.isEmpty else {
@@ -724,14 +754,46 @@ struct InternalBucketController: RouteCollection {
         let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
             app: req.application, candidates: candidates, bucketName: bucketName, key: key,
             versionId: versionId, requestId: req.id)
-        defer { _ = POSIXFile.unlink(tempPath) }
-        guard !meta.isDeleteMarker,
-            let data = try? Data(contentsOf: URL(fileURLWithPath: tempPath))
-        else {
+        guard !meta.isDeleteMarker else {
+            _ = POSIXFile.unlink(tempPath)
             throw Abort(.notFound, reason: "Object not found")
         }
-        let response = S3Service.buildVersionedObjectMetadataResponse(
-            meta: meta, includeBody: true, data: data)
+        return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key)
+    }
+
+    /// Streams a raw (header-less) temp file - the payload `ClusterReplicationClient
+    /// .fetchObjectToTempFile` spooled from a peer - straight to the client in fixed windows,
+    /// unlinking it once the stream drains (or fails). Distinct from
+    /// `S3Service.buildStreamingObjectResponse`, which streams an on-disk *Alarik object file*
+    /// (metadata header + payload); this file is bare bytes with `meta` supplied separately.
+    private func streamedResponse(
+        req: Request, rawTempFile tempPath: String, meta: ObjectMeta, key: String
+    ) -> Response {
+        let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta, includeBody: false)
+        let threadPool = req.application.threadPool
+        let payloadSize = meta.size
+        response.body = Response.Body(
+            managedAsyncStream: { writer in
+                let fd = try await threadPool.runIfActive { POSIXFile.open(tempPath, O_RDONLY) }
+                guard fd >= 0 else {
+                    _ = POSIXFile.unlink(tempPath)
+                    throw Abort(.internalServerError, reason: "Failed to open cluster fetch temp file")
+                }
+                do {
+                    try await StreamingIOLoops.readWindowed(
+                        threadPool: threadPool, fd: fd, offset: 0, length: payloadSize,
+                        chunkSize: Constants.streamingReadChunkSize
+                    ) { chunk in
+                        try await writer.writeBuffer(chunk)
+                    }
+                } catch {
+                    _ = POSIXFile.close(fd)
+                    _ = POSIXFile.unlink(tempPath)
+                    throw error
+                }
+                _ = POSIXFile.close(fd)
+                _ = POSIXFile.unlink(tempPath)
+            }, count: payloadSize)
         return Self.attachDownloadHeaders(to: response, key: key)
     }
 
