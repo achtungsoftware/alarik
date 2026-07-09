@@ -184,15 +184,19 @@ struct S3Controller: RouteCollection {
 
     /// Read-only cluster routing check for handlers that only ever need the forward-or-not
     /// answer (no local write, so no `peers` to carry forward for replication) - HEAD, tagging
-    /// GET, and plain object GET. Returns the forwarded response when this node isn't
-    /// responsible for `key`; `nil` means serve locally.
-    private func forwardIfNeeded(req: Request, bucketName: String, key: String) async throws
+    /// GET, plain object GET, and (with `requirePrimary: true`) ListParts. Returns the forwarded
+    /// response when this node isn't responsible for `key`; `nil` means serve locally.
+    private func forwardIfNeeded(
+        req: Request, bucketName: String, key: String, requirePrimary: Bool = false
+    ) async throws
         -> Response?
     {
-        guard
-            case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+        let decision =
+            requirePrimary
+            ? await ObjectRoutingService.multipartRoutingDecision(
                 req: req, bucketName: bucketName, key: key)
-        else {
+            : await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        guard case .forward(let candidates) = decision else {
             return nil
         }
         return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
@@ -694,11 +698,23 @@ struct S3Controller: RouteCollection {
 
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // UploadPart/UploadPartCopy must pin to the exact node coordinating this upload's
+        // Create, not "any responsible node" - see multipartRoutingDecision's doc comment.
+        let isUploadPart =
+            req.query[String.self, at: "partNumber"] != nil
+            && req.query[String.self, at: "uploadId"] != nil
+
         // Cluster routing: one check covers this whole handler's dispatch tree (UploadPart,
         // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
         // (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        let routingDecision =
+            isUploadPart
+            ? await ObjectRoutingService.multipartRoutingDecision(
+                req: req, bucketName: bucketName, key: keyPath)
+            : await ObjectRoutingService.routingDecision(
+                req: req, bucketName: bucketName, key: keyPath)
+        switch routingDecision {
         case .local(let localPeers):
             peers = localPeers
         case .forward(let candidates):
@@ -734,7 +750,8 @@ struct S3Controller: RouteCollection {
         // PUT ?tagging - set the tag-set of an existing object/version, distinct from a plain
         // body PUT
         if req.url.query?.lowercased().contains("tagging") == true {
-            return try await handleObjectTaggingPut(req: req, bucketName: bucketName, key: keyPath)
+            return try await handleObjectTaggingPut(
+                req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
@@ -870,7 +887,9 @@ struct S3Controller: RouteCollection {
     /// (verified against the PutObjectTagging API reference). Auth is already done by the
     /// caller (`handleObjectPut`) before dispatching here.
     @Sendable
-    private func handleObjectTaggingPut(req: Request, bucketName: String, key: String)
+    private func handleObjectTaggingPut(
+        req: Request, bucketName: String, key: String, peers: [ClusterNodeInfo]
+    )
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
@@ -891,6 +910,14 @@ struct S3Controller: RouteCollection {
         let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = tagging.tags }
         }
+
+        // Cluster peers physically hold the exact same version file, so a tag change must be
+        // pushed to them too - an in-place metadata edit has no outbox task backing it the way
+        // an object write/delete does, so without this a peer would silently serve stale tags
+        // forever rather than just temporarily lagging behind.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
 
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
@@ -936,7 +963,9 @@ struct S3Controller: RouteCollection {
     /// (or the current one). S3 returns 204 No Content. Auth is already done by the
     /// caller (`handleObjectDelete`) before dispatching here.
     @Sendable
-    private func handleObjectTaggingDelete(req: Request, bucketName: String, key: String)
+    private func handleObjectTaggingDelete(
+        req: Request, bucketName: String, key: String, peers: [ClusterNodeInfo]
+    )
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
@@ -952,6 +981,12 @@ struct S3Controller: RouteCollection {
         let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
+
+        // See handleObjectTaggingPut - an in-place metadata edit has no outbox task backing it,
+        // so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
 
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
@@ -1149,7 +1184,7 @@ struct S3Controller: RouteCollection {
         if let uploadId = req.query[String.self, at: "uploadId"] {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             if let forwarded = try await forwardIfNeeded(
-                req: req, bucketName: bucketName, key: keyPath)
+                req: req, bucketName: bucketName, key: keyPath, requirePrimary: true)
             {
                 return forwarded
             }
@@ -1245,10 +1280,22 @@ struct S3Controller: RouteCollection {
 
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // AbortMultipartUpload must pin to the exact node coordinating this upload's Create,
+        // not "any responsible node" - see multipartRoutingDecision's doc comment.
+        let isAbortMultipart =
+            req.query[String.self, at: "uploadId"] != nil
+            && req.query[String.self, at: "versionId"] == nil
+
         // Cluster routing: one check covers this handler's dispatch tree (AbortMultipartUpload,
         // tagging DELETE, plain object DELETE) - all key off this same (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        let routingDecision =
+            isAbortMultipart
+            ? await ObjectRoutingService.multipartRoutingDecision(
+                req: req, bucketName: bucketName, key: keyPath)
+            : await ObjectRoutingService.routingDecision(
+                req: req, bucketName: bucketName, key: keyPath)
+        switch routingDecision {
         case .local(let localPeers):
             peers = localPeers
         case .forward(let candidates):
@@ -1270,7 +1317,7 @@ struct S3Controller: RouteCollection {
         // DeleteObjectTagging - distinct from deleting the object/version itself
         if req.url.query?.lowercased().contains("tagging") == true {
             return try await handleObjectTaggingDelete(
-                req: req, bucketName: bucketName, key: keyPath)
+                req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
         let versionId = req.query[String.self, at: "versionId"]
@@ -1499,13 +1546,16 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        // Cluster routing: multipart create/complete both key off the same (bucketName,
-        // keyPath) as any other write to this object, so one check here covers both -
-        // forwarding a create/uploadPart/complete/abort sequence anywhere else would split a
-        // single upload's parts across nodes with no way to reassemble them, so the whole
-        // lifecycle must land on the same responsible node.
+        // Cluster routing: this whole handler is multipart create/complete, so every request
+        // through it pins to the primary responsible node specifically (multipartRoutingDecision,
+        // not routingDecision) - forwarding a create/uploadPart/complete/abort sequence to
+        // different-but-each-individually-"responsible" nodes would split a single upload's
+        // parts across nodes with no way to reassemble them, so the whole lifecycle must land on
+        // the identical node throughout.
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: keyPath) {
+        switch await ObjectRoutingService.multipartRoutingDecision(
+            req: req, bucketName: bucketName, key: keyPath)
+        {
         case .local(let localPeers):
             peers = localPeers
         case .forward(let candidates):

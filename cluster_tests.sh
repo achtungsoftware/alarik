@@ -45,6 +45,48 @@ fail() {
     ((FAIL_COUNT++))
 }
 
+# Kills node $1's process without touching its state_dir/port - used to simulate an
+# unreachable-but-not-yet-drained peer. The caller is responsible for restarting it (via
+# restart_node) unless the test deliberately leaves it down for the rest of the run.
+kill_node() {
+    local i=$1
+    if [ -n "${PIDS[$i]:-}" ] && kill -0 "${PIDS[$i]}" 2>/dev/null; then
+        kill "${PIDS[$i]}" 2>/dev/null
+        wait "${PIDS[$i]}" 2>/dev/null
+    fi
+    PIDS[$i]=""
+}
+
+# Restarts node $1 on its original port/state_dir (so its persisted cluster_node_id and local
+# disk contents survive the restart, matching a real process restart) and waits for it to start
+# accepting connections. A restart re-activates a previously-draining node automatically (see
+# ClusterMembershipLifecycle.registerSelf).
+restart_node() {
+    local i=$1
+    local port="${PORTS[$i]}"
+    (
+        cd "${STATE_DIRS[$i]}" \
+            && JWT="$JWT_SECRET" \
+                DATABASE_URL="$DATABASE_URL" \
+                CLUSTER_NODE_ADDRESS="http://localhost:$port" \
+                CLUSTER_SECRET="$CLUSTER_SECRET" \
+                exec "$BINARY" serve --hostname 127.0.0.1 --port "$port"
+    ) >"$LOG_DIR/node-$i-restart.log" 2>&1 &
+    PIDS[$i]="$!"
+
+    local up=0
+    for _ in $(seq 1 30); do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/" 2>/dev/null)
+        if [ "$code" != "000" ]; then
+            up=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$up" -eq 1 ]
+}
+
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -553,7 +595,7 @@ aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-delete
 NODE0_ID=$(echo "$NODES_RESP" | jq -r ".[0].id")
 
 DB_KEY=""
-for i in $(seq 1 20); do
+for i in $(seq 1 40); do
     candidate="db-key-$i.txt"
     echo "x" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://cluster-deletebucket-test/$candidate" >/dev/null
     sleep 0.3
@@ -593,7 +635,284 @@ else
     fail "Expected cluster-wide objectCount 5, got $STATS_COUNT (possible triple-count or under-count)."
 fi
 
-# ── Test 15: DeleteBucket fails closed when a peer is unreachable ──────────────
+# ── Test 15: quorum write survives a down replica + async outbox catch-up ──────
+# Proves the actual quorum mechanic (not just eventual consistency): a write must still
+# succeed when only a majority (2 of 3) of an object's responsible nodes are reachable, and a
+# revived replica must self-heal via the outbox once it's back - without ever being told to.
+echo ""
+echo "=== Test: quorum write survives a down replica + async outbox catch-up ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-quorum-test >/dev/null 2>&1
+echo "quorum test content v1" >"$CONTENT_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$CONTENT_FILE" s3://cluster-quorum-test/quorum-key.txt >/dev/null
+sleep 2
+
+QUORUM_PLACEMENT=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-quorum-test" -H "Authorization: Bearer $TOKEN")
+QUORUM_RESPONSIBLE_IDS_JSON=$(echo "$QUORUM_PLACEMENT" | jq -c '.items[] | select(.key == "quorum-key.txt") | .nodeIds')
+QUORUM_RESPONSIBLE_IDS=$(echo "$QUORUM_RESPONSIBLE_IDS_JSON" | jq -r '.[]')
+
+# The victim must be a SECONDARY replica (never nodeIds[0], the primary) - a body-carrying PUT
+# forward is only ever attempted once, against the primary, with no fallback (see
+# ClusterForwardingClient.forward's doc comment), so killing the primary would break the
+# request from ever reaching a coordinator at all rather than exercising quorum tolerance.
+# Also never node 0 - it's this test's (and every other test's) entry point.
+NODE0_ID=$(echo "$NODES_RESP" | jq -r ".[0].id")
+VICTIM_ID=$(echo "$QUORUM_RESPONSIBLE_IDS_JSON" | jq -r --arg n0 "$NODE0_ID" '.[1:][] | select(. != $n0)' | head -1)
+
+VICTIM_INDEX=""
+if [ -n "$VICTIM_ID" ]; then
+    for j in $(seq 0 $((NODE_COUNT - 1))); do
+        if [ "$(echo "$NODES_RESP" | jq -r ".[$j].id")" == "$VICTIM_ID" ]; then
+            VICTIM_INDEX="$j"
+            break
+        fi
+    done
+fi
+
+if [ -z "$VICTIM_INDEX" ]; then
+    fail "Could not find a secondary (non-primary, non-node-0) replica responsible for quorum-key.txt to use as the victim."
+else
+    kill_node "$VICTIM_INDEX"
+    sleep 1
+
+    echo "quorum test content v2 (written with one replica down)" >"$CONTENT_FILE"
+    QUORUM_WRITE_OK=0
+    aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$CONTENT_FILE" s3://cluster-quorum-test/quorum-key.txt >/dev/null 2>&1 && QUORUM_WRITE_OK=1
+
+    QUORUM_SURVIVORS_OK=1
+    VICTIM_ID=$(echo "$NODES_RESP" | jq -r ".[$VICTIM_INDEX].id")
+    for id in $QUORUM_RESPONSIBLE_IDS; do
+        [ "$id" == "$VICTIM_ID" ] && continue
+        for j in $(seq 0 $((NODE_COUNT - 1))); do
+            if [ "$(echo "$NODES_RESP" | jq -r ".[$j].id")" == "$id" ]; then
+                if ! aws --endpoint-url "${ENDPOINTS[$j]}" s3 cp s3://cluster-quorum-test/quorum-key.txt - 2>/dev/null | cmp -s - "$CONTENT_FILE"; then
+                    QUORUM_SURVIVORS_OK=0
+                fi
+            fi
+        done
+    done
+
+    if [ "$QUORUM_WRITE_OK" -eq 1 ] && [ "$QUORUM_SURVIVORS_OK" -eq 1 ]; then
+        pass "Quorum write succeeds and surviving replicas have the new content with one responsible node down."
+    else
+        fail "Quorum write did not behave correctly with one replica down (write_ok=$QUORUM_WRITE_OK survivors_ok=$QUORUM_SURVIVORS_OK)."
+    fi
+
+    if ! restart_node "$VICTIM_INDEX"; then
+        fail "Could not restart the victim node to test outbox catch-up."
+    else
+        sleep 15
+        # The dispatcher's first retry backoff is ~60s after the initial (failed, node-down)
+        # delivery attempt - wait comfortably past that rather than the immediate-delivery
+        # window every other cross-node test relies on.
+        CAUGHT_UP=0
+        for _ in $(seq 1 75); do
+            if aws --endpoint-url "${ENDPOINTS[$VICTIM_INDEX]}" s3 cp s3://cluster-quorum-test/quorum-key.txt - 2>/dev/null | cmp -s - "$CONTENT_FILE"; then
+                CAUGHT_UP=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$CAUGHT_UP" -eq 1 ]; then
+            pass "A revived replica catches up via the async outbox after missing a quorum write."
+        else
+            fail "Revived replica never caught up with the write it missed while down."
+        fi
+    fi
+fi
+
+# ── Test 16: a drained node reactivates after a restart ────────────────────────
+echo ""
+echo "=== Test: a drained node reactivates after a restart ==="
+REJOIN_NODE_ID=$(echo "$NODES_RESP" | jq -r ".[2].id")
+curl -s -X POST "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes/$REJOIN_NODE_ID/drain" -H "Authorization: Bearer $TOKEN" >/dev/null
+sleep 2
+
+DRAINED_STATUS=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes" -H "Authorization: Bearer $TOKEN" | jq -r ".[] | select(.id == \"$REJOIN_NODE_ID\") | .status")
+if [ "$DRAINED_STATUS" != "draining" ]; then
+    fail "Node 2 did not show status 'draining' after being drained (saw '$DRAINED_STATUS')."
+else
+    # Draining only flips status - the process keeps running. Actually stop it before
+    # "restarting", matching the real operator flow (drain, then stop, then start a fresh
+    # process) - restarting without first killing the still-running old process would just
+    # fail to bind the already-in-use port.
+    kill_node 2
+    if ! restart_node 2; then
+        fail "Node 2 did not come back up after being restarted."
+    else
+        sleep 3
+        REJOINED_STATUS=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes" -H "Authorization: Bearer $TOKEN" | jq -r ".[] | select(.id == \"$REJOIN_NODE_ID\") | .status")
+        if [ "$REJOINED_STATUS" == "active" ]; then
+            pass "A restarted node automatically re-activates out of 'draining' status."
+        else
+            fail "Node 2 did not return to 'active' status after restart (saw '$REJOINED_STATUS')."
+        fi
+    fi
+fi
+
+# ── Test 17: admin cluster storage endpoint reports correct totals ─────────────
+# Cluster-wide (all-buckets) counterpart of Test 14 - checks the delta after adding known
+# objects rather than an absolute total, so it's correct regardless of what earlier tests left
+# behind.
+echo ""
+echo "=== Test: admin cluster storage endpoint reports correct totals ==="
+STORAGE_BEFORE=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/storage" -H "Authorization: Bearer $TOKEN")
+TOTAL_BEFORE=$(echo "$STORAGE_BEFORE" | jq '[.[].objectCount] | add')
+
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-storage-endpoint-test >/dev/null 2>&1
+for i in $(seq 0 3); do
+    echo "storage endpoint content $i" | aws --endpoint-url "${ENDPOINTS[$((i % NODE_COUNT))]}" s3 cp - "s3://cluster-storage-endpoint-test/storage-key-$i.txt" >/dev/null
+done
+sleep 3
+
+STORAGE_AFTER=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/storage" -H "Authorization: Bearer $TOKEN")
+TOTAL_AFTER=$(echo "$STORAGE_AFTER" | jq '[.[].objectCount] | add')
+STORAGE_DELTA=$((TOTAL_AFTER - TOTAL_BEFORE))
+
+if [ "$STORAGE_DELTA" == "4" ]; then
+    pass "Admin cluster storage endpoint's total object count increases by exactly 4 after adding 4 objects (no triple-count, no under-count)."
+else
+    fail "Expected cluster storage total to increase by 4, increased by $STORAGE_DELTA instead (before=$TOTAL_BEFORE after=$TOTAL_AFTER)."
+fi
+
+# ── Test 18: cluster-wide resync endpoint ───────────────────────────────────────
+echo ""
+echo "=== Test: cluster-wide resync endpoint ==="
+RESYNC_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${ENDPOINTS[0]}/api/v1/admin/cluster/resync" -H "Authorization: Bearer $TOKEN")
+if [ "$RESYNC_HTTP_CODE" == "200" ]; then
+    pass "POST /admin/cluster/resync (cluster-wide, no node id) is accepted."
+else
+    fail "POST /admin/cluster/resync returned HTTP $RESYNC_HTTP_CODE, expected 200."
+fi
+sleep 2
+
+# ── Test 19: cross-node UploadPartCopy ──────────────────────────────────────────
+echo ""
+echo "=== Test: cross-node UploadPartCopy ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-uploadpartcopy-test >/dev/null 2>&1
+UPC_SOURCE_FILE=$(mktemp)
+head -c 6291456 /dev/urandom >"$UPC_SOURCE_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$UPC_SOURCE_FILE" s3://cluster-uploadpartcopy-test/source-part.bin >/dev/null
+sleep 2
+
+UPC_CREATE_RESP=$(aws --endpoint-url "${ENDPOINTS[1]}" s3api create-multipart-upload --bucket cluster-uploadpartcopy-test --key upc-dest.bin)
+UPC_UPLOAD_ID=$(echo "$UPC_CREATE_RESP" | jq -r '.UploadId')
+
+UPC_COPY_RESP=$(aws --endpoint-url "${ENDPOINTS[2]}" s3api upload-part-copy \
+    --bucket cluster-uploadpartcopy-test --key upc-dest.bin --part-number 1 --upload-id "$UPC_UPLOAD_ID" \
+    --copy-source "cluster-uploadpartcopy-test/source-part.bin" 2>&1)
+UPC_ETAG=$(echo "$UPC_COPY_RESP" | jq -r '.CopyPartResult.ETag // empty')
+
+if [ -z "$UPC_ETAG" ]; then
+    fail "Cross-node UploadPartCopy failed: $UPC_COPY_RESP"
+    aws --endpoint-url "${ENDPOINTS[0]}" s3api abort-multipart-upload --bucket cluster-uploadpartcopy-test --key upc-dest.bin --upload-id "$UPC_UPLOAD_ID" >/dev/null 2>&1
+else
+    UPC_COMPLETE_JSON=$(jq -n --arg e "$UPC_ETAG" '{Parts: [{ETag: $e, PartNumber: 1}]}')
+    aws --endpoint-url "${ENDPOINTS[0]}" s3api complete-multipart-upload \
+        --bucket cluster-uploadpartcopy-test --key upc-dest.bin --upload-id "$UPC_UPLOAD_ID" \
+        --multipart-upload "$UPC_COMPLETE_JSON" >/dev/null
+    sleep 2
+
+    if aws --endpoint-url "${ENDPOINTS[3]}" s3 cp s3://cluster-uploadpartcopy-test/upc-dest.bin - 2>/dev/null | cmp -s - "$UPC_SOURCE_FILE"; then
+        pass "UploadPartCopy correctly fetches its source across nodes and the completed object is byte-identical."
+    else
+        fail "Completed cross-node UploadPartCopy object content does not match its source."
+    fi
+fi
+
+# ── Test 20: cross-node multipart upload with multiple real parts ──────────────
+# CreateMultipartUpload, both parts, and CompleteMultipartUpload are each issued against a
+# different node - exercises the full cluster-routed multipart lifecycle, not just creation.
+echo ""
+echo "=== Test: cross-node multipart upload with multiple real parts ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-multipart-test >/dev/null 2>&1
+MP_PART1=$(mktemp)
+MP_PART2=$(mktemp)
+MP_FULL=$(mktemp)
+head -c 5242880 /dev/urandom >"$MP_PART1"
+head -c 2097152 /dev/urandom >"$MP_PART2"
+cat "$MP_PART1" "$MP_PART2" >"$MP_FULL"
+
+MP_CREATE_RESP=$(aws --endpoint-url "${ENDPOINTS[1]}" s3api create-multipart-upload --bucket cluster-multipart-test --key multipart-object.bin)
+MP_UPLOAD_ID=$(echo "$MP_CREATE_RESP" | jq -r '.UploadId')
+
+MP_ETAG1=$(aws --endpoint-url "${ENDPOINTS[2]}" s3api upload-part --bucket cluster-multipart-test --key multipart-object.bin \
+    --part-number 1 --upload-id "$MP_UPLOAD_ID" --body "$MP_PART1" | jq -r '.ETag')
+MP_ETAG2=$(aws --endpoint-url "${ENDPOINTS[3]}" s3api upload-part --bucket cluster-multipart-test --key multipart-object.bin \
+    --part-number 2 --upload-id "$MP_UPLOAD_ID" --body "$MP_PART2" | jq -r '.ETag')
+
+MP_COMPLETE_JSON=$(jq -n --arg e1 "$MP_ETAG1" --arg e2 "$MP_ETAG2" '{Parts: [{ETag: $e1, PartNumber: 1}, {ETag: $e2, PartNumber: 2}]}')
+aws --endpoint-url "${ENDPOINTS[0]}" s3api complete-multipart-upload \
+    --bucket cluster-multipart-test --key multipart-object.bin --upload-id "$MP_UPLOAD_ID" \
+    --multipart-upload "$MP_COMPLETE_JSON" >/dev/null
+sleep 3
+
+MP_ALL_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    if ! aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp s3://cluster-multipart-test/multipart-object.bin - 2>/dev/null | cmp -s - "$MP_FULL"; then
+        MP_ALL_OK=0
+        echo "  node $i has incorrect content for the completed multipart object"
+    fi
+done
+if [ "$MP_ALL_OK" -eq 1 ]; then
+    pass "A multipart upload with parts uploaded via different nodes completes correctly and replicates to every node."
+else
+    fail "Cross-node multipart upload did not replicate correctly to every node."
+fi
+
+# ── Test 21: object tagging visible across nodes ────────────────────────────────
+echo ""
+echo "=== Test: object tagging visible across nodes ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-tagging-test >/dev/null 2>&1
+echo "tagging test" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-tagging-test/tagged.txt >/dev/null
+sleep 2
+
+aws --endpoint-url "${ENDPOINTS[1]}" s3api put-object-tagging --bucket cluster-tagging-test --key tagged.txt \
+    --tagging '{"TagSet":[{"Key":"env","Value":"cluster-test"}]}' >/dev/null
+sleep 2
+
+TAG_VALUE=$(aws --endpoint-url "${ENDPOINTS[3]}" s3api get-object-tagging --bucket cluster-tagging-test --key tagged.txt 2>/dev/null | jq -r '.TagSet[] | select(.Key == "env") | .Value')
+if [ "$TAG_VALUE" == "cluster-test" ]; then
+    pass "Object tags set via one node are correctly visible via a different node."
+else
+    fail "Expected tag value 'cluster-test' visible from node 3, got '$TAG_VALUE'."
+fi
+
+# ── Test 22: conditional GET (If-None-Match) via a forwarded node ──────────────
+echo ""
+echo "=== Test: conditional GET (If-None-Match) via a forwarded node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-conditional-test >/dev/null 2>&1
+echo "conditional test" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-conditional-test/conditional.txt >/dev/null
+sleep 2
+
+COND_ETAG=$(aws --endpoint-url "${ENDPOINTS[0]}" s3api head-object --bucket cluster-conditional-test --key conditional.txt | jq -r '.ETag')
+COND_OUT_FILE=$(mktemp)
+COND_RESULT=$(aws --endpoint-url "${ENDPOINTS[2]}" s3api get-object --bucket cluster-conditional-test --key conditional.txt \
+    --if-none-match "$COND_ETAG" "$COND_OUT_FILE" 2>&1)
+COND_EXIT=$?
+
+if [ "$COND_EXIT" -ne 0 ] && echo "$COND_RESULT" | grep -qi "304\|not modified"; then
+    pass "If-None-Match conditional GET correctly returns 304 when forwarded to a non-responsible node."
+else
+    fail "Expected a 304/Not Modified response for a matching If-None-Match via a forwarded node, got: $COND_RESULT"
+fi
+
+# ── Test 23: placement endpoint reports correct object size ────────────────────
+echo ""
+echo "=== Test: placement endpoint reports correct object size ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-placement-size-test >/dev/null 2>&1
+SIZE_TEST_FILE=$(mktemp)
+head -c 12345 /dev/urandom >"$SIZE_TEST_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$SIZE_TEST_FILE" s3://cluster-placement-size-test/sized.bin >/dev/null
+sleep 2
+
+PLACEMENT_SIZE=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-placement-size-test" -H "Authorization: Bearer $TOKEN" | jq -r '.items[] | select(.key == "sized.bin") | .size')
+if [ "$PLACEMENT_SIZE" == "12345" ]; then
+    pass "Placement endpoint reports the correct object size (12345 bytes)."
+else
+    fail "Expected placement size 12345, got '$PLACEMENT_SIZE'."
+fi
+
+# ── Test 24: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't
 # confirm every active peer is also empty, per hasBucketObjects's fail-closed design.

@@ -64,6 +64,43 @@ enum ObjectRoutingService {
         return .forward(candidates: responsible)
     }
 
+    /// Like `routingDecision`, but pins to the *primary* (rank-0) responsible node specifically,
+    /// never "any of the responsible nodes." Required for every multipart upload operation
+    /// (CreateMultipartUpload/UploadPart/UploadPartCopy/CompleteMultipartUpload/
+    /// AbortMultipartUpload/ListParts) - unlike a single-shot PUT/GET/DELETE, where any
+    /// responsible replica can independently do the full job, an upload's in-progress part
+    /// state exists only on whichever *one* node happened to coordinate its `Create` - it's
+    /// never synced to the other responsible nodes while the upload is in flight. Letting each
+    /// request in the sequence independently ask "am I one of the responsible nodes, then serve
+    /// locally" (as `routingDecision` does) can land different requests for the *same* upload on
+    /// different, individually-valid-but-inconsistent nodes, since more than one node can
+    /// legitimately answer "yes" to that question. Pinning to the primary specifically guarantees
+    /// every request in one upload's lifecycle converges on the identical node, as long as
+    /// membership doesn't change mid-upload.
+    static func multipartRoutingDecision(req: Request, bucketName: String, key: String) async
+        -> RoutingDecision
+    {
+        let isTrustedForward = ClusterForwardAuthenticator.isTrustedForward(req)
+
+        let (responsible, config) = await placement(req: req, bucketName: bucketName, key: key)
+        guard let config else {
+            return .local(peers: [])
+        }
+        guard let primary = responsible.first else {
+            return .local(peers: [])
+        }
+
+        let peers = responsible.filter { $0.id != config.nodeId }
+
+        if isTrustedForward || primary.id == config.nodeId {
+            return .local(peers: peers)
+        }
+        // Only the primary ever holds real upload state - falling back to a secondary on
+        // failure would just find nothing there either, so (unlike routingDecision's
+        // full-candidate-list forward) there's no fallback candidate worth offering.
+        return .forward(candidates: [primary])
+    }
+
     /// Pure placement check, independent of how the *current* request arrived - for when a
     /// handler needs to know whether this node holds some OTHER key than the one that already
     /// drove the request's own top-level `routingDecision` (e.g. CopyObject's source key, which

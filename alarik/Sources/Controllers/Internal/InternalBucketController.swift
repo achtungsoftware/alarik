@@ -1523,7 +1523,7 @@ struct InternalBucketController: RouteCollection {
     /// entirely. Does not create a new version - modifies the existing version's metadata in
     /// place, matching the S3-protocol PutObjectTagging semantics.
     @Sendable
-    func setObjectTags(req: Request) async throws -> TagsDTO {
+    func setObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1541,6 +1541,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1548,15 +1557,21 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = input.tags }
         }
 
-        return TagsDTO(tags: input.tags)
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return try await TagsDTO(tags: input.tags).encodeResponse(for: req)
     }
 
     @Sendable
-    func getObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+    func getObjectMetadata(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1567,6 +1582,12 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let (meta, _) = try ObjectFileHandler.readCurrentObject(
                 bucketName: bucketName, key: key, loadData: false)
@@ -1574,7 +1595,8 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        return ObjectMetadataDTO(contentType: meta.contentType, metadata: meta.metadata)
+        return try await ObjectMetadataDTO(contentType: meta.contentType, metadata: meta.metadata)
+            .encodeResponse(for: req)
     }
 
     /// Updates the Content-Type and custom (`x-amz-meta-*`) metadata of the *current* version
@@ -1582,7 +1604,7 @@ struct InternalBucketController: RouteCollection {
     /// the body, and (also matching S3's PutObjectTagging/metadata-only semantics) no
     /// webhook notification, since the object's data hasn't changed.
     @Sendable
-    func setObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+    func setObjectMetadata(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1598,6 +1620,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1609,18 +1640,26 @@ struct InternalBucketController: RouteCollection {
         let normalizedMetadata = Dictionary(
             uniqueKeysWithValues: input.metadata.map { ($0.key.lowercased(), $0.value) })
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) {
                 $0.contentType = input.contentType
                 $0.metadata = normalizedMetadata
             }
         }
 
-        return ObjectMetadataDTO(contentType: input.contentType, metadata: normalizedMetadata)
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return try await ObjectMetadataDTO(
+            contentType: input.contentType, metadata: normalizedMetadata
+        ).encodeResponse(for: req)
     }
 
     @Sendable
-    func deleteObjectTags(req: Request) async throws -> HTTPStatus {
+    func deleteObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1631,6 +1670,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forward(let candidates):
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1638,11 +1686,17 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
 
-        return .noContent
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return Response(status: .noContent)
     }
 
     /// Per-key (not bucket-wide), so unlike `listObjects`/`getObjectStats` this doesn't need the
