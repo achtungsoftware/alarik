@@ -40,6 +40,31 @@ struct InternalClusterObjectController: RouteCollection {
         cluster.on(.POST, "push", body: .stream, use: handlePush)
         cluster.delete(use: handleDelete)
         cluster.get("fetch", use: handleFetch)
+        cluster.get("exists", use: handleExists)
+    }
+
+    /// Header-only existence probe (the read-side counterpart to `handleFetch`) - resolves the
+    /// object's on-disk path and answers `200`/`404` without opening or streaming any payload.
+    /// A live delete marker counts as "not found", matching what a client GET would see.
+    @Sendable
+    func handleExists(req: Request) async throws -> HTTPStatus {
+        guard
+            let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
+        }
+        let versionId = req.query[String.self, at: "versionId"]
+
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId),
+            let (meta, _, _) = try? ObjectFileHandler.payloadLocation(path: path),
+            !meta.isDeleteMarker
+        else {
+            return .notFound
+        }
+        return .ok
     }
 
     /// The read-mirror of `handlePush` - streams this node's local copy of an object back to a

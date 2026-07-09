@@ -163,6 +163,14 @@ enum CacheReloadDispatch {
                 await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
             }
 
+        case ("clusterRebalance", _):
+            // Operator-triggered resync: unlike a genuine membership change (whose NOTIFY carries
+            // a specific node id), this is a deliberate "re-check placement everywhere" broadcast,
+            // so every node runs its own self-scoped walk. That's what makes resync actually
+            // cluster-wide - the walk only ever sees this node's local disk, so a node holding an
+            // under-replicated object must run its own walk to push the missing copies out.
+            await ClusterRebalanceService.scheduleRebalance(app: app, reason: .manualResync)
+
         default:
             app.logger.error("Unknown cache invalidation message: \(message)")
         }

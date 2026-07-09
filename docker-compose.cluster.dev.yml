@@ -144,6 +144,45 @@ services:
     networks:
       - alarik-network
 
+  alarik-4:
+    image: alarik-cluster-dev:latest
+    container_name: alarik-cluster-dev-4
+    restart: unless-stopped
+    command: [".build/debug/Alarik", "serve", "--env", "development", "--hostname", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8084:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-debug}
+      - API_BASE_URL=http://localhost:8084
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
+      - JWT=dev-cluster-jwt-secret
+      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-4:8080
+      - CLUSTER_SECRET=dev-cluster-secret
+      - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+      - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    volumes:
+      - ./alarik:/app
+      - alarik-build:/app/.build:ro
+      - alarik-4-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      alarik-build:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      alarik-1:
+        condition: service_healthy
+    networks:
+      - alarik-network
+
   # Point this at any one node - or, in production, at a load balancer in front of all three.
   # Any node can serve any request, so there's no "primary" to pick.
   console:
@@ -170,6 +209,7 @@ services:
       - alarik-1
       - alarik-2
       - alarik-3
+      - alarik-4
     networks:
       - alarik-network
 
@@ -183,3 +223,4 @@ volumes:
   alarik-1-storage:
   alarik-2-storage:
   alarik-3-storage:
+  alarik-4-storage:

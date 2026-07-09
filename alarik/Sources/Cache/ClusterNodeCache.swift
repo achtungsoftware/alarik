@@ -32,15 +32,49 @@ final actor ClusterNodeCache {
     public static let shared = ClusterNodeCache()
 
     /// How long a node's `lastHeartbeatAt` can go without an update before every other node
-    /// treats it as unavailable. Must comfortably exceed `ClusterMembershipLifecycle`'s
-    /// heartbeat interval (10s) so one or two missed ticks (a brief GC pause, a slow query)
-    /// don't flap a healthy node in and out of the active set.
-    static let heartbeatStaleness: TimeInterval = 30
+    /// treats it as unavailable. Set well above `ClusterMembershipLifecycle`'s heartbeat
+    /// interval (10s) - six missed ticks - so a node that's briefly too busy to heartbeat (a GC
+    /// pause, a slow query, an IO-heavy burst) isn't falsely marked down and flapped out of the
+    /// active set. Membership stability matters more than fast failure detection here: a genuine
+    /// crash is recovered by an operator draining the node (which excludes it immediately, no
+    /// staleness wait), so a generous window costs nothing but avoids spurious placement churn.
+    static let heartbeatStaleness: TimeInterval = 60
 
     private var nodes: [UUID: ClusterNodeInfo] = [:]
 
     func load(initialData: [ClusterNodeInfo]) {
         nodes = Dictionary(uniqueKeysWithValues: initialData.map { ($0.id, $0) })
+    }
+
+    /// Like `load`, but for the periodic membership refresh rather than the boot-time bulk load:
+    /// a full replace would race with concurrent event-driven `upsert`/`remove` calls (a NOTIFY
+    /// landing between the refresh's DB read and this write), silently reverting them to the
+    /// snapshot's older view. Instead, keep the existing cached entry whenever it's strictly
+    /// fresher than the snapshot's row - a newer heartbeat, or (on an equal heartbeat) a
+    /// non-`active` status the snapshot was read just before it committed, so an in-flight drain
+    /// is never resurrected as active. Nodes absent from the snapshot are still dropped (the
+    /// authoritative "row removed" signal).
+    func reconcile(snapshot: [ClusterNodeInfo]) {
+        var merged: [UUID: ClusterNodeInfo] = [:]
+        for node in snapshot {
+            if let existing = nodes[node.id], Self.prefersExisting(existing, over: node) {
+                merged[node.id] = existing
+            } else {
+                merged[node.id] = node
+            }
+        }
+        nodes = merged
+    }
+
+    private static func prefersExisting(_ existing: ClusterNodeInfo, over snapshot: ClusterNodeInfo)
+        -> Bool
+    {
+        if existing.lastHeartbeatAt != snapshot.lastHeartbeatAt {
+            return existing.lastHeartbeatAt > snapshot.lastHeartbeatAt
+        }
+        // Same heartbeat: prefer a cached non-active status (a drain/removal the snapshot missed)
+        // over the snapshot's active one.
+        return existing.status != .active && snapshot.status == .active
     }
 
     func upsert(_ node: ClusterNodeInfo) {

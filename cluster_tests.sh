@@ -98,6 +98,81 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Placement helpers (all evaluate the global TOKEN/NODES_RESP/ENDPOINTS at call time, so they
+#    must only be called after cluster startup + login below) ───────────────────────────────────
+
+# responsible_ids <bucket> <key> -> the responsible node IDs for that key, one per line.
+responsible_ids() {
+    curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=$1" \
+        -H "Authorization: Bearer $TOKEN" \
+        | jq -r --arg k "$2" '.items[] | select(.key == $k) | .nodeIds[]'
+}
+
+# node_index_of <nodeId> -> the ENDPOINTS/STATE_DIRS index of that node (empty if not found).
+node_index_of() {
+    local i
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if [ "$(echo "$NODES_RESP" | jq -r ".[$i].id")" == "$1" ]; then
+            echo "$i"
+            return 0
+        fi
+    done
+}
+
+# wait_for_full_membership -> waits (best-effort, up to ~25s) until node 0 reports all NODE_COUNT
+# nodes healthy. Guards the "find a node not responsible for a key" pattern against transient
+# heartbeat flapping under heavy local load: when the active set momentarily shrinks,
+# RF=min(3,active) makes every active node responsible for every key, so no non-responsible node
+# exists to find. Returns after the timeout regardless, so callers still proceed.
+wait_for_full_membership() {
+    local healthy
+    for _ in $(seq 1 25); do
+        healthy=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes" \
+            -H "Authorization: Bearer $TOKEN" | jq '[.[] | select(.isHealthy == true)] | length' 2>/dev/null)
+        [ "$healthy" == "$NODE_COUNT" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# non_responsible_index <bucket> <key> -> the index of a node NOT responsible for the key (empty
+# if the key is responsible-everywhere, which shouldn't happen with 4 nodes / factor 3).
+non_responsible_index() {
+    wait_for_full_membership
+    local ids
+    ids=$(responsible_ids "$1" "$2")
+    local i node_id
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        node_id=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+        if ! echo "$ids" | grep -q "^$node_id$"; then
+            echo "$i"
+            return 0
+        fi
+    done
+}
+
+# responsible_index_except <bucket> <key> <excludedIndex> -> the index of a responsible node other
+# than <excludedIndex> (empty if none).
+responsible_index_except() {
+    wait_for_full_membership
+    local ids
+    ids=$(responsible_ids "$1" "$2")
+    local i node_id
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        [ "$i" == "$3" ] && continue
+        node_id=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+        if echo "$ids" | grep -q "^$node_id$"; then
+            echo "$i"
+            return 0
+        fi
+    done
+}
+
+# obj_path <index> <bucket> <key> -> the on-disk .obj path for that key in that node's state dir.
+obj_path() {
+    echo "${STATE_DIRS[$1]}/Storage/buckets/$2/$3.obj"
+}
+
 echo "==============================================="
 echo " Alarik cluster tests ($NODE_COUNT real instances + Postgres)"
 echo " Logs: $LOG_DIR"
@@ -460,9 +535,10 @@ else
         # The first rebalance pass (triggered by the drain) copies the object to its new owner
         # but finds reclaim gated on that just-enqueued copy task, so it self-schedules a
         # follow-up pass ~30s later (ClusterRebalanceService.gatedReclaimFollowUpDelay) once the
-        # copy has actually been confirmed delivered.
+        # copy has actually been confirmed delivered. That 30s is a hard floor with no slack for
+        # this run's own DB/dispatcher latency, so poll well past it rather than right up against it.
         RECLAIMED=0
-        for _ in $(seq 1 50); do
+        for _ in $(seq 1 90); do
             if [ ! -f "$DRAIN_OBJ_PATH" ]; then
                 RECLAIMED=1
                 break
@@ -594,6 +670,7 @@ echo "=== Test: DeleteBucket safety with objects on a non-coordinating node ==="
 aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-deletebucket-test >/dev/null 2>&1
 NODE0_ID=$(echo "$NODES_RESP" | jq -r ".[0].id")
 
+wait_for_full_membership
 DB_KEY=""
 for i in $(seq 1 40); do
     candidate="db-key-$i.txt"
@@ -1084,7 +1161,236 @@ else
     fi
 fi
 
-# ── Test 28: DeleteBucket fails closed when a peer is unreachable ──────────────
+# ── Test 29: admin console upload reclaims its stray local copy (no leak) ──────
+# uploadObject can't forward (the destination key is only known after the body is consumed), so a
+# write landing on a node NOT responsible for the key writes locally, pushes to the responsible
+# nodes, then must reclaim its own now-redundant copy. Proves both halves: the responsible nodes
+# physically hold it AND the entry node's stray .obj is gone.
+echo ""
+echo "=== Test: admin console upload reclaims its stray local copy ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-upload-reclaim-test >/dev/null 2>&1
+RECLAIM_UP_FILE=$(mktemp)
+echo "admin upload that must not leave a stray copy" >"$RECLAIM_UP_FILE"
+NODE0_ID=$(echo "$NODES_RESP" | jq -r ".[0].id")
+
+wait_for_full_membership
+STRAY_KEY=""
+for n in $(seq 1 25); do
+    candidate="stray-upload-$n.txt"
+    curl -s -o /dev/null -X POST "${ENDPOINTS[0]}/api/v1/objects?bucket=cluster-upload-reclaim-test" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "data=@${RECLAIM_UP_FILE};filename=$candidate"
+    sleep 1
+    if ! responsible_ids cluster-upload-reclaim-test "$candidate" | grep -q "^$NODE0_ID$"; then
+        STRAY_KEY="$candidate"
+        break
+    fi
+done
+
+if [ -z "$STRAY_KEY" ]; then
+    fail "Could not get an admin upload to land on a node not responsible for its key (needed to exercise stray reclaim)."
+else
+    STRAY_PATH=$(obj_path 0 cluster-upload-reclaim-test "$STRAY_KEY")
+    STRAY_GONE=0
+    for _ in $(seq 1 15); do
+        [ ! -f "$STRAY_PATH" ] && { STRAY_GONE=1; break; }
+        sleep 1
+    done
+    RESP_HAVE_IT=1
+    for id in $(responsible_ids cluster-upload-reclaim-test "$STRAY_KEY"); do
+        j=$(node_index_of "$id")
+        [ -z "$j" ] && continue
+        [ -f "$(obj_path "$j" cluster-upload-reclaim-test "$STRAY_KEY")" ] || RESP_HAVE_IT=0
+    done
+    if [ "$STRAY_GONE" -eq 1 ] && [ "$RESP_HAVE_IT" -eq 1 ]; then
+        pass "Admin upload to a non-responsible node replicates to the responsible nodes and reclaims its own stray local copy."
+    else
+        fail "Admin upload stray reclaim failed (stray_gone=$STRAY_GONE responsible_have_it=$RESP_HAVE_IT)."
+    fi
+fi
+
+# ── Test 30: getObjectTags forwards from a non-responsible node ─────────────────
+echo ""
+echo "=== Test: admin getObjectTags forwards from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-gettags-test >/dev/null 2>&1
+echo "tag me" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-gettags-test/tagged.txt >/dev/null
+sleep 2
+aws --endpoint-url "${ENDPOINTS[0]}" s3api put-object-tagging --bucket cluster-gettags-test --key tagged.txt \
+    --tagging '{"TagSet":[{"Key":"env","Value":"cluster"}]}' >/dev/null
+sleep 2
+GT_NR=$(non_responsible_index cluster-gettags-test tagged.txt)
+if [ -z "$GT_NR" ]; then
+    fail "Could not find a node not responsible for tagged.txt."
+else
+    GT_VAL=$(curl -s "${ENDPOINTS[$GT_NR]}/api/v1/objects/tags?bucket=cluster-gettags-test&key=tagged.txt" \
+        -H "Authorization: Bearer $TOKEN" | jq -r '.tags.env // empty')
+    if [ "$GT_VAL" == "cluster" ]; then
+        pass "Admin getObjectTags forwards to a responsible node and returns the correct tags from a node that doesn't hold the key."
+    else
+        fail "getObjectTags from a non-responsible node returned '$GT_VAL', expected 'cluster'."
+    fi
+fi
+
+# ── Test 31: getObjectMetadata forwards from a non-responsible node ─────────────
+echo ""
+echo "=== Test: admin getObjectMetadata forwards from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-getmeta-test >/dev/null 2>&1
+echo "meta me" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-getmeta-test/meta.txt --content-type "application/x-alarik-test" >/dev/null
+sleep 2
+GM_NR=$(non_responsible_index cluster-getmeta-test meta.txt)
+if [ -z "$GM_NR" ]; then
+    fail "Could not find a node not responsible for meta.txt."
+else
+    GM_CT=$(curl -s "${ENDPOINTS[$GM_NR]}/api/v1/objects/metadata?bucket=cluster-getmeta-test&key=meta.txt" \
+        -H "Authorization: Bearer $TOKEN" | jq -r '.contentType // empty')
+    if [ "$GM_CT" == "application/x-alarik-test" ]; then
+        pass "Admin getObjectMetadata forwards and returns the correct content-type from a non-holding node."
+    else
+        fail "getObjectMetadata from a non-responsible node returned contentType '$GM_CT'."
+    fi
+fi
+
+# ── Test 32: shareObject from a non-responsible node & the link serves cluster-wide ──
+# Two fixes at once: creating the link must succeed even when this node doesn't hold the object
+# (cluster-wide existence probe, not a local-disk check), and the resulting public link must
+# serve correct bytes from EVERY node (SharedLinkController forwards when it doesn't hold it).
+echo ""
+echo "=== Test: shareObject from a non-responsible node + shared link served from every node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-share-test >/dev/null 2>&1
+SHARE_FILE=$(mktemp)
+echo "shared across the whole cluster" >"$SHARE_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$SHARE_FILE" s3://cluster-share-test/shared.txt >/dev/null
+sleep 2
+SH_NR=$(non_responsible_index cluster-share-test shared.txt)
+if [ -z "$SH_NR" ]; then
+    fail "Could not find a node not responsible for shared.txt."
+else
+    SHARE_RESP=$(curl -s -X POST "${ENDPOINTS[$SH_NR]}/api/v1/objects/share" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"bucket":"cluster-share-test","key":"shared.txt"}')
+    SHARE_URL=$(echo "$SHARE_RESP" | jq -r '.url // empty')
+    if [ -z "$SHARE_URL" ]; then
+        fail "Creating a share link from a non-responsible node failed (cluster-wide existence check regressed): $SHARE_RESP"
+    else
+        SHARE_TOKEN=$(basename "$SHARE_URL")
+        SHARE_ALL_OK=1
+        for i in $(seq 0 $((NODE_COUNT - 1))); do
+            if ! curl -s "${ENDPOINTS[$i]}/api/v1/shared/$SHARE_TOKEN" 2>/dev/null | cmp -s - "$SHARE_FILE"; then
+                SHARE_ALL_OK=0
+                echo "  shared link did not serve correct content from node $i"
+            fi
+        done
+        if [ "$SHARE_ALL_OK" -eq 1 ]; then
+            pass "Share link created on a non-responsible node and served with correct content from every node (including non-holders)."
+        else
+            fail "Shared link was not served correctly from at least one node."
+        fi
+    fi
+fi
+
+# ── Test 33: bucket replication drains correctly with writes coordinated by any node ──
+echo ""
+echo "=== Test: bucket replication works with writes coordinated by different nodes ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-repl-src >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-repl-dst >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[0]}" s3api put-bucket-versioning --bucket cluster-repl-src --versioning-configuration Status=Enabled
+REPL_TARGET_RESP=$(curl -s -X PUT "${ENDPOINTS[0]}/api/v1/buckets/cluster-repl-src/replication/targets" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"targets\":[{\"id\":\"00000000-0000-0000-0000-000000000000\",\"endpoint\":\"${ENDPOINTS[0]}\",\"targetBucket\":\"cluster-repl-dst\",\"accessKeyId\":\"$ACCESS_KEY\",\"secretAccessKey\":\"$SECRET_KEY\",\"region\":\"us-east-1\",\"enabled\":true}]}")
+REPL_TARGET_ID=$(echo "$REPL_TARGET_RESP" | jq -r '.targets[0].id // empty')
+if [ -z "$REPL_TARGET_ID" ]; then
+    fail "Could not configure a replication target in the cluster: $REPL_TARGET_RESP"
+else
+    curl -s -o /dev/null -X PUT "${ENDPOINTS[0]}/api/v1/buckets/cluster-repl-src/replication/rules" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"rules\":[{\"id\":\"00000000-0000-0000-0000-000000000000\",\"targetId\":\"$REPL_TARGET_ID\",\"prefix\":null,\"replicateDeletes\":true,\"replicateExisting\":false,\"synchronous\":false,\"enabled\":true}]}"
+    sleep 2
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        echo "replicate me $i" | aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp - "s3://cluster-repl-src/repl-$i.txt" >/dev/null
+    done
+    REPL_ALL_OK=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        FOUND=0
+        for _ in $(seq 1 30); do
+            if aws --endpoint-url "${ENDPOINTS[0]}" s3api head-object --bucket cluster-repl-dst --key "repl-$i.txt" >/dev/null 2>&1; then
+                FOUND=1
+                break
+            fi
+            sleep 1
+        done
+        [ "$FOUND" -eq 0 ] && { REPL_ALL_OK=0; echo "  repl-$i.txt (written via node $i) never replicated to the destination bucket"; }
+    done
+    if [ "$REPL_ALL_OK" -eq 1 ]; then
+        pass "Bucket replication delivers objects written through every node to the destination bucket (outbox drained cluster-wide)."
+    else
+        fail "At least one object written via a non-node-0 node never replicated."
+    fi
+fi
+
+# ── Test 34: a presigned URL works when it lands on a non-responsible node ──────
+echo ""
+echo "=== Test: presigned GET URL forwarded from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-presign-test >/dev/null 2>&1
+PRESIGN_FILE=$(mktemp)
+echo "presigned and forwarded" >"$PRESIGN_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$PRESIGN_FILE" s3://cluster-presign-test/presigned.txt >/dev/null
+sleep 2
+PS_NR=$(non_responsible_index cluster-presign-test presigned.txt)
+if [ -z "$PS_NR" ]; then
+    fail "Could not find a node not responsible for presigned.txt."
+else
+    PS_URL=$(aws --endpoint-url "${ENDPOINTS[$PS_NR]}" s3 presign s3://cluster-presign-test/presigned.txt)
+    if curl -s "$PS_URL" 2>/dev/null | cmp -s - "$PRESIGN_FILE"; then
+        pass "A presigned URL validated on a node not responsible for the key still serves it (SigV4 verified locally, then forwarded)."
+    else
+        fail "Presigned URL fetch via a non-responsible node returned wrong content."
+    fi
+fi
+
+# ── Test 35: a ranged GET forwarded from a non-responsible node ────────────────
+echo ""
+echo "=== Test: ranged GET forwarded from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-range-test >/dev/null 2>&1
+RANGE_FILE=$(mktemp)
+printf 'ABCDEFGHIJ0123456789' >"$RANGE_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$RANGE_FILE" s3://cluster-range-test/range.bin >/dev/null
+sleep 2
+RG_NR=$(non_responsible_index cluster-range-test range.bin)
+if [ -z "$RG_NR" ]; then
+    fail "Could not find a node not responsible for range.bin."
+else
+    RG_OUT=$(mktemp)
+    aws --endpoint-url "${ENDPOINTS[$RG_NR]}" s3api get-object --bucket cluster-range-test --key range.bin --range "bytes=0-4" "$RG_OUT" >/dev/null 2>&1
+    RG_GOT=$(cat "$RG_OUT")
+    if [ "$RG_GOT" == "ABCDE" ]; then
+        pass "A ranged GET (bytes=0-4) forwarded through a non-responsible node returns exactly the requested slice."
+    else
+        fail "Ranged GET via a non-responsible node returned '$RG_GOT', expected 'ABCDE'."
+    fi
+fi
+
+# ── Test 36: an in-place metadata edit replicates across nodes ──────────────────
+echo ""
+echo "=== Test: setObjectMetadata replicates the change across nodes ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-setmeta-test >/dev/null 2>&1
+echo "metadata replication" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-setmeta-test/setmeta.txt >/dev/null
+sleep 2
+curl -s -o /dev/null -X PUT "${ENDPOINTS[0]}/api/v1/objects/metadata?bucket=cluster-setmeta-test&key=setmeta.txt" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"contentType":"application/x-replicated-meta","metadata":{"team":"cluster"}}'
+sleep 3
+SM_ALL_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    CT=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-object --bucket cluster-setmeta-test --key setmeta.txt 2>/dev/null | jq -r '.ContentType // empty')
+    [ "$CT" == "application/x-replicated-meta" ] || { SM_ALL_OK=0; echo "  node $i sees content-type '$CT'"; }
+done
+if [ "$SM_ALL_OK" -eq 1 ]; then
+    pass "An in-place metadata edit replicates to every responsible node (head-object returns the new content-type from every node)."
+else
+    fail "setObjectMetadata did not replicate the content-type to every node."
+fi
+
+# ── Test 37: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't
 # confirm every active peer is also empty, per hasBucketObjects's fail-closed design.
@@ -1097,7 +1403,7 @@ kill "${PIDS[$KILL_INDEX]}" 2>/dev/null
 wait "${PIDS[$KILL_INDEX]}" 2>/dev/null
 # Give the remaining nodes' heartbeat staleness window a moment - deliberately short: the check
 # should fail closed on an unreachable peer well before the cluster even agrees it's "down"
-# (ClusterNodeCache.heartbeatStaleness is 30s), since a live-but-unresponsive peer is exactly
+# (ClusterNodeCache.heartbeatStaleness is 60s), since a live-but-unresponsive peer is exactly
 # the case this gate exists for.
 sleep 2
 

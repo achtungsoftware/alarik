@@ -149,7 +149,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                         id: id, address: row.address, status: status,
                         lastHeartbeatAt: row.lastHeartbeatAt)
                 }
-                await ClusterNodeCache.shared.load(initialData: snapshot)
+                await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
             } catch {
                 app.logger.error("Cluster membership refresh failed: \(error)")
             }

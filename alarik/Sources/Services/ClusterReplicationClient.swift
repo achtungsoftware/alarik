@@ -90,6 +90,45 @@ enum ClusterReplicationClient {
         }
     }
 
+    /// Best-effort "does any of `candidates` physically hold this object" probe - a header-only
+    /// GET against the internal existence endpoint, no payload transferred. For read-side
+    /// callers (e.g. creating a share link) that need to confirm an object exists cluster-wide
+    /// but must run on *this* node rather than forward (so the answer, or a generated URL, stays
+    /// local). An unreachable peer is treated as "not found here" and the next candidate is
+    /// tried; `false` only after every candidate has been asked.
+    static func objectExists(
+        app: Application, candidates: [ClusterNodeInfo], bucketName: String, key: String,
+        versionId: String?
+    ) async -> Bool {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return false }
+
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        var urlSuffix = "?bucket=\(encodedBucket)&key=\(encodedKey)"
+        if let versionId {
+            let encodedVersionId =
+                versionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? versionId
+            urlSuffix += "&versionId=\(encodedVersionId)"
+        }
+
+        for node in candidates {
+            var outbound = HTTPClientRequest(
+                url: node.address + "/internal/cluster/objects/exists" + urlSuffix)
+            outbound.method = .GET
+            outbound.headers.replaceOrAdd(
+                name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+            do {
+                let response = try await app.http.client.shared.execute(
+                    outbound, timeout: requestTimeout, logger: app.logger)
+                if response.status == .ok { return true }
+            } catch {
+                continue
+            }
+        }
+        return false
+    }
+
     /// Tells `node` to delete its copy of `bucketName`/`key`/`versionId` (or the current object,
     /// if `versionId` is nil) - used both for genuine deletes and for reclaim tasks after a
     /// rebalance confirms the new owner(s) have a full copy. `coordinate: true` asks `node` to

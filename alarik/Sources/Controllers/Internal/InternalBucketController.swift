@@ -402,11 +402,25 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(
             req: req, bucketName: input.bucket, userId: auth.userId)
 
-        guard
-            try ObjectFileHandler.readCurrentObject(
-                bucketName: input.bucket, key: input.key, loadData: false) != nil
-        else {
-            throw Abort(.notFound, reason: "Object not found")
+        // The object may live on any node, but this handler must NOT forward - the share URL it
+        // returns is built from this node's own base address, so it has to be the one that
+        // answers. Check locally first, then (only if this node isn't responsible) confirm
+        // existence on a responsible peer with a header-only probe rather than pulling the bytes.
+        let localResult = try? ObjectFileHandler.readCurrentObject(
+            bucketName: input.bucket, key: input.key, loadData: false)
+        let existsLocally = (localResult ?? nil) != nil
+        if !existsLocally {
+            let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+                req: req, bucketName: input.bucket, key: input.key)
+            var existsRemotely = false
+            if !isLocal && !candidates.isEmpty {
+                existsRemotely = await ClusterReplicationClient.objectExists(
+                    app: req.application, candidates: candidates, bucketName: input.bucket,
+                    key: input.key, versionId: nil)
+            }
+            guard existsRemotely else {
+                throw Abort(.notFound, reason: "Object not found")
+            }
         }
 
         let expiresAt: Date?
@@ -770,31 +784,38 @@ struct InternalBucketController: RouteCollection {
         req: Request, rawTempFile tempPath: String, meta: ObjectMeta, key: String
     ) -> Response {
         let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta, includeBody: false)
+        Self.streamRawFile(req: req, path: tempPath, count: meta.size, into: response)
+        return Self.attachDownloadHeaders(to: response, key: key)
+    }
+
+    /// Attaches a windowed-read streaming body over a raw on-disk file to `response`, deleting
+    /// the file once the stream drains or fails - so a large payload (a peer-fetched object, a
+    /// built ZIP) is never buffered whole in memory just to send it, and the throwaway temp file
+    /// never leaks. `count` must be the exact byte length (drives Content-Length).
+    private static func streamRawFile(req: Request, path: String, count: Int, into response: Response) {
         let threadPool = req.application.threadPool
-        let payloadSize = meta.size
         response.body = Response.Body(
             managedAsyncStream: { writer in
-                let fd = try await threadPool.runIfActive { POSIXFile.open(tempPath, O_RDONLY) }
+                let fd = try await threadPool.runIfActive { POSIXFile.open(path, O_RDONLY) }
                 guard fd >= 0 else {
-                    _ = POSIXFile.unlink(tempPath)
-                    throw Abort(.internalServerError, reason: "Failed to open cluster fetch temp file")
+                    _ = POSIXFile.unlink(path)
+                    throw Abort(.internalServerError, reason: "Failed to open file for streaming")
                 }
                 do {
                     try await StreamingIOLoops.readWindowed(
-                        threadPool: threadPool, fd: fd, offset: 0, length: payloadSize,
+                        threadPool: threadPool, fd: fd, offset: 0, length: count,
                         chunkSize: Constants.streamingReadChunkSize
                     ) { chunk in
                         try await writer.writeBuffer(chunk)
                     }
                 } catch {
                     _ = POSIXFile.close(fd)
-                    _ = POSIXFile.unlink(tempPath)
+                    _ = POSIXFile.unlink(path)
                     throw error
                 }
                 _ = POSIXFile.close(fd)
-                _ = POSIXFile.unlink(tempPath)
-            }, count: payloadSize)
-        return Self.attachDownloadHeaders(to: response, key: key)
+                _ = POSIXFile.unlink(path)
+            }, count: count)
     }
 
     private static func attachDownloadHeaders(to response: Response, key: String) -> Response {
@@ -907,23 +928,22 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "No files found to download")
         }
 
-        // Read the ZIP file
-        let zipData = try Data(contentsOf: zipURL)
-
-        // Clean up
-        try? FileManager.default.removeItem(at: zipURL)
-
-        let response = Response(status: .ok, body: .init(data: zipData))
+        // Stream the finished archive straight off disk (unlinked once sent) rather than reading
+        // the whole thing into memory - a folder download can produce an arbitrarily large ZIP.
+        guard
+            let zipSize = (try? FileManager.default.attributesOfItem(atPath: zipURL.path))?[.size]
+                as? NSNumber
+        else {
+            try? FileManager.default.removeItem(at: zipURL)
+            throw Abort(.internalServerError, reason: "Failed to stat the generated ZIP archive")
+        }
+        let response = Response(status: .ok)
         response.headers.contentType = .zip
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(bucketName)-download.zip\""
         )
-        response.headers.replaceOrAdd(
-            name: .contentLength,
-            value: String(zipData.count)
-        )
-
+        Self.streamRawFile(req: req, path: zipURL.path, count: zipSize.intValue, into: response)
         return response
     }
 
@@ -1618,7 +1638,7 @@ struct InternalBucketController: RouteCollection {
     /// Returns the tags of the *current* version of an object. Internal API doesn't expose
     /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
     @Sendable
-    func getObjectTags(req: Request) async throws -> TagsDTO {
+    func getObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1629,6 +1649,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        // Tags live in the object's own metadata, so this must run on a node that physically
+        // holds the key - forward to a responsible node when this one doesn't (mirrors
+        // getObjectMetadata, which this was inconsistent with before).
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let (meta, _) = try ObjectFileHandler.readCurrentObject(
                 bucketName: bucketName, key: key, loadData: false)
@@ -1636,7 +1665,7 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        return TagsDTO(tags: meta.tags ?? [:])
+        return try await TagsDTO(tags: meta.tags ?? [:]).encodeResponse(for: req)
     }
 
     /// Sets the tags of the *current* version of an object, overwriting any existing tags

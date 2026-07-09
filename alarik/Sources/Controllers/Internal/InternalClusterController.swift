@@ -113,18 +113,20 @@ struct InternalClusterController: RouteCollection {
         return .ok
     }
 
-    /// Manually triggers a full cluster-wide rebalance walk - the "node recovered after an
-    /// extended outage, past the outbox's dead-letter point" recovery path (see
-    /// `ClusterRebalanceService`'s doc comment). Deliberately cluster-wide, not scoped to one
-    /// node - `ClusterRebalanceService.rebalance` always walks every bucket under the current
-    /// membership view regardless of which node asked for it, so a per-node route would be
-    /// misleading about what actually happens.
+    /// Manually triggers a rebalance walk on **every** node - the recovery path after a node has
+    /// crashed (a silent failure emits no membership NOTIFY, so nothing re-replicates its data
+    /// automatically) or recovered past the outbox's dead-letter point. A rebalance walk only
+    /// ever sees the node's own local disk, so re-replicating an under-replicated object requires
+    /// the node that still holds it to run its own walk - hence this broadcasts a `clusterRebalance`
+    /// NOTIFY that fans the walk out to all nodes, rather than rebalancing only whichever node
+    /// happened to field this request.
     @Sendable
     func resync(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        await ClusterRebalanceService.scheduleRebalance(app: req.application, reason: .manualResync)
+        CacheInvalidationService.notify(
+            on: req.db, cache: "clusterRebalance", op: .upsert, key: "resync")
         return .ok
     }
 
