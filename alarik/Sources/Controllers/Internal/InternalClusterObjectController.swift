@@ -103,9 +103,9 @@ struct InternalClusterObjectController: RouteCollection {
 
     /// Writes the exact version a peer sends - never mints a new version id, since replicas
     /// must agree on the id for the same write. The bucket's versioning status is read from
-    /// this node's own `BucketVersioningCache`, not re-derived from the pushed metadata - Phase
-    /// 1 already guarantees that cache is consistent cluster-wide, so both nodes compute the
-    /// identical on-disk path convention independently.
+    /// this node's own `BucketVersioningCache`, not re-derived from the pushed metadata - that
+    /// cache is already guaranteed consistent cluster-wide, so both nodes compute the identical
+    /// on-disk path convention independently.
     @Sendable
     func handlePush(req: Request) async throws -> HTTPStatus {
         guard

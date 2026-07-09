@@ -101,6 +101,33 @@ enum ObjectRoutingService {
         return .forward(candidates: [primary])
     }
 
+    /// Combines a routing decision with the actual forward call, for write handlers that need
+    /// `peers` to replicate a local write to - unlike `routingDecision`/`multipartRoutingDecision`
+    /// alone, which just return the decision and leave calling `ClusterForwardingClient.forward`
+    /// to every caller. This is the write-path counterpart to the read-only `forwardIfNeeded`
+    /// helpers already used for GET/HEAD-shaped handlers, and exists specifically so a routing
+    /// fix (like pinning multipart operations to the primary) only has to be made in one place
+    /// rather than at every "compute peers or forward" call site by hand.
+    enum WriteRouting {
+        case local(peers: [ClusterNodeInfo])
+        case forwarded(Response)
+    }
+
+    static func routeForWrite(
+        req: Request, bucketName: String, key: String, requirePrimary: Bool = false
+    ) async throws -> WriteRouting {
+        let decision =
+            requirePrimary
+            ? await multipartRoutingDecision(req: req, bucketName: bucketName, key: key)
+            : await routingDecision(req: req, bucketName: bucketName, key: key)
+        switch decision {
+        case .local(let peers):
+            return .local(peers: peers)
+        case .forward(let candidates):
+            return .forwarded(try await ClusterForwardingClient.forward(req: req, candidates: candidates))
+        }
+    }
+
     /// Pure placement check, independent of how the *current* request arrived - for when a
     /// handler needs to know whether this node holds some OTHER key than the one that already
     /// drove the request's own top-level `routingDecision` (e.g. CopyObject's source key, which

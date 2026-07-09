@@ -912,7 +912,179 @@ else
     fail "Expected placement size 12345, got '$PLACEMENT_SIZE'."
 fi
 
-# ── Test 24: DeleteBucket fails closed when a peer is unreachable ──────────────
+# ── Test 24: admin console upload replicates cluster-wide, download forwards ──
+echo ""
+echo "=== Test: admin console upload replicates cluster-wide, download forwards ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-admin-upload-test >/dev/null 2>&1
+ADMIN_UPLOAD_FILE=$(mktemp)
+echo "admin console upload test content" >"$ADMIN_UPLOAD_FILE"
+
+curl -s -o /dev/null -X POST "${ENDPOINTS[0]}/api/v1/objects?bucket=cluster-admin-upload-test" \
+    -H "Authorization: Bearer $TOKEN" \
+    -F "data=@${ADMIN_UPLOAD_FILE};filename=admin-upload.txt"
+sleep 3
+
+ADMIN_UPLOAD_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    if ! aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp s3://cluster-admin-upload-test/admin-upload.txt - 2>/dev/null | cmp -s - "$ADMIN_UPLOAD_FILE"; then
+        ADMIN_UPLOAD_OK=0
+        echo "  node $i does not have the correct content for the admin-uploaded object"
+    fi
+done
+if [ "$ADMIN_UPLOAD_OK" -eq 1 ]; then
+    pass "Admin console upload (POST /api/v1/objects) replicates to every node even when the admin node itself isn't responsible."
+else
+    fail "Admin console upload did not replicate correctly to every node."
+fi
+
+# Forwarded admin download: find a node NOT responsible for the key and download via its
+# admin API directly - proves downloadSingleFile's cross-node fetch fallback.
+ADMIN_PLACEMENT_RESP=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-admin-upload-test" -H "Authorization: Bearer $TOKEN")
+ADMIN_RESPONSIBLE_IDS=$(echo "$ADMIN_PLACEMENT_RESP" | jq -r '.items[] | select(.key == "admin-upload.txt") | .nodeIds[]')
+ADMIN_NON_RESPONSIBLE_ENDPOINT=""
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+    if ! echo "$ADMIN_RESPONSIBLE_IDS" | grep -q "^$NODE_ID$"; then
+        ADMIN_NON_RESPONSIBLE_ENDPOINT="${ENDPOINTS[$i]}"
+        break
+    fi
+done
+
+if [ -z "$ADMIN_NON_RESPONSIBLE_ENDPOINT" ]; then
+    fail "Could not find a node that isn't responsible for admin-upload.txt."
+else
+    ADMIN_DOWNLOAD_OUT=$(mktemp)
+    curl -s -X POST "$ADMIN_NON_RESPONSIBLE_ENDPOINT/api/v1/objects/download" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"bucket":"cluster-admin-upload-test","keys":["admin-upload.txt"]}' \
+        -o "$ADMIN_DOWNLOAD_OUT"
+    if cmp -s "$ADMIN_DOWNLOAD_OUT" "$ADMIN_UPLOAD_FILE"; then
+        pass "Admin console download from a node NOT responsible for the key still returns correct content (cross-node fetch)."
+    else
+        fail "Admin console download from a non-responsible node returned incorrect content."
+    fi
+fi
+
+# ── Test 25: admin console delete from a non-responsible node ──────────────────
+echo ""
+echo "=== Test: admin console delete from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-admin-delete-test >/dev/null 2>&1
+echo "to be deleted via admin console" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-admin-delete-test/admin-delete.txt >/dev/null
+sleep 2
+
+DEL_PLACEMENT_RESP=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-admin-delete-test" -H "Authorization: Bearer $TOKEN")
+DEL_RESPONSIBLE_IDS=$(echo "$DEL_PLACEMENT_RESP" | jq -r '.items[] | select(.key == "admin-delete.txt") | .nodeIds[]')
+DEL_NON_RESPONSIBLE_ENDPOINT=""
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+    if ! echo "$DEL_RESPONSIBLE_IDS" | grep -q "^$NODE_ID$"; then
+        DEL_NON_RESPONSIBLE_ENDPOINT="${ENDPOINTS[$i]}"
+        break
+    fi
+done
+
+if [ -z "$DEL_NON_RESPONSIBLE_ENDPOINT" ]; then
+    fail "Could not find a node that isn't responsible for admin-delete.txt."
+else
+    curl -s -o /dev/null -X DELETE "$DEL_NON_RESPONSIBLE_ENDPOINT/api/v1/objects?bucket=cluster-admin-delete-test&key=admin-delete.txt" \
+        -H "Authorization: Bearer $TOKEN"
+    sleep 2
+
+    DEL_ALL_GONE=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-object --bucket cluster-admin-delete-test --key admin-delete.txt >/dev/null 2>&1; then
+            DEL_ALL_GONE=0
+            echo "  node $i still has admin-delete.txt"
+        fi
+    done
+    if [ "$DEL_ALL_GONE" -eq 1 ]; then
+        pass "Admin console delete from a non-responsible node correctly delegates and removes the object cluster-wide."
+    else
+        fail "Admin console delete from a non-responsible node left the object present on at least one node."
+    fi
+fi
+
+# ── Test 26: admin console folder delete spans the whole cluster ───────────────
+echo ""
+echo "=== Test: admin console folder delete spans the whole cluster ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-admin-folder-test >/dev/null 2>&1
+for n in 1 2 3 4 5; do
+    echo "folder file $n" | aws --endpoint-url "${ENDPOINTS[$((n % NODE_COUNT))]}" s3 cp - "s3://cluster-admin-folder-test/folder/file-$n.txt" >/dev/null
+done
+sleep 3
+
+curl -s -o /dev/null -X DELETE "${ENDPOINTS[0]}/api/v1/objects?bucket=cluster-admin-folder-test&key=folder/" \
+    -H "Authorization: Bearer $TOKEN"
+sleep 3
+
+FOLDER_ALL_GONE=1
+for n in 1 2 3 4 5; do
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-object --bucket cluster-admin-folder-test --key "folder/file-$n.txt" >/dev/null 2>&1; then
+            FOLDER_ALL_GONE=0
+            echo "  node $i still has folder/file-$n.txt"
+        fi
+    done
+done
+if [ "$FOLDER_ALL_GONE" -eq 1 ]; then
+    pass "Admin console folder delete removes every key under the prefix from every node, regardless of placement."
+else
+    fail "Admin console folder delete left at least one key present on at least one node."
+fi
+
+# ── Test 27: admin console version delete from a non-responsible node ──────────
+echo ""
+echo "=== Test: admin console version delete from a non-responsible node ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-admin-version-test >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[0]}" s3api put-bucket-versioning --bucket cluster-admin-version-test --versioning-configuration Status=Enabled >/dev/null
+
+echo "version one" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-admin-version-test/versioned.txt >/dev/null
+sleep 1
+echo "version two" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-admin-version-test/versioned.txt >/dev/null
+sleep 2
+
+VERSIONS_RESP=$(aws --endpoint-url "${ENDPOINTS[0]}" s3api list-object-versions --bucket cluster-admin-version-test --prefix versioned.txt)
+OLD_VERSION_ID=$(echo "$VERSIONS_RESP" | jq -r '.Versions | sort_by(.LastModified) | .[0].VersionId')
+LATEST_VERSION_ID=$(echo "$VERSIONS_RESP" | jq -r '.Versions | sort_by(.LastModified) | .[-1].VersionId')
+
+VER_PLACEMENT_RESP=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=cluster-admin-version-test" -H "Authorization: Bearer $TOKEN")
+VER_RESPONSIBLE_IDS=$(echo "$VER_PLACEMENT_RESP" | jq -r '.items[] | select(.key == "versioned.txt") | .nodeIds[]')
+VER_NON_RESPONSIBLE_ENDPOINT=""
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$i].id")
+    if ! echo "$VER_RESPONSIBLE_IDS" | grep -q "^$NODE_ID$"; then
+        VER_NON_RESPONSIBLE_ENDPOINT="${ENDPOINTS[$i]}"
+        break
+    fi
+done
+
+if [ -z "$VER_NON_RESPONSIBLE_ENDPOINT" ] || [ -z "$OLD_VERSION_ID" ] || [ "$OLD_VERSION_ID" == "null" ]; then
+    fail "Could not set up the version-delete test (missing non-responsible node or version id)."
+else
+    curl -s -o /dev/null -X DELETE "$VER_NON_RESPONSIBLE_ENDPOINT/api/v1/objects/version?bucket=cluster-admin-version-test&key=versioned.txt&versionId=$OLD_VERSION_ID" \
+        -H "Authorization: Bearer $TOKEN"
+    sleep 2
+
+    VER_OLD_GONE=1
+    VER_LATEST_OK=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-object --bucket cluster-admin-version-test --key versioned.txt --version-id "$OLD_VERSION_ID" >/dev/null 2>&1; then
+            VER_OLD_GONE=0
+            echo "  node $i still has the deleted old version"
+        fi
+        if ! aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-object --bucket cluster-admin-version-test --key versioned.txt --version-id "$LATEST_VERSION_ID" >/dev/null 2>&1; then
+            VER_LATEST_OK=0
+            echo "  node $i is missing the latest version"
+        fi
+    done
+    if [ "$VER_OLD_GONE" -eq 1 ] && [ "$VER_LATEST_OK" -eq 1 ]; then
+        pass "Admin console version delete from a non-responsible node removes only the targeted version, cluster-wide."
+    else
+        fail "Admin console version delete did not behave correctly across the cluster."
+    fi
+fi
+
+# ── Test 28: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't
 # confirm every active peer is also empty, per hasBucketObjects's fail-closed design.

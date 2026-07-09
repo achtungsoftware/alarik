@@ -708,17 +708,13 @@ struct S3Controller: RouteCollection {
         // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
         // (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        let routingDecision =
-            isUploadPart
-            ? await ObjectRoutingService.multipartRoutingDecision(
-                req: req, bucketName: bucketName, key: keyPath)
-            : await ObjectRoutingService.routingDecision(
-                req: req, bucketName: bucketName, key: keyPath)
-        switch routingDecision {
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isUploadPart)
+        {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         // Check if this is an UploadPart request (PUT with partNumber & uploadId)
@@ -1289,17 +1285,13 @@ struct S3Controller: RouteCollection {
         // Cluster routing: one check covers this handler's dispatch tree (AbortMultipartUpload,
         // tagging DELETE, plain object DELETE) - all key off this same (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        let routingDecision =
-            isAbortMultipart
-            ? await ObjectRoutingService.multipartRoutingDecision(
-                req: req, bucketName: bucketName, key: keyPath)
-            : await ObjectRoutingService.routingDecision(
-                req: req, bucketName: bucketName, key: keyPath)
-        switch routingDecision {
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isAbortMultipart)
+        {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         // Check if this is AbortMultipartUpload (DELETE with uploadId, no versionId)
@@ -1394,7 +1386,7 @@ struct S3Controller: RouteCollection {
             }
 
             do {
-                let outcome = try await deleteOneObjectInBatch(
+                let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                     req: req, bucketName: bucketName, key: object.key,
                     versionId: object.versionId, versioningStatus: versioningStatus)
 
@@ -1430,41 +1422,6 @@ struct S3Controller: RouteCollection {
         let xmlData = try S3Service.buildDeleteObjectsResponse(
             deleted: quiet ? [] : deleted, errors: errors)
         return S3Service.buildXMLResponse(data: xmlData)
-    }
-
-    /// Per-key cluster routing for Multi-Object-Delete: each key in the batch can have a
-    /// different responsible node set, so (unlike a single-object DELETE) there's no one
-    /// whole-request forward decision. `authenticateWithCache` already validated the client once
-    /// for the entire batch in `handleBucketPost`, so a key this node isn't responsible for is
-    /// delegated straight to a responsible peer over the internal, secret-only replication
-    /// protocol rather than requiring a second per-key client signature. Tries peers in order
-    /// (only one becomes the delegate coordinator - never all of them, which would mint a
-    /// separate delete marker id per peer).
-    private func deleteOneObjectInBatch(
-        req: Request, bucketName: String, key: String, versionId: String?,
-        versioningStatus: VersioningStatus
-    ) async throws -> S3Service.ObjectDeleteOutcome {
-        let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
-            req: req, bucketName: bucketName, key: key)
-
-        if isLocal {
-            return try await ClusterReplicationService.coordinateDelete(
-                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
-                versioningStatus: versioningStatus, peers: peers)
-        }
-
-        var lastError: any Error = ClusterProxyError.objectNotFound
-        for node in responsible {
-            do {
-                return try await ClusterReplicationClient.deleteObject(
-                    app: req.application, to: node, bucketName: bucketName, key: key,
-                    versionId: versionId, coordinate: true)
-            } catch {
-                lastError = error
-                continue
-            }
-        }
-        throw lastError
     }
 
     /// Parses the Multi-Object Delete request XML body:
@@ -1553,13 +1510,13 @@ struct S3Controller: RouteCollection {
         // parts across nodes with no way to reassemble them, so the whole lifecycle must land on
         // the identical node throughout.
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.multipartRoutingDecision(
-            req: req, bucketName: bucketName, key: keyPath)
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: true)
         {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         // POST ?uploads → CreateMultipartUpload

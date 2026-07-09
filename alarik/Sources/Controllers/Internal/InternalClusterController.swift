@@ -161,6 +161,15 @@ struct InternalClusterController: RouteCollection {
         guard let bucketName = req.query[String.self, at: "bucket"] else {
             throw Abort(.badRequest, reason: "Missing bucket query parameter")
         }
+        // Unlike every other query param this route reads, `bucket` flows straight into
+        // filesystem path construction (via ClusterListingService -> ObjectFileHandler ->
+        // BucketHandler.bucketURL) - confirming it names a real, previously-validated bucket
+        // (CreateBucket already enforces safe S3 bucket-naming rules) rules out an admin-authed
+        // caller passing an arbitrary string through to disk I/O.
+        guard try await Bucket.query(on: req.db).filter(\.$name == bucketName).first() != nil
+        else {
+            throw Abort(.notFound, reason: "Bucket not found")
+        }
         let prefix = req.query[String.self, at: "prefix"] ?? ""
 
         let (objects, _, _, _) = try await ClusterListingService.listObjects(

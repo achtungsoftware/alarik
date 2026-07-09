@@ -116,6 +116,82 @@ enum ClusterReplicationService {
         return outcome
     }
 
+    /// Pushes an object this node just wrote locally out to every node that's actually
+    /// responsible for it, for the rare write path that can't determine its destination key (and
+    /// therefore routing) until *after* the request body is already consumed - the admin
+    /// console's upload endpoint can't know the key until it's decoded the multipart form body
+    /// looking for the filename, by which point forwarding the original request is no longer
+    /// possible. Unlike `replicateWrite`, this node's local write does NOT count toward quorum
+    /// (it isn't one of `responsible`'s real replicas), so every one of `responsible` needs its
+    /// own ack, not `responsible.count - 1`. The stray local copy this leaves behind on a node
+    /// that was never actually responsible is harmless and temporary - the next
+    /// `ClusterRebalanceService` walk reclaims it automatically via its existing "holds a copy
+    /// it's not responsible for" logic, the same as any other over-replicated straggler.
+    static func pushToResponsibleNodes(
+        app: Application, bucketName: String, key: String, versionId: String?,
+        responsible: [ClusterNodeInfo]
+    ) async {
+        guard !responsible.isEmpty else { return }
+        let quorum = PlacementService.quorumThreshold(replicaCount: responsible.count)
+
+        var delivered: Set<UUID> = []
+        await withTaskGroup(of: (node: ClusterNodeInfo, delivered: Bool).self) { group in
+            for node in responsible {
+                group.addTask {
+                    let ok = await attemptImmediateDelivery(
+                        app: app, node: node, bucketName: bucketName, key: key,
+                        versionId: versionId, operation: .put)
+                    return (node, ok)
+                }
+            }
+            for await outcome in group {
+                if outcome.delivered { delivered.insert(outcome.node.id) }
+                if delivered.count >= quorum { break }
+            }
+        }
+
+        let undelivered = responsible.filter { !delivered.contains($0.id) }
+        guard !undelivered.isEmpty else { return }
+        await enqueueOutbox(
+            app: app, nodes: undelivered, bucketName: bucketName, key: key, versionId: versionId,
+            operation: .put)
+    }
+
+    /// Deletes `key` correctly regardless of whether this node is one of its responsible nodes -
+    /// coordinates locally via `coordinateDelete` when it is, otherwise delegates to one of the
+    /// actual responsible peers over the internal, secret-only replication protocol (trying each
+    /// in turn until one succeeds). This is the shared logic behind both
+    /// `S3Controller.handleDeleteObjects`'s per-key Multi-Object-Delete routing and the admin
+    /// console's folder/prefix delete - any handler that already authenticated the caller once
+    /// for a whole batch/request and needs to delete a key it may not itself be responsible for,
+    /// without requiring a second per-key client signature.
+    static func deleteObjectClusterWide(
+        req: Request, bucketName: String, key: String, versionId: String?,
+        versioningStatus: VersioningStatus
+    ) async throws -> S3Service.ObjectDeleteOutcome {
+        let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
+            req: req, bucketName: bucketName, key: key)
+
+        if isLocal {
+            return try await coordinateDelete(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+                versioningStatus: versioningStatus, peers: peers)
+        }
+
+        var lastError: any Error = ClusterProxyError.objectNotFound
+        for node in responsible {
+            do {
+                return try await ClusterReplicationClient.deleteObject(
+                    app: req.application, to: node, bucketName: bucketName, key: key,
+                    versionId: versionId, coordinate: true)
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        throw lastError
+    }
+
     private static func enqueueOutbox(
         app: Application, nodes: [ClusterNodeInfo], bucketName: String, key: String,
         versionId: String?, operation: ClusterReplicationTask.Operation

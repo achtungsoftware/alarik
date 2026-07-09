@@ -20,8 +20,8 @@ import Vapor
 /// `InternalAuthenticator` (client-facing SigV4/JWT). By the time a request reaches a peer node
 /// it was already authenticated once at the entry node, and re-running SigV4 against a forwarded
 /// request wouldn't even work (the entry node never has the client's secret key to re-sign
-/// with). A single shared bearer secret, checked in constant time, is deliberately simple - Phase
-/// 2 assumes cluster traffic runs on a private network, same assumption Postgres/Redis
+/// with). A single shared bearer secret, checked in constant time, is deliberately simple -
+/// cluster traffic is assumed to run on a private network, the same assumption Postgres/Redis
 /// clustering commonly makes.
 enum ClusterForwardAuthenticator {
     static let forwardedHeaderName = "X-Alarik-Cluster-Forwarded"

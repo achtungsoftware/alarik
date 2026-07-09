@@ -532,6 +532,26 @@ struct InternalBucketController: RouteCollection {
             meta.isLatest = true
         }
 
+        // The destination key is only known after decoding the multipart body above, so unlike
+        // every other cluster-routed write this can't forward the *original* request (the body
+        // stream is already consumed) - instead it always writes locally (as above) and, if this
+        // node isn't actually one of the key's responsible nodes, pushes the freshly written
+        // version out to whichever nodes are. The local copy is a harmless, temporary stray in
+        // that case - ClusterRebalanceService's existing reclaim logic cleans it up automatically
+        // once the real owners are confirmed to have it, same as any other "holds a copy it's
+        // not responsible for" situation.
+        let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
+            req: req, bucketName: bucketName, key: keyPath)
+        if isLocal {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: meta.versionId, operation: .put, peers: peers)
+        } else if !responsible.isEmpty {
+            await ClusterReplicationService.pushToResponsibleNodes(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: meta.versionId, responsible: responsible)
+        }
+
         await NotificationService.emit(
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: meta.size, etag: etag, versionId: meta.versionId,
@@ -561,51 +581,66 @@ struct InternalBucketController: RouteCollection {
 
         // Check if this is a folder (prefix) deletion
         if key.hasSuffix("/") {
-            // Delete all objects with this prefix, emitting one event per removed object
-            let deletedKeys = try ObjectFileHandler.deletePrefix(bucketName: bucketName, prefix: key)
-            for deletedKey in deletedKeys {
-                await NotificationService.emit(
-                    event: .objectRemovedDelete, bucketName: bucketName, key: deletedKey,
-                    size: nil, etag: nil, versionId: nil,
-                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-                await ReplicationService.enqueueDelete(
-                    bucketName: bucketName, key: deletedKey, versionId: nil, on: req.db)
-            }
-        } else if versioningStatus == .enabled {
-            // Versioning enabled - create delete marker instead of permanent delete
-            let marker = try ObjectFileHandler.createDeleteMarker(bucketName: bucketName, key: key)
-            await NotificationService.emit(
-                event: .objectRemovedDeleteMarkerCreated, bucketName: bucketName, key: key,
-                size: nil, etag: nil, versionId: marker.versionId,
-                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-            await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: key, versionId: marker.versionId, on: req.db)
-        } else {
-            // Versioning disabled or suspended - permanent delete
-            // Check versioned storage first
-            if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
-                // Delete all versions
-                let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
-                for version in versions {
-                    if let vid = version.versionId {
-                        try? ObjectFileHandler.deleteVersion(
-                            bucketName: bucketName, key: key, versionId: vid)
-                    }
+            // Keys under this prefix can live on any node, not just this one, so (unlike the
+            // local-disk-only ObjectFileHandler.deletePrefix this used to call directly) the key
+            // set has to come from a cluster-wide listing, with each key then routed and deleted -
+            // locally or delegated to whichever node(s) actually hold it - via the same per-key
+            // `deleteObjectClusterWide` logic Multi-Object-Delete uses. `versioningStatus:
+            // .disabled` is passed unconditionally, regardless of the bucket's real status,
+            // to preserve deletePrefix's original behavior of hard-deleting every version rather
+            // than creating delete markers - folder delete has always been a permanent prune, not
+            // a versioning-aware operation.
+
+            // Same prefix sanitization/validation ObjectFileHandler.deletePrefix used to perform
+            // before touching disk - a prefix that's entirely ".." components (e.g. "../../")
+            // sanitizes down to empty and must be rejected outright, not silently listed as
+            // "zero matching keys, nothing to do".
+            var sanitizedPrefix = key
+            if sanitizedPrefix.contains("..") {
+                let components = sanitizedPrefix.components(separatedBy: "/")
+                sanitizedPrefix = components.map { $0.replacingOccurrences(of: "..", with: "") }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "/")
+                if key.hasSuffix("/") && !sanitizedPrefix.hasSuffix("/") {
+                    sanitizedPrefix += "/"
                 }
             }
-
-            // Also delete non-versioned path if exists
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-            if FileManager.default.fileExists(atPath: path) {
-                try FileManager.default.removeItem(atPath: path)
+            guard !sanitizedPrefix.isEmpty && sanitizedPrefix != "/" else {
+                throw Abort(.internalServerError, reason: "Invalid prefix for deletion")
             }
 
+            var marker: String? = nil
+            repeat {
+                let (objects, _, isTruncated, nextMarker) = try await ClusterListingService.listObjects(
+                    req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
+                    maxKeys: 1000, marker: marker)
+                for object in objects {
+                    guard
+                        let outcome = try? await ClusterReplicationService.deleteObjectClusterWide(
+                            req: req, bucketName: bucketName, key: object.key, versionId: nil,
+                            versioningStatus: .disabled)
+                    else { continue }
+                    await NotificationService.emit(
+                        event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
+                        size: nil, etag: nil, versionId: outcome.versionId,
+                        requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                    await ReplicationService.enqueueDelete(
+                        bucketName: bucketName, key: object.key, versionId: nil, on: req.db)
+                }
+                marker = isTruncated ? nextMarker : nil
+            } while marker != nil
+        } else {
+            let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+                req: req, bucketName: bucketName, key: key, versionId: nil,
+                versioningStatus: versioningStatus)
             await NotificationService.emit(
-                event: .objectRemovedDelete, bucketName: bucketName, key: key,
-                size: nil, etag: nil, versionId: nil,
+                event: outcome.isDeleteMarker
+                    ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
+                bucketName: bucketName, key: key, size: nil, etag: nil,
+                versionId: outcome.versionId,
                 requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
             await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: key, versionId: nil, on: req.db)
+                bucketName: bucketName, key: key, versionId: outcome.versionId, on: req.db)
         }
 
         return .noContent
@@ -651,38 +686,61 @@ struct InternalBucketController: RouteCollection {
                 path = plainPath
             }
         }
-        guard let path else {
-            throw Abort(.notFound, reason: "Object not found")
+
+        if let path, let location = try? ObjectFileHandler.payloadLocation(path: path),
+            !location.meta.isDeleteMarker
+        {
+            let meta = location.meta
+            let response: Response
+            if location.payloadSize > Constants.streamingThreshold {
+                response = S3Service.buildStreamingObjectResponse(
+                    req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
+            } else {
+                // Headers and body from the same read - one consistent snapshot of the file
+                guard
+                    let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                    let data
+                else {
+                    throw Abort(.internalServerError, reason: "Failed to read object data")
+                }
+                response = S3Service.buildVersionedObjectMetadataResponse(
+                    meta: freshMeta, includeBody: true, data: data)
+            }
+            return Self.attachDownloadHeaders(to: response, key: key)
         }
 
-        guard let location = try? ObjectFileHandler.payloadLocation(path: path),
-            !location.meta.isDeleteMarker
+        // Not physically on this node - the object may still exist cluster-wide (any
+        // responsible node could have served the console's list/browse request while a
+        // *different* node happens to hold the actual bytes). Fetch it from a responsible peer
+        // the same way CopyObject's cross-node source resolution and downloadAsZip's per-file
+        // fallback already do. Buffered fully in memory, matching downloadAsZip's existing
+        // cross-node fallback - not worth adding a new raw-file streaming primitive for what's
+        // expected to be the rare case where a single-file download lands on the wrong node.
+        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+            req: req, bucketName: bucketName, key: key)
+        guard !isLocal, !candidates.isEmpty else {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+        let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
+            app: req.application, candidates: candidates, bucketName: bucketName, key: key,
+            versionId: versionId, requestId: req.id)
+        defer { _ = POSIXFile.unlink(tempPath) }
+        guard !meta.isDeleteMarker,
+            let data = try? Data(contentsOf: URL(fileURLWithPath: tempPath))
         else {
             throw Abort(.notFound, reason: "Object not found")
         }
-        let meta = location.meta
+        let response = S3Service.buildVersionedObjectMetadataResponse(
+            meta: meta, includeBody: true, data: data)
+        return Self.attachDownloadHeaders(to: response, key: key)
+    }
 
-        let response: Response
-        if location.payloadSize > Constants.streamingThreshold {
-            response = S3Service.buildStreamingObjectResponse(
-                req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
-        } else {
-            // Headers and body from the same read - one consistent snapshot of the file
-            guard let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
-                let data
-            else {
-                throw Abort(.internalServerError, reason: "Failed to read object data")
-            }
-            response = S3Service.buildVersionedObjectMetadataResponse(
-                meta: freshMeta, includeBody: true, data: data)
-        }
-
+    private static func attachDownloadHeaders(to response: Response, key: String) -> Response {
         let fileName = String(key.split(separator: "/").last ?? "download")
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
         )
-
         return response
     }
 
@@ -1542,12 +1600,12 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
         {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         guard
@@ -1621,12 +1679,12 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
         {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         guard
@@ -1671,12 +1729,12 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let peers: [ClusterNodeInfo]
-        switch await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
         {
         case .local(let localPeers):
             peers = localPeers
-        case .forward(let candidates):
-            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        case .forwarded(let response):
+            return response
         }
 
         guard
@@ -1748,15 +1806,20 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        try ObjectFileHandler.deleteVersion(bucketName: bucketName, key: key, versionId: versionId)
+        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        // Cluster peers physically hold the exact same version files as this node - unlike
+        // ReplicationClient's external replication target, which has no per-version equivalent
+        // to prune (see ReplicationClient.replicateDelete) - so this needs to route to (or
+        // delegate to) whichever node(s) actually hold the version and replicate the deletion,
+        // the same as S3Controller.handleObjectDelete's versionId path.
+        let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            versioningStatus: versioningStatus)
 
         await NotificationService.emit(
             event: .objectRemovedDelete, bucketName: bucketName, key: key,
-            size: nil, etag: nil, versionId: versionId,
+            size: nil, etag: nil, versionId: outcome.versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-        // Not replicated: this permanently prunes one specific historical version, which has
-        // no meaningful equivalent on the replication target (see
-        // ReplicationClient.replicateDelete).
 
         return .noContent
     }
