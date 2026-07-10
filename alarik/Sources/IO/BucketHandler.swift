@@ -22,8 +22,26 @@ struct BucketHandler {
     static let rootURL = URL(fileURLWithPath: rootPath)
 
     public static func bucketURL(for name: String) -> URL {
-        let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
+        let encoded = encodedBucketName(name)
         return rootURL.appendingPathComponent(encoded)
+    }
+
+    /// Sanitizes and percent-encodes a bucket name for safe use in filesystem paths. `key`
+    /// has always had its `..` path components stripped before touching disk (in 3 separate
+    /// spots); `bucketName` was historically only percent-encoded, never `..`-stripped - since
+    /// `.` is an allowed path character, percent-encoding alone never blocks a
+    /// `../../etc`-style traversal. Every bucket-name-to-path construction site should route
+    /// through this rather than re-implementing its own encoding.
+    static func encodedBucketName(_ name: String) -> String {
+        let sanitized: String
+        if name.contains("..") {
+            let components = name.components(separatedBy: "/")
+            sanitized = components.map { $0.replacingOccurrences(of: "..", with: "") }.joined(
+                separator: "/")
+        } else {
+            sanitized = name
+        }
+        return sanitized.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sanitized
     }
 
     /// Creates a bucket directory if it doesn't exist.

@@ -48,32 +48,55 @@ struct MultipartFileHandlerTests {
         #expect(id1 == id1.lowercased())
     }
 
+    /// A syntactically-valid upload id (32 lowercase hex chars, matching `generateUploadId()`'s
+    /// format) for tests that need a fixed literal rather than a freshly-generated one - anything
+    /// not matching this shape is now rejected before it ever reaches a path.
+    private static let validUploadId = "0123456789abcdef0123456789abcdef"
+
     @Test("uploadPath generates correct path structure")
     func testUploadPath() throws {
-        let path = MultipartFileHandler.uploadPath(for: "test-bucket", uploadId: "abc123")
-        #expect(path == "Storage/multipart/test-bucket/abc123/")
+        let path = try MultipartFileHandler.uploadPath(
+            for: "test-bucket", uploadId: Self.validUploadId)
+        #expect(path == "Storage/multipart/test-bucket/\(Self.validUploadId)/")
     }
 
     @Test("metadataPath generates correct path")
     func testMetadataPath() throws {
-        let path = MultipartFileHandler.metadataPath(for: "test-bucket", uploadId: "abc123")
-        #expect(path == "Storage/multipart/test-bucket/abc123/meta.json")
+        let path = try MultipartFileHandler.metadataPath(
+            for: "test-bucket", uploadId: Self.validUploadId)
+        #expect(path == "Storage/multipart/test-bucket/\(Self.validUploadId)/meta.json")
     }
 
     @Test("partPath generates correct path for part numbers")
     func testPartPath() throws {
-        let path1 = MultipartFileHandler.partPath(for: "bucket", uploadId: "upload1", partNumber: 1)
-        let path5 = MultipartFileHandler.partPath(for: "bucket", uploadId: "upload1", partNumber: 5)
+        let path1 = try MultipartFileHandler.partPath(
+            for: "bucket", uploadId: Self.validUploadId, partNumber: 1)
+        let path5 = try MultipartFileHandler.partPath(
+            for: "bucket", uploadId: Self.validUploadId, partNumber: 5)
 
-        #expect(path1 == "Storage/multipart/bucket/upload1/part-1")
-        #expect(path5 == "Storage/multipart/bucket/upload1/part-5")
+        #expect(path1 == "Storage/multipart/bucket/\(Self.validUploadId)/part-1")
+        #expect(path5 == "Storage/multipart/bucket/\(Self.validUploadId)/part-5")
     }
 
     @Test("partMetaPath generates correct path")
     func testPartMetaPath() throws {
-        let path = MultipartFileHandler.partMetaPath(
-            for: "bucket", uploadId: "upload1", partNumber: 3)
-        #expect(path == "Storage/multipart/bucket/upload1/part-3.meta")
+        let path = try MultipartFileHandler.partMetaPath(
+            for: "bucket", uploadId: Self.validUploadId, partNumber: 3)
+        #expect(path == "Storage/multipart/bucket/\(Self.validUploadId)/part-3.meta")
+    }
+
+    @Test("uploadPath rejects an upload id that isn't exactly 32 lowercase hex characters")
+    func testUploadPathRejectsMalformedUploadId() throws {
+        // The exact shape this review found exploitable: a traversal payload disguised as an
+        // upload id must never reach path construction, regardless of what's actually on disk.
+        for malformed in [
+            "../../etc/passwd", "short", String(repeating: "a", count: 33),
+            "ABCDEF0123456789ABCDEF0123456789", "0123456789abcdef0123456789abcd/",
+        ] {
+            #expect(throws: (any Error).self) {
+                try MultipartFileHandler.uploadPath(for: "bucket", uploadId: malformed)
+            }
+        }
     }
 
     @Test("createUpload creates directory and metadata file")
@@ -91,11 +114,11 @@ struct MultipartFileHandlerTests {
         #expect(uploadId.count == 32)
 
         // Verify directory exists
-        let uploadDir = MultipartFileHandler.uploadPath(for: "test-bucket", uploadId: uploadId)
+        let uploadDir = try MultipartFileHandler.uploadPath(for: "test-bucket", uploadId: uploadId)
         #expect(FileManager.default.fileExists(atPath: uploadDir))
 
         // Verify metadata exists
-        let metaPath = MultipartFileHandler.metadataPath(for: "test-bucket", uploadId: uploadId)
+        let metaPath = try MultipartFileHandler.metadataPath(for: "test-bucket", uploadId: uploadId)
         #expect(FileManager.default.fileExists(atPath: metaPath))
 
         // Verify metadata content
@@ -145,7 +168,7 @@ struct MultipartFileHandlerTests {
         #expect(etag == expectedEtag)
 
         // Verify part file exists
-        let partPath = MultipartFileHandler.partPath(
+        let partPath = try MultipartFileHandler.partPath(
             for: "bucket", uploadId: uploadId, partNumber: 1)
         #expect(FileManager.default.fileExists(atPath: partPath))
 
@@ -316,7 +339,7 @@ struct MultipartFileHandlerTests {
         _ = try MultipartFileHandler.writePart(
             bucketName: "bucket", uploadId: uploadId, partNumber: 1, data: Data("part1".utf8))
 
-        let uploadDir = MultipartFileHandler.uploadPath(for: "bucket", uploadId: uploadId)
+        let uploadDir = try MultipartFileHandler.uploadPath(for: "bucket", uploadId: uploadId)
         #expect(FileManager.default.fileExists(atPath: uploadDir))
 
         try MultipartFileHandler.abortUpload(bucketName: "bucket", uploadId: uploadId)
@@ -427,7 +450,7 @@ struct MultipartFileHandlerTests {
         #expect(finalEtag.contains("-2"))
 
         // Verify multipart upload directory was cleaned up
-        let uploadDir = MultipartFileHandler.uploadPath(for: "test-bucket", uploadId: uploadId)
+        let uploadDir = try MultipartFileHandler.uploadPath(for: "test-bucket", uploadId: uploadId)
         #expect(!FileManager.default.fileExists(atPath: uploadDir))
 
         // Verify object was created

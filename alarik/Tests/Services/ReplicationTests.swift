@@ -596,6 +596,86 @@ struct ReplicationTests {
         }
     }
 
+    @Test(
+        "a replication target's secretAccessKey is never echoed back in plaintext, and an unrelated edit preserves it"
+    )
+    func replicationSecretIsMaskedAndPreservedAcrossEdits() async throws {
+        try await withApp { app, baseURL in
+            let token = try await loginDefaultAdminUser(app)
+            try await createBucket(app, bucketName: "repl-src-secretmask")
+
+            let target = ReplicationTarget(
+                id: ReplicationTarget.zeroUUID, endpoint: baseURL, targetBucket: "whatever",
+                accessKeyId: "the-access-key-id", secretAccessKey: "super-secret-value",
+                region: region, enabled: true)
+
+            var savedId: UUID?
+            try await app.test(
+                .PUT, "/api/v1/buckets/repl-src-secretmask/replication/targets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ReplicationTargetsDTO(targets: [target]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    // Not just GET - the PUT response that echoes the just-submitted target back
+                    // must not contain the real secret either.
+                    let bodyString = String(buffer: res.body)
+                    #expect(!bodyString.contains("super-secret-value"))
+                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    savedId = dto.targets.first?.id
+                    #expect(dto.targets.first?.secretAccessKey != "super-secret-value")
+                    #expect(dto.targets.first?.secretAccessKey.isEmpty == false)
+                })
+
+            let id = try #require(savedId)
+
+            var maskedSecret: String?
+            try await app.test(
+                .GET, "/api/v1/buckets/repl-src-secretmask/replication/targets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let bodyString = String(buffer: res.body)
+                    #expect(!bodyString.contains("super-secret-value"))
+                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    maskedSecret = dto.targets.first?.secretAccessKey
+                })
+
+            // Edit an unrelated field (disable the target) while echoing back exactly what GET
+            // returned (the masked placeholder, never the real secret) - the console's actual
+            // edit flow, since it never has the real value to send in the first place.
+            let editedTarget = ReplicationTarget(
+                id: id, endpoint: baseURL, targetBucket: "whatever",
+                accessKeyId: "the-access-key-id", secretAccessKey: try #require(maskedSecret),
+                region: region, enabled: false)
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/repl-src-secretmask/replication/targets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.ReplicationTargetsDTO(targets: [editedTarget]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    #expect(dto.targets.first?.enabled == false)
+                })
+
+            // The real secret must have survived server-side, unchanged, even though the client
+            // never saw or resent it.
+            let bucket = try #require(
+                try await Bucket.query(on: app.db).filter(\.$name == "repl-src-secretmask").first())
+            let storedSecret = ReplicationConfiguration.fromJSON(bucket.replicationConfig ?? "")
+                .targets.first?.secretAccessKey
+            #expect(storedSecret == "super-secret-value")
+        }
+    }
+
     @Test("more than 4 targets is rejected")
     func targetCountCapEnforced() async throws {
         try await withApp { app, baseURL in

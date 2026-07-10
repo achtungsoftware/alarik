@@ -64,14 +64,10 @@ final class LoadCacheLifecycle: LifecycleHandler {
         // Build cache mappings
         var bucketData: [(accessKey: String, bucketName: String)] = []
         var userMappingData: [(accessKey: String, userId: UUID)] = []
+        var secretKeyData: [(accessKey: String, secretKey: String)] = []
 
         for key in keys {
-
-            // Add to AccessKeySecretKeyMapCache
-            await AccessKeySecretKeyMapCache.shared.add(
-                accessKey: key.accessKey,
-                secretKey: key.secretKey
-            )
+            secretKeyData.append((accessKey: key.accessKey, secretKey: key.secretKey))
 
             let userID = key.$user.id
 
@@ -85,6 +81,10 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
         }
 
+        // Every cache below is a full replace, not a merge - `reloadAll` is also the safety-net
+        // reload after a missed-NOTIFY LISTEN gap, and re-`add`ing only what's currently in the
+        // DB would leave anything revoked/deleted during the gap cached forever.
+        await AccessKeySecretKeyMapCache.shared.load(initialData: secretKeyData)
         await AccessKeyUserMapCache.shared.load(initialData: userMappingData)
         await AccessKeyBucketMapCache.shared.load(initialData: bucketData)
 

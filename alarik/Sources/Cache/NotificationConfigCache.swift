@@ -24,10 +24,10 @@ final actor NotificationConfigCache {
 
     private var map: [String: NotificationConfiguration] = [:]
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot.
     func load(initialData: [(bucketName: String, config: NotificationConfiguration)]) {
-        for entry in initialData {
-            map[entry.bucketName] = entry.config
-        }
+        map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.bucketName, $0.config) })
     }
 
     /// Returns the bucket's configuration, or nil when the bucket has no (enabled) rules -

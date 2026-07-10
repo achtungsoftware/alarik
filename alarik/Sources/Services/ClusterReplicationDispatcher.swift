@@ -130,9 +130,16 @@ final actor ClusterReplicationDispatcher {
         // "tell the target to delete its copy" HTTP call that requires no local state at all, so
         // any node can correctly relay it regardless of which one happens to be executing.
         if row.operation == ClusterReplicationTask.Operation.put.rawValue {
+            // `resolvePath` makes several blocking filesystem syscalls (stat, open, read) -
+            // routed through the thread pool like every other disk access in this codebase,
+            // rather than run directly on a Swift concurrency cooperative thread, which only has
+            // as many threads as CPU cores and would otherwise be starved by this on every
+            // `.put` row drained (up to `maxConcurrentDeliveries` at once, every batch).
             let hasLocalCopy =
-                (try? ObjectFileHandler.resolvePath(
-                    bucketName: row.bucketName, key: row.key, versionId: row.versionId)) != nil
+                (try? await app.threadPool.runIfActive {
+                    try ObjectFileHandler.resolvePath(
+                        bucketName: row.bucketName, key: row.key, versionId: row.versionId)
+                }) != nil
             guard hasLocalCopy else { return }
         }
 

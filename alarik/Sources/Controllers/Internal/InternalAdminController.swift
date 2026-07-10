@@ -65,6 +65,20 @@ struct InternalAdminController: RouteCollection {
         let objectCount: Int
     }
 
+    /// `listBuckets`'s response shape - deliberately NOT the raw `Bucket` model. Fluent's
+    /// `Fields.encode` serializes every `@Field` with no exclusions, and `Bucket.$user`'s
+    /// eager-loaded `User` would do the same for `passwordHash` - `Bucket.ResponseDTO` (used
+    /// elsewhere) also doesn't carry ownership at all, so this exists specifically to answer
+    /// "which user owns this bucket" for the admin console without ever serializing a full
+    /// `User`/`Bucket` model to the wire.
+    struct AdminBucketDTO: Content {
+        let id: UUID?
+        let name: String
+        let creationDate: Date?
+        let versioningStatus: String
+        let user: User.ResponseDTO?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
 
         routes.grouped("admin").grouped("users")
@@ -207,14 +221,20 @@ struct InternalAdminController: RouteCollection {
     }
 
     @Sendable
-    func listBuckets(req: Request) async throws -> Page<Bucket> {
+    func listBuckets(req: Request) async throws -> Page<AdminBucketDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        return try await Bucket.query(on: req.db)
+        let page = try await Bucket.query(on: req.db)
             .sort(\.$creationDate, .descending)
             .with(\.$user)
             .paginate(for: req)
+
+        return page.map {
+            AdminBucketDTO(
+                id: $0.id, name: $0.name, creationDate: $0.creationDate,
+                versioningStatus: $0.versioningStatus, user: $0.user.toResponseDTO())
+        }
     }
 
     @Sendable
@@ -267,6 +287,27 @@ struct InternalAdminController: RouteCollection {
 
         let editUser: User.EditAdmin = try req.content.decode(User.EditAdmin.self)
 
+        // The bulk `.filter(...).update()` below silently affects zero rows for an unknown id -
+        // without this check first, editing a nonexistent user would return a fabricated 200
+        // (`editUser.toUserResponseDTO()` just echoes the request back) instead of a 404.
+        guard let existingUser = try await User.find(editUser.id, on: req.db) else {
+            throw Abort(.notFound, reason: "User not found")
+        }
+
+        // Every admin endpoint (including this one) requires an authenticated admin, so
+        // stripping the last admin's status would permanently lock every admin-only action -
+        // including re-promoting anyone - behind a login no account can pass anymore.
+        if existingUser.isAdmin && !editUser.isAdmin {
+            let remainingAdmins = try await User.query(on: req.db)
+                .filter(\.$isAdmin == true)
+                .filter(\.$id != editUser.id)
+                .count()
+            guard remainingAdmins > 0 else {
+                throw Abort(
+                    .conflict, reason: "Cannot remove admin status from the last administrator.")
+            }
+        }
+
         do {
             try await User.query(on: req.db)
                 .filter(\.$id == editUser.id)
@@ -306,16 +347,20 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.forbidden, reason: "Cannot delete yourself")
         }
 
-        // Delete all bucket folders from disk
+        // Force-delete every bucket the user owns through BucketService, not a raw local-disk
+        // removal - the same cluster-wide object cleanup, cache invalidation, and outbox purge
+        // every other bucket-teardown path in this codebase goes through. A raw
+        // `BucketHandler.forceDelete` only wipes the requesting node's own directory, leaving
+        // every other cluster node's physical copies orphaned - invisible until a bucket with
+        // the same name is created again (bucket paths are name-derived, not id-derived), at
+        // which point the "deleted" data silently resurfaces under the new bucket.
         let buckets = try await Bucket.query(on: req.db)
             .filter(\.$user.$id == userId)
             .all()
 
         for bucket in buckets {
-            try BucketHandler.forceDelete(name: bucket.name)
-            await BucketVersioningCache.shared.removeBucket(bucket.name)
-            CacheInvalidationService.notify(
-                on: req.db, cache: "bucketVersioning", op: .remove, key: bucket.name)
+            try await BucketService.delete(
+                req: req, bucketName: bucket.name, userId: userId, force: true)
         }
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -
@@ -328,7 +373,7 @@ struct InternalAdminController: RouteCollection {
             try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
         }
 
-        // Delete the user (buckets cascade delete in DB; access keys are already gone above)
+        // Delete the user - buckets and access keys are already fully torn down above.
         try await userToDelete.delete(on: req.db)
 
         return .noContent

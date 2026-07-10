@@ -116,7 +116,7 @@ enum ClusterRebalanceService {
                     bucketName: bucketName, prefix: "", delimiter: nil, keyMarker: keyMarker,
                     versionIdMarker: versionIdMarker, maxKeys: 1000)
 
-            var copyTasks: [ClusterReplicationTask] = []
+            var copyCandidates: [(key: String, versionId: String?, targetNodeId: UUID)] = []
             var reclaimCandidates: [(key: String, versionId: String?)] = []
 
             for entry in versions + deleteMarkers {
@@ -126,14 +126,62 @@ enum ClusterRebalanceService {
                     // This node is still responsible - only *other* responsible nodes ever need
                     // a copy pushed to them.
                     for node in responsible where node.id != selfNodeId {
-                        copyTasks.append(
-                            ClusterReplicationTask(
-                                bucketName: bucketName, key: entry.key,
-                                versionId: entry.versionId, operation: .put,
-                                targetNodeId: node.id, reason: .rebalance))
+                        copyCandidates.append((entry.key, entry.versionId, node.id))
                     }
                 } else {
                     reclaimCandidates.append((entry.key, entry.versionId))
+                }
+            }
+
+            // Every membership-change NOTIFY (a node join/drain/flap) re-triggers a full walk,
+            // and this loop used to unconditionally insert a fresh copy row per (key, target)
+            // pair every single pass with no check for one already outstanding - on a cluster
+            // with any membership churn, that's unbounded duplicate-row growth in the outbox
+            // table for exactly the same copy work. Existing `.pending` work for a (key, target)
+            // pair is already covered, so it's skipped; an existing `.failed` (dead-lettered) one
+            // is replaced with a fresh retry instead of either being left to silently expire via
+            // `purgeExpiredFailures` or piling up yet another duplicate row alongside it - the
+            // same reasoning `rebalanceBucket`'s reclaim phase already applies below.
+            var copyTasks: [ClusterReplicationTask] = []
+            if !copyCandidates.isEmpty {
+                let existingCopyTasks = try await ClusterReplicationTask.query(on: app.db)
+                    .filter(\.$bucketName == bucketName)
+                    .filter(\.$key ~~ copyCandidates.map(\.key))
+                    .filter(\.$operation == ClusterReplicationTask.Operation.put.rawValue)
+                    .filter(
+                        \.$state
+                            ~~ [
+                                ClusterReplicationTask.State.pending.rawValue,
+                                ClusterReplicationTask.State.failed.rawValue,
+                            ]
+                    )
+                    .all()
+
+                func pairKey(_ key: String, _ targetNodeId: UUID) -> String {
+                    "\(key)\u{0}\(targetNodeId)"
+                }
+
+                var pendingPairs: Set<String> = []
+                var failedTasksToRetry: [ClusterReplicationTask] = []
+                for task in existingCopyTasks {
+                    if task.state == ClusterReplicationTask.State.pending.rawValue {
+                        pendingPairs.insert(pairKey(task.key, task.targetNodeId))
+                    } else {
+                        failedTasksToRetry.append(task)
+                    }
+                }
+                for task in failedTasksToRetry {
+                    try await task.delete(on: app.db)
+                }
+
+                for candidate in copyCandidates {
+                    guard !pendingPairs.contains(pairKey(candidate.key, candidate.targetNodeId))
+                    else { continue }
+                    copyTasks.append(
+                        ClusterReplicationTask(
+                            bucketName: bucketName, key: candidate.key,
+                            versionId: candidate.versionId, operation: .put,
+                            targetNodeId: candidate.targetNodeId, reason: .rebalance))
                 }
             }
 
@@ -143,7 +191,7 @@ enum ClusterRebalanceService {
 
             var reclaimTasks: [ClusterReplicationTask] = []
             if !reclaimCandidates.isEmpty {
-                let stillOutstanding = try await ClusterReplicationTask.query(on: app.db)
+                let outstandingTasks = try await ClusterReplicationTask.query(on: app.db)
                     .filter(\.$bucketName == bucketName)
                     .filter(\.$key ~~ reclaimCandidates.map(\.key))
                     .filter(
@@ -154,7 +202,34 @@ enum ClusterRebalanceService {
                             ]
                     )
                     .all()
-                    .reduce(into: Set<String>()) { $0.insert($1.key) }
+
+                // A dead-lettered (`.failed`) copy task is retries-exhausted - the dispatcher
+                // only ever polls `.pending` rows, so nothing will ever touch it again on its
+                // own. Left alone it still correctly gates reclaim below (as "outstanding"), but
+                // only until `purgeExpiredFailures` deletes it after 7 days - at which point this
+                // same gate would misread "no task row" as "delivered" and reclaim (delete) the
+                // only copy that ever existed, even though the target never actually received
+                // one. Re-driving it with a fresh pending copy task keeps genuine delivery
+                // failures retrying (and thus gating reclaim) for as long as they keep failing,
+                // closing that silent-data-loss window instead of just waiting it out.
+                let deadLetteredCopies = outstandingTasks.filter {
+                    $0.state == ClusterReplicationTask.State.failed.rawValue
+                        && $0.operation == ClusterReplicationTask.Operation.put.rawValue
+                }
+                if !deadLetteredCopies.isEmpty {
+                    let retriedCopyTasks = deadLetteredCopies.map { task in
+                        ClusterReplicationTask(
+                            bucketName: bucketName, key: task.key, versionId: task.versionId,
+                            operation: .put, targetNodeId: task.targetNodeId, reason: .rebalance)
+                    }
+                    for task in deadLetteredCopies {
+                        try await task.delete(on: app.db)
+                    }
+                    try await retriedCopyTasks.create(on: app.db)
+                    ClusterReplicationDispatcher.shared.wake()
+                }
+
+                let stillOutstanding = Set(outstandingTasks.map(\.key))
 
                 reclaimTasks = reclaimCandidates
                     .filter { !stillOutstanding.contains($0.key) }

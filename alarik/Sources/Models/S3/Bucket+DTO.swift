@@ -129,6 +129,7 @@ final class Bucket: Content, Model, @unchecked Sendable {
         .init(
             id: self.id,
             name: self.$name.value,
+            creationDate: self.creationDate,
             versioningStatus: self.versioningStatus
         )
     }

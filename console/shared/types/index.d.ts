@@ -107,10 +107,13 @@ declare global {
     }
 
     export interface Bucket {
+        id?: string;
         name: string;
         creationDate: string;
         versioningStatus: string;
         policy?: string;
+        // Only present on the admin bucket list (GET /api/v1/admin/buckets) - the regular
+        // per-user bucket list never returns ownership info.
         user?: User;
     }
 

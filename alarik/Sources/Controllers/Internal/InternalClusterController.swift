@@ -177,20 +177,29 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let pending = try await ClusterReplicationTask.query(on: req.db)
-            .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
-            .all()
+        // A cluster mid-rebalance can have an enormous number of pending rows - counted here,
+        // not loaded (the previous version pulled every single one into memory just to tally
+        // `pending.count` and a per-reason breakdown in a Swift loop). `Reason` is a small,
+        // closed enum, so one COUNT query per reason is both simpler and more portable across
+        // this codebase's Postgres/SQLite backends than a raw SQL GROUP BY.
+        var byReason: [String: Int] = [:]
+        var pendingCount = 0
+        for reason in ClusterReplicationTask.Reason.allCases {
+            let count = try await ClusterReplicationTask.query(on: req.db)
+                .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
+                .filter(\.$reason == reason.rawValue)
+                .count()
+            pendingCount += count
+            if count > 0 {
+                byReason[reason.rawValue] = count
+            }
+        }
         let failedCount = try await ClusterReplicationTask.query(on: req.db)
             .filter(\.$state == ClusterReplicationTask.State.failed.rawValue)
             .count()
 
-        var byReason: [String: Int] = [:]
-        for task in pending {
-            byReason[task.reason, default: 0] += 1
-        }
-
         return RebalanceStatusDTO(
-            pendingCount: pending.count, failedCount: failedCount, pendingByReason: byReason,
+            pendingCount: pendingCount, failedCount: failedCount, pendingByReason: byReason,
             replicationFactor: PlacementService.replicationFactor)
     }
 

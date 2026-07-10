@@ -72,12 +72,15 @@ enum ClusterReplicationService {
                 if outcome.delivered { delivered.insert(outcome.node.id) }
                 if delivered.count >= quorumRemaining { break }
             }
-            // Exiting here while some child tasks may still be in flight is safe: Swift's
-            // TaskGroup cancels and awaits any stragglers before this closure truly returns.
-            // Their eventual outcome doesn't matter - any node not captured in `delivered`
-            // unconditionally gets an outbox task below, so a straggler that actually succeeds
-            // after we stopped listening just means one harmless redundant push later (the
-            // receiving side always writes the exact same version, so this is idempotent).
+            // Exiting here while some child tasks may still be in flight is safe: without an
+            // explicit `group.cancelAll()`, Swift's TaskGroup does NOT cancel stragglers when
+            // this closure returns - it only awaits them (structured concurrency guarantees no
+            // child outlives the group), letting each straggler's push run to completion in the
+            // background. Their eventual outcome doesn't matter either way - any node not
+            // captured in `delivered` unconditionally gets an outbox task below, so a straggler
+            // that actually succeeds after we stopped listening just means one harmless
+            // redundant push later (the receiving side always writes the exact same version, so
+            // this is idempotent).
         }
 
         let undelivered = peers.filter { !delivered.contains($0.id) }

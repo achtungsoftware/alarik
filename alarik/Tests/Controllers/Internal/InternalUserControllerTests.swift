@@ -739,6 +739,50 @@ struct UserControllerTests {
         }
     }
 
+    @Test(
+        "Delete user (self-service) purges pending cluster replication tasks too, not just the local directory"
+    )
+    func deleteUserPurgesClusterReplicationTasks() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+
+            try await createKey(app, token: token, accessKey: "outboxkey", secretKey: "testsecret")
+            let accessKey = try await AccessKey.query(on: app.db)
+                .filter(\.$accessKey == "outboxkey")
+                .first()
+            guard let userId = accessKey?.$user.id else {
+                Issue.record("Access key or user not found")
+                return
+            }
+
+            let bucket = Bucket(name: "self-outbox-bucket", userId: userId)
+            try await bucket.save(on: app.db)
+            try BucketHandler.create(name: "self-outbox-bucket")
+
+            // Same regression as InternalAdminControllerTests's equivalent - the self-service
+            // delete path used to call BucketHandler.forceDelete directly instead of
+            // BucketService.delete, leaving a straggler outbox row like this one behind forever.
+            let staleTask = ClusterReplicationTask(
+                bucketName: "self-outbox-bucket", key: "straggler.txt", versionId: nil,
+                operation: .put, targetNodeId: UUID(), reason: .write)
+            try await staleTask.save(on: app.db)
+
+            try await app.test(
+                .DELETE, "/api/v1/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            let remainingTasks = try await ClusterReplicationTask.query(on: app.db)
+                .filter(\.$bucketName == "self-outbox-bucket")
+                .count()
+            #expect(remainingTasks == 0)
+        }
+    }
+
     @Test("Auth with access key - should pass")
     func testAuthWithAccessKey() async throws {
         try await withApp { app in

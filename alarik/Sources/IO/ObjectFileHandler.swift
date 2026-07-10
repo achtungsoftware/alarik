@@ -327,9 +327,7 @@ struct ObjectFileHandler {
 
     /// Generates the storage path for an object.
     static func storagePath(for bucketName: String, key: String) -> String {
-        // Cache allowed character set
-        let encodedBucket =
-            bucketName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bucketName
+        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
 
         // Optimize path sanitization
         let sanitizedKey: String
@@ -598,8 +596,7 @@ struct ObjectFileHandler {
     /// Returns the base directory path for versioned objects
     /// Structure: Storage/buckets/{bucket}/{key}/.versions/
     static func versionedBasePath(for bucketName: String, key: String) -> String {
-        let encodedBucket =
-            bucketName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bucketName
+        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
 
         let sanitizedKey: String
         if key.contains("..") {
@@ -1154,6 +1151,53 @@ struct ObjectFileHandler {
         try write(metadata: meta, data: Data(), to: path)
 
         // Update latest pointer
+        try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+
+        return meta
+    }
+
+    /// Creates a delete marker for a *suspended*-versioning bucket - distinct from
+    /// `createDeleteMarker` (which is for `.enabled` buckets only). Per S3's documented
+    /// suspended-versioning delete semantics, this must only ever affect the "null" version:
+    /// it's overwritten with a delete marker (same "overwrite any existing null version" rule
+    /// `prepareVersionedWrite`'s `.suspended` case already applies to writes), and every other,
+    /// genuinely-versioned object created while versioning was enabled is left completely
+    /// untouched and still retrievable by its real version ID. Using `createDeleteMarker`
+    /// instead here would be wrong in two ways: it'd mint a fresh random version ID instead of
+    /// "null" (S3 always reports "null" for a suspended-bucket delete), and demoting-not-deleting
+    /// the prior versions is what `createDeleteMarker` already does correctly - the actual bug
+    /// this exists to fix lived one level up, in the caller that used to hard-delete every
+    /// version instead of calling anything like this at all.
+    static func createNullVersionDeleteMarker(bucketName: String, key: String) throws -> ObjectMeta {
+        // The existing "null" version may currently live at the plain non-versioned path (an
+        // object written before versioning was ever enabled on this bucket) rather than inside
+        // .versions/ - deleteVersion(versionId: "null") already knows this, so the marker write
+        // below doesn't silently leave that plain file behind as an orphaned duplicate.
+        let plainPath = storagePath(for: bucketName, key: key)
+        if FileManager.default.fileExists(atPath: plainPath) {
+            try FileManager.default.removeItem(atPath: plainPath)
+        }
+
+        let versionId = "null"
+        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+        // Demotes prior real versions to not-latest - never deletes them, matching
+        // prepareVersionedWrite's .suspended case exactly.
+        try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+
+        let meta = ObjectMeta(
+            bucketName: bucketName,
+            key: key,
+            size: 0,
+            contentType: "",
+            etag: "",
+            updatedAt: Date(),
+            versionId: versionId,
+            isLatest: true,
+            isDeleteMarker: true
+        )
+
+        try write(metadata: meta, data: Data(), to: path)
         try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
 
         return meta

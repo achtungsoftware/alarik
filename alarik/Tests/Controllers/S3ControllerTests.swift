@@ -444,6 +444,49 @@ struct S3ControllerTests {
         }
     }
 
+    @Test(
+        "List Objects V1 - A prefix VALUE containing 'uploads' or 'versions' must not be misrouted to ListMultipartUploads/ListVersions"
+    )
+    func testListObjectsV1PrefixValueNotMisroutedAsSubresource() async throws {
+        let bucketName = "test-list-prefix-not-subresource"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(
+                app, bucketName: bucketName, key: "uploads/2024/photo.jpg", content: "photo")
+            try await putObject(
+                app, bucketName: bucketName, key: "schema-versions/v1.json", content: "{}")
+
+            // The old substring-based check (`query.contains("uploads")`) matched this prefix
+            // VALUE and misrouted the request to ListMultipartUploads, returning an empty
+            // ListMultipartUploadsResult instead of the actual object listing.
+            let uploadsQuery = signedHeaders(
+                for: .GET, path: "/\(bucketName)", query: "prefix=uploads/2024/photo.jpg")
+            try await app.test(
+                .GET, "/\(bucketName)?prefix=uploads/2024/photo.jpg",
+                beforeRequest: { req in req.headers.add(contentsOf: uploadsQuery) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let body = res.body.string
+                    #expect(body.contains("<ListBucketResult"))
+                    #expect(!body.contains("ListMultipartUploadsResult"))
+                    #expect(body.contains("<Key>uploads/2024/photo.jpg</Key>"))
+                })
+
+            let versionsQuery = signedHeaders(
+                for: .GET, path: "/\(bucketName)", query: "prefix=schema-versions/v1.json")
+            try await app.test(
+                .GET, "/\(bucketName)?prefix=schema-versions/v1.json",
+                beforeRequest: { req in req.headers.add(contentsOf: versionsQuery) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let body = res.body.string
+                    #expect(body.contains("<ListBucketResult"))
+                    #expect(!body.contains("ListVersionsResult"))
+                    #expect(body.contains("<Key>schema-versions/v1.json</Key>"))
+                })
+        }
+    }
+
     @Test("List Objects V1 - With delimiter")
     func testListObjectsV1WithDelimiter() async throws {
         let bucketName = "test-list-delimiter"
@@ -1888,6 +1931,64 @@ struct S3ControllerTests {
         }
     }
 
+    @Test(
+        "UploadPart - A non-numeric partNumber returns InvalidArgument, not a silent whole-object overwrite"
+    )
+    func testUploadPartRejectsNonNumericPartNumber() async throws {
+        let bucketName = "test-multipart-bad-part-number"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            // A real prior object at this key - the bug this guards against would silently
+            // overwrite it with the "part" body below instead of rejecting the request, since
+            // the routing decision (partNumber present at all) and the dispatch check (partNumber
+            // must parse as Int) used to disagree.
+            try await putObject(
+                app, bucketName: bucketName, key: "test-file.txt", content: "original content")
+
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/test-file.txt", query: "uploads")
+            var uploadId: String = ""
+            try await app.test(
+                .POST, "/\(bucketName)/test-file.txt?uploads",
+                beforeRequest: { req in req.headers.add(contentsOf: createSigned) },
+                afterResponse: { res in
+                    let bodyString = res.body.string
+                    if let range = bodyString.range(of: "<UploadId>"),
+                        let endRange = bodyString[range.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(bodyString[range.upperBound..<endRange.lowerBound])
+                    }
+                })
+            #expect(!uploadId.isEmpty)
+
+            let partData = Data("malicious overwrite attempt".utf8)
+            let partSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/test-file.txt",
+                query: "partNumber=abc&uploadId=\(uploadId)", body: partData)
+
+            try await app.test(
+                .PUT, "/\(bucketName)/test-file.txt?partNumber=abc&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: partSigned)
+                    req.body = ByteBuffer(data: partData)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("InvalidArgument"))
+                })
+
+            // The original object must be completely untouched.
+            let getSigned = signedHeaders(for: .GET, path: "/\(bucketName)/test-file.txt")
+            try await app.test(
+                .GET, "/\(bucketName)/test-file.txt",
+                beforeRequest: { req in req.headers.add(contentsOf: getSigned) },
+                afterResponse: { res in
+                    #expect(res.body.string == "original content")
+                })
+        }
+    }
+
     @Test("CompleteMultipartUpload - POST /:bucket/:key?uploadId=Y")
     func testCompleteMultipartUpload() async throws {
         let bucketName = "test-multipart-complete"
@@ -2191,6 +2292,44 @@ struct S3ControllerTests {
                     #expect(bodyString.contains("<Key>file2.txt</Key>"))
                     #expect(bodyString.contains("<Key>file3.txt</Key>"))
                     #expect(bodyString.contains("<UploadId>"))
+                })
+        }
+    }
+
+    @Test(
+        "ListMultipartUploads - A client-supplied prefix containing XML special characters is escaped, never left to break the response"
+    )
+    func testListMultipartUploadsEscapesPrefix() async throws {
+        let bucketName = "test-multipart-xml-escape"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            let maliciousPrefix = "<x>&\"'"
+            // `.urlQueryAllowed` leaves `&` (and other query-delimiter characters) unescaped,
+            // which would prematurely split this manually-built query string - percent-encode
+            // everything except alphanumerics to keep the whole value intact as one parameter.
+            let encodedPrefix =
+                maliciousPrefix.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
+                ?? maliciousPrefix
+            let query = "uploads&prefix=\(encodedPrefix)"
+
+            let listSigned = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
+
+            try await app.test(
+                .GET, "/\(bucketName)?\(query)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let bodyString = res.body.string
+                    // The raw value must never appear literally in the XML body - it would
+                    // otherwise break out of the <Prefix> element entirely (or, depending on
+                    // the client's XML parser, be interpreted as markup rather than data).
+                    #expect(!bodyString.contains(maliciousPrefix))
+                    #expect(
+                        bodyString.contains(
+                            "<Prefix>&lt;x&gt;&amp;&quot;&apos;</Prefix>"))
                 })
         }
     }

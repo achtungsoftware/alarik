@@ -43,7 +43,7 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
     /// synchronous write" from "moving data because membership changed" from "removing a copy
     /// this node is no longer responsible for" without a separate job-tracking table (see
     /// `ClusterRebalanceService`).
-    enum Reason: String {
+    enum Reason: String, CaseIterable {
         case write
         case rebalance
         case reclaim

@@ -94,7 +94,7 @@ struct LifecycleServiceTests {
             uploadId: uploadId, bucketName: bucketName, key: key,
             contentType: "application/octet-stream", metadata: [:],
             initiated: Date().addingTimeInterval(-Double(daysOld) * 86400))
-        let metaPath = MultipartFileHandler.metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try MultipartFileHandler.metadataPath(for: bucketName, uploadId: uploadId)
         try JSONEncoder().encode(backdated).write(to: URL(fileURLWithPath: metaPath))
         return uploadId
     }

@@ -392,10 +392,60 @@ struct InternalAuthOIDCControllerTests {
         try await withApp { app, _ in
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=never-issued",
+                beforeRequest: { req in
+                    // A matching cookie so this test actually reaches (and exercises) the
+                    // unknown-state rejection, rather than being rejected one step earlier by
+                    // the state-cookie check for an unrelated reason.
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=never-issued")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
                     #expect(fragment(from: location)["error"] == "invalid_or_expired_state")
+                })
+        }
+    }
+
+    @Test("callback rejects a state whose cookie is missing")
+    func callbackMissingStateCookie() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withApp(oidc: provider) { app, providerId in
+            let id = try #require(providerId)
+            let (state, _) = try await performLoginRedirect(app, providerId: id)
+
+            // Deliberately no beforeRequest/cookie here - simulates the login-CSRF scenario the
+            // cookie exists to close: a callback URL completed by a browser that never actually
+            // went through /login (and therefore never received the cookie) for this state.
+            try await app.test(
+                .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                afterResponse: { res async throws in
+                    #expect(res.status == .seeOther)
+                    let location = res.headers.first(name: .location)
+                    #expect(fragment(from: location)["error"] == "missing_or_mismatched_state_cookie")
+                })
+        }
+    }
+
+    @Test("callback rejects a state cookie that doesn't match the state parameter")
+    func callbackMismatchedStateCookie() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+
+        try await withApp(oidc: provider) { app, providerId in
+            let id = try #require(providerId)
+            let (state, _) = try await performLoginRedirect(app, providerId: id)
+
+            try await app.test(
+                .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=some-other-value")
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .seeOther)
+                    let location = res.headers.first(name: .location)
+                    #expect(fragment(from: location)["error"] == "missing_or_mismatched_state_cookie")
                 })
         }
     }
@@ -412,6 +462,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -433,6 +486,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -454,6 +510,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -475,6 +534,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -495,6 +557,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -519,6 +584,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -554,6 +622,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -600,6 +671,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let location = res.headers.first(name: .location)
@@ -628,6 +702,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let location = res.headers.first(name: .location)
@@ -659,6 +736,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let location = res.headers.first(name: .location)
@@ -696,6 +776,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let created = try #require(
@@ -723,6 +806,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let location = res.headers.first(name: .location)
@@ -753,6 +839,9 @@ struct InternalAuthOIDCControllerTests {
 
                 try await app.test(
                     .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                    beforeRequest: { req in
+                        req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                    },
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let location = res.headers.first(name: .location)
@@ -789,6 +878,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -825,6 +917,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)
@@ -859,6 +954,9 @@ struct InternalAuthOIDCControllerTests {
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/callback?code=abc&state=\(state)",
+                beforeRequest: { req in
+                    req.headers.replaceOrAdd(name: .cookie, value: "oidc_state=\(state)")
+                },
                 afterResponse: { res async throws in
                     #expect(res.status == .seeOther)
                     let location = res.headers.first(name: .location)

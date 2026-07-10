@@ -23,10 +23,12 @@ final actor AccessKeySecretKeyMapCache {
 
     private var map: [String: String] = [:]
 
+    /// Full replace, not merge - this runs both at boot (map starts empty, so it's equivalent
+    /// either way) and after a LISTEN-outage reconnect (`LoadCacheLifecycle.reloadAll`), where a
+    /// key revoked while disconnected must actually disappear, not just have any *currently
+    /// existing* keys re-upserted on top of a map that still remembers the revoked one forever.
     func load(initialData: [(accessKey: String, secretKey: String)]) {
-        for entry: (accessKey: String, secretKey: String) in initialData {
-            map[entry.accessKey] = entry.secretKey
-        }
+        map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.accessKey, $0.secretKey) })
     }
 
     func add(accessKey: String, secretKey: String) {

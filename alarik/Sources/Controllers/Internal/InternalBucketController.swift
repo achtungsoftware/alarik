@@ -21,10 +21,6 @@ import XMLCoder
 import ZIPFoundation
 
 struct InternalBucketController: RouteCollection {
-    struct UploadInput: Content {
-        let data: File
-    }
-
     struct VersioningStatusDTO: Content {
         let status: String
     }
@@ -81,6 +77,39 @@ struct InternalBucketController: RouteCollection {
         let targets: [ReplicationTarget]
     }
 
+    /// Fixed placeholder every already-configured webhook `secret`/replication
+    /// `secretAccessKey` is replaced with before being sent to the client - GET and PUT
+    /// responses never echo the real value back over the wire, matching the write-only pattern
+    /// `AccessKey.ResponseDTO` already uses for access-key secrets. Unlike a full omission,
+    /// this stays a non-empty, truthy string so the console can still show "a secret is
+    /// configured" (e.g. the webhooks table's "Signed (HMAC)" badge) without ever revealing it,
+    /// and it doubles as the "unchanged" sentinel on the way back in: `setBucketNotifications`/
+    /// `setReplicationTargets` substitute the real stored secret whenever an existing rule's/
+    /// target's incoming value is exactly this placeholder, so the console's existing
+    /// edit-prefills-then-echoes-back flow round-trips correctly without ever needing to know
+    /// the real secret.
+    private static let secretMaskPlaceholder = "••••••••"
+
+    private static func maskedNotificationRules(_ rules: [NotificationRule]) -> [NotificationRule] {
+        rules.map { rule in
+            var masked = rule
+            if let secret = rule.secret, !secret.isEmpty {
+                masked.secret = secretMaskPlaceholder
+            }
+            return masked
+        }
+    }
+
+    private static func maskedReplicationTargets(_ targets: [ReplicationTarget]) -> [ReplicationTarget] {
+        targets.map { target in
+            var masked = target
+            if !target.secretAccessKey.isEmpty {
+                masked.secretAccessKey = secretMaskPlaceholder
+            }
+            return masked
+        }
+    }
+
     struct ReplicationRulesDTO: Content {
         let rules: [ReplicationRule]
     }
@@ -133,30 +162,43 @@ struct InternalBucketController: RouteCollection {
         let expiresAt: Date?
     }
 
+    /// The global `app.routes.defaultMaxBodySize` (`configure.swift`) is set to 5TB - it has to
+    /// be, to fit an actual S3 object upload. Every one of these routes is a small JSON
+    /// subresource body (a bucket policy, a handful of tags, a few webhook rules) with no
+    /// business ever buffering anywhere close to that: registered with the default `body:
+    /// .collect` behavior (no explicit `maxSize`), Vapor would happily buffer up to 5TB in
+    /// memory before the handler even runs and gets a chance to reject anything. Every route
+    /// below that decodes a JSON body (not a file upload) is registered with this override
+    /// instead of the `defaultMaxBodySize`-inheriting `.put(use:)`/`.post(use:)` convenience
+    /// methods, to actually bound that worst case.
+    private static let subresourceBodySizeLimit: ByteCount = "1mb"
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
         routes.grouped("buckets").grouped(":bucketName").delete(use: self.deleteBucket)
         routes.grouped("buckets").grouped(":bucketName").grouped("versioning").get(
             use: self.getVersioning)
-        routes.grouped("buckets").grouped(":bucketName").grouped("versioning").put(
-            use: self.setVersioning)
+        routes.grouped("buckets").grouped(":bucketName").grouped("versioning")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setVersioning)
         routes.grouped("buckets").grouped(":bucketName").grouped("policy").get(
             use: self.getPolicy)
-        routes.grouped("buckets").grouped(":bucketName").grouped("policy").put(
-            use: self.setPolicy)
+        routes.grouped("buckets").grouped(":bucketName").grouped("policy")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setPolicy)
         routes.grouped("buckets").grouped(":bucketName").grouped("policy").delete(
             use: self.deletePolicy)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").get(
             use: self.getBucketTags)
-        routes.grouped("buckets").grouped(":bucketName").grouped("tags").put(
-            use: self.setBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("tags")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").delete(
             use: self.deleteBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications").get(
             use: self.getBucketNotifications)
-        routes.grouped("buckets").grouped(":bucketName").grouped("notifications").put(
-            use: self.setBucketNotifications)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setBucketNotifications)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
             .grouped(":ruleId").grouped("test").post(use: self.testBucketNotification)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
@@ -167,11 +209,17 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("targets").get(use: self.getReplicationTargets)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
-            .grouped("targets").put(use: self.setReplicationTargets)
+            .grouped("targets")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setReplicationTargets)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("rules").get(use: self.getReplicationRules)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
-            .grouped("rules").put(use: self.setReplicationRules)
+            .grouped("rules")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setReplicationRules)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("rules").grouped(":ruleId").grouped("resync")
             .post(use: self.resyncReplicationRule)
@@ -182,16 +230,20 @@ struct InternalBucketController: RouteCollection {
             .post(use: self.retryReplicationTask)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
-        routes.grouped("objects").post(use: self.uploadObject)
+        routes.grouped("objects").on(.POST, body: .stream, use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
         routes.grouped("objects", "tags").get(use: self.getObjectTags)
-        routes.grouped("objects", "tags").put(use: self.setObjectTags)
+        routes.grouped("objects", "tags")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setObjectTags)
         routes.grouped("objects", "tags").delete(use: self.deleteObjectTags)
         routes.grouped("objects", "metadata").get(use: self.getObjectMetadata)
-        routes.grouped("objects", "metadata").put(use: self.setObjectMetadata)
+        routes.grouped("objects", "metadata")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setObjectMetadata)
         routes.grouped("objects", "share").post(use: self.shareObject)
         routes.grouped("objects", "share").get(use: self.listSharedLinks)
         routes.grouped("objects", "share").grouped(":sharedLinkId").delete(
@@ -226,7 +278,7 @@ struct InternalBucketController: RouteCollection {
     /// substring (case-insensitive, server-side) - needed so UI like a bucket picker can search
     /// as the user types instead of ever having to load every bucket up front.
     @Sendable
-    func listBuckets(req: Request) async throws -> Page<Bucket> {
+    func listBuckets(req: Request) async throws -> Page<Bucket.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
         let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
 
@@ -238,7 +290,14 @@ struct InternalBucketController: RouteCollection {
             query.filter(\.$name ~~ search)
         }
 
-        return try await query.paginate(for: req)
+        // Never the raw model - a bucket the caller doesn't own but that happens to match
+        // `search` would never reach here (already scoped to `auth.userId` above), but the raw
+        // `Bucket` model doesn't carry anything sensitive by itself either way; this is purely
+        // about not silently starting to leak the moment someone adds an eager-loaded relation
+        // (like `.with(\.$user)`) to this query later, the same mistake the admin bucket list
+        // endpoint made.
+        let page = try await query.paginate(for: req)
+        return page.map { $0.toResponseDTO() }
     }
 
     @Sendable
@@ -494,28 +553,22 @@ struct InternalBucketController: RouteCollection {
         // Verify bucket exists and belongs to user
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        // Parse multipart form data
-        let input = try req.content.decode(UploadInput.self)
-
-        let filename = input.data.filename
-        guard !filename.isEmpty else {
-            throw Abort(.badRequest, reason: "File must have a filename")
-        }
+        // Stream the multipart body to memory-or-spool-file with bounded memory, rather than
+        // buffering the whole file via `Content.decode` - see `AdminUploadSpooler`.
+        let spooled = try await AdminUploadSpooler.spool(req: req)
+        defer { spooled.cleanup() }
 
         // Construct the full key path (prefix + filename)
-        let keyPath = prefix.isEmpty ? filename : "\(prefix)\(filename)"
+        let keyPath = prefix.isEmpty ? spooled.filename : "\(prefix)\(spooled.filename)"
 
-        // Read file data
-        let fileData = Data(buffer: input.data.data)
-
-        let etag = S3Service.computeETag(fileData)
+        let etag = spooled.md5Hex
 
         // Create object metadata
         var meta = ObjectMeta(
             bucketName: bucketName,
             key: keyPath,
-            size: fileData.count,
-            contentType: input.data.contentType?.description ?? "application/octet-stream",
+            size: spooled.size,
+            contentType: spooled.contentType ?? "application/octet-stream",
             etag: etag,
             updatedAt: Date()
         )
@@ -524,21 +577,43 @@ struct InternalBucketController: RouteCollection {
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
         // Write object with versioning support - real blocking file IO, offloaded to the
-        // blocking-IO thread pool rather than tying up the async executor.
+        // blocking-IO thread pool rather than tying up the async executor. Small uploads arrive
+        // in memory and take the direct write; large ones were spooled to disk and are copied
+        // into the final .obj in fixed windows (mirrors S3Controller.handleObjectPut).
         let initialMeta = meta
+        let storage = spooled.storage
         let writtenVersionId: String? = try await S3Service.offloadBlockingIO(req) {
-            if versioningStatus != .disabled {
-                return try ObjectFileHandler.writeVersioned(
-                    metadata: initialMeta,
-                    data: fileData,
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versioningStatus: versioningStatus
-                )
-            } else {
-                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                try ObjectFileHandler.write(metadata: initialMeta, data: fileData, to: path)
-                return nil
+            switch storage {
+            case .memory(let data):
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersioned(
+                        metadata: initialMeta,
+                        data: data,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.write(metadata: initialMeta, data: data, to: path)
+                    return nil
+                }
+            case .file(let spoolPath):
+                let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersionedStreamed(
+                        metadata: initialMeta,
+                        payloadSources: spoolSource,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.writeStreamed(
+                        metadata: initialMeta, payloadSources: spoolSource, to: path)
+                    return nil
+                }
             }
         }
         if let writtenVersionId {
@@ -834,27 +909,44 @@ struct InternalBucketController: RouteCollection {
         let zipFileName = "download-\(UUID().uuidString).zip"
         let zipURL = tempDir.appendingPathComponent(zipFileName)
 
-        // Create ZIP archive
+        // Every early exit below (a thrown error, or the "nothing to download" guard) must not
+        // leak the temp ZIP file on disk - the previous version only cleaned it up on two of
+        // several possible exit paths (e.g. `Archive(url:accessMode:)` or `archive.addEntry`
+        // throwing left it behind forever). `streamRawFile` takes over ownership of `zipURL` on
+        // the success path and unlinks it itself once sent, so this only fires when that never
+        // happens.
+        var handedOffToStreaming = false
+        defer {
+            if !handedOffToStreaming {
+                try? FileManager.default.removeItem(at: zipURL)
+            }
+        }
+
         let archive: Archive
         do {
-            archive = try Archive(
-                url: zipURL, accessMode: .create)
+            archive = try Archive(url: zipURL, accessMode: .create)
         } catch {
             throw Abort(.internalServerError, reason: "Failed to create ZIP archive: \(error)")
         }
 
         var addedFiles = 0
+        // Keys that couldn't be included (not found locally or on any peer, or failed to add to
+        // the archive) - the previous version silently produced a ZIP missing some of the
+        // requested files with no way for the caller to know. Surfaced via a response header
+        // rather than failing the whole request, since a bucket-wide download partially
+        // succeeding is still more useful than an all-or-nothing failure.
+        var skippedKeys: [String] = []
 
-        // Reads object data (versioned or non-versioned), falling back to a cross-node fetch
-        // (the same ObjectRoutingService.isResponsible + ClusterReplicationClient
-        // .fetchObjectToTempFile primitive CopyObject's cross-node source fetch already uses)
-        // when the object isn't physically on this node - without this, a bucket-wide ZIP
-        // download would silently omit any object this node isn't itself responsible for.
-        func readObjectData(bucketName: String, key: String) async -> Data? {
-            if let (_, data) = try? ObjectFileHandler.readCurrentObject(
-                bucketName: bucketName, key: key, loadData: true)
+        // Resolves `key` to a local file path holding its current bytes - either the object's
+        // own on-disk path, or (if this node isn't responsible for it) a temp file fetched from
+        // whichever node is (the same ObjectRoutingService.isResponsible + ClusterReplicationClient
+        // .fetchObjectToTempFile primitive CopyObject's cross-node source fetch already uses).
+        // `isTemp` tells the caller whether that path needs unlinking afterward.
+        func resolveObjectFile(key: String) async -> (path: String, isTemp: Bool)? {
+            if let path = try? ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: nil)
             {
-                return data
+                return (path, false)
             }
 
             let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
@@ -866,9 +958,28 @@ struct InternalBucketController: RouteCollection {
                     app: req.application, candidates: candidates, bucketName: bucketName,
                     key: key, versionId: nil, requestId: req.id)
             else { return nil }
-            defer { _ = POSIXFile.unlink(tempPath) }
 
-            return try? Data(contentsOf: URL(fileURLWithPath: tempPath))
+            return (tempPath, true)
+        }
+
+        // Streams straight from `key`'s resolved file into the ZIP entry
+        // (`Archive.addEntry(with:fileURL:)` reads it in bounded chunks itself) rather than
+        // loading the whole object into memory first, like the previous `Data`-buffering
+        // version did for every single file regardless of size.
+        func addObject(key: String, entryPath: String) async {
+            guard let (filePath, isTemp) = await resolveObjectFile(key: key) else {
+                skippedKeys.append(key)
+                return
+            }
+            defer {
+                if isTemp { _ = POSIXFile.unlink(filePath) }
+            }
+            do {
+                try archive.addEntry(with: entryPath, fileURL: URL(fileURLWithPath: filePath))
+                addedFiles += 1
+            } catch {
+                skippedKeys.append(key)
+            }
         }
 
         for key in keys {
@@ -887,63 +998,48 @@ struct InternalBucketController: RouteCollection {
                     // Skip delete markers
                     if object.isDeleteMarker { continue }
 
-                    if let fileData = await readObjectData(bucketName: bucketName, key: object.key) {
-                        // Use relative path from the folder prefix
-                        let relativePath = String(object.key.dropFirst(key.count))
-                        let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
-
-                        try archive.addEntry(
-                            with: zipEntryPath, type: .file,
-                            uncompressedSize: Int64(fileData.count),
-                            bufferSize: 4096,
-                            provider: { position, size in
-                                let start = Int(position)
-                                let end = min(start + size, fileData.count)
-                                return fileData[start..<end]
-                            })
-                        addedFiles += 1
-                    }
+                    // Use relative path from the folder prefix
+                    let relativePath = String(object.key.dropFirst(key.count))
+                    let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
+                    await addObject(key: object.key, entryPath: zipEntryPath)
                 }
             } else {
                 // Single file - use just the filename without path
-                if let fileData = await readObjectData(bucketName: bucketName, key: key) {
-                    // Extract just the filename from the full key path
-                    let filename = key.split(separator: "/").last.map(String.init) ?? key
-
-                    try archive.addEntry(
-                        with: filename, type: .file, uncompressedSize: Int64(fileData.count),
-                        bufferSize: 4096,
-                        provider: { position, size in
-                            let start = Int(position)
-                            let end = min(start + size, fileData.count)
-                            return fileData[start..<end]
-                        })
-                    addedFiles += 1
-                }
+                let filename = key.split(separator: "/").last.map(String.init) ?? key
+                await addObject(key: key, entryPath: filename)
             }
         }
 
         guard addedFiles > 0 else {
-            try? FileManager.default.removeItem(at: zipURL)
             throw Abort(.notFound, reason: "No files found to download")
         }
 
         // Stream the finished archive straight off disk (unlinked once sent) rather than reading
         // the whole thing into memory - a folder download can produce an arbitrarily large ZIP.
+        // `.int64Value` (not `.intValue`, which is a 32-bit `Int32` and would silently truncate
+        // any archive over ~2GB) matches `streamRawFile`'s `count: Int` on this 64-bit platform.
         guard
-            let zipSize = (try? FileManager.default.attributesOfItem(atPath: zipURL.path))?[.size]
-                as? NSNumber
+            let attributes = try? FileManager.default.attributesOfItem(atPath: zipURL.path),
+            let zipSizeNumber = attributes[.size] as? NSNumber
         else {
-            try? FileManager.default.removeItem(at: zipURL)
             throw Abort(.internalServerError, reason: "Failed to stat the generated ZIP archive")
         }
+        let zipSize = Int(zipSizeNumber.int64Value)
+
         let response = Response(status: .ok)
         response.headers.contentType = .zip
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(bucketName)-download.zip\""
         )
-        Self.streamRawFile(req: req, path: zipURL.path, count: zipSize.intValue, into: response)
+        if !skippedKeys.isEmpty {
+            let encodedSkipped = skippedKeys.map {
+                $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0
+            }.joined(separator: ",")
+            response.headers.replaceOrAdd(name: "X-Alarik-Skipped-Keys", value: encodedSkipped)
+        }
+        handedOffToStreaming = true
+        Self.streamRawFile(req: req, path: zipURL.path, count: zipSize, into: response)
         return response
     }
 
@@ -1168,7 +1264,8 @@ struct InternalBucketController: RouteCollection {
         guard let raw = bucket.notificationConfig else {
             return NotificationConfigDTO(rules: [])
         }
-        return NotificationConfigDTO(rules: NotificationConfiguration.fromJSON(raw).rules)
+        return NotificationConfigDTO(
+            rules: Self.maskedNotificationRules(NotificationConfiguration.fromJSON(raw).rules))
     }
 
     /// Replaces the bucket's webhook rules wholesale. Validates every rule, assigns ids to
@@ -1190,6 +1287,13 @@ struct InternalBucketController: RouteCollection {
                     "A bucket may have at most \(NotificationConfiguration.maxRuleCount) notification rules."
             )
         }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+        let existingRulesById = Dictionary(
+            uniqueKeysWithValues:
+                (bucket.notificationConfig.map { NotificationConfiguration.fromJSON($0).rules } ?? [])
+                .map { ($0.id, $0) })
 
         // Validate + normalize each rule (fresh id for new rules so ids are always server-owned)
         let normalizedRules = try input.rules.map { rule -> NotificationRule in
@@ -1215,12 +1319,14 @@ struct InternalBucketController: RouteCollection {
             var normalized = rule
             if normalized.id == NotificationRule.zeroUUID {
                 normalized.id = UUID()
+            } else if normalized.secret == Self.secretMaskPlaceholder {
+                // The client never sees the real secret (see `secretMaskPlaceholder`) - an
+                // untouched edit echoes the placeholder straight back, which means "keep
+                // whatever's already stored," not "literally set the secret to this placeholder."
+                normalized.secret = existingRulesById[normalized.id]?.secret
             }
             return normalized
         }
-
-        let bucket = try await requireOwnedBucket(
-            req: req, bucketName: bucketName, userId: auth.userId)
 
         let config = NotificationConfiguration(rules: normalizedRules)
         bucket.notificationConfig = normalizedRules.isEmpty ? nil : config.toJSON()
@@ -1242,7 +1348,7 @@ struct InternalBucketController: RouteCollection {
         }
         try await purge.delete()
 
-        return NotificationConfigDTO(rules: normalizedRules)
+        return NotificationConfigDTO(rules: Self.maskedNotificationRules(normalizedRules))
     }
 
     /// Enqueues an `s3:TestEvent` for one rule, proving end-to-end delivery (incl. signature)
@@ -1348,7 +1454,8 @@ struct InternalBucketController: RouteCollection {
         guard let raw = bucket.replicationConfig else {
             return ReplicationTargetsDTO(targets: [])
         }
-        return ReplicationTargetsDTO(targets: ReplicationConfiguration.fromJSON(raw).targets)
+        return ReplicationTargetsDTO(
+            targets: Self.maskedReplicationTargets(ReplicationConfiguration.fromJSON(raw).targets))
     }
 
     /// Replaces the bucket's replication targets wholesale. Validates every target's endpoint
@@ -1373,6 +1480,13 @@ struct InternalBucketController: RouteCollection {
             )
         }
 
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+        let existingConfig =
+            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0) } ?? .empty
+        let existingTargetsById = Dictionary(
+            uniqueKeysWithValues: existingConfig.targets.map { ($0.id, $0) })
+
         let normalizedTargets = try input.targets.map { target -> ReplicationTarget in
             try WebhookURLValidator.validateStructure(target.endpoint)
             if WebhookURLValidator.isInternalHost(target.endpoint) && !auth.isAdmin {
@@ -1386,22 +1500,24 @@ struct InternalBucketController: RouteCollection {
                 throw Abort(
                     .badRequest, reason: "Each replication target requires a destination bucket.")
             }
-            guard !target.accessKeyId.isEmpty, !target.secretAccessKey.isEmpty else {
-                throw Abort(.badRequest, reason: "Each replication target requires credentials.")
-            }
 
             var normalized = target
             if normalized.id == ReplicationTarget.zeroUUID {
                 normalized.id = UUID()
+            } else if normalized.secretAccessKey == Self.secretMaskPlaceholder {
+                // The client never sees the real secret (see `secretMaskPlaceholder`) - an
+                // untouched edit echoes the placeholder straight back, which means "keep
+                // whatever's already stored," not "literally set the secret to this placeholder."
+                normalized.secretAccessKey = existingTargetsById[normalized.id]?.secretAccessKey ?? ""
+            }
+
+            guard !normalized.accessKeyId.isEmpty, !normalized.secretAccessKey.isEmpty else {
+                throw Abort(.badRequest, reason: "Each replication target requires credentials.")
             }
             return normalized
         }
 
-        let bucket = try await requireOwnedBucket(
-            req: req, bucketName: bucketName, userId: auth.userId)
-
-        let existingRules =
-            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0).rules } ?? []
+        let existingRules = existingConfig.rules
         let keptTargetIds = Set(normalizedTargets.map(\.id))
         // A rule referencing a target that no longer exists is disabled, never left dangling -
         // same "clean up, don't leave a dangling reference" precedent used when a webhook rule
@@ -1423,7 +1539,7 @@ struct InternalBucketController: RouteCollection {
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
         CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
 
-        return ReplicationTargetsDTO(targets: normalizedTargets)
+        return ReplicationTargetsDTO(targets: Self.maskedReplicationTargets(normalizedTargets))
     }
 
     @Sendable

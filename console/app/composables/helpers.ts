@@ -19,8 +19,11 @@ export const MAX_CONCURRENT_UPLOADS = 3;
 export function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 Bytes";
     const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const sizes = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB"];
+    // Clamped to the largest unit this table has - without it, a value at or beyond 1024 EB
+    // (a real possibility for total-cluster-storage stats, not just a single object) would
+    // index past the end of `sizes` and print "undefined" instead of a size.
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 

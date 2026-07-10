@@ -66,18 +66,19 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
 
         let query = req.url.query ?? ""
-        let lowerQuery = query.lowercased()
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle ?uploads - list multipart uploads (always requires strict auth - not in the
-        // public-access whitelist)
-        if lowerQuery.contains("uploads") && !lowerQuery.contains("uploadid") {
+        // public-access whitelist). Exact parameter-name match: a plain ListObjects call with
+        // e.g. ?prefix=uploads/2024/photo.jpg must never be misrouted here just because the
+        // *value* of an unrelated parameter contains the word "uploads".
+        if queryNames.contains("uploads") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             return try await handleListMultipartUploads(req: req, bucketName: bucketName)
         }
 
         // Handle ?versions - list object versions (always requires strict auth)
-        // Use word boundary check: "versions" but not "versioning"
-        let isListVersions = lowerQuery.contains("versions") && !lowerQuery.contains("versioning")
+        let isListVersions = queryNames.contains("versions")
         if isListVersions {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             return try await handleListVersions(req: req, bucketName: bucketName)
@@ -275,36 +276,37 @@ struct S3Controller: RouteCollection {
     func handleBucketPut(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle PUT ?versioning
-        if query.lowercased().contains("versioning") {
+        if queryNames.contains("versioning") {
             return try await handleVersioningPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?policy
-        if query.lowercased().contains("policy") {
+        if queryNames.contains("policy") {
             return try await handleBucketPolicyPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?publicAccessBlock
-        if query.lowercased().contains("publicaccessblock") {
+        if queryNames.contains("publicaccessblock") {
             return try await handlePublicAccessBlockPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?tagging
-        if query.lowercased().contains("tagging") {
+        if queryNames.contains("tagging") {
             return try await handleBucketTaggingPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?lifecycle
-        if query.lowercased().contains("lifecycle") {
+        if queryNames.contains("lifecycle") {
             return try await handleLifecyclePut(req: req, bucketName: bucketName)
         }
 
         // PUT ?notification - Alarik's webhook rules target http(s) URLs, not the SNS/SQS/Lambda
         // ARNs the S3 XML format carries, so there's nothing meaningful an S3 client could PUT
         // here. Managed via the console / internal API instead (GET ?notification still works).
-        if query.lowercased().contains("notification") {
+        if queryNames.contains("notification") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             throw S3Error(
                 status: .notImplemented, code: "NotImplemented",
@@ -317,7 +319,7 @@ struct S3Controller: RouteCollection {
         // credentials, which Alarik's model requires (see ReplicationTarget) - so there's
         // nothing meaningful an S3 client could PUT here. Managed via the console / internal
         // API instead (GET ?replication still works).
-        if query.lowercased().contains("replication") {
+        if queryNames.contains("replication") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             throw S3Error(
                 status: .notImplemented, code: "NotImplemented",
@@ -587,29 +589,30 @@ struct S3Controller: RouteCollection {
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle DELETE ?publicAccessBlock
-        if query.lowercased().contains("publicaccessblock") {
+        if queryNames.contains("publicaccessblock") {
             return try await handlePublicAccessBlockDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?tagging
-        if query.lowercased().contains("tagging") {
+        if queryNames.contains("tagging") {
             return try await handleBucketTaggingDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?lifecycle
-        if query.lowercased().contains("lifecycle") {
+        if queryNames.contains("lifecycle") {
             return try await handleLifecycleDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?policy
-        if query.lowercased().contains("policy") {
+        if queryNames.contains("policy") {
             return try await handleBucketPolicyDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?replication
-        if query.lowercased().contains("replication") {
+        if queryNames.contains("replication") {
             return try await handleReplicationDelete(req: req, bucketName: bucketName)
         }
 
@@ -698,12 +701,19 @@ struct S3Controller: RouteCollection {
 
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // Computed once and reused for both the routing decision below and the dispatch check
+        // further down - previously these were two independently-written conditions (routing
+        // only checked presence of the two params; dispatch also required partNumber to parse
+        // as an Int) that could disagree: a non-numeric partNumber (e.g. ?partNumber=abc) was
+        // routed as an UploadPart for cluster purposes, but then fell through past the dispatch
+        // check into the plain-PUT branch below, silently overwriting the destination object
+        // with the request body instead of returning InvalidArgument.
+        let partNumberStr = req.query[String.self, at: "partNumber"]
+        let uploadIdParam = req.query[String.self, at: "uploadId"]
+        let isUploadPart = partNumberStr != nil && uploadIdParam != nil
+
         // UploadPart/UploadPartCopy must pin to the exact node coordinating this upload's
         // Create, not "any responsible node" - see multipartRoutingDecision's doc comment.
-        let isUploadPart =
-            req.query[String.self, at: "partNumber"] != nil
-            && req.query[String.self, at: "uploadId"] != nil
-
         // Cluster routing: one check covers this whole handler's dispatch tree (UploadPart,
         // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
         // (bucketName, keyPath).
@@ -718,10 +728,14 @@ struct S3Controller: RouteCollection {
         }
 
         // Check if this is an UploadPart request (PUT with partNumber & uploadId)
-        if let partNumberStr = req.query[String.self, at: "partNumber"],
-            let partNumber = Int(partNumberStr),
-            let uploadId = req.query[String.self, at: "uploadId"]
-        {
+        if isUploadPart {
+            guard let partNumberStr, let partNumber = Int(partNumberStr) else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidArgument",
+                    message: "Part number must be a valid integer.", requestId: req.id)
+            }
+            let uploadId = uploadIdParam!
+
             // UploadPartCopy - same query params, but copies the part from another object
             if let copySource = try S3Service.parseCopySource(from: req) {
                 return try await handleUploadPartCopy(
@@ -745,7 +759,7 @@ struct S3Controller: RouteCollection {
 
         // PUT ?tagging - set the tag-set of an existing object/version, distinct from a plain
         // body PUT
-        if req.url.query?.lowercased().contains("tagging") == true {
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
             return try await handleObjectTaggingPut(
                 req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
@@ -1193,8 +1207,11 @@ struct S3Controller: RouteCollection {
         }
 
         // GetObjectTagging - a different permission than GetObject in S3, not covered by
-        // the bucket-policy public-access whitelist, so it always requires strict auth.
-        if req.url.query?.lowercased().contains("tagging") == true {
+        // the bucket-policy public-access whitelist, so it always requires strict auth. Exact
+        // parameter-name match: a plain GetObject with e.g.
+        // ?response-content-disposition=...tagging-report.csv must never be misrouted here just
+        // because that unrelated parameter's *value* contains the word "tagging".
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
             return try await handleObjectTaggingGet(req: req, bucketName: bucketName, key: keyPath)
         }
 
@@ -1307,7 +1324,7 @@ struct S3Controller: RouteCollection {
         }
 
         // DeleteObjectTagging - distinct from deleting the object/version itself
-        if req.url.query?.lowercased().contains("tagging") == true {
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
             return try await handleObjectTaggingDelete(
                 req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
@@ -1355,7 +1372,7 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        if query.lowercased().contains("delete") {
+        if S3Service.queryParameterNames(from: query).contains("delete") {
             return try await handleDeleteObjects(req: req, bucketName: bucketName)
         }
 
@@ -1520,7 +1537,7 @@ struct S3Controller: RouteCollection {
         }
 
         // POST ?uploads → CreateMultipartUpload
-        if query.lowercased().contains("uploads") && !query.contains("uploadId") {
+        if S3Service.queryParameterNames(from: query).contains("uploads") {
             return try handleCreateMultipartUpload(req: req, bucketName: bucketName, key: keyPath)
         }
 
@@ -1569,7 +1586,7 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <UploadId>\(uploadId)</UploadId>
             </InitiateMultipartUploadResult>
@@ -1651,8 +1668,8 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Location>\(location)</Location>
-                <Bucket>\(bucketName)</Bucket>
+                <Location>\(location.xmlEscaped)</Location>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <ETag>"\(etag)"</ETag>
             </CompleteMultipartUploadResult>
@@ -1882,7 +1899,7 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <UploadId>\(uploadId)</UploadId>
                 <PartNumberMarker>\(partNumberMarker)</PartNumberMarker>
@@ -1930,14 +1947,14 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
-                <KeyMarker>\(keyMarker ?? "")</KeyMarker>
-                <UploadIdMarker>\(uploadIdMarker ?? "")</UploadIdMarker>
-                <NextKeyMarker>\(nextKeyMarker ?? "")</NextKeyMarker>
-                <NextUploadIdMarker>\(nextUploadIdMarker ?? "")</NextUploadIdMarker>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
+                <KeyMarker>\((keyMarker ?? "").xmlEscaped)</KeyMarker>
+                <UploadIdMarker>\((uploadIdMarker ?? "").xmlEscaped)</UploadIdMarker>
+                <NextKeyMarker>\((nextKeyMarker ?? "").xmlEscaped)</NextKeyMarker>
+                <NextUploadIdMarker>\((nextUploadIdMarker ?? "").xmlEscaped)</NextUploadIdMarker>
                 <MaxUploads>\(maxUploads)</MaxUploads>
                 <IsTruncated>\(isTruncated)</IsTruncated>
-                <Prefix>\(prefix)</Prefix>
+                <Prefix>\(prefix.xmlEscaped)</Prefix>
             \(uploadsXml)
             </ListMultipartUploadsResult>
             """

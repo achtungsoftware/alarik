@@ -19,6 +19,7 @@ import Foundation
 import Testing
 import Vapor
 import VaporTesting
+import ZIPFoundation
 
 @testable import Alarik
 
@@ -111,7 +112,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 3)
                     #expect(page.metadata.total == 3)
 
@@ -139,7 +140,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     let names = Set(page.items.map { $0.name })
                     #expect(names == ["photos-archive", "video-archive"])
                 })
@@ -152,7 +153,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 2)
                 })
 
@@ -164,7 +165,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.isEmpty)
                 })
 
@@ -176,7 +177,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 3)
                 })
         }
@@ -195,7 +196,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 0)
                     #expect(page.metadata.total == 0)
                 })
@@ -232,7 +233,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 2)
                     #expect(page.metadata.total == 5)
                     #expect(page.metadata.page == 1)
@@ -248,7 +249,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 2)
                     #expect(page.metadata.page == 2)
                 })
@@ -324,7 +325,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                 })
 
@@ -345,7 +346,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 0)
                 })
         }
@@ -370,7 +371,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                 })
         }
@@ -443,7 +444,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token1)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.name == "user1-bucket")
                 })
@@ -475,7 +476,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count == 2)
 
                     let bucketNames = page.items.map { $0.name }
@@ -1241,6 +1242,63 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test(
+        "Upload object - A file larger than the in-memory streaming threshold spools to disk and is byte-identical"
+    )
+    func testUploadObjectLargeFileSpoolsToDisk() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "upload-large-bucket")
+
+            // Bigger than Constants.streamingThreshold (4MB) so AdminUploadSpooler must spill
+            // to a spool file rather than keep the whole part in memory - the exact code path
+            // `uploadObject` used to skip entirely (it buffered the whole multipart body via
+            // `Content.decode` regardless of size).
+            let fileContent = Data(repeating: 0x41, count: 6 * 1024 * 1024) + Data("END".utf8)
+            let fileName = "large-upload.bin"
+
+            try await app.test(
+                .POST, "/api/v1/objects?bucket=upload-large-bucket&prefix=",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+
+                    let boundary = "----WebKitFormBoundary\(UUID().uuidString)"
+                    req.headers.replaceOrAdd(
+                        name: .contentType, value: "multipart/form-data; boundary=\(boundary)")
+
+                    var body = Data()
+                    body.append(Data("--\(boundary)\r\n".utf8))
+                    body.append(
+                        Data(
+                            "Content-Disposition: form-data; name=\"data\"; filename=\"\(fileName)\"\r\n"
+                                .utf8))
+                    body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+                    body.append(fileContent)
+                    body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+
+                    req.body = ByteBuffer(data: body)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let meta = try res.content.decode(ObjectMeta.ResponseDTO.self)
+                    #expect(meta.size == fileContent.count)
+                    #expect(meta.etag == S3Service.computeETag(fileContent))
+                })
+
+            try await app.test(
+                .POST, "/api/v1/objects/download",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        DownloadRequestDTO(bucket: "upload-large-bucket", keys: [fileName]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    #expect(Data(buffer: res.body) == fileContent)
+                })
+        }
+    }
+
     @Test("Delete object - Success")
     func testDeleteObjectSuccess() async throws {
         try await withApp { app in
@@ -1813,6 +1871,47 @@ struct InternalBucketControllerTests {
                     // Verify we got data back
                     let data = Data(buffer: res.body)
                     #expect(data.count > 0)
+                })
+        }
+    }
+
+    @Test(
+        "Download multiple files - A key that doesn't exist is reported via a header, not silently dropped, and everything else still downloads"
+    )
+    func testDownloadMultipleFilesReportsSkippedKeys() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "download-skip-bucket")
+
+            try await putObject(
+                app, bucketName: "download-skip-bucket", key: "real1.txt", content: "content1")
+            try await putObject(
+                app, bucketName: "download-skip-bucket", key: "real2.txt", content: "content2")
+
+            try await app.test(
+                .POST, "/api/v1/objects/download",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        DownloadRequestDTO(
+                            bucket: "download-skip-bucket",
+                            keys: ["real1.txt", "does-not-exist.txt", "real2.txt"]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    // The missing key is surfaced, not silently swallowed.
+                    let skippedHeader = res.headers.first(name: "X-Alarik-Skipped-Keys")
+                    let skippedKeys =
+                        skippedHeader?.split(separator: ",")
+                        .map { $0.removingPercentEncoding ?? String($0) } ?? []
+                    #expect(skippedKeys == ["does-not-exist.txt"])
+
+                    // The two real files still made it into a valid, readable archive.
+                    let archive = try Archive(
+                        data: Data(buffer: res.body), accessMode: .read)
+                    let entryPaths = Set(archive.map(\.path))
+                    #expect(entryPaths == ["real1.txt", "real2.txt"])
                 })
         }
     }
@@ -2792,7 +2891,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<Bucket>.self)
+                    let page = try res.content.decode(Page<Bucket.ResponseDTO>.self)
                     #expect(page.items.count >= 1)
                 })
         }
@@ -3220,6 +3319,37 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     let dto = try res.content.decode(InternalBucketController.TagsDTO.self)
                     #expect(dto.tags == ["b": "2"])
+                })
+        }
+    }
+
+    @Test(
+        "Set bucket tags - A body far larger than any real subresource payload is rejected before buffering it all"
+    )
+    func testSetBucketTagsOversizedBodyRejected() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "test-tags-oversized-bucket")
+
+            // The in-memory `app.test(...)` tester (used everywhere else in this file) hands
+            // the body straight to `Request.body.data` and never exercises Vapor's actual
+            // streaming-collect-with-maxSize enforcement (that only runs when
+            // `request.body.data == nil`, i.e. for a real streamed connection) - so proving the
+            // 1MB cap registered on this route actually rejects an oversized body needs the
+            // `.running` tester, which binds a real port and starts/stops the server itself
+            // (calling `app.server.start` here too would double-start it).
+            let oversizedValue = String(repeating: "x", count: 2 * 1024 * 1024)
+            let liveTester = try app.testing(method: .running(hostname: "127.0.0.1", port: 0))
+
+            try await liveTester.test(
+                .PUT, "/api/v1/buckets/test-tags-oversized-bucket/tags",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        InternalBucketController.TagsDTO(tags: ["oversized": oversizedValue]))
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .payloadTooLarge)
                 })
         }
     }
