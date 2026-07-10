@@ -37,10 +37,6 @@ const apiBase = computed(() => useRuntimeConfig().public.apiBaseUrl);
 // else a node needs a swatch, without needing to persist a color assignment anywhere.
 const nodeColorPalette = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ef4444", "#06b6d4", "#ec4899", "#84cc16"];
 
-function shortAddress(address: string): string {
-    return address.replace(/^https?:\/\//, "");
-}
-
 function formatAge(iso: string): string {
     const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
     if (seconds < 60) return `${seconds}s ago`;

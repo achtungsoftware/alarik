@@ -57,6 +57,8 @@ declare global {
         sharedLinkCount: number;
         oidcProviderCount: number;
         multipartUploadCount: number;
+        // null when this node isn't part of a cluster.
+        clusterNode: { nodeId: string; address: string } | null;
     }
 
     export interface NotificationRule {

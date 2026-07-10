@@ -15,6 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import { CurveType } from "vue-chrts";
+
 definePageMeta({
     layout: "dashboard",
 });
@@ -58,6 +60,11 @@ onMounted(() => {
 onUnmounted(() => {
     if (pollTimer) clearInterval(pollTimer);
 });
+
+// null in single-node mode - the "This Node" / "Cluster-Wide" section labels below only render
+// when this is set, since the distinction is meaningless outside cluster mode (there's only ever
+// one node, so everything already describes "the whole deployment").
+const clusterNode = computed(() => sys.value?.clusterNode ?? null);
 
 const diskUsagePercent = computed(() => {
     if (!stats.value?.totalBytes) return 0;
@@ -182,6 +189,20 @@ function refreshAll() {
 
         <template #body>
             <div class="mx-auto max-w-5xl xl:pt-8 w-full space-y-6">
+                <!-- Only shown in cluster mode - in single-node mode there's nothing to
+                     disambiguate, everything below already describes the whole deployment. -->
+                <div v-if="clusterNode" class="space-y-1">
+                    <div class="flex items-center gap-2">
+                        <UIcon name="i-lucide-server" class="text-muted size-4 shrink-0" />
+                        <h2 class="text-sm font-medium text-muted">This Node</h2>
+                        <UBadge color="neutral" variant="subtle" size="sm">{{ shortAddress(clusterNode.address) }}</UBadge>
+                    </div>
+                    <p class="text-xs text-muted">
+                        Process/disk metrics below are local to this node, not the whole cluster - see the
+                        <ULink to="/console/admin/cluster" class="underline">Cluster</ULink> page for the aggregate view.
+                    </p>
+                </div>
+
                 <!-- System Overview Cards -->
                 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
                     <DetailKeyValueCard
@@ -209,37 +230,40 @@ function refreshAll() {
                         <template #header>
                             <CardHeader title="Traffic (last hour)" size="sm" />
                         </template>
-                        <AreaChart :data="trafficData" :height="180" :categories="trafficCategories" :xFormatter="trafficXFormatter" :yFormatter="(v: number) => formatBytes(v)" :xNumTicks="4" :yNumTicks="3" curveType="monotoneX" />
+                        <AreaChart :data="trafficData" :height="180" :categories="trafficCategories" :xFormatter="trafficXFormatter" :yFormatter="(v: number) => formatBytes(v)" :xNumTicks="4" :yNumTicks="3" :curveType="CurveType.MonotoneX" />
                     </UCard>
 
                     <UCard variant="subtle">
                         <template #header>
                             <CardHeader title="Requests (last hour)" size="sm" />
                         </template>
-                        <AreaChart :data="requestData" :height="180" :categories="requestCategories" :xFormatter="requestXFormatter" :xNumTicks="4" :yNumTicks="3" curveType="monotoneX" />
+                        <AreaChart :data="requestData" :height="180" :categories="requestCategories" :xFormatter="requestXFormatter" :xNumTicks="4" :yNumTicks="3" :curveType="CurveType.MonotoneX" />
                     </UCard>
 
                     <UCard variant="subtle">
                         <template #header>
                             <CardHeader title="CPU (last hour)" size="sm" />
                         </template>
-                        <AreaChart :data="cpuData" :height="180" :categories="cpuCategories" :xFormatter="cpuXFormatter" :yFormatter="(v: number) => `${v.toFixed(0)}%`" :xNumTicks="4" :yNumTicks="3" curveType="monotoneX" />
+                        <AreaChart :data="cpuData" :height="180" :categories="cpuCategories" :xFormatter="cpuXFormatter" :yFormatter="(v: number) => `${v.toFixed(0)}%`" :xNumTicks="4" :yNumTicks="3" :curveType="CurveType.MonotoneX" />
                     </UCard>
 
                     <UCard variant="subtle">
                         <template #header>
                             <CardHeader title="Memory (last hour)" size="sm" />
                         </template>
-                        <AreaChart :data="memoryData" :height="180" :categories="memoryCategories" :xFormatter="memoryXFormatter" :yFormatter="(v: number) => formatBytes(v)" :xNumTicks="4" :yNumTicks="3" curveType="monotoneX" />
+                        <AreaChart :data="memoryData" :height="180" :categories="memoryCategories" :xFormatter="memoryXFormatter" :yFormatter="(v: number) => formatBytes(v)" :xNumTicks="4" :yNumTicks="3" :curveType="CurveType.MonotoneX" />
                     </UCard>
                 </div>
 
-                <!-- Storage Overview Cards -->
-                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                <!-- Storage Overview Cards - local disk, plus Multipart Uploads (also node-local:
+                     an in-progress upload's state only ever exists on the one node coordinating
+                     it, see ObjectRoutingService.multipartRoutingDecision). -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6">
                     <DetailKeyValueCard title="Total Disk Space" icon="i-lucide-hard-drive" :value="formatBytes(stats?.totalBytes || 0)" />
                     <DetailKeyValueCard title="Disk Used" icon="i-lucide-database" :value="formatBytes(stats?.usedBytes || 0)" :subTitle="`${diskUsagePercent}% of total`" />
                     <DetailKeyValueCard title="Available" icon="i-lucide-check-circle" :value="formatBytes(stats?.availableBytes || 0)" :subTitle="`${100 - diskUsagePercent}% free`" />
                     <DetailKeyValueCard title="Alarik Storage" icon="i-lucide-cylinder" :value="formatBytes(stats?.alarikUsedBytes || 0)" :subTitle="`${alarikUsagePercent}% of disk`" />
+                    <DetailKeyValueCard title="Multipart Uploads" icon="i-lucide-layers" :value="sys?.multipartUploadCount ?? 0" subTitle="In progress" />
                 </div>
 
                 <!-- Disk Usage Bar -->
@@ -267,12 +291,18 @@ function refreshAll() {
                     </div>
                 </UCard>
 
+                <!-- Everything below is control-plane data (shared Postgres in cluster mode) -
+                     identical no matter which node answers, unlike the node-scoped section above. -->
+                <div v-if="clusterNode" class="flex items-center gap-2 pt-2">
+                    <UIcon name="i-lucide-database" class="text-muted size-4" />
+                    <h2 class="text-sm font-medium text-muted">Cluster-Wide</h2>
+                </div>
+
                 <!-- Resource Counts -->
-                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                     <DetailKeyValueCard title="Access Keys" icon="i-lucide-key-round" :value="sys?.accessKeyCount ?? 0" />
                     <DetailKeyValueCard title="Shared Links" icon="i-lucide-link" :value="sys?.sharedLinkCount ?? 0" />
                     <DetailKeyValueCard title="OIDC Providers" icon="i-lucide-shield-check" :value="sys?.oidcProviderCount ?? 0" />
-                    <DetailKeyValueCard title="Multipart Uploads" icon="i-lucide-layers" :value="sys?.multipartUploadCount ?? 0" subTitle="In progress" />
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">

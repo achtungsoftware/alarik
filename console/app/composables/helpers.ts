@@ -24,6 +24,13 @@ export function formatBytes(bytes: number): string {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 
+// A cluster node's address as stored (CLUSTER_NODE_ADDRESS) always includes the scheme, which
+// is redundant clutter in a compact UI label - used anywhere a node address is displayed
+// (cluster console, dashboard node badge).
+export function shortAddress(address: string): string {
+    return address.replace(/^https?:\/\//, "");
+}
+
 export function getFileIcon(filename: string, isFolder: boolean, isBucket: boolean): string {
     if (isBucket) return "i-lucide-cylinder";
     if (isFolder) return "i-lucide-folder";

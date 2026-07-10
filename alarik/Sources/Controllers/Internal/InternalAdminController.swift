@@ -42,6 +42,18 @@ struct InternalAdminController: RouteCollection {
         let sharedLinkCount: Int
         let oidcProviderCount: Int
         let multipartUploadCount: Int
+        /// `nil` when this node isn't part of a cluster. Lets the console tell the difference
+        /// between "these metrics describe the whole deployment" (single-node mode) and "these
+        /// describe only the one node that happened to answer this request" (cluster mode) -
+        /// `metrics`, the local disk stats in `storageStats`, and `multipartUploadCount` are all
+        /// genuinely per-node in cluster mode (each node tracks its own process/disk/uploads),
+        /// unlike the plain-Postgres counts above, which are identical no matter which node answers.
+        let clusterNode: ClusterNodeIdentityDTO?
+    }
+
+    struct ClusterNodeIdentityDTO: Content {
+        let nodeId: UUID
+        let address: String
     }
 
     struct PolicyDTO: Content {
@@ -362,12 +374,17 @@ struct InternalAdminController: RouteCollection {
         let sharedLinkCount = try await SharedLink.query(on: req.db).count()
         let oidcProviderCount = try await OIDCProvider.query(on: req.db).count()
 
+        let clusterNode = req.application.storage[ClusterConfigurationKey.self].map {
+            ClusterNodeIdentityDTO(nodeId: $0.nodeId, address: $0.address)
+        }
+
         return SystemStats(
             metrics: metrics,
             accessKeyCount: accessKeyCount,
             sharedLinkCount: sharedLinkCount,
             oidcProviderCount: oidcProviderCount,
-            multipartUploadCount: Self.countMultipartUploads()
+            multipartUploadCount: Self.countMultipartUploads(),
+            clusterNode: clusterNode
         )
     }
 
