@@ -48,6 +48,17 @@ function formatAge(iso: string): string {
     return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+// The future-facing counterpart of formatAge - for a task's nextAttemptAt, which under the
+// dispatcher's exponential backoff can be up to an hour out, the exact scenario that reads as
+// "stuck forever" without knowing it's actually still retrying, just slowly.
+function formatEta(iso: string): string {
+    const seconds = Math.floor((new Date(iso).getTime() - Date.now()) / 1000);
+    if (seconds <= 0) return "retrying now";
+    if (seconds < 60) return `in ${seconds}s`;
+    if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
+    return `in ${Math.floor(seconds / 3600)}h`;
+}
+
 // ── Nodes ────────────────────────────────────────────────────────────────────
 
 const {
@@ -78,6 +89,27 @@ const {
     headers: authHeaders.value,
     default: () => [],
 });
+
+// Drill-down behind "Pending Replication by Reason" - only fetched on demand (not polled): a
+// count going up or down is enough for the at-a-glance summary, this is for when an operator
+// actually needs to know which node a stuck task targets and why it keeps failing.
+const taskDetails = ref<ClusterReplicationTaskDetail[]>([]);
+const isLoadingTaskDetails = ref(false);
+const hasLoadedTaskDetails = ref(false);
+
+async function loadTaskDetails() {
+    isLoadingTaskDetails.value = true;
+    try {
+        taskDetails.value = await $fetch<ClusterReplicationTaskDetail[]>(`${apiBase.value}/api/v1/admin/cluster/rebalance/tasks`, {
+            headers: authHeaders.value,
+        });
+        hasLoadedTaskDetails.value = true;
+    } catch (err: any) {
+        toast.add({ title: "Failed to Load", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } finally {
+        isLoadingTaskDetails.value = false;
+    }
+}
 
 // Cheap endpoints (a small table each) - poll like the dashboard's systemStats, so node health
 // and rebalance progress stay live without a manual refresh.
@@ -254,10 +286,72 @@ const nodeColumns: TableColumn<ClusterNode>[] = [
     },
 ];
 
+// Drill-down table behind "Pending Replication by Reason" - see loadTaskDetails above.
+const taskDetailColumns: TableColumn<ClusterReplicationTaskDetail>[] = [
+    {
+        id: "object",
+        header: "Object",
+        cell: ({ row }) =>
+            h("div", { class: "flex flex-col" }, [
+                h("span", { class: "font-medium truncate max-w-64" }, row.original.key),
+                h("span", { class: "text-xs text-muted truncate max-w-64" }, row.original.bucketName),
+            ]),
+    },
+    {
+        id: "target",
+        header: "Target Node",
+        cell: ({ row }) =>
+            h("div", { class: "flex items-center gap-1.5" }, [
+                h("span", {
+                    class: "inline-block w-1.5 h-1.5 rounded-full shrink-0",
+                    style: { backgroundColor: nodeColor(row.original.targetNodeId) },
+                }),
+                h("span", { class: "text-sm whitespace-nowrap" }, shortAddress(nodeAddress(row.original.targetNodeId))),
+            ]),
+    },
+    {
+        accessorKey: "reason",
+        header: "Reason",
+        cell: ({ row }) => h(resolveComponent("UBadge"), { color: "neutral", variant: "subtle", size: "sm" }, () => row.original.reason),
+    },
+    {
+        accessorKey: "state",
+        header: "State",
+        cell: ({ row }) =>
+            h(
+                resolveComponent("UBadge"),
+                { color: row.original.state === "failed" ? "error" : "warning", variant: "subtle", size: "sm" },
+                () => row.original.state
+            ),
+    },
+    { accessorKey: "attempts", header: "Attempts" },
+    {
+        id: "nextAttempt",
+        header: "Next Retry",
+        cell: ({ row }) =>
+            row.original.state === "failed"
+                ? h("span", { class: "text-xs text-muted" }, "—")
+                : h("span", { class: "text-xs whitespace-nowrap" }, formatEta(row.original.nextAttemptAt)),
+    },
+    {
+        id: "lastError",
+        header: "Last Error",
+        cell: ({ row }) =>
+            row.original.lastError
+                ? h("span", { class: "text-xs text-muted truncate max-w-72 block", title: row.original.lastError }, row.original.lastError)
+                : h("span", { class: "text-xs text-muted" }, "—"),
+    },
+];
+
 // ── Placement browser ───────────────────────────────────────────────────────
 
 const placementBucket = ref("");
 const placementPrefix = ref("");
+// null = "All nodes." A concrete node id turns this from "browse a bucket's placement" into
+// "show me exactly which keys this node holds" - the direct answer to the question a wide,
+// one-column-per-node grid could only ever give indirectly, and the part that stopped scaling
+// once a cluster had more than a handful of nodes.
+const placementNodeFilter = ref<string | null>(null);
 const placementEntries = ref<ClusterPlacementEntry[]>([]);
 const placementTotal = ref(0);
 const placementPage = ref(1);
@@ -265,6 +359,11 @@ const placementPer = 25;
 const isLoadingPlacement = ref(false);
 const placementError = ref("");
 const hasSearchedPlacement = ref(false);
+
+const placementNodeFilterOptions = computed(() => [
+    { label: "All nodes", value: null },
+    ...nodes.value.map((node) => ({ label: shortAddress(node.address), value: node.id })),
+]);
 
 async function loadPlacement() {
     if (!placementBucket.value) {
@@ -278,7 +377,13 @@ async function loadPlacement() {
     hasSearchedPlacement.value = true;
     try {
         const response = await $fetch<Page<ClusterPlacementEntry>>(`${apiBase.value}/api/v1/admin/cluster/placement`, {
-            params: { bucket: placementBucket.value, prefix: placementPrefix.value || undefined, page: placementPage.value, per: placementPer },
+            params: {
+                bucket: placementBucket.value,
+                prefix: placementPrefix.value || undefined,
+                nodeId: placementNodeFilter.value || undefined,
+                page: placementPage.value,
+                per: placementPer,
+            },
             headers: authHeaders.value,
         });
         placementEntries.value = response.items;
@@ -292,34 +397,15 @@ async function loadPlacement() {
 }
 
 watch(placementPage, loadPlacement);
+watch(placementNodeFilter, () => {
+    placementPage.value = 1;
+    loadPlacement();
+});
 
-// One column per currently-known node (not just nodes appearing in results) - an always-empty
-// column for the browsed key set is itself useful signal, e.g. a node that's never a replica
-// for anything in this bucket. Rebuilt reactively so a node joining/leaving updates the grid.
-const placementNodeColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() =>
-    nodes.value.map((node) => ({
-        id: `node-${node.id}`,
-        header: () =>
-            h("div", { class: "flex items-center justify-center gap-1.5", title: node.address }, [
-                h("span", {
-                    class: `inline-block w-1.5 h-1.5 rounded-full ${node.isHealthy ? "bg-success" : "bg-error"}`,
-                }),
-                h("span", { class: "text-xs font-normal" }, shortAddress(node.address)),
-            ]),
-        cell: ({ row }) => {
-            const rank = row.original.nodeIds.indexOf(node.id);
-            const dotClass = rank === 0 ? "bg-primary" : rank > 0 ? "bg-primary/40" : "bg-muted/25";
-            const label = rank === 0 ? "Primary replica" : rank > 0 ? `Replica (rank ${rank + 1})` : "Not placed here";
-            return h("div", { class: "flex justify-center" }, [
-                h("span", {
-                    class: `inline-block w-2.5 h-2.5 rounded-full ${dotClass}`,
-                    title: `${label} on ${node.address}`,
-                }),
-            ]);
-        },
-    }))
-);
-
+// A single "Placement" column of small chips (primary filled, replicas faint) rather than one
+// column per node in the whole cluster - a key always has exactly `replicationFactor` replicas
+// regardless of cluster size, so this stays a handful of chips whether the cluster has 4 nodes
+// or 40, unlike the old one-column-per-node grid it replaces.
 const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
     { accessorKey: "key", header: "Key" },
     {
@@ -327,7 +413,32 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
         header: "Size",
         cell: ({ row }) => h("span", { class: "text-xs text-muted whitespace-nowrap" }, formatBytes(row.original.size)),
     },
-    ...placementNodeColumns.value,
+    {
+        id: "placement",
+        header: "Placement",
+        cell: ({ row }) =>
+            h(
+                "div",
+                { class: "flex flex-wrap items-center gap-1.5" },
+                row.original.nodeIds.map((id: string, rank: number) =>
+                    h(
+                        "span",
+                        {
+                            key: id,
+                            class: `inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-xs whitespace-nowrap ${rank === 0 ? "bg-primary/10 font-medium" : "bg-muted/50 text-muted"}`,
+                            title: `${rank === 0 ? "Primary replica" : `Replica (rank ${rank + 1})`} on ${nodeAddress(id)}`,
+                        },
+                        [
+                            h("span", {
+                                class: "inline-block w-1.5 h-1.5 rounded-full shrink-0",
+                                style: { backgroundColor: nodeColor(id) },
+                            }),
+                            h("span", {}, shortAddress(nodeAddress(id))),
+                        ]
+                    )
+                )
+            ),
+    },
 ]);
 </script>
 
@@ -368,13 +479,41 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                     <DetailKeyValueCard title="Failed Replication" icon="i-lucide-triangle-alert" :value="rebalanceStatus.failedCount" />
                 </div>
 
-                <UCard v-if="Object.keys(rebalanceStatus.pendingByReason).length > 0" variant="subtle">
+                <UCard v-if="Object.keys(rebalanceStatus.pendingByReason).length > 0 || rebalanceStatus.failedCount > 0" variant="subtle" :ui="{ body: taskDetails.length > 0 ? '!p-0' : undefined }">
                     <template #header>
-                        <CardHeader title="Pending Replication by Reason" size="sm" />
+                        <CardHeader title="Pending Replication by Reason" size="sm">
+                            <template #rightContent>
+                                <UButton
+                                    @click="loadTaskDetails"
+                                    icon="i-lucide-list"
+                                    color="neutral"
+                                    variant="ghost"
+                                    size="sm"
+                                    :loading="isLoadingTaskDetails"
+                                >
+                                    {{ hasLoadedTaskDetails ? "Refresh Details" : "View Details" }}
+                                </UButton>
+                            </template>
+                        </CardHeader>
                     </template>
-                    <div class="flex flex-wrap gap-2">
+                    <div v-if="!hasLoadedTaskDetails" class="flex flex-wrap gap-2">
                         <UBadge v-for="(count, reason) in rebalanceStatus.pendingByReason" :key="reason" color="neutral" variant="subtle">{{ reason }}: {{ count }}</UBadge>
                     </div>
+                    <UEmpty
+                        v-else-if="taskDetails.length === 0"
+                        title="Nothing Outstanding"
+                        description="No pending or failed replication tasks right now."
+                        icon="i-lucide-circle-check"
+                        size="sm"
+                        variant="naked"
+                        class="py-6"
+                    />
+                    <template v-else>
+                        <p class="px-4 pt-4 pb-2 text-xs text-muted">
+                            Sorted by attempt count - the most-stuck tasks first. Capped at 200 rows.
+                        </p>
+                        <UTable :data="taskDetails" :columns="taskDetailColumns" :ui="{ th: 'cursor-default' }" />
+                    </template>
                 </UCard>
 
                 <UCard variant="subtle">
@@ -438,12 +577,24 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                     </template>
                     <template #default>
                         <div class="p-4 flex flex-col sm:flex-row gap-3">
-                            <UInput v-model="placementBucket" placeholder="Bucket name" icon="i-lucide-cylinder" class="w-full sm:w-64" @keyup.enter="placementPage = 1; loadPlacement()" />
-                            <UInput v-model="placementPrefix" placeholder="Prefix (optional)" icon="i-lucide-filter" class="w-full sm:w-64" @keyup.enter="placementPage = 1; loadPlacement()" />
-                            <UButton label="Search" icon="i-lucide-search" color="neutral" variant="subtle" :loading="isLoadingPlacement" @click="placementPage = 1; loadPlacement()" />
+                            <UInput v-model="placementBucket" variant="subtle" placeholder="Bucket name" icon="i-lucide-cylinder" class="w-full sm:w-56" @keyup.enter="placementPage = 1; loadPlacement()" />
+                            <UInput v-model="placementPrefix" variant="subtle" placeholder="Prefix (optional)" icon="i-lucide-filter" class="w-full sm:w-56" @keyup.enter="placementPage = 1; loadPlacement()" />
+                            <USelectMenu
+                                v-model="placementNodeFilter"
+                                :items="placementNodeFilterOptions"
+                                value-key="value"
+                                icon="i-lucide-server"
+                                placeholder="All nodes"
+                                class="w-full sm:w-48"
+                                variant="subtle"
+                                size="lg"
+                            />
+                            <UButton size="lg" label="Search" icon="i-lucide-search" color="neutral" variant="subtle" :loading="isLoadingPlacement" @click="placementPage = 1; loadPlacement()" />
                         </div>
                         <p v-if="hasSearchedPlacement" class="px-4 pb-4 -mt-2 text-xs text-muted">
-                            A filled dot marks the primary replica, a faint dot a secondary replica. Limited to the first 1000 matching objects.
+                            A filled chip marks the primary replica, a faint chip a secondary replica.
+                            <template v-if="placementNodeFilter">Showing only keys placed on <strong>{{ shortAddress(nodeAddress(placementNodeFilter)) }}</strong>.</template>
+                            Limited to the first 1000 matching objects.
                         </p>
 
                         <UAlert v-if="placementError" title="Error" :description="placementError" color="error" variant="subtle" class="mx-4 mb-4" />
@@ -451,7 +602,15 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                         <div v-if="isLoadingPlacement" class="flex items-center justify-center p-6">
                             <LoadingIndicator />
                         </div>
-                        <UEmpty v-else-if="placementEntries.length === 0" title="No Objects" description="Search a bucket above to see where its objects are placed." icon="i-lucide-map" size="sm" variant="naked" class="py-6" />
+                        <UEmpty
+                            v-else-if="placementEntries.length === 0"
+                            title="No Objects"
+                            :description="hasSearchedPlacement ? 'No matching objects found for this bucket/prefix/node combination.' : 'Search a bucket above to see where its objects are placed.'"
+                            icon="i-lucide-map"
+                            size="sm"
+                            variant="naked"
+                            class="py-6"
+                        />
                         <template v-else>
                             <UTable :data="placementEntries" :columns="placementColumns" :ui="{ th: 'cursor-default' }" />
                             <div v-if="placementTotal > placementPer" class="flex justify-center p-4">

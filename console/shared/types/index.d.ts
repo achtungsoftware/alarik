@@ -185,6 +185,19 @@ declare global {
         objectCount: number;
     }
 
+    export interface ClusterReplicationTaskDetail {
+        id: string;
+        bucketName: string;
+        key: string;
+        operation: string;
+        targetNodeId: string;
+        reason: string;
+        attempts: number;
+        nextAttemptAt: string;
+        state: "pending" | "failed";
+        lastError: string | null;
+    }
+
     // Fluent Page
     export interface Page<T> {
         items: T[];

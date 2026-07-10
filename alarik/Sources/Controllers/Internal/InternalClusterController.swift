@@ -57,12 +57,29 @@ struct InternalClusterController: RouteCollection {
         let objectCount: Int
     }
 
+    /// One outbox row's full detail - the drill-down behind the "Pending Replication by Reason"
+    /// summary, for the exact question that summary can't answer: *which* node is a stuck task
+    /// targeting, and why does it keep failing.
+    struct ReplicationTaskDetailDTO: Content {
+        let id: UUID
+        let bucketName: String
+        let key: String
+        let operation: String
+        let targetNodeId: UUID
+        let reason: String
+        let attempts: Int
+        let nextAttemptAt: Date
+        let state: String
+        let lastError: String?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         let cluster = routes.grouped("admin").grouped("cluster")
         cluster.grouped("nodes").get(use: listNodes)
         cluster.grouped("nodes", ":nodeId", "drain").post(use: drainNode)
         cluster.grouped("resync").post(use: resync)
         cluster.grouped("rebalance", "status").get(use: rebalanceStatus)
+        cluster.grouped("rebalance", "tasks").get(use: rebalanceTasks)
         cluster.grouped("placement").get(use: placement)
         cluster.grouped("storage").get(use: storage)
     }
@@ -102,6 +119,20 @@ struct InternalClusterController: RouteCollection {
 
         node.status = ClusterNode.Status.draining.rawValue
         try await node.save(on: req.db)
+
+        // Any outstanding task that exists to keep this node in sync as a *responsible* replica
+        // (a `write` straggler catch-up, or a `rebalance` copy) is now pointless - draining
+        // excludes it from placement, so nothing should keep retrying to push it data, and a
+        // `pending` row that was just going to sit in growing backoff against a node that'll never
+        // become responsible again is exactly the "why is this stuck" confusion operators hit.
+        // Deliberately NOT touching `reclaim` tasks: those are the drained node cleaning up its
+        // own now-unowned copies, which is still wanted and still runs (draining doesn't stop the
+        // node's process) - only rows this node itself enqueues, so `targetNodeId` for a reclaim
+        // task is always this same node, never confusable with the copy/catch-up tasks above.
+        try await ClusterReplicationTask.query(on: req.db)
+            .filter(\.$targetNodeId == nodeId)
+            .filter(\.$reason != ClusterReplicationTask.Reason.reclaim.rawValue)
+            .delete()
 
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
@@ -152,6 +183,38 @@ struct InternalClusterController: RouteCollection {
             replicationFactor: PlacementService.replicationFactor)
     }
 
+    /// Full detail for outstanding (pending or failed) outbox rows - the "Pending Replication by
+    /// Reason" card only ever answers "how many," which is exactly the gap operators keep hitting
+    /// ("write: 8 stuck - is this normal?"): without knowing *which node* those 8 are aimed at and
+    /// *why* they keep failing (`lastError`), there's no way to tell "waiting out a slow peer's
+    /// backoff" from "targeting a node that's actually gone." Sorted by attempts descending so the
+    /// most-stuck rows surface first; capped at 200 - a drill-down view, not a paginated browser.
+    @Sendable
+    func rebalanceTasks(req: Request) async throws -> [ReplicationTaskDetailDTO] {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        let tasks = try await ClusterReplicationTask.query(on: req.db)
+            .filter(
+                \.$state
+                    ~~ [
+                        ClusterReplicationTask.State.pending.rawValue,
+                        ClusterReplicationTask.State.failed.rawValue,
+                    ]
+            )
+            .sort(\.$attempts, .descending)
+            .limit(200)
+            .all()
+
+        return tasks.compactMap { task in
+            guard let id = task.id else { return nil }
+            return ReplicationTaskDetailDTO(
+                id: id, bucketName: task.bucketName, key: task.key, operation: task.operation,
+                targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
+                nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
+        }
+    }
+
     /// Paginated placement for a bucket (optionally prefix-scoped) - computed on the fly via
     /// `PlacementService`, never persisted. Not backed by a Fluent query, so pagination is done
     /// by hand over the in-memory listing rather than `.paginate(for:)`.
@@ -173,27 +236,41 @@ struct InternalClusterController: RouteCollection {
             throw Abort(.notFound, reason: "Bucket not found")
         }
         let prefix = req.query[String.self, at: "prefix"] ?? ""
+        let nodeFilter = req.query[UUID.self, at: "nodeId"]
+        let page = req.query[Int.self, at: "page"] ?? 1
+        let per = req.query[Int.self, at: "per"] ?? 25
 
         let (objects, _, _, _) = try await ClusterListingService.listObjects(
             req: req, bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 1000,
             marker: nil)
-
-        let page = req.query[Int.self, at: "page"] ?? 1
-        let per = req.query[Int.self, at: "per"] ?? 25
-        let start = max(0, (page - 1) * per)
-        let end = min(objects.count, start + per)
-        let pageObjects = start < end ? Array(objects[start..<end]) : []
-
-        // Placement hashing (SHA256-based HRW, one call per object) only ever runs over this
-        // page's objects, not the full up-to-1000-object listing - cost scales with `per`, not
-        // with how much of the bucket was fetched.
         let active = await ClusterNodeCache.shared.activeNodes()
-        let pageItems = pageObjects.map { object -> PlacementEntryDTO in
+
+        func entry(for object: ObjectMeta) -> PlacementEntryDTO {
             let responsible = PlacementService.responsibleNodes(
                 bucketName: bucketName, key: object.key, activeNodes: active)
             return PlacementEntryDTO(
                 key: object.key, nodeIds: responsible.map(\.id), size: object.size)
         }
+
+        if let nodeFilter {
+            // "Which keys does this node hold" needs every fetched object's placement resolved
+            // before paging (a non-matching object can sort anywhere in the listing), unlike the
+            // unfiltered path below - bounded by the same up-to-1000-object listing cap every
+            // other placement view already has.
+            let matching = objects.map(entry(for:)).filter { $0.nodeIds.contains(nodeFilter) }
+            let start = max(0, (page - 1) * per)
+            let end = min(matching.count, start + per)
+            return Page(
+                items: start < end ? Array(matching[start..<end]) : [],
+                metadata: PageMetadata(page: page, per: per, total: matching.count))
+        }
+
+        // No node filter: placement hashing (SHA256-based HRW, one call per object) only ever
+        // runs over this page's objects, not the full up-to-1000-object listing - cost scales
+        // with `per`, not with how much of the bucket was fetched.
+        let start = max(0, (page - 1) * per)
+        let end = min(objects.count, start + per)
+        let pageItems = start < end ? Array(objects[start..<end]).map(entry(for:)) : []
 
         return Page(items: pageItems, metadata: PageMetadata(page: page, per: per, total: objects.count))
     }
