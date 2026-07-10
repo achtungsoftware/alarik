@@ -117,6 +117,25 @@ final actor ClusterReplicationDispatcher {
     }
 
     private static func deliver(_ row: ClusterReplicationTask, app: Application) async {
+        // Every node runs this same dispatcher independently against the same shared table (no
+        // leader election, no row claiming), so any node's tick can pick up any pending row - not
+        // just the one that actually holds the object. A `.put` only makes sense for whichever
+        // node physically has it: `pushObject` resolves the local path first and would throw
+        // immediately otherwise, and treating that guaranteed failure as a real delivery attempt
+        // would burn the shared `attempts` budget with failures that were never going to succeed,
+        // risking premature dead-lettering of a push some *other* node could deliver just fine.
+        // Skip silently instead - the node that actually has the object still retries normally on
+        // its own tick, so this doesn't weaken the eventual dead-letter safety net for a push
+        // that's genuinely undeliverable by everyone. `.delete` needs no such check: it's a plain
+        // "tell the target to delete its copy" HTTP call that requires no local state at all, so
+        // any node can correctly relay it regardless of which one happens to be executing.
+        if row.operation == ClusterReplicationTask.Operation.put.rawValue {
+            let hasLocalCopy =
+                (try? ObjectFileHandler.resolvePath(
+                    bucketName: row.bucketName, key: row.key, versionId: row.versionId)) != nil
+            guard hasLocalCopy else { return }
+        }
+
         var succeeded = false
         var failureReason: String?
         do {

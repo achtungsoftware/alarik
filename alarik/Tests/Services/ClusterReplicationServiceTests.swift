@@ -105,4 +105,28 @@ struct ClusterReplicationServiceTests {
             #expect(!FileManager.default.fileExists(atPath: path))
         }
     }
+
+    @Test(
+        "ClusterReplicationDispatcher skips a .put task it can't fulfill locally, without counting a failed attempt"
+    )
+    func dispatcherSkipsUndeliverablePutWithoutBurningAttempts() async throws {
+        try await withApp { app in
+            // Every node runs this dispatcher independently against the same shared table, so any
+            // node's tick can pick up a .put task for an object it doesn't actually hold locally -
+            // this simulates exactly that: a task with no corresponding file on disk at all.
+            let task = ClusterReplicationTask(
+                bucketName: "no-local-copy-bucket", key: "missing.txt", versionId: nil,
+                operation: .put, targetNodeId: UUID(), reason: .write)
+            try await task.save(on: app.db)
+            let taskId = try task.requireID()
+
+            await ClusterReplicationDispatcher.shared.drain()
+
+            let reloaded = try #require(
+                try await ClusterReplicationTask.find(taskId, on: app.db))
+            #expect(reloaded.state == ClusterReplicationTask.State.pending.rawValue)
+            #expect(reloaded.attempts == 0)
+            #expect(reloaded.lastError == nil)
+        }
+    }
 }
