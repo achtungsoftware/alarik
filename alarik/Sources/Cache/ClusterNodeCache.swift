@@ -24,6 +24,25 @@ struct ClusterNodeInfo: Sendable, Equatable {
     let address: String
     let status: ClusterNode.Status
     let lastHeartbeatAt: Date
+    /// Self-reported disk capacity, mirrored from `ClusterNode.totalBytes`/`availableBytes`.
+    /// `nil` until the node's first post-upgrade heartbeat - `ClusterCapacityPolicy` treats a
+    /// `nil` as "unknown", never as "full". Defaulted so every pre-existing construction site
+    /// that isn't about capacity (membership load/reconcile from a `ClusterNode` row that
+    /// doesn't carry it, test fixtures, etc.) doesn't need to opt in explicitly.
+    let totalBytes: Int64?
+    let availableBytes: Int64?
+
+    init(
+        id: UUID, address: String, status: ClusterNode.Status, lastHeartbeatAt: Date,
+        totalBytes: Int64? = nil, availableBytes: Int64? = nil
+    ) {
+        self.id = id
+        self.address = address
+        self.status = status
+        self.lastHeartbeatAt = lastHeartbeatAt
+        self.totalBytes = totalBytes
+        self.availableBytes = availableBytes
+    }
 }
 
 /// This is every node's in-memory view of cluster membership - `PlacementService` and

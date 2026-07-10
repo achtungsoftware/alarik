@@ -141,7 +141,8 @@ final class LoadCacheLifecycle: LifecycleHandler {
             return ClusterNodeInfo(
                 id: id, address: node.address,
                 status: ClusterNode.Status(rawValue: node.status) ?? .active,
-                lastHeartbeatAt: node.lastHeartbeatAt)
+                lastHeartbeatAt: node.lastHeartbeatAt,
+                totalBytes: node.totalBytes, availableBytes: node.availableBytes)
         }
         await ClusterNodeCache.shared.load(initialData: clusterNodeData)
     }

@@ -122,10 +122,42 @@ enum ObjectRoutingService {
             : await routingDecision(req: req, bucketName: bucketName, key: key)
         switch decision {
         case .local(let peers):
+            if !requirePrimary, let redirect = await capacityRedirectTarget(req: req, peers: peers) {
+                let candidates = [redirect] + peers.filter { $0.id != redirect.id }
+                return .forwarded(
+                    try await ClusterForwardingClient.forward(req: req, candidates: candidates))
+            }
             return .local(peers: peers)
         case .forward(let candidates):
             return .forwarded(try await ClusterForwardingClient.forward(req: req, candidates: candidates))
         }
+    }
+
+    /// Soft capacity-aware coordination redirect - only ever considered for a write that already
+    /// resolved to `.local` via the non-primary-pinned path. Multipart operations
+    /// (`requirePrimary: true`) are excluded entirely: only the primary ever holds in-progress
+    /// upload state, so redirecting `CreateMultipartUpload`'s coordination would strand
+    /// subsequent `UploadPart` calls, which independently re-resolve placement and would still
+    /// land back on the *original* HRW primary, not wherever this redirected to. A request that
+    /// already arrived pre-routed from a trusted peer is also excluded - it must be served
+    /// locally unconditionally per `routingDecision`'s own invariant, or a redirect could bounce
+    /// a request between two nodes each convinced the other is less full. `peers` is exactly the
+    /// true-responsible set minus self that the caller already computed - never re-derived, never
+    /// widened, so this can only ever pick one of the same HRW-chosen nodes.
+    private static func capacityRedirectTarget(req: Request, peers: [ClusterNodeInfo]) async
+        -> ClusterNodeInfo?
+    {
+        guard !peers.isEmpty, !ClusterForwardAuthenticator.isTrustedForward(req) else { return nil }
+        guard let config = req.application.storage[ClusterConfigurationKey.self],
+            let selfNode = await ClusterNodeCache.shared.get(id: config.nodeId)
+        else { return nil }
+        let redirect = ClusterCapacityPolicy.preferredCoordinator(selfNode: selfNode, peers: peers)
+        if let redirect {
+            req.logger.info(
+                "Cluster capacity redirect: \(config.nodeId) is near-full, handing write coordination for \(req.url.path) to \(redirect.address)"
+            )
+        }
+        return redirect
     }
 
     /// Pure placement check, independent of how the *current* request arrived - for when a

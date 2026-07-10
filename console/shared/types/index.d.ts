@@ -166,6 +166,9 @@ declare global {
         joinedAt: string;
         lastHeartbeatAt: string;
         isHealthy: boolean;
+        totalBytes: number | null;
+        availableBytes: number | null;
+        isNearFull: boolean;
     }
 
     export interface ClusterRebalanceStatus {

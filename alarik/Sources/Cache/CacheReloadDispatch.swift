@@ -149,7 +149,8 @@ enum CacheReloadDispatch {
                     ClusterNodeInfo(
                         id: uuid, address: node.address,
                         status: ClusterNode.Status(rawValue: node.status) ?? .active,
-                        lastHeartbeatAt: node.lastHeartbeatAt))
+                        lastHeartbeatAt: node.lastHeartbeatAt,
+                        totalBytes: node.totalBytes, availableBytes: node.availableBytes))
             } else {
                 await ClusterNodeCache.shared.remove(id: uuid)
             }

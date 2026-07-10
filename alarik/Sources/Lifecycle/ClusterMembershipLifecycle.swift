@@ -81,22 +81,26 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     /// they want it back in service, not a state the node should second-guess.
     private func registerSelf(app: Application, config: ClusterConfiguration) async throws {
         let now = Date()
+        let (totalBytes, availableBytes) = DiskSpace.availableAndTotal(for: BucketHandler.rootURL)
         let node: ClusterNode
         if let existing = try await ClusterNode.find(config.nodeId, on: app.db) {
             node = existing
             node.address = config.address
             node.status = ClusterNode.Status.active.rawValue
             node.lastHeartbeatAt = now
+            node.totalBytes = totalBytes
+            node.availableBytes = availableBytes
         } else {
             node = ClusterNode(
                 id: config.nodeId, address: config.address, status: .active, joinedAt: now,
-                lastHeartbeatAt: now)
+                lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes)
         }
         try await node.save(on: app.db)
 
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
-                id: config.nodeId, address: config.address, status: .active, lastHeartbeatAt: now)
+                id: config.nodeId, address: config.address, status: .active, lastHeartbeatAt: now,
+                totalBytes: totalBytes, availableBytes: availableBytes)
         )
         CacheInvalidationService.notify(
             on: app.db, cache: "clusterNode", op: .upsert, key: config.nodeId.uuidString)
@@ -108,10 +112,13 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             guard !Task.isCancelled else { return }
 
             let now = Date()
+            let (totalBytes, availableBytes) = DiskSpace.availableAndTotal(for: BucketHandler.rootURL)
             do {
                 try await ClusterNode.query(on: app.db)
                     .filter(\.$id == config.nodeId)
                     .set(\.$lastHeartbeatAt, to: now)
+                    .set(\.$totalBytes, to: totalBytes)
+                    .set(\.$availableBytes, to: availableBytes)
                     .update()
             } catch {
                 app.logger.error("Cluster heartbeat update failed: \(error)")
@@ -121,7 +128,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             if var current = await ClusterNodeCache.shared.get(id: config.nodeId) {
                 current = ClusterNodeInfo(
                     id: current.id, address: current.address, status: current.status,
-                    lastHeartbeatAt: now)
+                    lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes)
                 await ClusterNodeCache.shared.upsert(current)
             }
         }
@@ -147,7 +154,8 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                     }
                     return ClusterNodeInfo(
                         id: id, address: row.address, status: status,
-                        lastHeartbeatAt: row.lastHeartbeatAt)
+                        lastHeartbeatAt: row.lastHeartbeatAt,
+                        totalBytes: row.totalBytes, availableBytes: row.availableBytes)
                 }
                 await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
             } catch {

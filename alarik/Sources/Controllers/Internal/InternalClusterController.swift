@@ -33,6 +33,13 @@ struct InternalClusterController: RouteCollection {
         /// `ClusterNodeCache.activeNodes` uses to decide placement eligibility, surfaced here so
         /// the console doesn't need to reimplement the staleness math.
         let isHealthy: Bool
+        /// Self-reported disk capacity - `nil` until this node's first post-upgrade heartbeat.
+        let totalBytes: Int64?
+        let availableBytes: Int64?
+        /// Same check `ClusterCapacityPolicy.isNearFull` uses to decide whether new-write
+        /// coordination should prefer another node - surfaced here so the console doesn't need
+        /// to reimplement the threshold math.
+        let isNearFull: Bool
     }
 
     struct RebalanceStatusDTO: Content {
@@ -98,7 +105,10 @@ struct InternalClusterController: RouteCollection {
                 && now.timeIntervalSince(node.lastHeartbeatAt) <= ClusterNodeCache.heartbeatStaleness
             return ClusterNodeDTO(
                 id: id, address: node.address, status: node.status, joinedAt: node.joinedAt,
-                lastHeartbeatAt: node.lastHeartbeatAt, isHealthy: isHealthy)
+                lastHeartbeatAt: node.lastHeartbeatAt, isHealthy: isHealthy,
+                totalBytes: node.totalBytes, availableBytes: node.availableBytes,
+                isNearFull: ClusterCapacityPolicy.isNearFull(
+                    totalBytes: node.totalBytes, availableBytes: node.availableBytes))
         }
     }
 
@@ -137,7 +147,8 @@ struct InternalClusterController: RouteCollection {
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
                 id: nodeId, address: node.address, status: .draining,
-                lastHeartbeatAt: node.lastHeartbeatAt))
+                lastHeartbeatAt: node.lastHeartbeatAt,
+                totalBytes: node.totalBytes, availableBytes: node.availableBytes))
         CacheInvalidationService.notify(
             on: req.db, cache: "clusterNode", op: .upsert, key: nodeId.uuidString)
 

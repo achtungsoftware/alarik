@@ -253,6 +253,22 @@ const nodeColumns: TableColumn<ClusterNode>[] = [
         },
     },
     {
+        id: "freeSpace",
+        header: "Free Space",
+        cell: ({ row }) => {
+            const { totalBytes, availableBytes, isNearFull } = row.original;
+            if (totalBytes == null || availableBytes == null || totalBytes === 0) {
+                return h("span", { class: "text-xs text-muted" }, "—");
+            }
+            const pct = (availableBytes / totalBytes) * 100;
+            return h("div", { class: "flex items-center gap-2 min-w-36" }, [
+                h(resolveComponent("UProgress"), { modelValue: pct, max: 100, size: "sm", class: "flex-1", color: isNearFull ? "warning" : "primary" }),
+                h("span", { class: "text-xs text-muted whitespace-nowrap" }, `${pct.toFixed(1)}% free`),
+                isNearFull ? h(resolveComponent("UBadge"), { color: "warning", variant: "subtle", size: "sm" }, () => "Low Disk") : null,
+            ]);
+        },
+    },
+    {
         id: "heartbeat",
         header: "Last Heartbeat",
         cell: ({ row }) => formatAge(row.original.lastHeartbeatAt),

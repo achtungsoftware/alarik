@@ -111,6 +111,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateOIDCState())
     app.migrations.add(CreateClusterNode())
     app.migrations.add(CreateClusterReplicationTask())
+    app.migrations.add(AddClusterNodeCapacity())
 
     app.migrations.add(CreateDefaultUser())
 

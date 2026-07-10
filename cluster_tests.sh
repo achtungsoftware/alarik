@@ -60,9 +60,12 @@ kill_node() {
 # Restarts node $1 on its original port/state_dir (so its persisted cluster_node_id and local
 # disk contents survive the restart, matching a real process restart) and waits for it to start
 # accepting connections. A restart re-activates a previously-draining node automatically (see
-# ClusterMembershipLifecycle.registerSelf).
+# ClusterMembershipLifecycle.registerSelf). An optional $2 "KEY=VALUE KEY2=VALUE2" string adds
+# extra env vars on top of the standard ones - used to override e.g. CLUSTER_MIN_FREE_PERCENT for
+# a single node without touching every other node's process.
 restart_node() {
     local i=$1
+    local extra_env="${2:-}"
     local port="${PORTS[$i]}"
     (
         cd "${STATE_DIRS[$i]}" \
@@ -70,7 +73,7 @@ restart_node() {
                 DATABASE_URL="$DATABASE_URL" \
                 CLUSTER_NODE_ADDRESS="http://localhost:$port" \
                 CLUSTER_SECRET="$CLUSTER_SECRET" \
-                exec "$BINARY" serve --hostname 127.0.0.1 --port "$port"
+                exec env $extra_env "$BINARY" serve --hostname 127.0.0.1 --port "$port"
     ) >"$LOG_DIR/node-$i-restart.log" 2>&1 &
     PIDS[$i]="$!"
 
@@ -106,6 +109,17 @@ responsible_ids() {
     curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=$1" \
         -H "Authorization: Bearer $TOKEN" \
         | jq -r --arg k "$2" '.items[] | select(.key == $k) | .nodeIds[]'
+}
+
+# responsible_ids_via <endpoint> <bucket> <key> -> same as responsible_ids, but queried against a
+# SPECIFIC node rather than always node 0. The placement handler computes "responsible" from
+# ClusterNodeCache.shared.activeNodes() - each node's OWN in-memory membership view, not a shared
+# or DB-direct read - so this can legitimately differ from responsible_ids() (node 0's view) if
+# that node's cache hasn't converged yet.
+responsible_ids_via() {
+    curl -s "$1/api/v1/admin/cluster/placement?bucket=$2" \
+        -H "Authorization: Bearer $TOKEN" \
+        | jq -r --arg k "$3" '.items[] | select(.key == $k) | .nodeIds[]'
 }
 
 # node_index_of <nodeId> -> the ENDPOINTS/STATE_DIRS index of that node (empty if not found).
@@ -1445,7 +1459,111 @@ else
     fail "Force-deleting a bucket left ghost objects behind (listing_clean=$GHOST_LISTING_CLEAN disk_clean=$GHOST_DISK_CLEAN) - they reappeared after recreating it under the same name."
 fi
 
-# ── Test 38: DeleteBucket fails closed when a peer is unreachable ──────────────
+# ── Test 38: new-write coordination prefers a non-full peer over a near-full node ──
+# Regression coverage for ClusterCapacityPolicy. All 4 nodes in this suite run on ONE physical
+# disk (different subdirectories, same volume), so they always report virtually identical real
+# free space - there's no threshold value that can make node 3 look "near-full" while its peers
+# (with the SAME real numbers) look "fine" to it, since preferredCoordinator judges peers using
+# self's own threshold. CLUSTER_DEBUG_TOTAL_BYTES/CLUSTER_DEBUG_AVAILABLE_BYTES (DiskSpace's
+# test-only override) sidestep this: node 3 reports an artificially tiny free-space reading while
+# its peers keep reporting their real (much higher) numbers, so the default 10% threshold
+# correctly finds node 3 near-full and its peers not. There's no admin-API signal for "which
+# physical node coordinated this write" - the responsible set is deliberately unaffected by
+# capacity - so the "Cluster capacity redirect" log line ObjectRoutingService emits is the only
+# way to observe the redirect actually firing.
+echo ""
+echo "=== Test: new-write coordination prefers a non-full peer over a near-full node ==="
+CAP_INDEX=3
+kill_node "$CAP_INDEX"
+if ! restart_node "$CAP_INDEX" "CLUSTER_DEBUG_TOTAL_BYTES=1000000000 CLUSTER_DEBUG_AVAILABLE_BYTES=1000"; then
+    fail "Node $CAP_INDEX failed to restart with a debug capacity override set."
+else
+    wait_for_full_membership
+    aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-capacity-test >/dev/null 2>&1
+    CAP_NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$CAP_INDEX].id")
+
+    # Find a key whose responsible set includes the near-full node - placement is a pure hash of
+    # (bucket, key), so a throwaway upload per candidate is enough to read its placement back.
+    CAP_KEY=""
+    for n in $(seq 0 30); do
+        candidate="cap-redirect-$n.txt"
+        echo "probe" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://cluster-capacity-test/$candidate" >/dev/null 2>&1
+        if responsible_ids cluster-capacity-test "$candidate" | grep -q "^$CAP_NODE_ID$"; then
+            CAP_KEY="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$CAP_KEY" ]; then
+        fail "Could not find a key for which node $CAP_INDEX is responsible."
+    else
+        # capacityRedirectTarget computes `peers` from THIS node's own ClusterNodeCache (via
+        # ObjectRoutingService's private placement() -> ClusterNodeCache.shared.activeNodes()) -
+        # a per-node, in-memory view that isn't shared/synchronized in real time with any other
+        # node's. Checking responsible_ids() (always node 0) only proves node 0's view is stable;
+        # it says nothing about node 3's OWN view, which is what actually matters here. Query node
+        # 3's placement endpoint directly so this checks the view that actually drives the
+        # decision, and poll (same local-machine-load flakiness other tests in this suite already
+        # guard against with wait_for_full_membership) since a lot of search-loop traffic happened
+        # since CAP_KEY was first found.
+        CAP_MEMBERSHIP_STABLE=0
+        for _ in $(seq 1 15); do
+            wait_for_full_membership
+            CAP_COUNT=$(responsible_ids_via "${ENDPOINTS[$CAP_INDEX]}" cluster-capacity-test "$CAP_KEY" | wc -l | tr -d ' ')
+            if [ "$CAP_COUNT" -eq 3 ]; then
+                CAP_MEMBERSHIP_STABLE=1
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$CAP_MEMBERSHIP_STABLE" -ne 1 ]; then
+            fail "Node $CAP_INDEX's own view of $CAP_KEY's responsible set didn't stabilize at 3 (last saw $CAP_COUNT) - can't reliably exercise the redirect."
+        else
+            # The write that should actually be redirected: sent directly to the near-full node's
+            # own endpoint, so it's the local entry point (not already a forward) and genuinely
+            # exercises the .local + near-full branch in ObjectRoutingService.routeForWrite.
+            echo "capacity redirect payload" | aws --endpoint-url "${ENDPOINTS[$CAP_INDEX]}" s3 cp - "s3://cluster-capacity-test/$CAP_KEY" >/dev/null
+            sleep 3
+
+            CAP_ALL_CORRECT=1
+            for i in $(seq 0 $((NODE_COUNT - 1))); do
+                BODY=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp "s3://cluster-capacity-test/$CAP_KEY" - 2>/dev/null)
+                [ "$BODY" == "capacity redirect payload" ] || { CAP_ALL_CORRECT=0; echo "  node $i returned unexpected content for $CAP_KEY"; }
+            done
+
+            CAP_PLACEMENT_UNCHANGED=1
+            responsible_ids cluster-capacity-test "$CAP_KEY" | grep -q "^$CAP_NODE_ID$" || CAP_PLACEMENT_UNCHANGED=0
+
+            # Restarting node 3 late in the suite means it comes back up owing a large replication
+            # catch-up backlog (every write across the whole run that landed elsewhere while it was
+            # briefly down/restarting), which can keep it busy for a while - poll rather than a
+            # single fixed-delay check, so a temporarily-saturated node doesn't read as "never
+            # redirected".
+            CAP_REDIRECT_LOGGED=0
+            for _ in $(seq 1 20); do
+                if grep -q "Cluster capacity redirect" "$LOG_DIR/node-$CAP_INDEX-restart.log" 2>/dev/null; then
+                    CAP_REDIRECT_LOGGED=1
+                    break
+                fi
+                sleep 1
+            done
+
+            if [ "$CAP_ALL_CORRECT" -eq 1 ] && [ "$CAP_PLACEMENT_UNCHANGED" -eq 1 ] && [ "$CAP_REDIRECT_LOGGED" -eq 1 ]; then
+                pass "A near-full node hands off write coordination to a non-full peer, without changing placement or losing data."
+            else
+                fail "Capacity-aware redirect did not behave as expected (correct_content=$CAP_ALL_CORRECT placement_unchanged=$CAP_PLACEMENT_UNCHANGED redirect_logged=$CAP_REDIRECT_LOGGED)."
+            fi
+        fi
+    fi
+
+    # Restore node 3 to its default (non-near-full) env before any later test relies on it.
+    kill_node "$CAP_INDEX"
+    restart_node "$CAP_INDEX"
+    wait_for_full_membership
+fi
+
+# ── Test 39: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't
 # confirm every active peer is also empty, per hasBucketObjects's fail-closed design.

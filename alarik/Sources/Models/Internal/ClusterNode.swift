@@ -57,6 +57,14 @@ final class ClusterNode: Model, @unchecked Sendable {
     @Field(key: "last_heartbeat_at")
     var lastHeartbeatAt: Date
 
+    /// Self-reported disk capacity, refreshed on every heartbeat tick. `nil` until this node's
+    /// first post-upgrade heartbeat - always treated as "unknown" (fail open), never as "full".
+    @OptionalField(key: "total_bytes")
+    var totalBytes: Int64?
+
+    @OptionalField(key: "available_bytes")
+    var availableBytes: Int64?
+
     init() {}
 
     init(
@@ -64,12 +72,16 @@ final class ClusterNode: Model, @unchecked Sendable {
         address: String,
         status: Status = .active,
         joinedAt: Date = Date(),
-        lastHeartbeatAt: Date = Date()
+        lastHeartbeatAt: Date = Date(),
+        totalBytes: Int64? = nil,
+        availableBytes: Int64? = nil
     ) {
         self.id = id
         self.address = address
         self.status = status.rawValue
         self.joinedAt = joinedAt
         self.lastHeartbeatAt = lastHeartbeatAt
+        self.totalBytes = totalBytes
+        self.availableBytes = availableBytes
     }
 }
