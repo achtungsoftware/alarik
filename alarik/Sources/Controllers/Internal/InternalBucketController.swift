@@ -282,7 +282,7 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: auth.userId, force: true)
+            req: req, bucketName: bucketName, userId: auth.userId, force: true)
 
         return .noContent
     }

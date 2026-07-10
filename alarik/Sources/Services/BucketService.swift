@@ -73,13 +73,31 @@ struct BucketService {
     }
 
     static func delete(
-        on database: any Database,
+        req: Request,
         bucketName: String,
         userId: UUID,
         force: Bool = false
     )
         async throws
     {
+        let database = req.db
+
+        // A force delete may be removing a genuinely non-empty bucket (unlike the S3-protocol
+        // DeleteBucket path, which requires cluster-wide emptiness *before* ever reaching this
+        // function) - every object, across every version and delete marker, on every node, has
+        // to be explicitly deleted first. Skipping this and only wiping this node's own local
+        // directory (the previous behavior) left every other node's physical copies completely
+        // orphaned: invisible while no Bucket row existed to reach them through the API, but
+        // immediately visible again the moment a bucket with the same name was recreated, since
+        // the on-disk path is derived purely from the bucket name, not any unique bucket id.
+        // Propagates (doesn't swallow) a per-object failure - if any object can't be confirmed
+        // deleted everywhere, the Bucket row below must not be dropped, or whatever's left would
+        // become unreachably orphaned exactly like before. Safe to retry: already-deleted
+        // objects simply won't reappear in the next listing.
+        if force {
+            try await Self.deleteAllObjectsClusterWide(req: req, bucketName: bucketName)
+        }
+
         try await Bucket.query(on: database)
             .filter(\.$name == bucketName)
             .filter(\.$user.$id == userId)
@@ -111,7 +129,40 @@ struct BucketService {
         try await ReplicationTask.query(on: database)
             .filter(\.$bucketName == bucketName)
             .delete()
+        try await ClusterReplicationTask.query(on: database)
+            .filter(\.$bucketName == bucketName)
+            .delete()
 
         try BucketHandler.delete(name: bucketName, force: force)
+    }
+
+    /// Enumerates every current object, historical version, and delete marker across the *whole
+    /// cluster* (not just this node's local disk) and deletes each one via the same cluster-aware
+    /// per-key routing/replication `S3Controller.handleDeleteObjects` and the admin console's
+    /// folder delete already use - so a force-deleted bucket's data is actually gone everywhere,
+    /// not just on whichever node happened to field the delete request.
+    private static func deleteAllObjectsClusterWide(req: Request, bucketName: String) async throws {
+        var keyMarker: String?
+        var versionIdMarker: String?
+        repeat {
+            let (versions, deleteMarkers, _, isTruncated, nextKeyMarker, nextVersionIdMarker) =
+                try await ClusterListingService.listAllVersions(
+                    req: req, bucketName: bucketName, prefix: "", delimiter: nil,
+                    keyMarker: keyMarker, versionIdMarker: versionIdMarker, maxKeys: 1000)
+
+            for entry in versions + deleteMarkers {
+                // versioningStatus: .disabled unconditionally - regardless of the bucket's real
+                // status, so this hard-deletes rather than creating a delete marker. Irrelevant
+                // whenever entry.versionId is non-nil anyway (a specific version/marker id always
+                // takes the hard-delete path), and correct for the nil case too: a bucket-wide
+                // force delete is a permanent prune, not a versioning-aware operation.
+                _ = try await ClusterReplicationService.deleteObjectClusterWide(
+                    req: req, bucketName: bucketName, key: entry.key, versionId: entry.versionId,
+                    versioningStatus: .disabled)
+            }
+
+            keyMarker = isTruncated ? nextKeyMarker : nil
+            versionIdMarker = isTruncated ? nextVersionIdMarker : nil
+        } while keyMarker != nil
     }
 }

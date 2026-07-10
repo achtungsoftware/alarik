@@ -660,7 +660,7 @@ struct S3Controller: RouteCollection {
         // BucketHandler.delete's own redundant *local-only* re-check is skipped rather than left
         // in as a second, incomplete gate.
         try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: bucket.user.id!, force: true)
+            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
 
         return .noContent
     }

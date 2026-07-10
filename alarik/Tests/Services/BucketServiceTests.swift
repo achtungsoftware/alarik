@@ -140,4 +140,79 @@ struct BucketServiceTests {
             #expect(versioningMap["rollback-fail-bucket"] == nil)
         }
     }
+
+    @Test(
+        "delete - Force-deleting a non-empty bucket removes its objects, so recreating it under the same name doesn't resurrect them"
+    )
+    func testForceDeleteRemovesObjectsSoRecreatedBucketStartsEmpty() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+
+            try await BucketService.create(on: app.db, bucketName: "ghost-bucket", userId: userId)
+
+            // A real object in the bucket before force-deleting it - the exact scenario this
+            // regression covers: force-delete used to only wipe this node's local directory via
+            // a raw filesystem remove, without ever running the object through a real delete -
+            // in a cluster, every *other* node's copy was left completely untouched, and the
+            // on-disk path being derived purely from the bucket name (not a unique id) meant a
+            // bucket recreated under the same name silently reused the old, never-cleaned data.
+            let path = ObjectFileHandler.storagePath(for: "ghost-bucket", key: "leftover.txt")
+            let data = Data("should not survive".utf8)
+            try ObjectFileHandler.write(
+                metadata: ObjectMeta(
+                    bucketName: "ghost-bucket", key: "leftover.txt", size: data.count,
+                    contentType: "text/plain", etag: Insecure.MD5.hash(data: data).hex,
+                    updatedAt: Date()),
+                data: data, to: path)
+            #expect(FileManager.default.fileExists(atPath: path))
+
+            let req = Request(application: app, on: app.eventLoopGroup.next())
+            try await BucketService.delete(
+                req: req, bucketName: "ghost-bucket", userId: userId, force: true)
+
+            #expect(!FileManager.default.fileExists(atPath: path))
+            let deletedBucket = try await Bucket.query(on: app.db)
+                .filter(\.$name == "ghost-bucket")
+                .first()
+            #expect(deletedBucket == nil)
+
+            // Recreate a bucket under the exact same name - it must start genuinely empty.
+            try await BucketService.create(on: app.db, bucketName: "ghost-bucket", userId: userId)
+
+            #expect(!FileManager.default.fileExists(atPath: path))
+            let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: "ghost-bucket")
+            #expect(objects.isEmpty)
+        }
+    }
+
+    @Test(
+        "delete - Purges pending internal cluster replication tasks for the bucket, not just what's currently visible"
+    )
+    func testForceDeletePurgesPendingClusterReplicationTasks() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+
+            try await BucketService.create(on: app.db, bucketName: "straggler-bucket", userId: userId)
+
+            // Simulates the completely normal (not an error case) outcome of a quorum write: 2 of
+            // 3 responsible nodes ack in time, satisfying quorum, while the 3rd is left with a
+            // durable catch-up task to deliver later. From that snapshot in time, the straggler
+            // node genuinely doesn't have the object yet, so a cluster-wide listing at delete time
+            // can never find (and therefore never delete) anything there - only purging this row
+            // directly stops the dispatcher from delivering it after the bucket is gone.
+            let task = ClusterReplicationTask(
+                bucketName: "straggler-bucket", key: "in-flight.txt", versionId: nil,
+                operation: .put, targetNodeId: UUID(), reason: .write)
+            try await task.save(on: app.db)
+
+            let req = Request(application: app, on: app.eventLoopGroup.next())
+            try await BucketService.delete(
+                req: req, bucketName: "straggler-bucket", userId: userId, force: true)
+
+            let remaining = try await ClusterReplicationTask.query(on: app.db)
+                .filter(\.$bucketName == "straggler-bucket")
+                .count()
+            #expect(remaining == 0)
+        }
+    }
 }

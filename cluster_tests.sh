@@ -1390,7 +1390,62 @@ else
     fail "setObjectMetadata did not replicate the content-type to every node."
 fi
 
-# ── Test 37: DeleteBucket fails closed when a peer is unreachable ──────────────
+# ── Test 37: force-deleting a bucket doesn't leave ghost objects on other nodes ──
+# Regression test: BucketService.delete used to only wipe the bucket directory on whichever node
+# fielded the (force) delete request - every other node's physical copies of its objects were
+# left completely untouched. Invisible while no Bucket row existed to reach them through the API,
+# but immediately visible again the moment a bucket was recreated under the same name, since the
+# on-disk path is derived purely from the bucket name, not a unique id - i.e. exactly "delete a
+# bucket, recreate it, and the old objects are back."
+echo ""
+echo "=== Test: force-deleting a bucket doesn't leave ghost objects on other nodes ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-forcedelete-ghost-test >/dev/null 2>&1
+for i in $(seq 0 3); do
+    echo "ghost content $i" | aws --endpoint-url "${ENDPOINTS[$((i % NODE_COUNT))]}" s3 cp - "s3://cluster-forcedelete-ghost-test/ghost-$i.txt" >/dev/null
+done
+sleep 3
+
+# Confirm the objects are actually physically spread across more than one node before deleting -
+# otherwise this test wouldn't be exercising the cross-node gap at all.
+GHOST_NODE_IDS=""
+for i in 0 1 2 3; do
+    GHOST_NODE_IDS="$GHOST_NODE_IDS $(responsible_ids cluster-forcedelete-ghost-test "ghost-$i.txt" | sort -u | tr '\n' ',')"
+done
+UNIQUE_GHOST_NODES=$(echo "$GHOST_NODE_IDS" | tr ',' '\n' | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+
+# Force-delete via the admin console endpoint (InternalBucketController.deleteBucket, the
+# vulnerable path - unlike the S3-protocol DeleteBucket, which only ever allows deleting an
+# already cluster-wide-confirmed-empty bucket and was never affected).
+curl -s -o /dev/null -X DELETE "${ENDPOINTS[0]}/api/v1/buckets/cluster-forcedelete-ghost-test" \
+    -H "Authorization: Bearer $TOKEN"
+sleep 3
+
+# Recreate a bucket under the exact same name from a DIFFERENT node than the one that deleted it.
+aws --endpoint-url "${ENDPOINTS[2]}" s3api create-bucket --bucket cluster-forcedelete-ghost-test >/dev/null 2>&1
+sleep 2
+
+GHOST_LISTING_CLEAN=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    SEEN=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-objects-v2 --bucket cluster-forcedelete-ghost-test 2>/dev/null | jq -r '.Contents // [] | length')
+    [ "$SEEN" == "0" ] || { GHOST_LISTING_CLEAN=0; echo "  node $i's listing of the recreated bucket shows $SEEN object(s)"; }
+done
+
+GHOST_DISK_CLEAN=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    for n in 0 1 2 3; do
+        [ -f "$(obj_path "$i" cluster-forcedelete-ghost-test "ghost-$n.txt")" ] && { GHOST_DISK_CLEAN=0; echo "  node $i still physically has ghost-$n.txt on disk"; }
+    done
+done
+
+if [ "$UNIQUE_GHOST_NODES" -lt 2 ]; then
+    fail "Test setup didn't spread ghost-*.txt across multiple nodes (saw $UNIQUE_GHOST_NODES) - can't prove the cross-node gap is fixed."
+elif [ "$GHOST_LISTING_CLEAN" -eq 1 ] && [ "$GHOST_DISK_CLEAN" -eq 1 ]; then
+    pass "Force-deleting a bucket removes its objects cluster-wide - recreating it under the same name starts genuinely empty on every node."
+else
+    fail "Force-deleting a bucket left ghost objects behind (listing_clean=$GHOST_LISTING_CLEAN disk_clean=$GHOST_DISK_CLEAN) - they reappeared after recreating it under the same name."
+fi
+
+# ── Test 38: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't
 # confirm every active peer is also empty, per hasBucketObjects's fail-closed design.

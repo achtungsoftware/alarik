@@ -122,7 +122,7 @@ struct InternalAdminController: RouteCollection {
         }
 
         try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: bucket.user.id!, force: true)
+            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
 
         return .noContent
     }

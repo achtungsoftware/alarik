@@ -527,8 +527,9 @@ struct ReplicationTests {
             _ = try await putObject(app, bucketName: "repl-doomed", key: "a.txt", data: Data("x".utf8))
             #expect(try await ReplicationTask.query(on: app.db).count() == 1)
 
+            let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
-                on: app.db, bucketName: "repl-doomed", userId: admin.id!, force: true)
+                req: req, bucketName: "repl-doomed", userId: admin.id!, force: true)
 
             #expect(try await ReplicationTask.query(on: app.db).count() == 0)
         }

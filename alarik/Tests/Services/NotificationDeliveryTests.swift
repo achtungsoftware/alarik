@@ -293,8 +293,9 @@ struct NotificationDeliveryTests {
             await NotificationDispatcher.shared.drain()
             #expect(try await NotificationDelivery.query(on: app.db).count() >= 1)
 
+            let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
-                on: app.db, bucketName: "doomed", userId: admin.id!, force: true)
+                req: req, bucketName: "doomed", userId: admin.id!, force: true)
 
             #expect(try await NotificationDelivery.query(on: app.db).count() == 0)
         }
