@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=alarik
+      - POSTGRES_PASSWORD=YOUR_SECURE_DB_PASSWORD
+      - POSTGRES_DB=alarik
+    volumes:
+      - alarik-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alarik"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  alarik-1:
+    image: ghcr.io/achtungsoftware/alarik:latest
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - API_BASE_URL=http://localhost:8081
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=alarik
+      - ADMIN_PASSWORD=alarik
+      - JWT=YOUR_SECURE_JWT_KEY
+      - ALLOW_ACCOUNT_CREATION=false
+      - DATABASE_URL=postgres://alarik:YOUR_SECURE_DB_PASSWORD@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-1:8080
+      - CLUSTER_SECRET=YOUR_SECURE_CLUSTER_SECRET
+    volumes:
+      - alarik-1-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  alarik-2:
+    image: ghcr.io/achtungsoftware/alarik:latest
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    environment:
+      - API_BASE_URL=http://localhost:8082
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=alarik
+      - ADMIN_PASSWORD=alarik
+      - JWT=YOUR_SECURE_JWT_KEY
+      - ALLOW_ACCOUNT_CREATION=false
+      - DATABASE_URL=postgres://alarik:YOUR_SECURE_DB_PASSWORD@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-2:8080
+      - CLUSTER_SECRET=YOUR_SECURE_CLUSTER_SECRET
+    volumes:
+      - alarik-2-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      alarik-1:
+        condition: service_healthy
+
+  alarik-3:
+    image: ghcr.io/achtungsoftware/alarik:latest
+    restart: unless-stopped
+    ports:
+      - "8083:8080"
+    environment:
+      - API_BASE_URL=http://localhost:8083
+      - CONSOLE_BASE_URL=http://localhost:3000
+      - ADMIN_USERNAME=alarik
+      - ADMIN_PASSWORD=alarik
+      - JWT=YOUR_SECURE_JWT_KEY
+      - ALLOW_ACCOUNT_CREATION=false
+      - DATABASE_URL=postgres://alarik:YOUR_SECURE_DB_PASSWORD@postgres:5432/alarik
+      - CLUSTER_NODE_ADDRESS=http://alarik-3:8080
+      - CLUSTER_SECRET=YOUR_SECURE_CLUSTER_SECRET
+    volumes:
+      - alarik-3-storage:/app/Storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      alarik-1:
+        condition: service_healthy
+
+  # Point this at any one node - or, in production, at a load balancer in front of all three.
+  # Any node can serve any request, so there's no "primary" to pick.
+  console:
+    image: ghcr.io/achtungsoftware/alarik-console:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NUXT_PUBLIC_API_BASE_URL=http://localhost:8081
+      - NUXT_PUBLIC_CONSOLE_BASE_URL=http://localhost:3000
+      - NUXT_PUBLIC_ALLOW_ACCOUNT_CREATION=false
+    depends_on:
+      - alarik-1
+      - alarik-2
+      - alarik-3
+
+volumes:
+  alarik-postgres:
+  alarik-1-storage:
+  alarik-2-storage:
+  alarik-3-storage:

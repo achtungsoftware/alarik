@@ -29,9 +29,14 @@ struct AccessKeyService {
             .filter(\.$accessKey == accessKey)
             .delete()
 
-        // Remove from all caches
+        // Remove from all caches. Security-sensitive: a revoked key must stop authenticating
+        // on every node, not just this one - notify immediately after each removal, not
+        // batched, so the signal goes out as soon as this node itself has forgotten the key.
         await AccessKeySecretKeyMapCache.shared.remove(accessKey: accessKey)
+        CacheInvalidationService.notify(on: database, cache: "accessKeySecret", op: .remove, key: accessKey)
         await AccessKeyUserMapCache.shared.remove(accessKey: accessKey)
+        CacheInvalidationService.notify(on: database, cache: "accessKeyUser", op: .remove, key: accessKey)
         await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey)
+        CacheInvalidationService.notify(on: database, cache: "accessKeyBucket", op: .remove, key: accessKey)
     }
 }

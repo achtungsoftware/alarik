@@ -147,33 +147,18 @@ struct S3Service {
                             message: "The object changed while the response was being prepared")
                     }
 
-                    let allocator = ByteBufferAllocator()
-                    var position = snapshot.payloadOffset + start
-                    var remaining = length
-                    while remaining > 0 {
-                        let toRead = Swift.min(Constants.streamingReadChunkSize, remaining)
-                        let readPosition = position
-                        let chunk = try await threadPool.runIfActive { () -> ByteBuffer in
-                            var buffer = allocator.buffer(capacity: toRead)
-                            _ = try buffer.writeWithUnsafeMutableBytes(
-                                minimumWritableBytes: toRead
-                            ) { raw in
-                                let bytesRead = POSIXFile.pread(
-                                    fd, raw.baseAddress!, toRead, off_t(readPosition))
-                                guard bytesRead > 0 else {
-                                    throw S3Error(
-                                        status: .internalServerError, code: "InternalError",
-                                        message: "Object payload ended early")
-                                }
-                                return bytesRead
-                            }
-                            return buffer
-                        }
-                        position += chunk.readableBytes
-                        remaining -= chunk.readableBytes
+                    try await StreamingIOLoops.readWindowed(
+                        threadPool: threadPool, fd: fd, offset: snapshot.payloadOffset + start,
+                        length: length, chunkSize: Constants.streamingReadChunkSize
+                    ) { chunk in
                         try await writer.writeBuffer(chunk)
                     }
                     _ = POSIXFile.close(fd)
+                } catch is IOLoopError {
+                    _ = POSIXFile.close(fd)
+                    throw S3Error(
+                        status: .internalServerError, code: "InternalError",
+                        message: "Object payload ended early")
                 } catch {
                     _ = POSIXFile.close(fd)
                     throw error
@@ -589,54 +574,71 @@ struct S3Service {
         return response
     }
 
+    /// Parses a raw query string into the set of parameter NAMES it contains (lowercased,
+    /// values discarded) - e.g. "prefix=uploads/x&tagging" yields {"prefix", "tagging"}. S3
+    /// subresource dispatch (here and throughout the controller) must key off exactly this:
+    /// whether a specific parameter name is present, never whether some unrelated parameter's
+    /// *value* happens to contain that word - a client-supplied `?prefix=uploads/2024/photo.jpg`
+    /// must never be mistaken for the `?uploads` subresource flag, and a plain
+    /// `?response-content-disposition=...tagging-report.csv` must never be mistaken for
+    /// `?tagging`. A raw split (no percent-decoding) is enough: every name this codebase ever
+    /// checks for is a fixed ASCII keyword that's never itself percent-encoded by a real client.
+    static func queryParameterNames(from query: String) -> Set<String> {
+        guard !query.isEmpty else { return [] }
+        return Set(
+            query.split(separator: "&").map { pair in
+                String(pair.split(separator: "=", maxSplits: 1)[0]).lowercased()
+            })
+    }
+
     static func shouldHandleSubresource(query: String) -> Bool {
-        let lowerQuery = query.lowercased()
-        return lowerQuery.contains("location")
-            || lowerQuery.contains("policy")
-            || lowerQuery.contains("versioning")
-            || lowerQuery.contains("versions")
-            || lowerQuery.contains("publicaccessblock")
-            || lowerQuery.contains("tagging")
-            || lowerQuery.contains("lifecycle")
-            || lowerQuery.contains("notification")
-            || lowerQuery.contains("replication")
+        let names = queryParameterNames(from: query)
+        return names.contains("location")
+            || names.contains("policy")
+            || names.contains("versioning")
+            || names.contains("versions")
+            || names.contains("publicaccessblock")
+            || names.contains("tagging")
+            || names.contains("lifecycle")
+            || names.contains("notification")
+            || names.contains("replication")
     }
 
     static func handleSubresourceQuery(query: String, req: Request, bucket: Bucket?) async throws
         -> Response?
     {
-        let lowerQuery = query.lowercased()
+        let names = queryParameterNames(from: query)
 
-        if lowerQuery.contains("location") {
+        if names.contains("location") {
             return handleLocationQuery(req: req)
         }
 
-        if lowerQuery.contains("publicaccessblock") {
+        if names.contains("publicaccessblock") {
             return try handlePublicAccessBlockGet(bucket: bucket, requestId: req.id)
         }
 
-        if lowerQuery.contains("tagging") {
+        if names.contains("tagging") {
             return try handleBucketTaggingGet(bucket: bucket, requestId: req.id)
         }
 
-        if lowerQuery.contains("lifecycle") {
+        if names.contains("lifecycle") {
             return try handleLifecycleGet(bucket: bucket, requestId: req.id)
         }
 
-        if lowerQuery.contains("notification") {
+        if names.contains("notification") {
             return handleNotificationGet(bucket: bucket)
         }
 
-        if lowerQuery.contains("replication") {
+        if names.contains("replication") {
             return try handleReplicationGet(bucket: bucket, requestId: req.id)
         }
 
-        if lowerQuery.contains("policy") {
+        if names.contains("policy") {
             return try handlePolicyQuery(bucket: bucket, requestId: req.id)
         }
 
         // Handle versioning configuration (GET only - PUT handled in controller)
-        if lowerQuery.contains("versioning") && !lowerQuery.contains("versions") {
+        if names.contains("versioning") {
             return handleVersioningGet(bucket: bucket)
         }
 
@@ -889,7 +891,7 @@ struct S3Service {
 
     /// Outcome of deleting a single object, used to build both the single-object
     /// DELETE response headers and the multi-object DeleteResult XML entries.
-    struct ObjectDeleteOutcome {
+    struct ObjectDeleteOutcome: Codable {
         let versionId: String?
         let isDeleteMarker: Bool
     }
@@ -919,17 +921,22 @@ struct S3Service {
             return ObjectDeleteOutcome(versionId: deleteMarker.versionId, isDeleteMarker: true)
         }
 
-        // Versioning disabled or suspended - permanent delete
-        if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
-            let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
-            for version in versions {
-                if let vid = version.versionId {
-                    try? ObjectFileHandler.deleteVersion(
-                        bucketName: bucketName, key: key, versionId: vid)
-                }
-            }
+        if versioningStatus == .suspended {
+            // Per S3's documented behavior, a DELETE with no version ID against a
+            // suspended-versioning bucket only ever touches the "null" version - it's replaced
+            // with a delete marker (also versioned "null"), while every other, genuinely-
+            // versioned object created while versioning was enabled remains completely intact
+            // and retrievable by its real version ID. This used to fall into the same
+            // permanent-delete branch as truly non-versioned buckets, which hard-deleted every
+            // historical version - a real, silent, irrecoverable data-loss divergence from S3.
+            let deleteMarker = try ObjectFileHandler.createNullVersionDeleteMarker(
+                bucketName: bucketName, key: key)
+            return ObjectDeleteOutcome(versionId: deleteMarker.versionId, isDeleteMarker: true)
         }
 
+        // Versioning has never been enabled for this bucket - genuinely permanent delete, and
+        // (unlike the suspended case above) there's no version history to preserve: a bucket
+        // that's never had versioning on can only ever have the one, current copy.
         let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
         if FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(atPath: path)

@@ -21,10 +21,10 @@ final actor AccessKeyUserMapCache {
 
     private var map: [String: UUID] = [:]
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot.
     func load(initialData: [(accessKey: String, userId: UUID)]) {
-        for entry in initialData {
-            map[entry.accessKey] = entry.userId
-        }
+        map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.accessKey, $0.userId) })
     }
 
     func add(accessKey: String, userId: UUID) {

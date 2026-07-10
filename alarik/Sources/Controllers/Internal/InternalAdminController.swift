@@ -42,6 +42,18 @@ struct InternalAdminController: RouteCollection {
         let sharedLinkCount: Int
         let oidcProviderCount: Int
         let multipartUploadCount: Int
+        /// `nil` when this node isn't part of a cluster. Lets the console tell the difference
+        /// between "these metrics describe the whole deployment" (single-node mode) and "these
+        /// describe only the one node that happened to answer this request" (cluster mode) -
+        /// `metrics`, the local disk stats in `storageStats`, and `multipartUploadCount` are all
+        /// genuinely per-node in cluster mode (each node tracks its own process/disk/uploads),
+        /// unlike the plain-Postgres counts above, which are identical no matter which node answers.
+        let clusterNode: ClusterNodeIdentityDTO?
+    }
+
+    struct ClusterNodeIdentityDTO: Content {
+        let nodeId: UUID
+        let address: String
     }
 
     struct PolicyDTO: Content {
@@ -51,6 +63,20 @@ struct InternalAdminController: RouteCollection {
     struct BucketStatsDTO: Content {
         let sizeBytes: Int64
         let objectCount: Int
+    }
+
+    /// `listBuckets`'s response shape - deliberately NOT the raw `Bucket` model. Fluent's
+    /// `Fields.encode` serializes every `@Field` with no exclusions, and `Bucket.$user`'s
+    /// eager-loaded `User` would do the same for `passwordHash` - `Bucket.ResponseDTO` (used
+    /// elsewhere) also doesn't carry ownership at all, so this exists specifically to answer
+    /// "which user owns this bucket" for the admin console without ever serializing a full
+    /// `User`/`Bucket` model to the wire.
+    struct AdminBucketDTO: Content {
+        let id: UUID?
+        let name: String
+        let creationDate: Date?
+        let versioningStatus: String
+        let user: User.ResponseDTO?
     }
 
     func boot(routes: any RoutesBuilder) throws {
@@ -110,7 +136,7 @@ struct InternalAdminController: RouteCollection {
         }
 
         try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: bucket.user.id!, force: true)
+            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
 
         return .noContent
     }
@@ -195,14 +221,20 @@ struct InternalAdminController: RouteCollection {
     }
 
     @Sendable
-    func listBuckets(req: Request) async throws -> Page<Bucket> {
+    func listBuckets(req: Request) async throws -> Page<AdminBucketDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        return try await Bucket.query(on: req.db)
+        let page = try await Bucket.query(on: req.db)
             .sort(\.$creationDate, .descending)
             .with(\.$user)
             .paginate(for: req)
+
+        return page.map {
+            AdminBucketDTO(
+                id: $0.id, name: $0.name, creationDate: $0.creationDate,
+                versioningStatus: $0.versioningStatus, user: $0.user.toResponseDTO())
+        }
     }
 
     @Sendable
@@ -255,6 +287,27 @@ struct InternalAdminController: RouteCollection {
 
         let editUser: User.EditAdmin = try req.content.decode(User.EditAdmin.self)
 
+        // The bulk `.filter(...).update()` below silently affects zero rows for an unknown id -
+        // without this check first, editing a nonexistent user would return a fabricated 200
+        // (`editUser.toUserResponseDTO()` just echoes the request back) instead of a 404.
+        guard let existingUser = try await User.find(editUser.id, on: req.db) else {
+            throw Abort(.notFound, reason: "User not found")
+        }
+
+        // Every admin endpoint (including this one) requires an authenticated admin, so
+        // stripping the last admin's status would permanently lock every admin-only action -
+        // including re-promoting anyone - behind a login no account can pass anymore.
+        if existingUser.isAdmin && !editUser.isAdmin {
+            let remainingAdmins = try await User.query(on: req.db)
+                .filter(\.$isAdmin == true)
+                .filter(\.$id != editUser.id)
+                .count()
+            guard remainingAdmins > 0 else {
+                throw Abort(
+                    .conflict, reason: "Cannot remove admin status from the last administrator.")
+            }
+        }
+
         do {
             try await User.query(on: req.db)
                 .filter(\.$id == editUser.id)
@@ -294,14 +347,20 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.forbidden, reason: "Cannot delete yourself")
         }
 
-        // Delete all bucket folders from disk
+        // Force-delete every bucket the user owns through BucketService, not a raw local-disk
+        // removal - the same cluster-wide object cleanup, cache invalidation, and outbox purge
+        // every other bucket-teardown path in this codebase goes through. A raw
+        // `BucketHandler.forceDelete` only wipes the requesting node's own directory, leaving
+        // every other cluster node's physical copies orphaned - invisible until a bucket with
+        // the same name is created again (bucket paths are name-derived, not id-derived), at
+        // which point the "deleted" data silently resurfaces under the new bucket.
         let buckets = try await Bucket.query(on: req.db)
             .filter(\.$user.$id == userId)
             .all()
 
         for bucket in buckets {
-            try BucketHandler.forceDelete(name: bucket.name)
-            await BucketVersioningCache.shared.removeBucket(bucket.name)
+            try await BucketService.delete(
+                req: req, bucketName: bucket.name, userId: userId, force: true)
         }
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -
@@ -314,7 +373,7 @@ struct InternalAdminController: RouteCollection {
             try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
         }
 
-        // Delete the user (buckets cascade delete in DB; access keys are already gone above)
+        // Delete the user - buckets and access keys are already fully torn down above.
         try await userToDelete.delete(on: req.db)
 
         return .noContent
@@ -328,7 +387,7 @@ struct InternalAdminController: RouteCollection {
         let storageURL = URL(fileURLWithPath: BucketHandler.rootPath)
 
         // Get disk space info
-        let (totalBytes, availableBytes) = Self.getDiskSpace(for: storageURL)
+        let (totalBytes, availableBytes) = DiskSpace.availableAndTotal(for: storageURL)
 
         let usedBytes = totalBytes - availableBytes
 
@@ -360,12 +419,17 @@ struct InternalAdminController: RouteCollection {
         let sharedLinkCount = try await SharedLink.query(on: req.db).count()
         let oidcProviderCount = try await OIDCProvider.query(on: req.db).count()
 
+        let clusterNode = req.application.storage[ClusterConfigurationKey.self].map {
+            ClusterNodeIdentityDTO(nodeId: $0.nodeId, address: $0.address)
+        }
+
         return SystemStats(
             metrics: metrics,
             accessKeyCount: accessKeyCount,
             sharedLinkCount: sharedLinkCount,
             oidcProviderCount: oidcProviderCount,
-            multipartUploadCount: Self.countMultipartUploads()
+            multipartUploadCount: Self.countMultipartUploads(),
+            clusterNode: clusterNode
         )
     }
 
@@ -389,35 +453,6 @@ struct InternalAdminController: RouteCollection {
         return count
     }
 
-    private static func getDiskSpace(for url: URL) -> (total: Int64, available: Int64) {
-        let path =
-            FileManager.default.fileExists(atPath: url.path)
-            ? url.path
-            : url.deletingLastPathComponent().path
-
-        #if os(Linux)
-            var stat = statvfs()
-            guard statvfs(path, &stat) == 0 else {
-                return (0, 0)
-            }
-            let blockSize = UInt64(stat.f_frsize)
-            let totalBytes = Int64(UInt64(stat.f_blocks) * blockSize)
-            let availableBytes = Int64(UInt64(stat.f_bavail) * blockSize)
-            return (totalBytes, availableBytes)
-        #else
-            do {
-                let values = try URL(fileURLWithPath: path).resourceValues(forKeys: [
-                    .volumeAvailableCapacityForImportantUsageKey,
-                    .volumeTotalCapacityKey,
-                ])
-                let total = Int64(values.volumeTotalCapacity ?? 0)
-                let available = Int64(values.volumeAvailableCapacityForImportantUsage ?? 0)
-                return (total, available)
-            } catch {
-                return (0, 0)
-            }
-        #endif
-    }
 
     private static func calculateDirectorySize(at url: URL) -> Int64 {
         let fileManager = FileManager.default

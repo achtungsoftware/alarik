@@ -65,12 +65,26 @@ struct LifecycleService {
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(
             bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
+        // Membership is read once for the whole sweep, not per object - the active set doesn't
+        // meaningfully change within a single pass, and re-reading it per key would both add
+        // thousands of redundant actor hops and let placement decisions drift mid-sweep.
+        let clusterContext = await clusterContext(app: app)
+
         for object in objects where object.updatedAt <= cutoff {
-            let outcome = try await S3Service.offloadBlockingIO(app) {
-                try S3Service.deleteObject(
-                    bucketName: bucketName, key: object.key, versionId: nil,
-                    versioningStatus: versioningStatus)
-            }
+            // Every replica of this bucket runs its own sweep independently and would otherwise
+            // all race to expire the same object - gating on "am I the primary (rank-0)
+            // responsible node for this key" means exactly one node acts, the same way ownership
+            // already determines who coordinates a client-facing write. Being primary implies
+            // holding a local replica, so this node's own local listing above is already
+            // sufficient to find every key it's primary for - no cluster-wide fan-out listing
+            // needed here.
+            let (isPrimary, peers) = primaryAuthority(
+                context: clusterContext, bucketName: bucketName, key: object.key)
+            guard isPrimary else { continue }
+
+            let outcome = try await ClusterReplicationService.coordinateDelete(
+                app: app, bucketName: bucketName, key: object.key, versionId: nil,
+                versioningStatus: versioningStatus, peers: peers)
 
             await NotificationService.emit(
                 event: outcome.isDeleteMarker
@@ -96,7 +110,15 @@ struct LifecycleService {
 
         let keys = Set(versions.map(\.key) + deleteMarkers.map(\.key))
 
+        // Read membership once for the whole sweep - see expireCurrentObjects.
+        let clusterContext = await clusterContext(app: app)
+
         for key in keys {
+            // See expireCurrentObjects - same primary-only gating, for the same reason.
+            let (isPrimary, peers) = primaryAuthority(
+                context: clusterContext, bucketName: bucketName, key: key)
+            guard isPrimary else { continue }
+
             let chain = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
             guard chain.count > 1 else { continue }
 
@@ -107,24 +129,63 @@ struct LifecycleService {
                 let becameNoncurrentAt = chain[i - 1].updatedAt
                 guard becameNoncurrentAt <= cutoff else { continue }
 
-                try await S3Service.offloadBlockingIO(app) {
-                    try ObjectFileHandler.deleteVersion(
-                        bucketName: bucketName, key: key, versionId: versionId)
-                }
+                // Unlike external replication (ReplicationClient.replicateDelete), cluster peers
+                // physically hold the exact same version files as this node, so this specific
+                // historical version does need to propagate - versioningStatus is irrelevant
+                // here since coordinateDelete's own deleteObject always hard-deletes an
+                // explicitly-versionId'd delete.
+                let outcome = try await ClusterReplicationService.coordinateDelete(
+                    app: app, bucketName: bucketName, key: key, versionId: versionId,
+                    versioningStatus: .disabled, peers: peers)
 
                 await NotificationService.emit(
                     event: .lifecycleExpirationDelete, bucketName: bucketName, key: key,
-                    size: nil, etag: nil, versionId: versionId,
+                    size: nil, etag: nil, versionId: outcome.versionId,
                     requestId: UUID().uuidString, sourceIP: nil, on: db)
-                // Not replicated: NoncurrentVersionExpiration permanently prunes one specific
-                // historical version, which has no meaningful equivalent on the replication
-                // target (see ReplicationClient.replicateDelete).
             }
         }
     }
 
+    /// One-time-per-sweep membership snapshot: `nil` means not clustered (or no peers registered
+    /// yet), the "act alone" case every other cluster feature treats as inert. Read once and
+    /// threaded into `primaryAuthority` per object so a single sweep sees one consistent
+    /// membership view.
+    private static func clusterContext(app: Application) async -> (
+        config: ClusterConfiguration, active: [ClusterNodeInfo]
+    )? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let active = await ClusterNodeCache.shared.activeNodes()
+        guard !active.isEmpty else { return nil }
+        return (config, active)
+    }
+
+    /// Pure cluster-aware write authority for a key, for background sweeps that have no `Request`
+    /// to drive `ObjectRoutingService`'s per-request routing decision. A `nil` context (not
+    /// clustered) always answers "yes, alone". Returns the other responsible nodes as `peers` so
+    /// a caller that gets `isPrimary: true` can replicate its write without a second placement
+    /// lookup.
+    private static func primaryAuthority(
+        context: (config: ClusterConfiguration, active: [ClusterNodeInfo])?,
+        bucketName: String, key: String
+    ) -> (isPrimary: Bool, peers: [ClusterNodeInfo]) {
+        guard let context else { return (true, []) }
+        let responsible = PlacementService.responsibleNodes(
+            bucketName: bucketName, key: key, activeNodes: context.active)
+        guard let primary = responsible.first, primary.id == context.config.nodeId else {
+            return (false, [])
+        }
+        let peers = responsible.filter { $0.id != context.config.nodeId }
+        return (true, peers)
+    }
+
     /// AbortIncompleteMultipartUpload - aborts in-progress multipart uploads initiated at least
-    /// `days` ago.
+    /// `days` ago. Deliberately local-only, unlike the two sweeps above: an upload's part state
+    /// only ever exists on the single primary node that coordinated its Create (see
+    /// `ObjectRoutingService.multipartRoutingDecision`), so this node's own local listing already
+    /// only surfaces uploads it genuinely owns - no other node could independently discover the
+    /// same upload to race on, and there is no peer state to replicate an abort to. The only gap
+    /// this leaves is that an upload whose owning node is permanently lost never gets swept, the
+    /// same durability tradeoff every other primary-pinned multipart operation already accepts.
     private static func abortStaleMultipartUploads(
         bucketName: String, prefix: String, days: Int, app: Application
     ) async throws {

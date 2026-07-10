@@ -121,10 +121,14 @@ struct InternalUserController: RouteCollection {
             accessKey: create.accessKey,
             secretKey: create.secretKey
         )
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeySecret", op: .upsert, key: create.accessKey)
         await AccessKeyUserMapCache.shared.add(
             accessKey: create.accessKey,
             userId: auth.userId
         )
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeyUser", op: .upsert, key: create.accessKey)
 
         // Map the new access key to all existing buckets for this user
         let userBuckets = try await Bucket.query(on: req.db)
@@ -137,6 +141,10 @@ struct InternalUserController: RouteCollection {
                 bucketName: bucket.name
             )
         }
+        // One notify for the whole key, not per bucket - accessKeyBucket/upsert reloads this
+        // key's entire bucket set from the DB in one shot on the receiving end.
+        CacheInvalidationService.notify(
+            on: req.db, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
 
         return accessKey.toResponseDTO()
     }
@@ -192,14 +200,17 @@ struct InternalUserController: RouteCollection {
     func deleteUser(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
-        // Delete all bucket folders from disk
+        // Force-delete every bucket the user owns through BucketService, not a raw local-disk
+        // removal - see InternalAdminController.deleteUser for why a raw `forceDelete` leaves
+        // every other cluster node's physical copies orphaned, ready to silently resurface if a
+        // bucket with the same name is ever created again.
         let buckets = try await Bucket.query(on: req.db)
             .filter(\.$user.$id == auth.userId)
             .all()
 
         for bucket in buckets {
-            try BucketHandler.forceDelete(name: bucket.name)
-            await BucketVersioningCache.shared.removeBucket(bucket.name)
+            try await BucketService.delete(
+                req: req, bucketName: bucket.name, userId: auth.userId, force: true)
         }
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -
@@ -212,7 +223,7 @@ struct InternalUserController: RouteCollection {
             try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
         }
 
-        // Delete the user (buckets cascade delete in DB; access keys are already gone above)
+        // Delete the user - buckets and access keys are already fully torn down above.
         try await auth.user.delete(on: req.db)
 
         return .noContent

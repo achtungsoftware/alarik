@@ -27,10 +27,10 @@ final actor BucketPolicyCache {
     private var map: [String: BucketPolicy] = [:]
     private var publicAccessBlockMap: [String: PublicAccessBlockConfiguration] = [:]
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot.
     func load(initialData: [(bucketName: String, policy: BucketPolicy)]) {
-        for entry in initialData {
-            map[entry.bucketName] = entry.policy
-        }
+        map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.bucketName, $0.policy) })
     }
 
     /// Get the parsed policy for a bucket, or nil if none has been set
@@ -52,12 +52,13 @@ final actor BucketPolicyCache {
         map
     }
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot.
     func loadPublicAccessBlocks(
         initialData: [(bucketName: String, configuration: PublicAccessBlockConfiguration)]
     ) {
-        for entry in initialData {
-            publicAccessBlockMap[entry.bucketName] = entry.configuration
-        }
+        publicAccessBlockMap = Dictionary(
+            uniqueKeysWithValues: initialData.map { ($0.bucketName, $0.configuration) })
     }
 
     /// Get the public access block configuration for a bucket, or nil if never configured

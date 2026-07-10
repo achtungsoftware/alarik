@@ -21,11 +21,13 @@ final actor BucketVersioningCache {
 
     private var map: [String: VersioningStatus] = [:]
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot.
     func load(initialData: [(bucketName: String, versioningStatus: String)]) {
-        for entry in initialData {
-            let status = VersioningStatus(rawValue: entry.versioningStatus) ?? .disabled
-            map[entry.bucketName] = status
-        }
+        map = Dictionary(
+            uniqueKeysWithValues: initialData.map {
+                ($0.bucketName, VersioningStatus(rawValue: $0.versioningStatus) ?? .disabled)
+            })
     }
 
     /// Get versioning status for a bucket

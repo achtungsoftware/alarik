@@ -184,6 +184,32 @@ struct InternalAdminControllerTests {
         }
     }
 
+    @Test("Edit a nonexistent user - should 404, not fabricate a success response")
+    func testEditNonexistentUser() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+
+            let editDTO = User.EditAdmin(
+                id: UUID(),
+                name: "Ghost",
+                username: "ghost@example.com",
+                isAdmin: false
+            )
+
+            try await app.test( 
+                .PUT, "/api/v1/admin/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(editDTO)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .notFound)
+                })
+
+            #expect(try await User.query(on: app.db).filter(\.$username == "ghost@example.com").first() == nil)
+        }
+    }
+
     @Test("Edit user as non admin - should fail")
     func testEditUserAsNonAdmin() async throws {
         try await withApp { app in
@@ -264,6 +290,74 @@ struct InternalAdminControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .conflict)
+                })
+        }
+    }
+
+    @Test("Removing admin status from the sole remaining admin - should fail")
+    func testEditUserCannotDemoteLastAdmin() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            let admin = try #require(
+                try await User.query(on: app.db).filter(\.$username == "alarik").first())
+
+            // The seeded default admin is the only admin in a fresh test app - demoting it must
+            // be rejected, since every admin endpoint (including this one) requires an
+            // authenticated admin and there'd be no account left that could ever undo this.
+            let editDTO = User.EditAdmin(
+                id: try admin.requireID(), name: admin.name, username: admin.username,
+                isAdmin: false
+            )
+
+            try await app.test(
+                .PUT, "/api/v1/admin/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(editDTO)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .conflict)
+                })
+
+            let reloaded = try #require(try await User.find(admin.requireID(), on: app.db))
+            #expect(reloaded.isAdmin == true)
+        }
+    }
+
+    @Test("Removing admin status from an admin - should pass when another admin remains")
+    func testEditUserCanDemoteAdminWhenAnotherRemains() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            let defaultAdmin = try #require(
+                try await User.query(on: app.db).filter(\.$username == "alarik").first())
+
+            let createDTO = User.Create(
+                name: "Second Admin", username: "second-admin@example.com",
+                password: "SecurePass123!", isAdmin: true)
+            try await app.test(
+                .POST, "/api/v1/admin/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res async in #expect(res.status == .ok) })
+
+            // Two admins now exist - demoting one is safe, the other remains.
+            let editDTO = User.EditAdmin(
+                id: try defaultAdmin.requireID(), name: defaultAdmin.name,
+                username: defaultAdmin.username, isAdmin: false
+            )
+
+            try await app.test(
+                .PUT, "/api/v1/admin/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(editDTO)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let user = try res.content.decode(User.ResponseDTO.self)
+                    #expect(user.isAdmin == false)
                 })
         }
     }
@@ -432,6 +526,63 @@ struct InternalAdminControllerTests {
                 .filter(\.$user.$id == userId!)
                 .all()
             #expect(remainingBuckets.isEmpty)
+        }
+    }
+
+    @Test(
+        "Delete user with buckets - purges pending cluster replication tasks too, not just the local directory"
+    )
+    func testDeleteUserPurgesClusterReplicationTasks() async throws {
+        try await withApp { app in
+            let adminToken = try await loginDefaultAdminUser(app)
+
+            let createDTO = User.Create(
+                name: "User With Pending Outbox Row",
+                username: "outboxuser@example.com",
+                password: "SecurePass123!",
+                isAdmin: false
+            )
+
+            var userId: UUID?
+            try await app.test(
+                .POST, "/api/v1/admin/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: adminToken)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res async throws in
+                    let user = try res.content.decode(User.ResponseDTO.self)
+                    userId = user.id
+                })
+
+            let bucket = Bucket(name: "outbox-bucket", userId: userId!)
+            try await bucket.save(on: app.db)
+            try BucketHandler.create(name: "outbox-bucket")
+
+            // Deleting a user used to only call BucketHandler.forceDelete (a raw local-disk
+            // removal) instead of BucketService.delete - which meant a pending outbox row like
+            // this, left over from a straggler replica that hadn't caught up yet, was never
+            // purged and would keep trying to deliver an object into a bucket that no longer
+            // exists. Directly inserting one here proves the controller now routes through
+            // BucketService.delete instead of reimplementing a partial version of it.
+            let staleTask = ClusterReplicationTask(
+                bucketName: "outbox-bucket", key: "straggler.txt", versionId: nil,
+                operation: .put, targetNodeId: UUID(), reason: .write)
+            try await staleTask.save(on: app.db)
+
+            try await app.test(
+                .DELETE, "/api/v1/admin/users/\(userId!.uuidString)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: adminToken)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .noContent)
+                })
+
+            let remainingTasks = try await ClusterReplicationTask.query(on: app.db)
+                .filter(\.$bucketName == "outbox-bucket")
+                .count()
+            #expect(remainingTasks == 0)
         }
     }
 
@@ -1393,6 +1544,52 @@ struct InternalAdminControllerTests {
                 .GET, "/api/v1/admin/buckets/some-bucket/stats",
                 afterResponse: { res async in
                     #expect(res.status == .unauthorized)
+                })
+        }
+    }
+
+    @Test("List buckets as admin never serializes the owner's password hash onto the wire")
+    func testListBucketsNeverLeaksPasswordHash() async throws {
+        try await withApp { app in
+            let adminToken = try await loginDefaultAdminUser(app)
+            let ownerToken = try await createUserAndLogin(
+                app, username: "bucket-owner@example.com")
+
+            // Fetch the owner's actual stored bcrypt hash directly from the DB, so the
+            // assertion below checks for the literal bytes that `Bucket.$user`'s eager load
+            // used to serialize wholesale onto the wire - not just "decoding into a narrower
+            // DTO type happens to ignore extra fields", which wouldn't catch a real leak.
+            let owner = try #require(
+                try await User.query(on: app.db)
+                    .filter(\.$username == "bucket-owner@example.com")
+                    .first())
+
+            let createDTO = Bucket.Create(name: "owner-bucket", versioningEnabled: false)
+            try await app.test(
+                .POST, "/api/v1/buckets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: ownerToken)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            try await app.test(
+                .GET, "/api/v1/admin/buckets",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: adminToken)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+
+                    let rawBody = String(buffer: res.body)
+                    #expect(!rawBody.contains(owner.passwordHash))
+                    #expect(!rawBody.lowercased().contains("passwordhash"))
+
+                    let page = try res.content.decode(Page<InternalAdminController.AdminBucketDTO>.self)
+                    let ownerEntry = try #require(page.items.first { $0.name == "owner-bucket" })
+                    #expect(ownerEntry.user?.username == "bucket-owner@example.com")
                 })
         }
     }

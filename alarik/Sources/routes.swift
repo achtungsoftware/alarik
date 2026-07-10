@@ -28,12 +28,20 @@ func routes(_ app: Application) throws {
     try apiV1.grouped(InternalAuthenticator()).register(
         collection: InternalAdminOIDCProviderController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBucketController())
+    try apiV1.grouped(InternalAuthenticator()).register(collection: InternalClusterController())
 
     // Public, unauthenticated shared-file links - kept under /api/v1 (ungrouped, so no
     // InternalAuthenticator applies) rather than top-level, so it can never collide with
     // path-style S3 bucket routing (a bucket literally named "shared" would otherwise shadow
     // or be shadowed by this route).
     try apiV1.register(collection: SharedLinkController())
+
+    // Cluster: inter-node object push/delete and bucket-wide-scan fan-out, guarded by
+    // ClusterSecretMiddleware (not InternalAuthenticator - this is node-to-node, not
+    // client-facing) - kept top-level, not under /api/v1, since it's never part of the public
+    // API surface.
+    try app.register(collection: InternalClusterObjectController())
+    try app.register(collection: InternalClusterListingController())
 
     // S3
     try app.register(collection: S3Controller())

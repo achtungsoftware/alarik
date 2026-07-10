@@ -90,27 +90,10 @@ struct InternalAuthenticator: AsyncRequestAuthenticator {
         }
 
         // Verify secret key using constant-time comparison
-        guard constantTimeCompare(secretKey, accessKey.secretKey) else {
+        guard secretKey.constantTimeCompare(to: accessKey.secretKey) else {
             return nil
         }
 
         return AuthenticatedUser(user: accessKey.user, authMethod: .accessKey)
-    }
-
-    /// Constant-time string comparison to prevent timing attacks
-    private func constantTimeCompare(_ a: String, _ b: String) -> Bool {
-        let aBytes = Array(a.utf8)
-        let bBytes = Array(b.utf8)
-
-        guard aBytes.count == bBytes.count else {
-            return false
-        }
-
-        var result: UInt8 = 0
-        for (aByte, bByte) in zip(aBytes, bBytes) {
-            result |= aByte ^ bByte
-        }
-
-        return result == 0
     }
 }

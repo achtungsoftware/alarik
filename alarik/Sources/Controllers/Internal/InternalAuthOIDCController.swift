@@ -70,8 +70,9 @@ struct InternalAuthOIDCController: RouteCollection {
         let codeVerifier = OIDCPKCE.randomURLSafeString()
         let codeChallenge = OIDCPKCE.codeChallenge(forVerifier: codeVerifier)
 
-        await OIDCStateCache.shared.store(
-            state: state, providerId: providerId, nonce: nonce, codeVerifier: codeVerifier)
+        try await OIDCStateCache.shared.store(
+            on: req.db, state: state, providerId: providerId, nonce: nonce,
+            codeVerifier: codeVerifier)
 
         var components = URLComponents(string: discovery.authorizationEndpoint)
         components?.queryItems = [
@@ -89,7 +90,21 @@ struct InternalAuthOIDCController: RouteCollection {
             throw Abort(.internalServerError, reason: "Failed to build OIDC authorization URL.")
         }
 
-        return req.redirect(to: authorizationURL)
+        let response = req.redirect(to: authorizationURL)
+        // Binds this flow to the browser that actually started it - without this, `state` alone
+        // only proves the callback carries a value this server once issued to *someone*, not
+        // that it's the same browser. An attacker can start their own login (getting a valid
+        // code+state for their own IdP identity) and lure a victim into loading the callback URL
+        // with the attacker's values, silently signing the victim into the attacker's account
+        // (login CSRF). Requiring the callback to also present this cookie means only the
+        // browser that received this exact redirect can complete the flow. HttpOnly (never
+        // needed by JS), SameSite=Lax (must survive the top-level redirect back from the IdP,
+        // which Strict would block), short-lived (only needs to outlive the IdP round trip).
+        response.cookies["oidc_state"] = HTTPCookies.Value(
+            string: state, expires: Date().addingTimeInterval(600), maxAge: 600,
+            isSecure: !Self.redirectURL.hasPrefix("http://localhost"), isHTTPOnly: true,
+            sameSite: .lax)
+        return response
     }
 
     /// Single fixed callback URL shared by every provider - admins register this exact value
@@ -118,7 +133,11 @@ struct InternalAuthOIDCController: RouteCollection {
         func completeRedirect(fragment: String) -> Response {
             var components = URLComponents(string: completeURL)
             components?.fragment = fragment
-            return req.redirect(to: components?.url?.absoluteString ?? completeURL)
+            let response = req.redirect(to: components?.url?.absoluteString ?? completeURL)
+            // One-shot: whether this flow succeeded or failed, the cookie set in login() has
+            // done its job and must not be replayable for a second attempt.
+            response.cookies["oidc_state"] = HTTPCookies.Value(string: "", expires: .distantPast)
+            return response
         }
 
         func errorRedirect(_ code: String) -> Response {
@@ -132,7 +151,17 @@ struct InternalAuthOIDCController: RouteCollection {
             return errorRedirect("missing_code_or_state")
         }
 
-        guard let stateEntry = await OIDCStateCache.shared.consume(state: state) else {
+        // The cookie set in login() proves this callback is being completed by the same browser
+        // that started the flow - without it, `state` alone only proves the value came from
+        // this server at some point, not that it's bound to this browser (see login()'s comment
+        // for the login-CSRF scenario this closes). Checked before consuming the state entry so
+        // a forged callback can't burn a legitimate, still-pending state.
+        guard let stateCookie = req.cookies["oidc_state"]?.string, stateCookie == state else {
+            return errorRedirect("missing_or_mismatched_state_cookie")
+        }
+
+        guard let stateEntry = try await OIDCStateCache.shared.consume(on: req.db, state: state)
+        else {
             return errorRedirect("invalid_or_expired_state")
         }
 

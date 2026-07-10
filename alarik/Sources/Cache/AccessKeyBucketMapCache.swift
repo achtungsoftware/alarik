@@ -22,14 +22,13 @@ final actor AccessKeyBucketMapCache {
 
     private var map: [String: Set<String>] = [:]
 
+    /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
+    /// LISTEN-outage reload, not just at boot: a bucket unmapped from a key while disconnected
+    /// must actually disappear from that key's set, not just have currently-mapped buckets
+    /// re-inserted into a set that still remembers the removed one forever.
     func load(initialData: [(accessKey: String, bucketName: String)]) {
-        for entry in initialData {
-            if map[entry.accessKey] != nil {
-                map[entry.accessKey]?.insert(entry.bucketName)
-            } else {
-                map[entry.accessKey] = [entry.bucketName]
-            }
-        }
+        map = Dictionary(grouping: initialData, by: \.accessKey)
+            .mapValues { Set($0.map(\.bucketName)) }
     }
 
     func add(accessKey: String, bucketName: String) {

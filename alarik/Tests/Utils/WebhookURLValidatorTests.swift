@@ -93,4 +93,38 @@ struct WebhookURLValidatorTests {
         #expect(!WebhookURLValidator.isInternalHost("https://example.com/h"))
         #expect(!WebhookURLValidator.isInternalHost("https://hooks.slack.com/services/x"))
     }
+
+    @Test("alternate IPv4 encodings of internal addresses are still recognized as internal")
+    func alternateEncodingsOfInternalAddresses() {
+        for url in [
+            "http://2130706433/h",  // decimal for 127.0.0.1
+            "http://0x7f000001/h",  // hex for 127.0.0.1
+            "http://0177.0.0.1/h",  // octal first octet for 127.0.0.1
+            "http://127.1/h",  // short form for 127.0.0.1
+            "http://127.0.1/h",  // short form for 127.0.0.1
+            "http://0x7f.0.0.1/h",  // mixed hex/decimal octets for 127.0.0.1
+            "http://2852039166/h",  // decimal for 169.254.169.254 (cloud metadata)
+            "http://0xA9FEA9FE/h",  // hex for 169.254.169.254
+            "http://0x0a000001/h",  // hex for 10.0.0.1
+        ] {
+            #expect(WebhookURLValidator.isInternalHost(url), "expected internal: \(url)")
+        }
+    }
+
+    @Test("alternate IPv4 encodings of public addresses stay public")
+    func alternateEncodingsOfPublicAddresses() {
+        for url in [
+            "http://134744072/h",  // decimal for 8.8.8.8
+            "http://0x08080808/h",  // hex for 8.8.8.8
+        ] {
+            #expect(!WebhookURLValidator.isInternalHost(url), "expected public: \(url)")
+        }
+    }
+
+    @Test("hostnames that merely look numeric-ish are never misclassified as an IP")
+    func numericLookingHostnamesStayPublic() {
+        #expect(!WebhookURLValidator.isInternalHost("https://2130706433.example.com/h"))
+        #expect(!WebhookURLValidator.isInternalHost("https://0x7f000001.example.com/h"))
+        #expect(!WebhookURLValidator.isInternalHost("https://999999999999999999999/h"))
+    }
 }

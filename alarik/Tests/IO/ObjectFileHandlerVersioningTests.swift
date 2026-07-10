@@ -594,6 +594,76 @@ struct ObjectFileHandlerVersioningTests {
         #expect(deleteMeta.isLatest == true)
     }
 
+    @Test(
+        "createNullVersionDeleteMarker - Only replaces the null version, real historical versions stay intact"
+    )
+    func testCreateNullVersionDeleteMarkerPreservesHistory() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        // Two real versions, created while versioning was enabled.
+        let v1 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v1"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+        let v2 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v2"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .enabled)
+
+        // Versioning is now suspended, and the key is deleted with no explicit version ID -
+        // exactly the S3-documented case that must only touch the "null" version.
+        let marker = try ObjectFileHandler.createNullVersionDeleteMarker(
+            bucketName: "test-bucket", key: "test-file.txt")
+
+        #expect(marker.versionId == "null")
+        #expect(marker.isDeleteMarker == true)
+
+        // Both real versions must still exist and still be readable by their actual version ID.
+        let (v1Meta, v1Data) = try ObjectFileHandler.readVersion(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: v1)
+        #expect(v1Data == createTestData("v1"))
+        #expect(v1Meta.isDeleteMarker == false)
+
+        let (v2Meta, v2Data) = try ObjectFileHandler.readVersion(
+            bucketName: "test-bucket", key: "test-file.txt", versionId: v2)
+        #expect(v2Data == createTestData("v2"))
+        #expect(v2Meta.isDeleteMarker == false)
+
+        // The delete marker is the latest version, and v1/v2 are correctly demoted, not deleted.
+        let latestVersionId = try ObjectFileHandler.getLatestVersionId(
+            bucketName: "test-bucket", key: "test-file.txt")
+        #expect(latestVersionId == "null")
+        #expect(v1Meta.isLatest == false)
+        #expect(v2Meta.isLatest == false)
+
+        let allVersions = try ObjectFileHandler.listVersions(
+            bucketName: "test-bucket", key: "test-file.txt")
+        #expect(Set(allVersions.map { $0.versionId }) == Set([v1, v2, "null"]))
+    }
+
+    @Test(
+        "createNullVersionDeleteMarker - Overwrites a prior null version rather than stacking a new one"
+    )
+    func testCreateNullVersionDeleteMarkerOverwritesExistingNull() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        // A write under suspended versioning also uses "null" - simulates deleting an object
+        // that was already re-created once since the last delete under suspended versioning.
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("current"),
+            bucketName: "test-bucket", key: "test-file.txt", versioningStatus: .suspended)
+
+        _ = try ObjectFileHandler.createNullVersionDeleteMarker(
+            bucketName: "test-bucket", key: "test-file.txt")
+
+        let allVersions = try ObjectFileHandler.listVersions(
+            bucketName: "test-bucket", key: "test-file.txt")
+        // Exactly one "null" entry (the delete marker), not two.
+        #expect(allVersions.count == 1)
+        #expect(allVersions.first?.versionId == "null")
+        #expect(allVersions.first?.isDeleteMarker == true)
+    }
+
     @Test("isVersioned - Returns true for versioned objects")
     func testIsVersionedTrue() throws {
         setupTestBucket()

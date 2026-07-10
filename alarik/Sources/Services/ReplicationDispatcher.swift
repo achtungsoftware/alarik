@@ -85,13 +85,16 @@ final actor ReplicationDispatcher {
 
             // Bounded parallelism: at most maxConcurrentDeliveries transfers in flight - a
             // slow/unreachable target delays its own queue, not the whole outbox. Tasks for
-            // the same (bucket, key) are never run concurrently: `due` is oldest-first, so a
-            // key already in flight has its later, conflicting task skipped this pass rather
-            // than raced against it - two objects for the same key are never in doubt about
-            // which order they take effect on the target. A skipped task is still `pending`
-            // and picked up on the very next pass (once the row it conflicted with has been
-            // deleted or rescheduled), so nothing here is a queue - it's a same-key mutex over
-            // this one drain call.
+            // the same (bucket, key, target) are never run concurrently: `due` is oldest-first,
+            // so a (key, target) pair already in flight has its later, conflicting task skipped
+            // this pass rather than raced against it - two versions of the same key are never
+            // in doubt about which order they take effect on that target. Different targets for
+            // the same key are unrelated deliveries with no ordering to protect, so they're
+            // never held up by each other - `taskKey` includes `targetId` for exactly this
+            // reason (see `ClusterReplicationDispatcher.taskKey`'s equivalent `targetNodeId`). A
+            // skipped task is still `pending` and picked up on the very next pass (once the row
+            // it conflicted with has been deleted or rescheduled), so nothing here is a queue -
+            // it's a same-(key,target) mutex over this one drain call.
             var remaining = due
             var inFlightKeys: Set<String> = []
 
@@ -135,7 +138,7 @@ final actor ReplicationDispatcher {
     }
 
     private static func taskKey(_ row: ReplicationTask) -> String {
-        "\(row.bucketName)\u{0}\(row.key)"
+        "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.targetId)"
     }
 
     /// Replicates one outbox row to its (snapshotted) target. Success deletes the row; any

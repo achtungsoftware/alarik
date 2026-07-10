@@ -287,17 +287,13 @@ private struct SpoolSink {
     private static func writeFully(
         fd: Int32, _ raw: UnsafeRawBufferPointer, requestId: String
     ) throws {
-        guard let base = raw.baseAddress, raw.count > 0 else { return }
-        var offset = 0
-        while offset < raw.count {
-            let written = POSIXFile.write(fd, base + offset, raw.count - offset)
-            guard written > 0 else {
-                throw S3Error(
-                    status: .internalServerError, code: "InternalError",
-                    message: "We encountered an internal error. Please try again.",
-                    requestId: requestId)
-            }
-            offset += written
+        do {
+            try StreamingIOLoops.writeFully(fd: fd, raw)
+        } catch {
+            throw S3Error(
+                status: .internalServerError, code: "InternalError",
+                message: "We encountered an internal error. Please try again.",
+                requestId: requestId)
         }
     }
 }

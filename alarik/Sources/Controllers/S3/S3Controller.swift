@@ -66,21 +66,22 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
 
         let query = req.url.query ?? ""
-        let lowerQuery = query.lowercased()
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle ?uploads - list multipart uploads (always requires strict auth - not in the
-        // public-access whitelist)
-        if lowerQuery.contains("uploads") && !lowerQuery.contains("uploadid") {
+        // public-access whitelist). Exact parameter-name match: a plain ListObjects call with
+        // e.g. ?prefix=uploads/2024/photo.jpg must never be misrouted here just because the
+        // *value* of an unrelated parameter contains the word "uploads".
+        if queryNames.contains("uploads") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-            return try handleListMultipartUploads(req: req, bucketName: bucketName)
+            return try await handleListMultipartUploads(req: req, bucketName: bucketName)
         }
 
         // Handle ?versions - list object versions (always requires strict auth)
-        // Use word boundary check: "versions" but not "versioning"
-        let isListVersions = lowerQuery.contains("versions") && !lowerQuery.contains("versioning")
+        let isListVersions = queryNames.contains("versions")
         if isListVersions {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-            return try handleListVersions(req: req, bucketName: bucketName)
+            return try await handleListVersions(req: req, bucketName: bucketName)
         }
 
         // Handle subresource queries (location, policy, versioning config) - always requires
@@ -107,13 +108,15 @@ struct S3Controller: RouteCollection {
 
         let params = S3Service.parseListObjectsParams(from: req, bucketName: bucketName)
 
-        let (objects, commonPrefixes, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
-            bucketName: params.bucketName,
-            prefix: params.prefix,
-            delimiter: params.delimiter,
-            maxKeys: params.maxKeys,
-            marker: params.marker
-        )
+        let (objects, commonPrefixes, isTruncated, nextMarker) =
+            try await ClusterListingService.listObjects(
+                req: req,
+                bucketName: params.bucketName,
+                prefix: params.prefix,
+                delimiter: params.delimiter,
+                maxKeys: params.maxKeys,
+                marker: params.marker
+            )
 
         // listObjects already returns the latest version of each object and filters delete markers
         let xmlData = try S3Service.buildListObjectsResponse(
@@ -129,7 +132,7 @@ struct S3Controller: RouteCollection {
 
     /// Handles GET /:bucketName?versions - list all object versions
     @Sendable
-    private func handleListVersions(req: Request, bucketName: String) throws -> Response {
+    private func handleListVersions(req: Request, bucketName: String) async throws -> Response {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
         let keyMarker = req.query[String.self, at: "key-marker"]
@@ -139,7 +142,8 @@ struct S3Controller: RouteCollection {
         let (
             versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker
         ) =
-            try ObjectFileHandler.listAllVersions(
+            try await ClusterListingService.listAllVersions(
+                req: req,
                 bucketName: bucketName,
                 prefix: prefix,
                 delimiter: delimiter,
@@ -179,6 +183,26 @@ struct S3Controller: RouteCollection {
         return response
     }
 
+    /// Read-only cluster routing check for handlers that only ever need the forward-or-not
+    /// answer (no local write, so no `peers` to carry forward for replication) - HEAD, tagging
+    /// GET, plain object GET, and (with `requirePrimary: true`) ListParts. Returns the forwarded
+    /// response when this node isn't responsible for `key`; `nil` means serve locally.
+    private func forwardIfNeeded(
+        req: Request, bucketName: String, key: String, requirePrimary: Bool = false
+    ) async throws
+        -> Response?
+    {
+        let decision =
+            requirePrimary
+            ? await ObjectRoutingService.multipartRoutingDecision(
+                req: req, bucketName: bucketName, key: key)
+            : await ObjectRoutingService.routingDecision(req: req, bucketName: bucketName, key: key)
+        guard case .forward(let candidates) = decision else {
+            return nil
+        }
+        return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+    }
+
     @Sendable
     func handleObjectHead(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
@@ -192,6 +216,10 @@ struct S3Controller: RouteCollection {
         _ = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+            return forwarded
+        }
 
         // Read object (versioned or non-versioned)
         let (meta, _): (ObjectMeta, Data?)
@@ -248,36 +276,37 @@ struct S3Controller: RouteCollection {
     func handleBucketPut(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle PUT ?versioning
-        if query.lowercased().contains("versioning") {
+        if queryNames.contains("versioning") {
             return try await handleVersioningPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?policy
-        if query.lowercased().contains("policy") {
+        if queryNames.contains("policy") {
             return try await handleBucketPolicyPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?publicAccessBlock
-        if query.lowercased().contains("publicaccessblock") {
+        if queryNames.contains("publicaccessblock") {
             return try await handlePublicAccessBlockPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?tagging
-        if query.lowercased().contains("tagging") {
+        if queryNames.contains("tagging") {
             return try await handleBucketTaggingPut(req: req, bucketName: bucketName)
         }
 
         // Handle PUT ?lifecycle
-        if query.lowercased().contains("lifecycle") {
+        if queryNames.contains("lifecycle") {
             return try await handleLifecyclePut(req: req, bucketName: bucketName)
         }
 
         // PUT ?notification - Alarik's webhook rules target http(s) URLs, not the SNS/SQS/Lambda
         // ARNs the S3 XML format carries, so there's nothing meaningful an S3 client could PUT
         // here. Managed via the console / internal API instead (GET ?notification still works).
-        if query.lowercased().contains("notification") {
+        if queryNames.contains("notification") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             throw S3Error(
                 status: .notImplemented, code: "NotImplemented",
@@ -290,7 +319,7 @@ struct S3Controller: RouteCollection {
         // credentials, which Alarik's model requires (see ReplicationTarget) - so there's
         // nothing meaningful an S3 client could PUT here. Managed via the console / internal
         // API instead (GET ?replication still works).
-        if query.lowercased().contains("replication") {
+        if queryNames.contains("replication") {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
             throw S3Error(
                 status: .notImplemented, code: "NotImplemented",
@@ -374,6 +403,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -408,6 +438,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
@@ -433,6 +464,8 @@ struct S3Controller: RouteCollection {
 
         await BucketPolicyCache.shared.setPublicAccessBlock(
             for: bucketName, configuration: configuration)
+        CacheInvalidationService.notify(
+            on: req.db, cache: "bucketPublicAccessBlock", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -454,6 +487,8 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+        CacheInvalidationService.notify(
+            on: req.db, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -544,6 +579,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -553,29 +589,30 @@ struct S3Controller: RouteCollection {
     func handleBucketDelete(req: Request) async throws -> HTTPStatus {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
+        let queryNames = S3Service.queryParameterNames(from: query)
 
         // Handle DELETE ?publicAccessBlock
-        if query.lowercased().contains("publicaccessblock") {
+        if queryNames.contains("publicaccessblock") {
             return try await handlePublicAccessBlockDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?tagging
-        if query.lowercased().contains("tagging") {
+        if queryNames.contains("tagging") {
             return try await handleBucketTaggingDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?lifecycle
-        if query.lowercased().contains("lifecycle") {
+        if queryNames.contains("lifecycle") {
             return try await handleLifecycleDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?policy
-        if query.lowercased().contains("policy") {
+        if queryNames.contains("policy") {
             return try await handleBucketPolicyDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?replication
-        if query.lowercased().contains("replication") {
+        if queryNames.contains("replication") {
             return try await handleReplicationDelete(req: req, bucketName: bucketName)
         }
 
@@ -602,7 +639,19 @@ struct S3Controller: RouteCollection {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 
-        if ObjectFileHandler.hasBucketObjects(bucketName: bucketName) {
+        let notEmpty: Bool
+        do {
+            notEmpty = try await ClusterListingService.hasBucketObjects(
+                req: req, bucketName: bucketName)
+        } catch {
+            throw S3Error(
+                status: .serviceUnavailable,
+                code: "ServiceUnavailable",
+                message:
+                    "Could not verify the bucket is empty across every cluster node; refusing to delete."
+            )
+        }
+        if notEmpty {
             throw S3Error(
                 status: .conflict,
                 code: "BucketNotEmpty",
@@ -610,7 +659,11 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        try await BucketService.delete(on: req.db, bucketName: bucketName, userId: bucket.user.id!)
+        // force: true - the cluster-wide emptiness check above already ran authoritatively, so
+        // BucketHandler.delete's own redundant *local-only* re-check is skipped rather than left
+        // in as a second, incomplete gate.
+        try await BucketService.delete(
+            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
 
         return .noContent
     }
@@ -629,6 +682,7 @@ struct S3Controller: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -647,11 +701,41 @@ struct S3Controller: RouteCollection {
 
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        // Check if this is an UploadPart request (PUT with partNumber & uploadId)
-        if let partNumberStr = req.query[String.self, at: "partNumber"],
-            let partNumber = Int(partNumberStr),
-            let uploadId = req.query[String.self, at: "uploadId"]
+        // Computed once and reused for both the routing decision below and the dispatch check
+        // further down - previously these were two independently-written conditions (routing
+        // only checked presence of the two params; dispatch also required partNumber to parse
+        // as an Int) that could disagree: a non-numeric partNumber (e.g. ?partNumber=abc) was
+        // routed as an UploadPart for cluster purposes, but then fell through past the dispatch
+        // check into the plain-PUT branch below, silently overwriting the destination object
+        // with the request body instead of returning InvalidArgument.
+        let partNumberStr = req.query[String.self, at: "partNumber"]
+        let uploadIdParam = req.query[String.self, at: "uploadId"]
+        let isUploadPart = partNumberStr != nil && uploadIdParam != nil
+
+        // UploadPart/UploadPartCopy must pin to the exact node coordinating this upload's
+        // Create, not "any responsible node" - see multipartRoutingDecision's doc comment.
+        // Cluster routing: one check covers this whole handler's dispatch tree (UploadPart,
+        // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
+        // (bucketName, keyPath).
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isUploadPart)
         {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
+        // Check if this is an UploadPart request (PUT with partNumber & uploadId)
+        if isUploadPart {
+            guard let partNumberStr, let partNumber = Int(partNumberStr) else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidArgument",
+                    message: "Part number must be a valid integer.", requestId: req.id)
+            }
+            let uploadId = uploadIdParam!
+
             // UploadPartCopy - same query params, but copies the part from another object
             if let copySource = try S3Service.parseCopySource(from: req) {
                 return try await handleUploadPartCopy(
@@ -675,8 +759,9 @@ struct S3Controller: RouteCollection {
 
         // PUT ?tagging - set the tag-set of an existing object/version, distinct from a plain
         // body PUT
-        if req.url.query?.lowercased().contains("tagging") == true {
-            return try await handleObjectTaggingPut(req: req, bucketName: bucketName, key: keyPath)
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
+            return try await handleObjectTaggingPut(
+                req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
@@ -688,7 +773,8 @@ struct S3Controller: RouteCollection {
                 destinationBucket: bucketName,
                 destinationKey: keyPath,
                 copySource: copySource,
-                versioningStatus: versioningStatus
+                versioningStatus: versioningStatus,
+                peers: peers
             )
         }
 
@@ -798,6 +884,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: bucketName, key: keyPath, versionId: writtenVersionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: keyPath,
+            versionId: writtenVersionId, operation: .put, peers: peers)
 
         return Response(status: .ok, headers: headers)
     }
@@ -808,7 +897,9 @@ struct S3Controller: RouteCollection {
     /// (verified against the PutObjectTagging API reference). Auth is already done by the
     /// caller (`handleObjectPut`) before dispatching here.
     @Sendable
-    private func handleObjectTaggingPut(req: Request, bucketName: String, key: String)
+    private func handleObjectTaggingPut(
+        req: Request, bucketName: String, key: String, peers: [ClusterNodeInfo]
+    )
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
@@ -830,6 +921,14 @@ struct S3Controller: RouteCollection {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = tagging.tags }
         }
 
+        // Cluster peers physically hold the exact same version file, so a tag change must be
+        // pushed to them too - an in-place metadata edit has no outbox task backing it the way
+        // an object write/delete does, so without this a peer would silently serve stale tags
+        // forever rather than just temporarily lagging behind.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
@@ -845,6 +944,10 @@ struct S3Controller: RouteCollection {
         async throws -> Response
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: key) {
+            return forwarded
+        }
 
         let versionId = req.query[String.self, at: "versionId"]
         guard
@@ -870,7 +973,9 @@ struct S3Controller: RouteCollection {
     /// (or the current one). S3 returns 204 No Content. Auth is already done by the
     /// caller (`handleObjectDelete`) before dispatching here.
     @Sendable
-    private func handleObjectTaggingDelete(req: Request, bucketName: String, key: String)
+    private func handleObjectTaggingDelete(
+        req: Request, bucketName: String, key: String, peers: [ClusterNodeInfo]
+    )
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
@@ -887,6 +992,12 @@ struct S3Controller: RouteCollection {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
 
+        // See handleObjectTaggingPut - an in-place metadata edit has no outbox task backing it,
+        // so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
@@ -896,29 +1007,55 @@ struct S3Controller: RouteCollection {
 
     // Helper method to handle copy operations
     @Sendable
+    /// Resolves a CopyObject/UploadPartCopy source - locally if this node holds it, otherwise
+    /// fetches it from a responsible peer into a local temp file first. Source and destination
+    /// of a copy can be arbitrary, unrelated buckets/keys with no placement relationship to each
+    /// other, so the source may live elsewhere even though this node is already correctly
+    /// responsible for the destination (that's what the caller's own top-level routing check
+    /// already established). Returns the same shape `S3Service.resolveObjectForCopy` does
+    /// either way; callers must call `cleanup` once done reading (a no-op when the source was
+    /// local - that path never allocates a temp file).
+    private func resolveCopySource(
+        req: Request, bucketName: String, key: String, versionId: String?
+    ) async throws -> (
+        meta: ObjectMeta, path: String, payloadOffset: Int, payloadSize: Int, cleanup: () -> Void
+    ) {
+        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+            req: req, bucketName: bucketName, key: key)
+        if isLocal {
+            let (meta, path, offset, size) = try await S3Service.offloadBlockingIO(req) {
+                try S3Service.resolveObjectForCopy(
+                    bucketName: bucketName, key: key, versionId: versionId, requestId: req.id)
+            }
+            return (meta, path, offset, size, {})
+        }
+        let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
+            app: req.application, candidates: candidates, bucketName: bucketName, key: key,
+            versionId: versionId, requestId: req.id)
+        return (meta, tempPath, 0, meta.size, { _ = POSIXFile.unlink(tempPath) })
+    }
+
     private func handleCopyObject(
         req: Request,
         destinationBucket: String,
         destinationKey: String,
         copySource: CopySource,
-        versioningStatus: VersioningStatus
+        versioningStatus: VersioningStatus,
+        peers: [ClusterNodeInfo] = []
     ) async throws -> Response {
         try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
 
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Resolve the source straight to its on-disk file - the payload is streamed
-        // file-to-file in fixed windows, never buffered whole
-        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try await S3Service.offloadBlockingIO(req) {
-                try S3Service.resolveObjectForCopy(
-                    bucketName: copySource.bucketName,
-                    key: copySource.key,
-                    versionId: copySource.versionId,
-                    requestId: req.id
-                )
-            }
+        // Resolve the source straight to its on-disk file (fetching it from a peer first if
+        // this node doesn't hold it) - the payload is streamed file-to-file in fixed windows,
+        // never buffered whole.
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
+            try await resolveCopySource(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId)
+        defer { cleanupSource() }
 
         // Validate copy conditions (if-match, if-none-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -1028,6 +1165,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: destinationBucket, key: destinationKey, versionId: versionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: destinationBucket, key: destinationKey,
+            versionId: versionId, operation: .put, peers: peers)
 
         // Build copy result response (S3 returns XML for copy operations)
         let copyResult = """
@@ -1053,6 +1193,11 @@ struct S3Controller: RouteCollection {
         // public-access whitelist, so it's checked before any anonymous-access decision.
         if let uploadId = req.query[String.self, at: "uploadId"] {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+            if let forwarded = try await forwardIfNeeded(
+                req: req, bucketName: bucketName, key: keyPath, requirePrimary: true)
+            {
+                return forwarded
+            }
             return try handleListParts(
                 req: req,
                 bucketName: bucketName,
@@ -1062,8 +1207,11 @@ struct S3Controller: RouteCollection {
         }
 
         // GetObjectTagging - a different permission than GetObject in S3, not covered by
-        // the bucket-policy public-access whitelist, so it always requires strict auth.
-        if req.url.query?.lowercased().contains("tagging") == true {
+        // the bucket-policy public-access whitelist, so it always requires strict auth. Exact
+        // parameter-name match: a plain GetObject with e.g.
+        // ?response-content-disposition=...tagging-report.csv must never be misrouted here just
+        // because that unrelated parameter's *value* contains the word "tagging".
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
             return try await handleObjectTaggingGet(req: req, bucketName: bucketName, key: keyPath)
         }
 
@@ -1073,6 +1221,10 @@ struct S3Controller: RouteCollection {
         _ = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
+
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+            return forwarded
+        }
 
         // Resolve to a single on-disk path up front - the meta, conditional checks, range
         // math, and body all come off that one file, and large payloads stream from it
@@ -1141,6 +1293,24 @@ struct S3Controller: RouteCollection {
 
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // AbortMultipartUpload must pin to the exact node coordinating this upload's Create,
+        // not "any responsible node" - see multipartRoutingDecision's doc comment.
+        let isAbortMultipart =
+            req.query[String.self, at: "uploadId"] != nil
+            && req.query[String.self, at: "versionId"] == nil
+
+        // Cluster routing: one check covers this handler's dispatch tree (AbortMultipartUpload,
+        // tagging DELETE, plain object DELETE) - all key off this same (bucketName, keyPath).
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isAbortMultipart)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
         // Check if this is AbortMultipartUpload (DELETE with uploadId, no versionId)
         if let uploadId = req.query[String.self, at: "uploadId"],
             req.query[String.self, at: "versionId"] == nil
@@ -1154,22 +1324,20 @@ struct S3Controller: RouteCollection {
         }
 
         // DeleteObjectTagging - distinct from deleting the object/version itself
-        if req.url.query?.lowercased().contains("tagging") == true {
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
             return try await handleObjectTaggingDelete(
-                req: req, bucketName: bucketName, key: keyPath)
+                req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
         let versionId = req.query[String.self, at: "versionId"]
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        let outcome = try await S3Service.offloadBlockingIO(req) {
-            try S3Service.deleteObject(
-                bucketName: bucketName,
-                key: keyPath,
-                versionId: versionId,
-                versioningStatus: versioningStatus
-            )
-        }
+        // Unlike external replication (below), cluster peers physically hold the exact same
+        // version files as this node, so an explicit historical-version delete DOES need to
+        // propagate - always fan out, not just for current-object deletes.
+        let outcome = try await ClusterReplicationService.coordinateDelete(
+            app: req.application, bucketName: bucketName, key: keyPath, versionId: versionId,
+            versioningStatus: versioningStatus, peers: peers)
 
         var headers = HTTPHeaders()
         if let resultVersionId = outcome.versionId {
@@ -1204,7 +1372,7 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        if query.lowercased().contains("delete") {
+        if S3Service.queryParameterNames(from: query).contains("delete") {
             return try await handleDeleteObjects(req: req, bucketName: bucketName)
         }
 
@@ -1235,14 +1403,9 @@ struct S3Controller: RouteCollection {
             }
 
             do {
-                let outcome = try await S3Service.offloadBlockingIO(req) {
-                    try S3Service.deleteObject(
-                        bucketName: bucketName,
-                        key: object.key,
-                        versionId: object.versionId,
-                        versioningStatus: versioningStatus
-                    )
-                }
+                let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+                    req: req, bucketName: bucketName, key: object.key,
+                    versionId: object.versionId, versioningStatus: versioningStatus)
 
                 deleted.append(
                     DeletedEntry(
@@ -1357,15 +1520,31 @@ struct S3Controller: RouteCollection {
         try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
+        // Cluster routing: this whole handler is multipart create/complete, so every request
+        // through it pins to the primary responsible node specifically (multipartRoutingDecision,
+        // not routingDecision) - forwarding a create/uploadPart/complete/abort sequence to
+        // different-but-each-individually-"responsible" nodes would split a single upload's
+        // parts across nodes with no way to reassemble them, so the whole lifecycle must land on
+        // the identical node throughout.
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: keyPath, requirePrimary: true)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
         // POST ?uploads → CreateMultipartUpload
-        if query.lowercased().contains("uploads") && !query.contains("uploadId") {
+        if S3Service.queryParameterNames(from: query).contains("uploads") {
             return try handleCreateMultipartUpload(req: req, bucketName: bucketName, key: keyPath)
         }
 
         // POST ?uploadId=X → CompleteMultipartUpload
         if let uploadId = req.query[String.self, at: "uploadId"] {
             return try await handleCompleteMultipartUpload(
-                req: req, bucketName: bucketName, key: keyPath, uploadId: uploadId)
+                req: req, bucketName: bucketName, key: keyPath, uploadId: uploadId, peers: peers)
         }
 
         throw S3Error(
@@ -1407,7 +1586,7 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <UploadId>\(uploadId)</UploadId>
             </InitiateMultipartUploadResult>
@@ -1422,7 +1601,8 @@ struct S3Controller: RouteCollection {
         req: Request,
         bucketName: String,
         key: String,
-        uploadId: String
+        uploadId: String,
+        peers: [ClusterNodeInfo] = []
     ) async throws -> Response {
         // Verify upload exists
         guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
@@ -1472,6 +1652,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
             bucketName: bucketName, key: key, versionId: versionId, on: req.db)
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+            operation: .put, peers: peers)
 
         // Build response headers
         var headers = HTTPHeaders()
@@ -1485,8 +1668,8 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Location>\(location)</Location>
-                <Bucket>\(bucketName)</Bucket>
+                <Location>\(location.xmlEscaped)</Location>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <ETag>"\(etag)"</ETag>
             </CompleteMultipartUploadResult>
@@ -1594,17 +1777,14 @@ struct S3Controller: RouteCollection {
         // Authenticate access to the source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
-        // Resolve the source straight to its on-disk file - the copied region is streamed
-        // file-to-file in fixed windows, never buffered whole
-        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize) =
-            try await S3Service.offloadBlockingIO(req) {
-                try S3Service.resolveObjectForCopy(
-                    bucketName: copySource.bucketName,
-                    key: copySource.key,
-                    versionId: copySource.versionId,
-                    requestId: req.id
-                )
-            }
+        // Resolve the source straight to its on-disk file (fetching it from a peer first if
+        // this node doesn't hold it) - the copied region is streamed file-to-file in fixed
+        // windows, never buffered whole.
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
+            try await resolveCopySource(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId)
+        defer { cleanupSource() }
 
         // Validate copy conditions (x-amz-copy-source-if-match, etc.)
         try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
@@ -1719,7 +1899,7 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <UploadId>\(uploadId)</UploadId>
                 <PartNumberMarker>\(partNumberMarker)</PartNumberMarker>
@@ -1735,14 +1915,17 @@ struct S3Controller: RouteCollection {
 
     /// ListMultipartUploads - GET /:bucket?uploads
     @Sendable
-    private func handleListMultipartUploads(req: Request, bucketName: String) throws -> Response {
+    private func handleListMultipartUploads(req: Request, bucketName: String) async throws
+        -> Response
+    {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let keyMarker = req.query[String.self, at: "key-marker"]
         let uploadIdMarker = req.query[String.self, at: "upload-id-marker"]
         let maxUploads = req.query[Int.self, at: "max-uploads"] ?? 1000
 
         let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
-            try MultipartFileHandler.listUploads(
+            try await ClusterListingService.listUploads(
+                req: req,
                 bucketName: bucketName,
                 prefix: prefix,
                 keyMarker: keyMarker,
@@ -1764,14 +1947,14 @@ struct S3Controller: RouteCollection {
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-                <Bucket>\(bucketName)</Bucket>
-                <KeyMarker>\(keyMarker ?? "")</KeyMarker>
-                <UploadIdMarker>\(uploadIdMarker ?? "")</UploadIdMarker>
-                <NextKeyMarker>\(nextKeyMarker ?? "")</NextKeyMarker>
-                <NextUploadIdMarker>\(nextUploadIdMarker ?? "")</NextUploadIdMarker>
+                <Bucket>\(bucketName.xmlEscaped)</Bucket>
+                <KeyMarker>\((keyMarker ?? "").xmlEscaped)</KeyMarker>
+                <UploadIdMarker>\((uploadIdMarker ?? "").xmlEscaped)</UploadIdMarker>
+                <NextKeyMarker>\((nextKeyMarker ?? "").xmlEscaped)</NextKeyMarker>
+                <NextUploadIdMarker>\((nextUploadIdMarker ?? "").xmlEscaped)</NextUploadIdMarker>
                 <MaxUploads>\(maxUploads)</MaxUploads>
                 <IsTruncated>\(isTruncated)</IsTruncated>
-                <Prefix>\(prefix)</Prefix>
+                <Prefix>\(prefix.xmlEscaped)</Prefix>
             \(uploadsXml)
             </ListMultipartUploadsResult>
             """

@@ -97,6 +97,18 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Resync | On-demand replication of a bucket's existing objects for a rule |
 | Task health | Inspect pending/failed replication tasks and retry on demand, from the console or API |
 
+### Horizontal Scaling
+
+| Feature | Notes |
+| --- | --- |
+| Postgres-backed control plane | Opt-in multi-node HA for buckets, users, access keys, and policies behind a load balancer |
+| Sharded, replicated object data | Rendezvous (HRW) hashing places each object on 3 nodes cluster-wide, no range-sharding hotspots |
+| Any node serves any request | An entry node forwards to a responsible node transparently - no client-visible routing logic |
+| Quorum writes | A write acks once a majority of replicas confirm, with async catch-up for stragglers |
+| Automatic rebalancing | Node join/drain/removal triggers copy + safe reclaim, including historical versions and delete markers |
+| Cluster-aware listing | `ListObjects`, `ListObjectVersions`, `ListMultipartUploads`, and `DeleteBucket` safety checks work correctly across every node |
+| Admin console | Live node health, storage distribution, and an object placement browser under Admin → Cluster |
+
 See the [documentation](https://alarik.io/docs) for the full API reference.
 
 ## Installation

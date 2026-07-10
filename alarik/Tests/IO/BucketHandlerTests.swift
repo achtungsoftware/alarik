@@ -373,4 +373,51 @@ struct BucketHandlerTests {
             #expect(stats.objectCount == 0)
         }
     }
+
+    // MARK: - Path traversal in bucketName
+
+    @Test("bucketURL - Path traversal in bucketName is sanitized, never escaping Storage/buckets")
+    func testBucketURLTraversalSanitized() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            // "../../etc/passwd" must never resolve outside Storage/buckets/ - this is the
+            // exact shape of value the internal cluster listing/object endpoints pass straight
+            // through as `bucketName` from an unvalidated query parameter.
+            let url = BucketHandler.bucketURL(for: "../../etc/passwd")
+            let rootPath = BucketHandler.rootURL.standardizedFileURL.path
+            #expect(url.standardizedFileURL.path.hasPrefix(rootPath))
+        }
+    }
+
+    @Test("bucketURL - A bucketName that is entirely '..' components resolves inside the bucket root")
+    func testBucketURLAllDotDotSanitized() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            let url = BucketHandler.bucketURL(for: "../../../../../../")
+            let rootPath = BucketHandler.rootURL.standardizedFileURL.path
+            #expect(url.standardizedFileURL.path.hasPrefix(rootPath))
+        }
+    }
+
+    @Test("storagePath - Path traversal in bucketName is sanitized, matching bucketURL")
+    func testObjectStoragePathBucketNameTraversalSanitized() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            let path = ObjectFileHandler.storagePath(for: "../../etc", key: "passwd")
+            let rootPath = BucketHandler.rootURL.standardizedFileURL.path
+            #expect(URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(rootPath))
+        }
+    }
+
+    @Test("MultipartFileHandler.uploadPath - Path traversal in bucketName is sanitized")
+    func testMultipartUploadPathBucketNameTraversalSanitized() async throws {
+        try await withApp { _ in
+            try StorageHelper.cleanStorage()
+            let path = try MultipartFileHandler.uploadPath(
+                for: "../../etc", uploadId: "0123456789abcdef0123456789abcdef")
+            let rootPath = URL(fileURLWithPath: MultipartFileHandler.rootPath).standardizedFileURL
+                .path
+            #expect(URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(rootPath))
+        }
+    }
 }

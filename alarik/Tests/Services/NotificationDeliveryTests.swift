@@ -293,8 +293,9 @@ struct NotificationDeliveryTests {
             await NotificationDispatcher.shared.drain()
             #expect(try await NotificationDelivery.query(on: app.db).count() >= 1)
 
+            let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
-                on: app.db, bucketName: "doomed", userId: admin.id!, force: true)
+                req: req, bucketName: "doomed", userId: admin.id!, force: true)
 
             #expect(try await NotificationDelivery.query(on: app.db).count() == 0)
         }
@@ -338,6 +339,86 @@ struct NotificationDeliveryTests {
                     #expect(dto.rules.count == 1)
                     #expect(dto.rules[0].url == "https://example.com/h")
                 })
+        }
+    }
+
+    @Test(
+        "a webhook signing secret is never echoed back in plaintext, and an unrelated edit preserves it"
+    )
+    func webhookSecretIsMaskedAndPreservedAcrossEdits() async throws {
+        try await withApp { app in
+            let token = try await loginDefaultAdminUser(app)
+            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
+            let bucketModel = Bucket(name: "secret-mask-bucket", userId: admin.id!)
+            try await bucketModel.save(on: app.db)
+
+            let createBody = #"""
+                {"rules":[{"id":"00000000-0000-0000-0000-000000000000","url":"https://example.com/h","secret":"super-secret-value","events":["s3:ObjectCreated:*"],"enabled":true}]}
+                """#
+
+            var ruleId: UUID?
+            try await app.test(
+                .PUT, "/api/v1/buckets/secret-mask-bucket/notifications",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    req.headers.contentType = .json
+                    req.body = ByteBuffer(string: createBody)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    // The just-submitted response must not echo the real secret back either -
+                    // the whole point is that the plaintext value never appears in a response
+                    // body, not just that GET is sanitized.
+                    let bodyString = String(buffer: res.body)
+                    #expect(!bodyString.contains("super-secret-value"))
+                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    ruleId = dto.rules.first?.id
+                    #expect(dto.rules.first?.secret != nil)
+                    #expect(dto.rules.first?.secret != "super-secret-value")
+                })
+
+            let id = try #require(ruleId)
+
+            try await app.test(
+                .GET, "/api/v1/buckets/secret-mask-bucket/notifications",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let bodyString = String(buffer: res.body)
+                    #expect(!bodyString.contains("super-secret-value"))
+                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    #expect(dto.rules.first?.secret != nil)
+                })
+
+            // Edit an unrelated field (disable the rule) while echoing back exactly what GET
+            // returned (the masked placeholder, never the real secret) - the console's actual
+            // edit flow, since it never has the real value to send in the first place.
+            let editBody = """
+                {"rules":[{"id":"\(id.uuidString)","url":"https://example.com/h","secret":"••••••••","events":["s3:ObjectCreated:*"],"enabled":false}]}
+                """
+
+            try await app.test(
+                .PUT, "/api/v1/buckets/secret-mask-bucket/notifications",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    req.headers.contentType = .json
+                    req.body = ByteBuffer(string: editBody)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    #expect(dto.rules.first?.enabled == false)
+                })
+
+            // The real secret must have survived server-side, unchanged, even though the client
+            // never saw or resent it.
+            let bucket = try #require(
+                try await Bucket.query(on: app.db).filter(\.$name == "secret-mask-bucket").first())
+            let storedSecret = NotificationConfiguration.fromJSON(bucket.notificationConfig ?? "")
+                .rules.first?.secret
+            #expect(storedSecret == "super-secret-value")
         }
     }
 

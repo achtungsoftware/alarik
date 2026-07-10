@@ -57,6 +57,8 @@ declare global {
         sharedLinkCount: number;
         oidcProviderCount: number;
         multipartUploadCount: number;
+        // null when this node isn't part of a cluster.
+        clusterNode: { nodeId: string; address: string } | null;
     }
 
     export interface NotificationRule {
@@ -105,10 +107,13 @@ declare global {
     }
 
     export interface Bucket {
+        id?: string;
         name: string;
         creationDate: string;
         versioningStatus: string;
         policy?: string;
+        // Only present on the admin bucket list (GET /api/v1/admin/buckets) - the regular
+        // per-user bucket list never returns ownership info.
         user?: User;
     }
 
@@ -155,6 +160,50 @@ declare global {
         issuerURL: string;
         clientId: string;
         enabled: boolean;
+    }
+
+    export interface ClusterNode {
+        id: string;
+        address: string;
+        status: "active" | "draining" | "removed";
+        joinedAt: string;
+        lastHeartbeatAt: string;
+        isHealthy: boolean;
+        totalBytes: number | null;
+        availableBytes: number | null;
+        isNearFull: boolean;
+    }
+
+    export interface ClusterRebalanceStatus {
+        pendingCount: number;
+        failedCount: number;
+        pendingByReason: Record<string, number>;
+        replicationFactor: number;
+    }
+
+    export interface ClusterPlacementEntry {
+        key: string;
+        nodeIds: string[];
+        size: number;
+    }
+
+    export interface ClusterNodeStorage {
+        nodeId: string;
+        sizeBytes: number;
+        objectCount: number;
+    }
+
+    export interface ClusterReplicationTaskDetail {
+        id: string;
+        bucketName: string;
+        key: string;
+        operation: string;
+        targetNodeId: string;
+        reason: string;
+        attempts: number;
+        nextAttemptAt: string;
+        state: "pending" | "failed";
+        lastError: string | null;
     }
 
     // Fluent Page

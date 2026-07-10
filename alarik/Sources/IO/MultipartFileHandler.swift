@@ -36,27 +36,46 @@ struct MultipartFileHandler {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
+    /// `uploadId` always originates from `generateUploadId()`, but every public function below
+    /// also accepts one back from the client (UploadPart/CompleteMultipartUpload/
+    /// AbortMultipartUpload/UploadPartCopy/ListParts all echo it via a query param) - unlike
+    /// `key`, which gets its `..` components stripped before touching disk, `uploadId` had no
+    /// validation at all, so a crafted value like `../../otherbucket/<id>` could escape
+    /// `Storage/multipart/{bucket}/` entirely. Every path-building function below routes through
+    /// `uploadPath`, so validating here once, before any path is constructed, protects all of
+    /// them - rejecting exactly matches the "no such upload" case, since a real upload ID can
+    /// never fail this check.
+    private static func validateUploadId(_ uploadId: String) throws {
+        guard uploadId.count == 32, uploadId.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw NSError(
+                domain: "NoSuchUpload", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+        }
+    }
+
     /// Returns the base directory for a multipart upload
     /// Structure: Storage/multipart/{bucketName}/{uploadId}/
-    static func uploadPath(for bucketName: String, uploadId: String) -> String {
-        let encodedBucket =
-            bucketName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bucketName
+    static func uploadPath(for bucketName: String, uploadId: String) throws -> String {
+        try validateUploadId(uploadId)
+        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
         return "\(rootPath)\(encodedBucket)/\(uploadId)/"
     }
 
     /// Returns the path to the upload metadata file
-    static func metadataPath(for bucketName: String, uploadId: String) -> String {
-        return "\(uploadPath(for: bucketName, uploadId: uploadId))meta.json"
+    static func metadataPath(for bucketName: String, uploadId: String) throws -> String {
+        return "\(try uploadPath(for: bucketName, uploadId: uploadId))meta.json"
     }
 
     /// Returns the path for a specific part
-    static func partPath(for bucketName: String, uploadId: String, partNumber: Int) -> String {
-        return "\(uploadPath(for: bucketName, uploadId: uploadId))part-\(partNumber)"
+    static func partPath(for bucketName: String, uploadId: String, partNumber: Int) throws -> String {
+        return "\(try uploadPath(for: bucketName, uploadId: uploadId))part-\(partNumber)"
     }
 
     /// Returns the path to a part's metadata
-    static func partMetaPath(for bucketName: String, uploadId: String, partNumber: Int) -> String {
-        return "\(uploadPath(for: bucketName, uploadId: uploadId))part-\(partNumber).meta"
+    static func partMetaPath(for bucketName: String, uploadId: String, partNumber: Int) throws
+        -> String
+    {
+        return "\(try uploadPath(for: bucketName, uploadId: uploadId))part-\(partNumber).meta"
     }
 
     /// Creates a new multipart upload and returns the upload ID
@@ -67,7 +86,7 @@ struct MultipartFileHandler {
         metadata: [String: String] = [:]
     ) throws -> String {
         let uploadId = generateUploadId()
-        let uploadDir = uploadPath(for: bucketName, uploadId: uploadId)
+        let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
 
         // Create the upload directory
         try FileManager.default.createDirectory(
@@ -86,7 +105,7 @@ struct MultipartFileHandler {
         )
 
         let metaData = try jsonEncoder.encode(meta)
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         try metaData.write(to: URL(fileURLWithPath: metaPath))
 
         return uploadId
@@ -107,7 +126,7 @@ struct MultipartFileHandler {
         }
 
         // Verify upload exists
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
@@ -117,7 +136,7 @@ struct MultipartFileHandler {
         let etag = S3Service.computeETag(data)
 
         // Write part data
-        let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+        let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         try data.write(to: URL(fileURLWithPath: partPath))
 
         try writePartMeta(
@@ -144,14 +163,14 @@ struct MultipartFileHandler {
                 domain: "InvalidPartNumber", code: 400,
                 userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
         }
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
                 userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
         }
 
-        let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+        let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
 
         // Same durability contract as object writes: flush the part before acknowledging it,
         // otherwise a crash between UploadPart's 200 and CompleteMultipartUpload could lose
@@ -205,7 +224,7 @@ struct MultipartFileHandler {
                 domain: "InvalidPartNumber", code: 400,
                 userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
         }
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
@@ -221,7 +240,7 @@ struct MultipartFileHandler {
         defer { _ = POSIXFile.close(sourceFd) }
         _ = POSIXFile.lseek(sourceFd, off_t(sourceOffset), SEEK_SET)
 
-        let partPath = partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+        let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         var writer = try AtomicObjectWriter(finalPath: partPath)
         var md5 = Insecure.MD5()
         do {
@@ -266,7 +285,7 @@ struct MultipartFileHandler {
             lastModified: Date()
         )
         let partMetaData = try jsonEncoder.encode(partMeta)
-        let partMetaPath = partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
+        let partMetaPath = try partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         try partMetaData.write(to: URL(fileURLWithPath: partMetaPath))
     }
 
@@ -278,7 +297,7 @@ struct MultipartFileHandler {
         versioningStatus: VersioningStatus
     ) throws -> (etag: String, size: Int, versionId: String?) {
         // Read upload metadata
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
@@ -314,7 +333,7 @@ struct MultipartFileHandler {
         var totalSize = 0
 
         for part in sortedParts {
-            let partFilePath = partPath(
+            let partFilePath = try partPath(
                 for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
 
             guard FileManager.default.fileExists(atPath: partFilePath) else {
@@ -326,7 +345,7 @@ struct MultipartFileHandler {
             }
 
             // Read and verify part metadata
-            let partMetaFilePath = partMetaPath(
+            let partMetaFilePath = try partMetaPath(
                 for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
             let partSize: Int
             if FileManager.default.fileExists(atPath: partMetaFilePath) {
@@ -411,7 +430,7 @@ struct MultipartFileHandler {
 
     /// Aborts (deletes) a multipart upload and all its parts
     static func abortUpload(bucketName: String, uploadId: String) throws {
-        let uploadDir = uploadPath(for: bucketName, uploadId: uploadId)
+        let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
 
         guard FileManager.default.fileExists(atPath: uploadDir) else {
             throw NSError(
@@ -422,7 +441,7 @@ struct MultipartFileHandler {
         try FileManager.default.removeItem(atPath: uploadDir)
 
         // Clean up empty bucket directory if needed
-        let bucketDir = "\(rootPath)\(bucketName)/"
+        let bucketDir = "\(rootPath)\(BucketHandler.encodedBucketName(bucketName))/"
         if let contents = try? FileManager.default.contentsOfDirectory(atPath: bucketDir),
             contents.isEmpty
         {
@@ -437,14 +456,14 @@ struct MultipartFileHandler {
         maxParts: Int = 1000,
         partNumberMarker: Int = 0
     ) throws -> (parts: [MultipartPartMeta], isTruncated: Bool, nextPartNumberMarker: Int?) {
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
                 userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
         }
 
-        let uploadDir = uploadPath(for: bucketName, uploadId: uploadId)
+        let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
         let contents = try FileManager.default.contentsOfDirectory(atPath: uploadDir)
 
         var parts: [MultipartPartMeta] = []
@@ -485,8 +504,7 @@ struct MultipartFileHandler {
         uploads: [MultipartUploadMeta], isTruncated: Bool, nextKeyMarker: String?,
         nextUploadIdMarker: String?
     ) {
-        let encodedBucket =
-            bucketName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bucketName
+        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
         let bucketDir = "\(rootPath)\(encodedBucket)/"
 
         guard FileManager.default.fileExists(atPath: bucketDir) else {
@@ -550,7 +568,7 @@ struct MultipartFileHandler {
 
     /// Gets the metadata for an upload
     static func getUploadMeta(bucketName: String, uploadId: String) throws -> MultipartUploadMeta {
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
@@ -563,7 +581,9 @@ struct MultipartFileHandler {
 
     /// Checks if an upload exists
     static func uploadExists(bucketName: String, uploadId: String) -> Bool {
-        let metaPath = metadataPath(for: bucketName, uploadId: uploadId)
+        guard let metaPath = try? metadataPath(for: bucketName, uploadId: uploadId) else {
+            return false
+        }
         return FileManager.default.fileExists(atPath: metaPath)
     }
 }

@@ -21,10 +21,6 @@ import XMLCoder
 import ZIPFoundation
 
 struct InternalBucketController: RouteCollection {
-    struct UploadInput: Content {
-        let data: File
-    }
-
     struct VersioningStatusDTO: Content {
         let status: String
     }
@@ -81,6 +77,39 @@ struct InternalBucketController: RouteCollection {
         let targets: [ReplicationTarget]
     }
 
+    /// Fixed placeholder every already-configured webhook `secret`/replication
+    /// `secretAccessKey` is replaced with before being sent to the client - GET and PUT
+    /// responses never echo the real value back over the wire, matching the write-only pattern
+    /// `AccessKey.ResponseDTO` already uses for access-key secrets. Unlike a full omission,
+    /// this stays a non-empty, truthy string so the console can still show "a secret is
+    /// configured" (e.g. the webhooks table's "Signed (HMAC)" badge) without ever revealing it,
+    /// and it doubles as the "unchanged" sentinel on the way back in: `setBucketNotifications`/
+    /// `setReplicationTargets` substitute the real stored secret whenever an existing rule's/
+    /// target's incoming value is exactly this placeholder, so the console's existing
+    /// edit-prefills-then-echoes-back flow round-trips correctly without ever needing to know
+    /// the real secret.
+    private static let secretMaskPlaceholder = "••••••••"
+
+    private static func maskedNotificationRules(_ rules: [NotificationRule]) -> [NotificationRule] {
+        rules.map { rule in
+            var masked = rule
+            if let secret = rule.secret, !secret.isEmpty {
+                masked.secret = secretMaskPlaceholder
+            }
+            return masked
+        }
+    }
+
+    private static func maskedReplicationTargets(_ targets: [ReplicationTarget]) -> [ReplicationTarget] {
+        targets.map { target in
+            var masked = target
+            if !target.secretAccessKey.isEmpty {
+                masked.secretAccessKey = secretMaskPlaceholder
+            }
+            return masked
+        }
+    }
+
     struct ReplicationRulesDTO: Content {
         let rules: [ReplicationRule]
     }
@@ -133,30 +162,43 @@ struct InternalBucketController: RouteCollection {
         let expiresAt: Date?
     }
 
+    /// The global `app.routes.defaultMaxBodySize` (`configure.swift`) is set to 5TB - it has to
+    /// be, to fit an actual S3 object upload. Every one of these routes is a small JSON
+    /// subresource body (a bucket policy, a handful of tags, a few webhook rules) with no
+    /// business ever buffering anywhere close to that: registered with the default `body:
+    /// .collect` behavior (no explicit `maxSize`), Vapor would happily buffer up to 5TB in
+    /// memory before the handler even runs and gets a chance to reject anything. Every route
+    /// below that decodes a JSON body (not a file upload) is registered with this override
+    /// instead of the `defaultMaxBodySize`-inheriting `.put(use:)`/`.post(use:)` convenience
+    /// methods, to actually bound that worst case.
+    private static let subresourceBodySizeLimit: ByteCount = "1mb"
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
         routes.grouped("buckets").grouped(":bucketName").delete(use: self.deleteBucket)
         routes.grouped("buckets").grouped(":bucketName").grouped("versioning").get(
             use: self.getVersioning)
-        routes.grouped("buckets").grouped(":bucketName").grouped("versioning").put(
-            use: self.setVersioning)
+        routes.grouped("buckets").grouped(":bucketName").grouped("versioning")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setVersioning)
         routes.grouped("buckets").grouped(":bucketName").grouped("policy").get(
             use: self.getPolicy)
-        routes.grouped("buckets").grouped(":bucketName").grouped("policy").put(
-            use: self.setPolicy)
+        routes.grouped("buckets").grouped(":bucketName").grouped("policy")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setPolicy)
         routes.grouped("buckets").grouped(":bucketName").grouped("policy").delete(
             use: self.deletePolicy)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").get(
             use: self.getBucketTags)
-        routes.grouped("buckets").grouped(":bucketName").grouped("tags").put(
-            use: self.setBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("tags")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").delete(
             use: self.deleteBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications").get(
             use: self.getBucketNotifications)
-        routes.grouped("buckets").grouped(":bucketName").grouped("notifications").put(
-            use: self.setBucketNotifications)
+        routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setBucketNotifications)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
             .grouped(":ruleId").grouped("test").post(use: self.testBucketNotification)
         routes.grouped("buckets").grouped(":bucketName").grouped("notifications")
@@ -167,11 +209,17 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("targets").get(use: self.getReplicationTargets)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
-            .grouped("targets").put(use: self.setReplicationTargets)
+            .grouped("targets")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setReplicationTargets)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("rules").get(use: self.getReplicationRules)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
-            .grouped("rules").put(use: self.setReplicationRules)
+            .grouped("rules")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setReplicationRules)
         routes.grouped("buckets").grouped(":bucketName").grouped("replication")
             .grouped("rules").grouped(":ruleId").grouped("resync")
             .post(use: self.resyncReplicationRule)
@@ -182,16 +230,20 @@ struct InternalBucketController: RouteCollection {
             .post(use: self.retryReplicationTask)
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
-        routes.grouped("objects").post(use: self.uploadObject)
+        routes.grouped("objects").on(.POST, body: .stream, use: self.uploadObject)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
         routes.grouped("objects", "tags").get(use: self.getObjectTags)
-        routes.grouped("objects", "tags").put(use: self.setObjectTags)
+        routes.grouped("objects", "tags")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setObjectTags)
         routes.grouped("objects", "tags").delete(use: self.deleteObjectTags)
         routes.grouped("objects", "metadata").get(use: self.getObjectMetadata)
-        routes.grouped("objects", "metadata").put(use: self.setObjectMetadata)
+        routes.grouped("objects", "metadata")
+            .on(
+                .PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.setObjectMetadata)
         routes.grouped("objects", "share").post(use: self.shareObject)
         routes.grouped("objects", "share").get(use: self.listSharedLinks)
         routes.grouped("objects", "share").grouped(":sharedLinkId").delete(
@@ -226,7 +278,7 @@ struct InternalBucketController: RouteCollection {
     /// substring (case-insensitive, server-side) - needed so UI like a bucket picker can search
     /// as the user types instead of ever having to load every bucket up front.
     @Sendable
-    func listBuckets(req: Request) async throws -> Page<Bucket> {
+    func listBuckets(req: Request) async throws -> Page<Bucket.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
         let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
 
@@ -238,7 +290,14 @@ struct InternalBucketController: RouteCollection {
             query.filter(\.$name ~~ search)
         }
 
-        return try await query.paginate(for: req)
+        // Never the raw model - a bucket the caller doesn't own but that happens to match
+        // `search` would never reach here (already scoped to `auth.userId` above), but the raw
+        // `Bucket` model doesn't carry anything sensitive by itself either way; this is purely
+        // about not silently starting to leak the moment someone adds an eager-loaded relation
+        // (like `.with(\.$user)`) to this query later, the same mistake the admin bucket list
+        // endpoint made.
+        let page = try await query.paginate(for: req)
+        return page.map { $0.toResponseDTO() }
     }
 
     @Sendable
@@ -282,7 +341,7 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         try await BucketService.delete(
-            on: req.db, bucketName: bucketName, userId: auth.userId, force: true)
+            req: req, bucketName: bucketName, userId: auth.userId, force: true)
 
         return .noContent
     }
@@ -307,11 +366,13 @@ struct InternalBucketController: RouteCollection {
         let isSearching = search?.isEmpty == false
         let delimiter = isSearching ? "" : (req.query[String.self, at: "delimiter"] ?? "/")
 
-        let (objects, commonPrefixes, _, _) = try ObjectFileHandler.listObjects(
+        let (objects, commonPrefixes, _, _) = try await ClusterListingService.listObjects(
+            req: req,
             bucketName: bucketName,
             prefix: prefix,
             delimiter: delimiter,
-            maxKeys: 10000
+            maxKeys: 10000,
+            marker: nil
         )
 
         // Convert objects to DTOs
@@ -375,8 +436,8 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let (sizeBytes, objectCount) = BucketHandler.calculateStats(
-            bucketName: bucketName, prefix: prefix)
+        let (sizeBytes, objectCount) = try await ClusterListingService.calculateStats(
+            req: req, bucketName: bucketName, prefix: prefix)
         return StatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
     }
 
@@ -400,11 +461,25 @@ struct InternalBucketController: RouteCollection {
         try await requireOwnedBucketExists(
             req: req, bucketName: input.bucket, userId: auth.userId)
 
-        guard
-            try ObjectFileHandler.readCurrentObject(
-                bucketName: input.bucket, key: input.key, loadData: false) != nil
-        else {
-            throw Abort(.notFound, reason: "Object not found")
+        // The object may live on any node, but this handler must NOT forward - the share URL it
+        // returns is built from this node's own base address, so it has to be the one that
+        // answers. Check locally first, then (only if this node isn't responsible) confirm
+        // existence on a responsible peer with a header-only probe rather than pulling the bytes.
+        let localResult = try? ObjectFileHandler.readCurrentObject(
+            bucketName: input.bucket, key: input.key, loadData: false)
+        let existsLocally = (localResult ?? nil) != nil
+        if !existsLocally {
+            let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+                req: req, bucketName: input.bucket, key: input.key)
+            var existsRemotely = false
+            if !isLocal && !candidates.isEmpty {
+                existsRemotely = await ClusterReplicationClient.objectExists(
+                    app: req.application, candidates: candidates, bucketName: input.bucket,
+                    key: input.key, versionId: nil)
+            }
+            guard existsRemotely else {
+                throw Abort(.notFound, reason: "Object not found")
+            }
         }
 
         let expiresAt: Date?
@@ -478,28 +553,22 @@ struct InternalBucketController: RouteCollection {
         // Verify bucket exists and belongs to user
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        // Parse multipart form data
-        let input = try req.content.decode(UploadInput.self)
-
-        let filename = input.data.filename
-        guard !filename.isEmpty else {
-            throw Abort(.badRequest, reason: "File must have a filename")
-        }
+        // Stream the multipart body to memory-or-spool-file with bounded memory, rather than
+        // buffering the whole file via `Content.decode` - see `AdminUploadSpooler`.
+        let spooled = try await AdminUploadSpooler.spool(req: req)
+        defer { spooled.cleanup() }
 
         // Construct the full key path (prefix + filename)
-        let keyPath = prefix.isEmpty ? filename : "\(prefix)\(filename)"
+        let keyPath = prefix.isEmpty ? spooled.filename : "\(prefix)\(spooled.filename)"
 
-        // Read file data
-        let fileData = Data(buffer: input.data.data)
-
-        let etag = S3Service.computeETag(fileData)
+        let etag = spooled.md5Hex
 
         // Create object metadata
         var meta = ObjectMeta(
             bucketName: bucketName,
             key: keyPath,
-            size: fileData.count,
-            contentType: input.data.contentType?.description ?? "application/octet-stream",
+            size: spooled.size,
+            contentType: spooled.contentType ?? "application/octet-stream",
             etag: etag,
             updatedAt: Date()
         )
@@ -508,26 +577,78 @@ struct InternalBucketController: RouteCollection {
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
         // Write object with versioning support - real blocking file IO, offloaded to the
-        // blocking-IO thread pool rather than tying up the async executor.
+        // blocking-IO thread pool rather than tying up the async executor. Small uploads arrive
+        // in memory and take the direct write; large ones were spooled to disk and are copied
+        // into the final .obj in fixed windows (mirrors S3Controller.handleObjectPut).
         let initialMeta = meta
+        let storage = spooled.storage
         let writtenVersionId: String? = try await S3Service.offloadBlockingIO(req) {
-            if versioningStatus != .disabled {
-                return try ObjectFileHandler.writeVersioned(
-                    metadata: initialMeta,
-                    data: fileData,
-                    bucketName: bucketName,
-                    key: keyPath,
-                    versioningStatus: versioningStatus
-                )
-            } else {
-                let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                try ObjectFileHandler.write(metadata: initialMeta, data: fileData, to: path)
-                return nil
+            switch storage {
+            case .memory(let data):
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersioned(
+                        metadata: initialMeta,
+                        data: data,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.write(metadata: initialMeta, data: data, to: path)
+                    return nil
+                }
+            case .file(let spoolPath):
+                let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersionedStreamed(
+                        metadata: initialMeta,
+                        payloadSources: spoolSource,
+                        bucketName: bucketName,
+                        key: keyPath,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    try ObjectFileHandler.writeStreamed(
+                        metadata: initialMeta, payloadSources: spoolSource, to: path)
+                    return nil
+                }
             }
         }
         if let writtenVersionId {
             meta.versionId = writtenVersionId
             meta.isLatest = true
+        }
+
+        // The destination key is only known after decoding the multipart body above, so unlike
+        // every other cluster-routed write this can't forward the *original* request (the body
+        // stream is already consumed) - instead it always writes locally (as above) and, if this
+        // node isn't actually one of the key's responsible nodes, pushes the freshly written
+        // version out to whichever nodes are, then reclaims its own now-redundant local copy.
+        let (isLocal, peers, responsible) = await ObjectRoutingService.coordinationTarget(
+            req: req, bucketName: bucketName, key: keyPath)
+        if isLocal {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: meta.versionId, operation: .put, peers: peers)
+        } else if !responsible.isEmpty {
+            let reachedQuorum = await ClusterReplicationService.pushToResponsibleNodes(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: meta.versionId, responsible: responsible)
+            // This node isn't one of the object's replicas - once a quorum of the nodes that
+            // actually are hold the exact version durably, the local copy written above is a
+            // stray that violates the placement invariant and leaks disk, so drop it eagerly
+            // (a local-only delete - the responsible nodes keep theirs). If quorum wasn't
+            // reached synchronously it's kept as the sole durability backstop until the outbox
+            // catches the responsible nodes up; a later rebalance walk reclaims it then.
+            if reachedQuorum {
+                try? await S3Service.offloadBlockingIO(req) {
+                    _ = try? S3Service.deleteObject(
+                        bucketName: bucketName, key: keyPath, versionId: nil,
+                        versioningStatus: .disabled)
+                }
+            }
         }
 
         await NotificationService.emit(
@@ -559,51 +680,86 @@ struct InternalBucketController: RouteCollection {
 
         // Check if this is a folder (prefix) deletion
         if key.hasSuffix("/") {
-            // Delete all objects with this prefix, emitting one event per removed object
-            let deletedKeys = try ObjectFileHandler.deletePrefix(bucketName: bucketName, prefix: key)
-            for deletedKey in deletedKeys {
-                await NotificationService.emit(
-                    event: .objectRemovedDelete, bucketName: bucketName, key: deletedKey,
-                    size: nil, etag: nil, versionId: nil,
-                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-                await ReplicationService.enqueueDelete(
-                    bucketName: bucketName, key: deletedKey, versionId: nil, on: req.db)
-            }
-        } else if versioningStatus == .enabled {
-            // Versioning enabled - create delete marker instead of permanent delete
-            let marker = try ObjectFileHandler.createDeleteMarker(bucketName: bucketName, key: key)
-            await NotificationService.emit(
-                event: .objectRemovedDeleteMarkerCreated, bucketName: bucketName, key: key,
-                size: nil, etag: nil, versionId: marker.versionId,
-                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-            await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: key, versionId: marker.versionId, on: req.db)
-        } else {
-            // Versioning disabled or suspended - permanent delete
-            // Check versioned storage first
-            if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
-                // Delete all versions
-                let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
-                for version in versions {
-                    if let vid = version.versionId {
-                        try? ObjectFileHandler.deleteVersion(
-                            bucketName: bucketName, key: key, versionId: vid)
-                    }
+            // Keys under this prefix can live on any node, not just this one, so (unlike the
+            // local-disk-only ObjectFileHandler.deletePrefix this used to call directly) the key
+            // set has to come from a cluster-wide listing, with each key then routed and deleted -
+            // locally or delegated to whichever node(s) actually hold it - via the same per-key
+            // `deleteObjectClusterWide` logic Multi-Object-Delete uses. `versioningStatus:
+            // .disabled` is passed unconditionally, regardless of the bucket's real status,
+            // to preserve deletePrefix's original behavior of hard-deleting every version rather
+            // than creating delete markers - folder delete has always been a permanent prune, not
+            // a versioning-aware operation.
+
+            // Same prefix sanitization/validation ObjectFileHandler.deletePrefix used to perform
+            // before touching disk - a prefix that's entirely ".." components (e.g. "../../")
+            // sanitizes down to empty and must be rejected outright, not silently listed as
+            // "zero matching keys, nothing to do".
+            var sanitizedPrefix = key
+            if sanitizedPrefix.contains("..") {
+                let components = sanitizedPrefix.components(separatedBy: "/")
+                sanitizedPrefix = components.map { $0.replacingOccurrences(of: "..", with: "") }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "/")
+                if key.hasSuffix("/") && !sanitizedPrefix.hasSuffix("/") {
+                    sanitizedPrefix += "/"
                 }
             }
-
-            // Also delete non-versioned path if exists
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-            if FileManager.default.fileExists(atPath: path) {
-                try FileManager.default.removeItem(atPath: path)
+            guard !sanitizedPrefix.isEmpty && sanitizedPrefix != "/" else {
+                throw Abort(.internalServerError, reason: "Invalid prefix for deletion")
             }
 
+            var marker: String? = nil
+            var failedKeys = 0
+            repeat {
+                let (objects, _, isTruncated, nextMarker) = try await ClusterListingService.listObjects(
+                    req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
+                    maxKeys: 1000, marker: marker)
+                for object in objects {
+                    // A per-key delete can fail (a responsible peer being unreachable) - unlike
+                    // the local-disk-only deletePrefix this replaced, whose only failure mode was
+                    // a local IO error. Rather than silently reporting the whole folder deleted
+                    // when some objects survived, count the failures and surface them below.
+                    let outcome: S3Service.ObjectDeleteOutcome
+                    do {
+                        outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+                            req: req, bucketName: bucketName, key: object.key, versionId: nil,
+                            versioningStatus: .disabled)
+                    } catch {
+                        failedKeys += 1
+                        req.logger.warning(
+                            "Folder delete: failed to delete '\(object.key)' under '\(sanitizedPrefix)': \(error)"
+                        )
+                        continue
+                    }
+                    await NotificationService.emit(
+                        event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
+                        size: nil, etag: nil, versionId: outcome.versionId,
+                        requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                    await ReplicationService.enqueueDelete(
+                        bucketName: bucketName, key: object.key, versionId: nil, on: req.db)
+                }
+                marker = isTruncated ? nextMarker : nil
+            } while marker != nil
+
+            if failedKeys > 0 {
+                throw Abort(
+                    .internalServerError,
+                    reason:
+                        "Failed to delete \(failedKeys) object(s) under the prefix; some may remain. Please retry."
+                )
+            }
+        } else {
+            let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+                req: req, bucketName: bucketName, key: key, versionId: nil,
+                versioningStatus: versioningStatus)
             await NotificationService.emit(
-                event: .objectRemovedDelete, bucketName: bucketName, key: key,
-                size: nil, etag: nil, versionId: nil,
+                event: outcome.isDeleteMarker
+                    ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
+                bucketName: bucketName, key: key, size: nil, etag: nil,
+                versionId: outcome.versionId,
                 requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
             await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: key, versionId: nil, on: req.db)
+                bucketName: bucketName, key: key, versionId: outcome.versionId, on: req.db)
         }
 
         return .noContent
@@ -649,38 +805,100 @@ struct InternalBucketController: RouteCollection {
                 path = plainPath
             }
         }
-        guard let path else {
-            throw Abort(.notFound, reason: "Object not found")
-        }
 
-        guard let location = try? ObjectFileHandler.payloadLocation(path: path),
+        if let path, let location = try? ObjectFileHandler.payloadLocation(path: path),
             !location.meta.isDeleteMarker
-        else {
+        {
+            let meta = location.meta
+            let response: Response
+            if location.payloadSize > Constants.streamingThreshold {
+                response = S3Service.buildStreamingObjectResponse(
+                    req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
+            } else {
+                // Headers and body from the same read - one consistent snapshot of the file
+                guard
+                    let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                    let data
+                else {
+                    throw Abort(.internalServerError, reason: "Failed to read object data")
+                }
+                response = S3Service.buildVersionedObjectMetadataResponse(
+                    meta: freshMeta, includeBody: true, data: data)
+            }
+            return Self.attachDownloadHeaders(to: response, key: key)
+        }
+
+        // Not physically on this node - the object may still exist cluster-wide (any
+        // responsible node could have served the console's list/browse request while a
+        // *different* node happens to hold the actual bytes). Fetch it from a responsible peer
+        // into a local temp file the same way CopyObject's cross-node source resolution and
+        // downloadAsZip's per-file fallback already do, then stream that temp file straight to
+        // the client (windowed, never buffering the whole object in memory - a console download
+        // of a multi-GB object that lands on the wrong node must not OOM this node).
+        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+            req: req, bucketName: bucketName, key: key)
+        guard !isLocal, !candidates.isEmpty else {
             throw Abort(.notFound, reason: "Object not found")
         }
-        let meta = location.meta
-
-        let response: Response
-        if location.payloadSize > Constants.streamingThreshold {
-            response = S3Service.buildStreamingObjectResponse(
-                req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
-        } else {
-            // Headers and body from the same read - one consistent snapshot of the file
-            guard let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
-                let data
-            else {
-                throw Abort(.internalServerError, reason: "Failed to read object data")
-            }
-            response = S3Service.buildVersionedObjectMetadataResponse(
-                meta: freshMeta, includeBody: true, data: data)
+        let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
+            app: req.application, candidates: candidates, bucketName: bucketName, key: key,
+            versionId: versionId, requestId: req.id)
+        guard !meta.isDeleteMarker else {
+            _ = POSIXFile.unlink(tempPath)
+            throw Abort(.notFound, reason: "Object not found")
         }
+        return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key)
+    }
 
+    /// Streams a raw (header-less) temp file - the payload `ClusterReplicationClient
+    /// .fetchObjectToTempFile` spooled from a peer - straight to the client in fixed windows,
+    /// unlinking it once the stream drains (or fails). Distinct from
+    /// `S3Service.buildStreamingObjectResponse`, which streams an on-disk *Alarik object file*
+    /// (metadata header + payload); this file is bare bytes with `meta` supplied separately.
+    private func streamedResponse(
+        req: Request, rawTempFile tempPath: String, meta: ObjectMeta, key: String
+    ) -> Response {
+        let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta, includeBody: false)
+        Self.streamRawFile(req: req, path: tempPath, count: meta.size, into: response)
+        return Self.attachDownloadHeaders(to: response, key: key)
+    }
+
+    /// Attaches a windowed-read streaming body over a raw on-disk file to `response`, deleting
+    /// the file once the stream drains or fails - so a large payload (a peer-fetched object, a
+    /// built ZIP) is never buffered whole in memory just to send it, and the throwaway temp file
+    /// never leaks. `count` must be the exact byte length (drives Content-Length).
+    private static func streamRawFile(req: Request, path: String, count: Int, into response: Response) {
+        let threadPool = req.application.threadPool
+        response.body = Response.Body(
+            managedAsyncStream: { writer in
+                let fd = try await threadPool.runIfActive { POSIXFile.open(path, O_RDONLY) }
+                guard fd >= 0 else {
+                    _ = POSIXFile.unlink(path)
+                    throw Abort(.internalServerError, reason: "Failed to open file for streaming")
+                }
+                do {
+                    try await StreamingIOLoops.readWindowed(
+                        threadPool: threadPool, fd: fd, offset: 0, length: count,
+                        chunkSize: Constants.streamingReadChunkSize
+                    ) { chunk in
+                        try await writer.writeBuffer(chunk)
+                    }
+                } catch {
+                    _ = POSIXFile.close(fd)
+                    _ = POSIXFile.unlink(path)
+                    throw error
+                }
+                _ = POSIXFile.close(fd)
+                _ = POSIXFile.unlink(path)
+            }, count: count)
+    }
+
+    private static func attachDownloadHeaders(to response: Response, key: String) -> Response {
         let fileName = String(key.split(separator: "/").last ?? "download")
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
         )
-
         return response
     }
 
@@ -691,100 +909,137 @@ struct InternalBucketController: RouteCollection {
         let zipFileName = "download-\(UUID().uuidString).zip"
         let zipURL = tempDir.appendingPathComponent(zipFileName)
 
-        // Create ZIP archive
+        // Every early exit below (a thrown error, or the "nothing to download" guard) must not
+        // leak the temp ZIP file on disk - the previous version only cleaned it up on two of
+        // several possible exit paths (e.g. `Archive(url:accessMode:)` or `archive.addEntry`
+        // throwing left it behind forever). `streamRawFile` takes over ownership of `zipURL` on
+        // the success path and unlinks it itself once sent, so this only fires when that never
+        // happens.
+        var handedOffToStreaming = false
+        defer {
+            if !handedOffToStreaming {
+                try? FileManager.default.removeItem(at: zipURL)
+            }
+        }
+
         let archive: Archive
         do {
-            archive = try Archive(
-                url: zipURL, accessMode: .create)
+            archive = try Archive(url: zipURL, accessMode: .create)
         } catch {
             throw Abort(.internalServerError, reason: "Failed to create ZIP archive: \(error)")
         }
 
         var addedFiles = 0
+        // Keys that couldn't be included (not found locally or on any peer, or failed to add to
+        // the archive) - the previous version silently produced a ZIP missing some of the
+        // requested files with no way for the caller to know. Surfaced via a response header
+        // rather than failing the whole request, since a bucket-wide download partially
+        // succeeding is still more useful than an all-or-nothing failure.
+        var skippedKeys: [String] = []
 
-        // Helper function to read object data (versioned or non-versioned)
-        func readObjectData(bucketName: String, key: String) -> Data? {
-            guard
-                let (_, data) = try? ObjectFileHandler.readCurrentObject(
-                    bucketName: bucketName, key: key, loadData: true)
-            else {
-                return nil
+        // Resolves `key` to a local file path holding its current bytes - either the object's
+        // own on-disk path, or (if this node isn't responsible for it) a temp file fetched from
+        // whichever node is (the same ObjectRoutingService.isResponsible + ClusterReplicationClient
+        // .fetchObjectToTempFile primitive CopyObject's cross-node source fetch already uses).
+        // `isTemp` tells the caller whether that path needs unlinking afterward.
+        func resolveObjectFile(key: String) async -> (path: String, isTemp: Bool)? {
+            if let path = try? ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: nil)
+            {
+                return (path, false)
             }
-            return data
+
+            let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
+                req: req, bucketName: bucketName, key: key)
+            guard !isLocal, !candidates.isEmpty else { return nil }
+
+            guard
+                let (tempPath, _) = try? await ClusterReplicationClient.fetchObjectToTempFile(
+                    app: req.application, candidates: candidates, bucketName: bucketName,
+                    key: key, versionId: nil, requestId: req.id)
+            else { return nil }
+
+            return (tempPath, true)
+        }
+
+        // Streams straight from `key`'s resolved file into the ZIP entry
+        // (`Archive.addEntry(with:fileURL:)` reads it in bounded chunks itself) rather than
+        // loading the whole object into memory first, like the previous `Data`-buffering
+        // version did for every single file regardless of size.
+        func addObject(key: String, entryPath: String) async {
+            guard let (filePath, isTemp) = await resolveObjectFile(key: key) else {
+                skippedKeys.append(key)
+                return
+            }
+            defer {
+                if isTemp { _ = POSIXFile.unlink(filePath) }
+            }
+            do {
+                try archive.addEntry(with: entryPath, fileURL: URL(fileURLWithPath: filePath))
+                addedFiles += 1
+            } catch {
+                skippedKeys.append(key)
+            }
         }
 
         for key in keys {
             if key.hasSuffix("/") {
                 // It's a folder - add all files with this prefix
-                let (objects, _, _, _) = try ObjectFileHandler.listObjects(
+                let (objects, _, _, _) = try await ClusterListingService.listObjects(
+                    req: req,
                     bucketName: bucketName,
                     prefix: key,
                     delimiter: nil,  // No delimiter to get all nested files
-                    maxKeys: 10000
+                    maxKeys: 10000,
+                    marker: nil
                 )
 
                 for object in objects {
                     // Skip delete markers
                     if object.isDeleteMarker { continue }
 
-                    if let fileData = readObjectData(bucketName: bucketName, key: object.key) {
-                        // Use relative path from the folder prefix
-                        let relativePath = String(object.key.dropFirst(key.count))
-                        let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
-
-                        try archive.addEntry(
-                            with: zipEntryPath, type: .file,
-                            uncompressedSize: Int64(fileData.count),
-                            bufferSize: 4096,
-                            provider: { position, size in
-                                let start = Int(position)
-                                let end = min(start + size, fileData.count)
-                                return fileData[start..<end]
-                            })
-                        addedFiles += 1
-                    }
+                    // Use relative path from the folder prefix
+                    let relativePath = String(object.key.dropFirst(key.count))
+                    let zipEntryPath = relativePath.isEmpty ? object.key : relativePath
+                    await addObject(key: object.key, entryPath: zipEntryPath)
                 }
             } else {
                 // Single file - use just the filename without path
-                if let fileData = readObjectData(bucketName: bucketName, key: key) {
-                    // Extract just the filename from the full key path
-                    let filename = key.split(separator: "/").last.map(String.init) ?? key
-
-                    try archive.addEntry(
-                        with: filename, type: .file, uncompressedSize: Int64(fileData.count),
-                        bufferSize: 4096,
-                        provider: { position, size in
-                            let start = Int(position)
-                            let end = min(start + size, fileData.count)
-                            return fileData[start..<end]
-                        })
-                    addedFiles += 1
-                }
+                let filename = key.split(separator: "/").last.map(String.init) ?? key
+                await addObject(key: key, entryPath: filename)
             }
         }
 
         guard addedFiles > 0 else {
-            try? FileManager.default.removeItem(at: zipURL)
             throw Abort(.notFound, reason: "No files found to download")
         }
 
-        // Read the ZIP file
-        let zipData = try Data(contentsOf: zipURL)
+        // Stream the finished archive straight off disk (unlinked once sent) rather than reading
+        // the whole thing into memory - a folder download can produce an arbitrarily large ZIP.
+        // `.int64Value` (not `.intValue`, which is a 32-bit `Int32` and would silently truncate
+        // any archive over ~2GB) matches `streamRawFile`'s `count: Int` on this 64-bit platform.
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: zipURL.path),
+            let zipSizeNumber = attributes[.size] as? NSNumber
+        else {
+            throw Abort(.internalServerError, reason: "Failed to stat the generated ZIP archive")
+        }
+        let zipSize = Int(zipSizeNumber.int64Value)
 
-        // Clean up
-        try? FileManager.default.removeItem(at: zipURL)
-
-        let response = Response(status: .ok, body: .init(data: zipData))
+        let response = Response(status: .ok)
         response.headers.contentType = .zip
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
             value: "attachment; filename=\"\(bucketName)-download.zip\""
         )
-        response.headers.replaceOrAdd(
-            name: .contentLength,
-            value: String(zipData.count)
-        )
-
+        if !skippedKeys.isEmpty {
+            let encodedSkipped = skippedKeys.map {
+                $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0
+            }.joined(separator: ",")
+            response.headers.replaceOrAdd(name: "X-Alarik-Skipped-Keys", value: encodedSkipped)
+        }
+        handedOffToStreaming = true
+        Self.streamRawFile(req: req, path: zipURL.path, count: zipSize, into: response)
         return response
     }
 
@@ -832,6 +1087,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return VersioningStatusDTO(status: newStatus.rawValue)
     }
@@ -923,6 +1179,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return PolicyDTO(policy: rawJSON)
     }
@@ -932,6 +1189,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
     }
 
     @Sendable
@@ -1006,7 +1264,8 @@ struct InternalBucketController: RouteCollection {
         guard let raw = bucket.notificationConfig else {
             return NotificationConfigDTO(rules: [])
         }
-        return NotificationConfigDTO(rules: NotificationConfiguration.fromJSON(raw).rules)
+        return NotificationConfigDTO(
+            rules: Self.maskedNotificationRules(NotificationConfiguration.fromJSON(raw).rules))
     }
 
     /// Replaces the bucket's webhook rules wholesale. Validates every rule, assigns ids to
@@ -1028,6 +1287,13 @@ struct InternalBucketController: RouteCollection {
                     "A bucket may have at most \(NotificationConfiguration.maxRuleCount) notification rules."
             )
         }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+        let existingRulesById = Dictionary(
+            uniqueKeysWithValues:
+                (bucket.notificationConfig.map { NotificationConfiguration.fromJSON($0).rules } ?? [])
+                .map { ($0.id, $0) })
 
         // Validate + normalize each rule (fresh id for new rules so ids are always server-owned)
         let normalizedRules = try input.rules.map { rule -> NotificationRule in
@@ -1053,18 +1319,21 @@ struct InternalBucketController: RouteCollection {
             var normalized = rule
             if normalized.id == NotificationRule.zeroUUID {
                 normalized.id = UUID()
+            } else if normalized.secret == Self.secretMaskPlaceholder {
+                // The client never sees the real secret (see `secretMaskPlaceholder`) - an
+                // untouched edit echoes the placeholder straight back, which means "keep
+                // whatever's already stored," not "literally set the secret to this placeholder."
+                normalized.secret = existingRulesById[normalized.id]?.secret
             }
             return normalized
         }
-
-        let bucket = try await requireOwnedBucket(
-            req: req, bucketName: bucketName, userId: auth.userId)
 
         let config = NotificationConfiguration(rules: normalizedRules)
         bucket.notificationConfig = normalizedRules.isEmpty ? nil : config.toJSON()
         try await bucket.save(on: req.db)
 
         await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "notificationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued events for rules that were just removed - if a rule
         // is deleted because its endpoint is wrong or compromised, in-flight deliveries to the
@@ -1079,7 +1348,7 @@ struct InternalBucketController: RouteCollection {
         }
         try await purge.delete()
 
-        return NotificationConfigDTO(rules: normalizedRules)
+        return NotificationConfigDTO(rules: Self.maskedNotificationRules(normalizedRules))
     }
 
     /// Enqueues an `s3:TestEvent` for one rule, proving end-to-end delivery (incl. signature)
@@ -1185,7 +1454,8 @@ struct InternalBucketController: RouteCollection {
         guard let raw = bucket.replicationConfig else {
             return ReplicationTargetsDTO(targets: [])
         }
-        return ReplicationTargetsDTO(targets: ReplicationConfiguration.fromJSON(raw).targets)
+        return ReplicationTargetsDTO(
+            targets: Self.maskedReplicationTargets(ReplicationConfiguration.fromJSON(raw).targets))
     }
 
     /// Replaces the bucket's replication targets wholesale. Validates every target's endpoint
@@ -1210,6 +1480,13 @@ struct InternalBucketController: RouteCollection {
             )
         }
 
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+        let existingConfig =
+            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0) } ?? .empty
+        let existingTargetsById = Dictionary(
+            uniqueKeysWithValues: existingConfig.targets.map { ($0.id, $0) })
+
         let normalizedTargets = try input.targets.map { target -> ReplicationTarget in
             try WebhookURLValidator.validateStructure(target.endpoint)
             if WebhookURLValidator.isInternalHost(target.endpoint) && !auth.isAdmin {
@@ -1223,22 +1500,24 @@ struct InternalBucketController: RouteCollection {
                 throw Abort(
                     .badRequest, reason: "Each replication target requires a destination bucket.")
             }
-            guard !target.accessKeyId.isEmpty, !target.secretAccessKey.isEmpty else {
-                throw Abort(.badRequest, reason: "Each replication target requires credentials.")
-            }
 
             var normalized = target
             if normalized.id == ReplicationTarget.zeroUUID {
                 normalized.id = UUID()
+            } else if normalized.secretAccessKey == Self.secretMaskPlaceholder {
+                // The client never sees the real secret (see `secretMaskPlaceholder`) - an
+                // untouched edit echoes the placeholder straight back, which means "keep
+                // whatever's already stored," not "literally set the secret to this placeholder."
+                normalized.secretAccessKey = existingTargetsById[normalized.id]?.secretAccessKey ?? ""
+            }
+
+            guard !normalized.accessKeyId.isEmpty, !normalized.secretAccessKey.isEmpty else {
+                throw Abort(.badRequest, reason: "Each replication target requires credentials.")
             }
             return normalized
         }
 
-        let bucket = try await requireOwnedBucket(
-            req: req, bucketName: bucketName, userId: auth.userId)
-
-        let existingRules =
-            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0).rules } ?? []
+        let existingRules = existingConfig.rules
         let keptTargetIds = Set(normalizedTargets.map(\.id))
         // A rule referencing a target that no longer exists is disabled, never left dangling -
         // same "clean up, don't leave a dangling reference" precedent used when a webhook rule
@@ -1258,8 +1537,9 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
 
-        return ReplicationTargetsDTO(targets: normalizedTargets)
+        return ReplicationTargetsDTO(targets: Self.maskedReplicationTargets(normalizedTargets))
     }
 
     @Sendable
@@ -1332,6 +1612,7 @@ struct InternalBucketController: RouteCollection {
         try await bucket.save(on: req.db)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
+        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued tasks for rules that were just removed - same
         // reasoning as the equivalent webhook-delivery purge above.
@@ -1473,7 +1754,7 @@ struct InternalBucketController: RouteCollection {
     /// Returns the tags of the *current* version of an object. Internal API doesn't expose
     /// per-version tag management (the S3-protocol endpoints already do, via `versionId`).
     @Sendable
-    func getObjectTags(req: Request) async throws -> TagsDTO {
+    func getObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1484,6 +1765,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        // Tags live in the object's own metadata, so this must run on a node that physically
+        // holds the key - forward to a responsible node when this one doesn't (mirrors
+        // getObjectMetadata, which this was inconsistent with before).
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let (meta, _) = try ObjectFileHandler.readCurrentObject(
                 bucketName: bucketName, key: key, loadData: false)
@@ -1491,14 +1781,14 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        return TagsDTO(tags: meta.tags ?? [:])
+        return try await TagsDTO(tags: meta.tags ?? [:]).encodeResponse(for: req)
     }
 
     /// Sets the tags of the *current* version of an object, overwriting any existing tags
     /// entirely. Does not create a new version - modifies the existing version's metadata in
     /// place, matching the S3-protocol PutObjectTagging semantics.
     @Sendable
-    func setObjectTags(req: Request) async throws -> TagsDTO {
+    func setObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1516,6 +1806,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1523,15 +1822,21 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = input.tags }
         }
 
-        return TagsDTO(tags: input.tags)
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return try await TagsDTO(tags: input.tags).encodeResponse(for: req)
     }
 
     @Sendable
-    func getObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+    func getObjectMetadata(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1542,6 +1847,12 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
         guard
             let (meta, _) = try ObjectFileHandler.readCurrentObject(
                 bucketName: bucketName, key: key, loadData: false)
@@ -1549,7 +1860,8 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        return ObjectMetadataDTO(contentType: meta.contentType, metadata: meta.metadata)
+        return try await ObjectMetadataDTO(contentType: meta.contentType, metadata: meta.metadata)
+            .encodeResponse(for: req)
     }
 
     /// Updates the Content-Type and custom (`x-amz-meta-*`) metadata of the *current* version
@@ -1557,7 +1869,7 @@ struct InternalBucketController: RouteCollection {
     /// the body, and (also matching S3's PutObjectTagging/metadata-only semantics) no
     /// webhook notification, since the object's data hasn't changed.
     @Sendable
-    func setObjectMetadata(req: Request) async throws -> ObjectMetadataDTO {
+    func setObjectMetadata(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1573,6 +1885,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1584,18 +1905,26 @@ struct InternalBucketController: RouteCollection {
         let normalizedMetadata = Dictionary(
             uniqueKeysWithValues: input.metadata.map { ($0.key.lowercased(), $0.value) })
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) {
                 $0.contentType = input.contentType
                 $0.metadata = normalizedMetadata
             }
         }
 
-        return ObjectMetadataDTO(contentType: input.contentType, metadata: normalizedMetadata)
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return try await ObjectMetadataDTO(
+            contentType: input.contentType, metadata: normalizedMetadata
+        ).encodeResponse(for: req)
     }
 
     @Sendable
-    func deleteObjectTags(req: Request) async throws -> HTTPStatus {
+    func deleteObjectTags(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"],
@@ -1606,6 +1935,15 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
+        let peers: [ClusterNodeInfo]
+        switch try await ObjectRoutingService.routeForWrite(req: req, bucketName: bucketName, key: key)
+        {
+        case .local(let localPeers):
+            peers = localPeers
+        case .forwarded(let response):
+            return response
+        }
+
         guard
             let path = try ObjectFileHandler.resolvePath(
                 bucketName: bucketName, key: key, versionId: nil)
@@ -1613,15 +1951,24 @@ struct InternalBucketController: RouteCollection {
             throw Abort(.notFound, reason: "Object not found")
         }
 
-        _ = try await S3Service.offloadBlockingIO(req) {
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
             try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
         }
 
-        return .noContent
+        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
+        // task backing it, so cluster peers must be pushed the change directly here.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return Response(status: .noContent)
     }
 
+    /// Per-key (not bucket-wide), so unlike `listObjects`/`getObjectStats` this doesn't need the
+    /// fan-out/merge machinery - it just needs to land on whichever node actually holds `key`,
+    /// the same single-key `ObjectRoutingService` forwarding `ListParts` already uses.
     @Sendable
-    func listObjectVersions(req: Request) async throws -> [ObjectMeta.ResponseDTO] {
+    func listObjectVersions(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"] else {
@@ -1634,9 +1981,18 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
+            req: req, bucketName: bucketName, key: key)
+        {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
 
-        return versions.map { ObjectMeta.ResponseDTO(from: $0) }
+        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        let dtos = versions.map { ObjectMeta.ResponseDTO(from: $0) }
+        // Uses Vapor's own Content encoding (not a hand-rolled JSONEncoder) so the response is
+        // byte-identical to what this route returned before routing was added - the console
+        // frontend depends on the app-wide date format Content encoding applies.
+        return try await dtos.encodeResponse(for: req)
     }
 
     @Sendable
@@ -1657,15 +2013,20 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        try ObjectFileHandler.deleteVersion(bucketName: bucketName, key: key, versionId: versionId)
+        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        // Cluster peers physically hold the exact same version files as this node - unlike
+        // ReplicationClient's external replication target, which has no per-version equivalent
+        // to prune (see ReplicationClient.replicateDelete) - so this needs to route to (or
+        // delegate to) whichever node(s) actually hold the version and replicate the deletion,
+        // the same as S3Controller.handleObjectDelete's versionId path.
+        let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            versioningStatus: versioningStatus)
 
         await NotificationService.emit(
             event: .objectRemovedDelete, bucketName: bucketName, key: key,
-            size: nil, etag: nil, versionId: versionId,
+            size: nil, etag: nil, versionId: outcome.versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
-        // Not replicated: this permanently prunes one specific historical version, which has
-        // no meaningful equivalent on the replication target (see
-        // ReplicationClient.replicateDelete).
 
         return .noContent
     }

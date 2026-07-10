@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 import Fluent
+import FluentPostgresDriver
 import FluentSQLiteDriver
 import JWTKit
 import NIOSSL
+import PostgresKit
 import Vapor
 
 public func configure(_ app: Application) async throws {
@@ -29,8 +31,6 @@ public func configure(_ app: Application) async throws {
     let consoleBaseUrl = ConsoleBaseURL.resolve()
 
     #if DEBUG
-        // In debug, test & profiling - store the db relative to the work dir
-        app.databases.use(.sqlite(.file("db.sqlite")), as: .sqlite)
     #else
         try FileManager.default.createDirectory(
             atPath: "Storage/buckets",
@@ -41,10 +41,52 @@ public func configure(_ app: Application) async throws {
             atPath: "Storage/multipart",
             withIntermediateDirectories: true
         )
-
-        app.databases.use(
-            DatabaseConfigurationFactory.sqlite(.file("Storage/db.sqlite")), as: .sqlite)
     #endif
+
+    // A single node needs nothing beyond the zero-config SQLite default. `DATABASE_URL`
+    // opts into Postgres - required (not just supported) the moment more than one node shares
+    // this control-plane data, since SQLite has no safe multi-writer/multi-host story. The
+    // parsed config is reused for both the pooled Fluent connections and the dedicated
+    // LISTEN connection below - never re-parsed from the URL string a second time.
+    if let databaseURL = Environment.sanitizedGet("DATABASE_URL") {
+        let postgresConfig = try SQLPostgresConfiguration(url: databaseURL)
+        app.databases.use(.postgres(configuration: postgresConfig), as: .psql)
+        app.storage[PostgresListenConfigurationKey.self] = postgresConfig.coreConfiguration
+    } else {
+        #if DEBUG
+            // In debug, test & profiling - store the db relative to the work dir
+            app.databases.use(.sqlite(.file("db.sqlite")), as: .sqlite)
+        #else
+            app.databases.use(
+                DatabaseConfigurationFactory.sqlite(.file("Storage/db.sqlite")), as: .sqlite)
+        #endif
+    }
+
+    // Object-data clustering is opt-in on top of the Postgres control plane above - a node only
+    // joins the cluster when both `CLUSTER_NODE_ADDRESS` (its own internally-reachable base URL)
+    // and `CLUSTER_SECRET` (shared inter-node auth secret) are set. Neither alone is enough, and
+    // clustering requires `DATABASE_URL` (membership + cache invalidation need the shared
+    // Postgres control plane) - a single Postgres-mode node without these vars stays a plain
+    // single-node deployment with a shared control plane, never joining any cluster.
+    let clusterNodeAddress = Environment.sanitizedGet("CLUSTER_NODE_ADDRESS")
+    let clusterSecret = Environment.sanitizedGet("CLUSTER_SECRET")
+    if clusterNodeAddress != nil || clusterSecret != nil {
+        guard Environment.sanitizedGet("DATABASE_URL") != nil else {
+            throw ClusterConfigurationError(
+                description:
+                    "CLUSTER_NODE_ADDRESS/CLUSTER_SECRET require DATABASE_URL to be set - object-data clustering needs the shared Postgres control plane."
+            )
+        }
+        guard let clusterNodeAddress, let clusterSecret else {
+            throw ClusterConfigurationError(
+                description:
+                    "Both CLUSTER_NODE_ADDRESS and CLUSTER_SECRET must be set to enable cluster mode - only one was provided."
+            )
+        }
+        let nodeId = try ClusterNodeIdentity.loadOrCreate()
+        app.storage[ClusterConfigurationKey.self] = ClusterConfiguration(
+            nodeId: nodeId, address: clusterNodeAddress, secret: clusterSecret)
+    }
 
     // Spool files are per-request transients; anything still here is an orphan from an
     // unclean shutdown mid-upload.
@@ -66,6 +108,10 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddBucketReplicationConfig())
     app.migrations.add(CreateReplicationTask())
     app.migrations.add(MakeSharedLinkExpiryOptional())
+    app.migrations.add(CreateOIDCState())
+    app.migrations.add(CreateClusterNode())
+    app.migrations.add(CreateClusterReplicationTask())
+    app.migrations.add(AddClusterNodeCapacity())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -101,6 +147,16 @@ public func configure(_ app: Application) async throws {
     }
 
     app.lifecycle.use(LoadCacheLifecycle())
+    // Must be registered after LoadCacheLifecycle: Vapor runs didBootAsync handlers
+    // sequentially in registration order, and the LISTEN loop's reconnect-safety-net reload
+    // reuses the exact same bulk-load path - it must never race the initial one. No-op when
+    // running SQLite (no DATABASE_URL was set above).
+    app.lifecycle.use(CacheInvalidationListener.shared)
+    // Self-registers this node into `cluster_nodes` and starts its heartbeat - must run after
+    // the two handlers above for the same reason: it needs caches loaded and cluster-invalidation
+    // NOTIFYs flowing before it announces itself. No-op when `ClusterConfigurationKey` wasn't
+    // stashed above (cluster mode off).
+    app.lifecycle.use(ClusterMembershipLifecycle.shared)
 
     // Outbound HTTP timeouts (webhook deliveries, OIDC fetches): a hung remote endpoint
     // must never wedge a background task or login flow indefinitely
@@ -114,6 +170,7 @@ public func configure(_ app: Application) async throws {
     // gated to non-testing)
     await NotificationDispatcher.shared.configure(app: app)
     await ReplicationDispatcher.shared.configure(app: app)
+    await ClusterReplicationDispatcher.shared.configure(app: app)
 
     try routes(app)
 
@@ -150,7 +207,11 @@ public func configure(_ app: Application) async throws {
 
                 // In-flight OIDC login attempts (state/nonce/PKCE verifier) older than 10
                 // minutes - a login that never completes a round-trip should not linger.
-                await OIDCStateCache.shared.removeExpired(olderThan: 600)
+                do {
+                    try await OIDCStateCache.shared.removeExpired(on: app.db, olderThan: 600)
+                } catch {
+                    app.logger.error("Failed to clean up expired OIDC login states: \(error)")
+                }
             }
         }
 
@@ -192,6 +253,21 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Cluster replication outbox tick - same reasoning as the two ticks above: fresh
+        // quorum-fanout catch-up and rebalance/reclaim tasks are woken near-instantly via the
+        // explicit wake() in ClusterReplicationService/ClusterRebalanceService, this tick exists
+        // to pick up retries whose backoff has elapsed. Cheap single indexed SELECT against an
+        // always-empty table when cluster mode is off, same as the other two outboxes when
+        // their respective features are unused.
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .seconds(2),
+            delay: .seconds(2)
+        ) { task in
+            Task {
+                await ClusterReplicationDispatcher.shared.drain()
+            }
+        }
+
         // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
         // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
         // the way short-lived access keys/share links are. Matches S3, which evaluates
@@ -217,6 +293,12 @@ public func configure(_ app: Application) async throws {
                     try await ReplicationDispatcher.purgeExpiredFailures(on: app.db)
                 } catch {
                     app.logger.error("Failed to purge expired replication failures: \(error)")
+                }
+
+                do {
+                    try await ClusterReplicationDispatcher.purgeExpiredFailures(on: app.db)
+                } catch {
+                    app.logger.error("Failed to purge expired cluster replication failures: \(error)")
                 }
             }
         }

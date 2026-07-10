@@ -115,4 +115,24 @@ extension String {
         result = result.replacingOccurrences(of: "&amp;", with: "&")
         return result
     }
+
+    /// Constant-time string comparison to prevent timing attacks - shared by every credential/
+    /// secret check that compares two plain UTF-8 strings (access key secrets, the cluster
+    /// bearer secret). `Data.constantTimeCompare(to:)` is a separate, hex-aware comparison
+    /// optimized for the SigV4 signature hot path and intentionally not unified with this one.
+    func constantTimeCompare(to other: String) -> Bool {
+        let selfBytes = Array(self.utf8)
+        let otherBytes = Array(other.utf8)
+
+        guard selfBytes.count == otherBytes.count else {
+            return false
+        }
+
+        var result: UInt8 = 0
+        for (selfByte, otherByte) in zip(selfBytes, otherBytes) {
+            result |= selfByte ^ otherByte
+        }
+
+        return result == 0
+    }
 }
