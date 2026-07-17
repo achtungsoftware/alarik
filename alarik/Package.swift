@@ -19,6 +19,14 @@ let package = Package(
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.0"),
     ],
     targets: [
+        .systemLibrary(
+            name: "CISAL",
+            pkgConfig: "libisal",
+            providers: [
+                .brew(["isa-l"]),
+                .apt(["libisal-dev"]),
+            ]
+        ),
         .executableTarget(
             name: "Alarik",
             dependencies: [
@@ -35,7 +43,10 @@ let package = Package(
                 .product(name: "SotoSES", package: "soto"),
                 .product(name: "SotoIAM", package: "soto"),
                 .product(name: "ZIPFoundation", package: "ZIPFoundation"),
+                .target(name: "CISAL"),
             ],
+            path: "Sources",
+            exclude: ["CISAL"],
             swiftSettings: swiftSettings
         ),
         .testTarget(

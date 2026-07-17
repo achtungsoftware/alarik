@@ -44,32 +44,65 @@ struct SharedLinkController: RouteCollection {
             throw Abort(.notFound)
         }
 
-        // Resolve the object's on-disk path so the body can stream straight from the file -
-        // a shared link to a multi-GB object must not buffer it in memory per download.
-        // resolvePath also nils delete markers (object deleted from a versioned bucket after
-        // the link was created), matching every other GetObject-style read in this codebase.
-        if let path = try? ObjectFileHandler.resolvePath(
-            bucketName: link.bucketName, key: link.key, versionId: nil),
-            let (meta, payloadOffset, payloadSize) = try? ObjectFileHandler.payloadLocation(
-                path: path)
-        {
-            let response: Response
-            if payloadSize > Constants.streamingThreshold {
-                response = S3Service.buildStreamingObjectResponse(
-                    req: req, meta: meta, path: path, payloadOffset: payloadOffset)
-            } else {
-                // Headers and body from the same read, so they always describe one snapshot of
-                // the file (the streaming branch gets the same guarantee from its ETag check)
-                guard
-                    let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
-                    let data
-                else {
-                    throw Abort(.notFound)
-                }
-                response = S3Service.buildVersionedObjectMetadataResponse(
-                    meta: freshMeta, includeBody: true, data: data)
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: link.bucketName, key: link.key)
+
+        if isLocal {
+            // EC-aware: check this node's own local shard first, falling through to the plain
+            // `.obj` path unchanged when the target isn't erasure-coded.
+            if let config = req.application.storage[ClusterConfigurationKey.self],
+                req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+                let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId }),
+                ErasureCodedDeleteCoordinator.localShardExists(
+                    bucketName: link.bucketName, key: link.key, versionId: nil, selfRank: selfRank)
+            {
+                let (meta, body) = try await ErasureCodedReadCoordinator.read(
+                    app: req.application, bucketName: link.bucketName, key: link.key,
+                    versionId: nil, responsible: responsible, selfNodeId: config.nodeId,
+                    requestId: req.id)
+                guard !meta.isDeleteMarker else { throw Abort(.notFound) }
+
+                let response = S3Service.buildObjectMetadataResponse(
+                    meta: meta, includeBody: false, data: nil, range: nil)
+                response.headers.replaceOrAdd(name: .contentLength, value: String(meta.size))
+                S3Service.addVersionHeaders(to: response, meta: meta)
+                response.body = Response.Body(
+                    managedAsyncStream: { writer in
+                        for try await chunk in body {
+                            try await writer.writeBuffer(chunk)
+                        }
+                    }, count: meta.size)
+                return attachDisposition(to: response, key: link.key)
             }
-            return attachDisposition(to: response, key: link.key)
+
+            // Resolve the object's on-disk path so the body can stream straight from the file -
+            // a shared link to a multi-GB object must not buffer it in memory per download.
+            // resolvePath also nils delete markers (object deleted from a versioned bucket after
+            // the link was created), matching every other GetObject-style read in this codebase.
+            if let path = try? ObjectFileHandler.resolvePath(
+                bucketName: link.bucketName, key: link.key, versionId: nil),
+                let (meta, payloadOffset, payloadSize) = try? ObjectFileHandler.payloadLocation(
+                    path: path)
+            {
+                let response: Response
+                if payloadSize > Constants.streamingThreshold {
+                    response = S3Service.buildStreamingObjectResponse(
+                        req: req, meta: meta, path: path, payloadOffset: payloadOffset)
+                } else {
+                    // Headers and body from the same read, so they always describe one snapshot of
+                    // the file (the streaming branch gets the same guarantee from its ETag check)
+                    guard
+                        let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                        let data
+                    else {
+                        throw Abort(.notFound)
+                    }
+                    response = S3Service.buildVersionedObjectMetadataResponse(
+                        meta: freshMeta, includeBody: true, data: data)
+                }
+                return attachDisposition(to: response, key: link.key)
+            }
         }
 
         // Not on this node - a shared link is public and lands on whichever node the load
@@ -78,9 +111,22 @@ struct SharedLinkController: RouteCollection {
         // nodes, so forward there (the object never being local, unlike an authed GET this can't
         // fall through to a local read). A deleted object resolves nowhere and the responsible
         // node returns 404 the same as a local miss would.
-        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
-            req: req, bucketName: link.bucketName, key: link.key)
-        guard !isLocal, !candidates.isEmpty else {
+        //
+        // `candidates` is empty whenever `isLocal` was true (this node sits in the wider
+        // top-(k+m) set) - but once k+m > 3, being in that wider set doesn't mean this node is
+        // also one of the legacy top-3 a plain (non-EC) object actually replicated to, so both
+        // local branches above can find nothing even though the object is real. Forward to the
+        // legacy top-3 in that case too, unless this node genuinely is one of them (then nothing
+        // local really does mean 404, forwarding to itself again would just loop).
+        if let config = req.application.storage[ClusterConfigurationKey.self],
+            candidates.isEmpty, !responsible.isEmpty,
+            !ObjectRoutingService.isLegacyReplica(responsible: responsible, selfNodeId: config.nodeId)
+        {
+            return try await ClusterForwardingClient.forward(
+                req: req, candidates: Array(responsible.prefix(PlacementService.replicationFactor)))
+        }
+
+        guard !candidates.isEmpty else {
             throw Abort(.notFound)
         }
         return try await ClusterForwardingClient.forward(req: req, candidates: candidates)

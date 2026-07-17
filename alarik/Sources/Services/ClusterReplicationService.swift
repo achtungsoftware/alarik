@@ -102,6 +102,50 @@ enum ClusterReplicationService {
         app: Application, bucketName: String, key: String, versionId: String?,
         versioningStatus: VersioningStatus, peers: [ClusterNodeInfo]
     ) async throws -> S3Service.ObjectDeleteOutcome {
+        let ecPlacement = await ErasureCodedDeleteCoordinator.ecPlacement(
+            app: app, bucketName: bucketName, key: key)
+
+        // A fresh delete marker is a write - erasure-code it like any other write when EC is
+        // configured. Scoped to `.enabled` only for now; `.suspended`'s "null"-version-specific
+        // semantics stay on the plain path (still fully correct, just not yet EC).
+        if versionId == nil, versioningStatus == .enabled, let placement = ecPlacement {
+            // Only rank-0 may coordinate an EC marker write: `createDeleteMarker` ->
+            // `ErasureCodedWriteCoordinator.write` unconditionally places shard 0 on the running
+            // node and hands 1..k+m-1 to peers in order, so running it anywhere but rank-0
+            // scrambles placement. Multi-Object-Delete and admin folder-delete reach here via the
+            // top-3 `coordinationTarget`, which isn't rank-0-pinned, so a non-rank-0 responsible
+            // node must delegate the whole delete to rank-0 rather than mint the marker itself.
+            guard let rank0 = placement.responsible.first else {
+                throw ClusterProxyError.objectNotFound
+            }
+            if rank0.id == placement.selfNodeId {
+                let marker = try await ErasureCodedDeleteCoordinator.createDeleteMarker(
+                    app: app, bucketName: bucketName, key: key,
+                    peers: placement.responsible.filter { $0.id != placement.selfNodeId },
+                    ecConfig: placement.ecConfig)
+                return S3Service.ObjectDeleteOutcome(
+                    versionId: marker.versionId, isDeleteMarker: true)
+            }
+            return try await ClusterReplicationClient.deleteObject(
+                app: app, to: rank0, bucketName: bucketName, key: key, versionId: nil,
+                coordinate: true)
+        }
+
+        // Removing existing bytes (a specific version, or the plain non-versioned path) - detect
+        // whether the target is actually EC-encoded (this node holds a shard, or a peer does)
+        // before it's gone, since S3Service.deleteObject below would otherwise just remove
+        // whichever file exists locally without telling any sibling shard-holders.
+        if let placement = ecPlacement,
+            await ErasureCodedDeleteCoordinator.targetIsErasureCoded(
+                app: app, responsible: placement.responsible, selfNodeId: placement.selfNodeId,
+                bucketName: bucketName, key: key, versionId: versionId)
+        {
+            try await ErasureCodedDeleteCoordinator.removeVersion(
+                app: app, bucketName: bucketName, key: key, versionId: versionId,
+                responsible: placement.responsible, selfNodeId: placement.selfNodeId)
+            return S3Service.ObjectDeleteOutcome(versionId: versionId, isDeleteMarker: false)
+        }
+
         let outcome = try await S3Service.offloadBlockingIO(app) {
             try S3Service.deleteObject(
                 bucketName: bucketName, key: key, versionId: versionId,
@@ -247,7 +291,9 @@ enum ClusterReplicationService {
         }
     }
 
-    private static func withTimeout<T: Sendable>(
+    /// Not private: `ErasureCodedWriteCoordinator` reuses this exact bounded-attempt shape for
+    /// per-shard pushes, rather than duplicating it.
+    static func withTimeout<T: Sendable>(
         _ timeout: Duration,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {

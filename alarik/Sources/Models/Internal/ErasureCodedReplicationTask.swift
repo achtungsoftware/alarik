@@ -20,17 +20,16 @@ import Vapor
 import struct Foundation.Date
 import struct Foundation.UUID
 
-/// One pending (or dead-lettered) internal-cluster object push/delete - the persistent outbox
-/// row that makes cluster replication survive restarts and peer-node outages. Structurally
-/// identical to `ReplicationTask`; never holds the object's bytes, only enough to re-read the
-/// exact payload from `ObjectFileHandler` at delivery time (`bucketName`+`key`+`versionId`).
-final class ClusterReplicationTask: Model, @unchecked Sendable {
-    static let schema = "cluster_replication_tasks"
+/// One pending (or dead-lettered) shard push/delete/reconstruction - the erasure-coding sibling
+/// of `ClusterReplicationTask`, targeting one `(bucketName, key, versionId, shardIndex)` shard
+/// instead of a whole object. Never holds shard bytes, only enough to re-derive them at delivery
+/// time: `.write`/`.rebalance`/`.reclaim` re-read this node's own local shard file; `.reconstruct`
+/// re-derives the shard from `k` healthy survivors via `ReedSolomonEngine`.
+final class ErasureCodedReplicationTask: Model, @unchecked Sendable {
+    static let schema = "erasure_coded_replication_tasks"
 
     enum State: String {
         case pending
-        /// Retries exhausted - kept for a few days so failures are inspectable, then purged by
-        /// the hourly cleanup task, same as `ReplicationTask`.
         case failed
     }
 
@@ -39,14 +38,14 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         case delete
     }
 
-    /// Why this task exists - lets the console distinguish "catching up a replica that missed a
-    /// synchronous write" from "moving data because membership changed" from "removing a copy
-    /// this node is no longer responsible for" without a separate job-tracking table (see
-    /// `ClusterRebalanceService`).
+    /// Why this task exists - `.reconstruct` is the one case `ClusterReplicationTask.Reason`
+    /// never needs: rebuilding a permanently-lost shard from survivors, rather than copying an
+    /// existing file to a new home.
     enum Reason: String, CaseIterable {
         case write
         case rebalance
         case reclaim
+        case reconstruct
     }
 
     @ID(key: .id)
@@ -60,6 +59,9 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
 
     @Field(key: "version_id")
     var versionId: String?
+
+    @Field(key: "shard_index")
+    var shardIndex: Int
 
     @Field(key: "operation")
     var operation: String
@@ -91,6 +93,7 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         bucketName: String,
         key: String,
         versionId: String?,
+        shardIndex: Int,
         operation: Operation,
         targetNodeId: UUID,
         reason: Reason
@@ -98,6 +101,7 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         self.bucketName = bucketName
         self.key = key
         self.versionId = versionId
+        self.shardIndex = shardIndex
         self.operation = operation.rawValue
         self.targetNodeId = targetNodeId
         self.reason = reason.rawValue
@@ -108,4 +112,4 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
     }
 }
 
-extension ClusterReplicationTask: OutboxRow {}
+extension ErasureCodedReplicationTask: OutboxRow {}

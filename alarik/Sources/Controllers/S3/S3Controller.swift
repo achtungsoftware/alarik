@@ -203,6 +203,106 @@ struct S3Controller: RouteCollection {
         return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
     }
 
+    /// The on-disk path of *whatever* EC shard this node actually holds for (bucketName, key,
+    /// effective version) - `nil` when EC isn't configured or this node holds no shard for it.
+    /// Crucially index-agnostic: after any membership change a node can hold a shard whose index
+    /// no longer equals its current HRW rank, so this discovers what's on disk
+    /// (`locallyHeldShardIndices`) rather than computing an own-rank path that would miss a
+    /// drifted shard and wrongly report the object as absent.
+    private static func localHeldShardPath(
+        req: Request, bucketName: String, key: String, versionId: String?
+    ) -> String? {
+        guard req.application.storage[ClusterErasureCodingConfigKey.self] != nil else { return nil }
+
+        let effectiveVersionId: String?
+        if let versionId {
+            effectiveVersionId = versionId
+        } else if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
+            effectiveVersionId = try? ObjectFileHandler.getLatestVersionId(
+                bucketName: bucketName, key: key)
+        } else {
+            effectiveVersionId = nil
+        }
+
+        let held = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: effectiveVersionId)
+        guard let index = held.first else { return nil }
+
+        return ErasureCodedObjectHandler.shardPath(
+            bucketName: bucketName, key: key, versionId: effectiveVersionId, shardIndex: index)
+    }
+
+    /// Whether this node holds a local EC shard for (bucketName, key, versionId) right now -
+    /// used by read-side handlers to decide whether the legacy top-3 forward check even applies
+    /// (a real shard holder outside the legacy top-3 - always possible once k+m > 3 - must never
+    /// be redirected away from data it actually has).
+    static func hasLocalECShard(
+        req: Request, bucketName: String, key: String, versionId: String?,
+        responsible: [ClusterNodeInfo]
+    ) async -> Bool {
+        localHeldShardPath(req: req, bucketName: bucketName, key: key, versionId: versionId) != nil
+    }
+
+    /// Whether any responsible peer holds a shard for (bucketName, key, effectiveVersionId) -
+    /// cluster-wide EC detection for the narrow window where this coordinating node is responsible
+    /// but doesn't itself hold a shard yet (mid-reindex, or it just gained a rank). Without this,
+    /// such a GET would fall through to the plain path and wrongly 404 an object that plainly
+    /// exists on peers. Probed in parallel; only invoked on a local miss, so a plain object (which
+    /// resolves locally or forwards via the top-3 path) never pays for it.
+    static func anyPeerHoldsShard(
+        req: Request, responsible: [ClusterNodeInfo], selfNodeId: UUID,
+        bucketName: String, key: String, versionId: String?
+    ) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            for node in responsible where node.id != selfNodeId {
+                group.addTask {
+                    let held = await ClusterReplicationClient.heldShards(
+                        app: req.application, node: node, bucketName: bucketName, key: key,
+                        versionId: versionId)
+                    return !(held ?? []).isEmpty
+                }
+            }
+            for await holds in group where holds {
+                group.cancelAll()
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Resolves an object's `ObjectMeta` for HEAD-shaped handlers, EC-aware: reads whatever EC
+    /// shard this node holds (header only, no stripe data touched), falling through to the plain
+    /// `.obj` path unchanged when the target isn't erasure-coded here. Throws `NoSuchKey` when
+    /// found by neither format. `static`, not instance-private - reused by
+    /// `InternalBucketController`/`SharedLinkController` (`S3Controller` has no stored state).
+    static func resolveObjectMetaEitherFormat(
+        req: Request, bucketName: String, key: String, versionId: String?,
+        responsible: [ClusterNodeInfo]
+    ) async throws -> ObjectMeta {
+        if let localShardPath = localHeldShardPath(
+            req: req, bucketName: bucketName, key: key, versionId: versionId)
+        {
+            return try await S3Service.offloadBlockingIO(req) {
+                try ErasureCodedShardReader(path: localShardPath).header.objectMeta
+            }
+        }
+
+        do {
+            let (meta, _) = try ObjectFileHandler.readVersion(
+                bucketName: bucketName, key: key, versionId: versionId, loadData: false)
+            return meta
+        } catch {
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
+                throw S3Error(
+                    status: .notFound, code: "NoSuchKey",
+                    message: "The specified key does not exist.", requestId: req.id)
+            }
+            let (meta, _) = try ObjectFileHandler.read(from: path, loadData: false)
+            return meta
+        }
+    }
+
     @Sendable
     func handleObjectHead(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
@@ -217,29 +317,33 @@ struct S3Controller: RouteCollection {
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
 
-        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+        // EC-aware locality - see handleObjectGet's identical reasoning; replaces
+        // forwardIfNeeded's plain top-3 check entirely for this handler.
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: keyPath)
+        if !isLocal {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
+        // isLocal above only proves membership in the *wider* top-(k+m) set - when k+m > 3 a
+        // node can be in that set without holding a legacy plain replica at all, so a plain
+        // (non-EC) object with no local EC shard still needs the legacy top-3 forward, exactly
+        // like handleObjectGet's identical fallthrough. Only forward when there's genuinely no
+        // local EC shard to serve - `hasLocalECShard` mirrors the exact check
+        // `resolveObjectMetaEitherFormat` runs internally, so a real shard holder outside the
+        // legacy top-3 is never wrongly redirected away from data it actually has.
+        if !(await Self.hasLocalECShard(
+            req: req, bucketName: bucketName, key: keyPath, versionId: versionId,
+            responsible: responsible)),
+            let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath)
+        {
             return forwarded
         }
 
-        // Read object (versioned or non-versioned)
-        let (meta, _): (ObjectMeta, Data?)
-        do {
-            (meta, _) = try ObjectFileHandler.readVersion(
-                bucketName: bucketName,
-                key: keyPath,
-                versionId: versionId,
-                loadData: false
-            )
-        } catch {
-            // Fallback to non-versioned path for backwards compatibility
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            guard ObjectFileHandler.keyExists(for: bucketName, key: keyPath, path: path) else {
-                throw S3Error(
-                    status: .notFound, code: "NoSuchKey",
-                    message: "The specified key does not exist.", requestId: req.id)
-            }
-            (meta, _) = try ObjectFileHandler.read(from: path, loadData: false)
-        }
+        let meta = try await Self.resolveObjectMetaEitherFormat(
+            req: req, bucketName: bucketName, key: keyPath, versionId: versionId,
+            responsible: responsible)
 
         // Check if latest version is a delete marker (object is "deleted")
         if meta.isDeleteMarker && versionId == nil {
@@ -711,6 +815,17 @@ struct S3Controller: RouteCollection {
         let partNumberStr = req.query[String.self, at: "partNumber"]
         let uploadIdParam = req.query[String.self, at: "uploadId"]
         let isUploadPart = partNumberStr != nil && uploadIdParam != nil
+        let hasTaggingParam =
+            S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging")
+
+        // A plain, single-shot PUT or CopyObject destination (no upload-part/tagging) is
+        // erasure-coded end to end - routed independently of the rest of this handler's dispatch
+        // tree, straight to rank-0 (`erasureCodedRoutingDecision`'s own pinning), never through
+        // the top-3 `routeForWrite` path the other branches below still use. UploadPart/tagging
+        // PUT remain on plain 3x replication for now (multipart's own EC integration is
+        // separate, larger work).
+        let usesECDestinationRouting = !isUploadPart && !hasTaggingParam
+        let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self]
 
         // UploadPart/UploadPartCopy must pin to the exact node coordinating this upload's
         // Create, not "any responsible node" - see multipartRoutingDecision's doc comment.
@@ -718,13 +833,30 @@ struct S3Controller: RouteCollection {
         // UploadPartCopy, tagging PUT, CopyObject, plain PUT) - all key off this same
         // (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        switch try await ObjectRoutingService.routeForWrite(
-            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isUploadPart)
-        {
-        case .local(let localPeers):
-            peers = localPeers
-        case .forwarded(let response):
-            return response
+        var ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)?
+        if usesECDestinationRouting, let ecConfig {
+            switch try await ObjectRoutingService.routeForErasureCodedWrite(
+                req: req, bucketName: bucketName, key: keyPath)
+            {
+            case .notClustered:
+                // Unreachable (ecConfig != nil implies cluster mode is on), but fall through to
+                // the plain non-EC write below exactly like a genuinely non-clustered node.
+                peers = []
+            case .local(let localPeers):
+                peers = []
+                ecWriteFanOut = (localPeers, ecConfig)
+            case .forwarded(let response):
+                return response
+            }
+        } else {
+            switch try await ObjectRoutingService.routeForWrite(
+                req: req, bucketName: bucketName, key: keyPath, requirePrimary: isUploadPart)
+            {
+            case .local(let localPeers):
+                peers = localPeers
+            case .forwarded(let response):
+                return response
+            }
         }
 
         // Check if this is an UploadPart request (PUT with partNumber & uploadId)
@@ -774,7 +906,8 @@ struct S3Controller: RouteCollection {
                 destinationKey: keyPath,
                 copySource: copySource,
                 versioningStatus: versioningStatus,
-                peers: peers
+                peers: peers,
+                ecWriteFanOut: ecWriteFanOut
             )
         }
 
@@ -833,44 +966,93 @@ struct S3Controller: RouteCollection {
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
 
-        // Write with versioning support. Small bodies arrive in memory and take the direct
-        // write; large ones were spooled to disk and are copied into the final .obj in fixed
-        // windows. Both are fsynced by AtomicObjectWriter before the PUT is acknowledged -
-        // real blocking syscalls, so the whole write+fsync+rename sequence is offloaded to
-        // the blocking-IO thread pool rather than tying up the async executor.
-        let storage = spooled.storage
-        let finalMeta = meta
-        let writtenVersionId: String? = try await S3Service.offloadBlockingIO(req) {
-            switch storage {
+        let writtenVersionId: String?
+        if let ecWriteFanOut {
+            // Erasure-coded write: mint the version id the same way the plain versioned-write
+            // path does (tags/listing behave identically either way), but encode+place shards
+            // instead of writing a single `.obj` file.
+            let (versionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+                metadata: meta, bucketName: bucketName, key: keyPath,
+                versioningStatus: versioningStatus)
+
+            let payloadSources: [(path: String, offset: Int, size: Int)]
+            var ecTempSourcePath: String?
+            switch spooled.storage {
             case .memory(let data):
-                if versioningStatus != .disabled {
-                    return try ObjectFileHandler.writeVersioned(
-                        metadata: finalMeta,
-                        data: data,
-                        bucketName: bucketName,
-                        key: keyPath,
-                        versioningStatus: versioningStatus
-                    )
-                } else {
-                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                    try ObjectFileHandler.write(metadata: finalMeta, data: data, to: path)
-                    return nil
+                let tempPath = Constants.spoolDirectory + ".ec-source-" + UUID().uuidString
+                try await S3Service.offloadBlockingIO(req) {
+                    try FileManager.default.createDirectory(
+                        atPath: Constants.spoolDirectory, withIntermediateDirectories: true)
+                    try data.write(to: URL(fileURLWithPath: tempPath))
                 }
+                ecTempSourcePath = tempPath
+                payloadSources = [(path: tempPath, offset: 0, size: data.count)]
             case .file(let spoolPath):
-                let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
-                if versioningStatus != .disabled {
-                    return try ObjectFileHandler.writeVersionedStreamed(
-                        metadata: finalMeta,
-                        payloadSources: spoolSource,
-                        bucketName: bucketName,
-                        key: keyPath,
-                        versioningStatus: versioningStatus
-                    )
-                } else {
-                    let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-                    try ObjectFileHandler.writeStreamed(
-                        metadata: finalMeta, payloadSources: spoolSource, to: path)
-                    return nil
+                payloadSources = [(path: spoolPath, offset: 0, size: spooled.size)]
+            }
+            defer {
+                if let ecTempSourcePath { _ = POSIXFile.unlink(ecTempSourcePath) }
+            }
+
+            do {
+                try await ErasureCodedWriteCoordinator.write(
+                    app: req.application, bucketName: bucketName, key: keyPath,
+                    objectMeta: versionedMeta, payloadSources: payloadSources,
+                    peers: ecWriteFanOut.peers, ecConfig: ecWriteFanOut.config,
+                    priorLatestVersionId: priorLatestVersionId)
+            } catch let error as ErasureCodedCoordinatorError {
+                throw S3Error(
+                    status: .serviceUnavailable, code: "ServiceUnavailable",
+                    message: "\(error)", requestId: req.id)
+            }
+
+            if let versionId {
+                try await S3Service.offloadBlockingIO(req) {
+                    try ObjectFileHandler.updateLatestPointer(
+                        bucketName: bucketName, key: keyPath, versionId: versionId)
+                }
+            }
+            writtenVersionId = versionId
+        } else {
+            // Write with versioning support. Small bodies arrive in memory and take the direct
+            // write; large ones were spooled to disk and are copied into the final .obj in fixed
+            // windows. Both are fsynced by AtomicObjectWriter before the PUT is acknowledged -
+            // real blocking syscalls, so the whole write+fsync+rename sequence is offloaded to
+            // the blocking-IO thread pool rather than tying up the async executor.
+            let storage = spooled.storage
+            let finalMeta = meta
+            writtenVersionId = try await S3Service.offloadBlockingIO(req) {
+                switch storage {
+                case .memory(let data):
+                    if versioningStatus != .disabled {
+                        return try ObjectFileHandler.writeVersioned(
+                            metadata: finalMeta,
+                            data: data,
+                            bucketName: bucketName,
+                            key: keyPath,
+                            versioningStatus: versioningStatus
+                        )
+                    } else {
+                        let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                        try ObjectFileHandler.write(metadata: finalMeta, data: data, to: path)
+                        return nil
+                    }
+                case .file(let spoolPath):
+                    let spoolSource = [(path: spoolPath, offset: 0, size: spooled.size)]
+                    if versioningStatus != .disabled {
+                        return try ObjectFileHandler.writeVersionedStreamed(
+                            metadata: finalMeta,
+                            payloadSources: spoolSource,
+                            bucketName: bucketName,
+                            key: keyPath,
+                            versioningStatus: versioningStatus
+                        )
+                    } else {
+                        let path = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                        try ObjectFileHandler.writeStreamed(
+                            metadata: finalMeta, payloadSources: spoolSource, to: path)
+                        return nil
+                    }
                 }
             }
         }
@@ -883,12 +1065,88 @@ struct S3Controller: RouteCollection {
             size: spooled.size, etag: etag, versionId: writtenVersionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
-            bucketName: bucketName, key: keyPath, versionId: writtenVersionId, on: req.db)
-        await ClusterReplicationService.replicateWrite(
             app: req.application, bucketName: bucketName, key: keyPath,
-            versionId: writtenVersionId, operation: .put, peers: peers)
+            versionId: writtenVersionId, on: req.db)
+        if ecWriteFanOut == nil {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: writtenVersionId, operation: .put, peers: peers)
+        }
 
         return Response(status: .ok, headers: headers)
+    }
+
+    /// `ObjectFileHandler.prepareVersionedWrite`, but correct for EC path selection: leaves
+    /// `versionId` as true Swift `nil` for `.disabled` buckets, instead of
+    /// `prepareVersionedWrite`'s own `"null"`-string sentinel. EC shard path selection
+    /// (`ErasureCodedObjectHandler.shardPath` vs `versionedShardPath`) keys off `versionId ==
+    /// nil`, and the plain path never mints a `"null"` string for `.disabled` either - it simply
+    /// never touches `versionId` at all for that case (the caller-supplied `metadata` already
+    /// has `versionId == nil` from its own default init). `.suspended` is unaffected: it
+    /// genuinely uses versioned storage under the literal name `"null"`, so it still needs
+    /// `prepareVersionedWrite`'s real behavior.
+    private func prepareErasureCodedVersionedWrite(
+        metadata: ObjectMeta, bucketName: String, key: String, versioningStatus: VersioningStatus
+    ) throws -> (versionId: String?, versionedMeta: ObjectMeta, priorLatestVersionId: String?) {
+        guard versioningStatus != .disabled else {
+            return (nil, metadata, nil)
+        }
+        // Capture the version `.latest` pointed at BEFORE the demote below, so a failed-quorum
+        // rollback can restore it (see ErasureCodedWriteCoordinator.rollback).
+        let priorLatestVersionId = try? ObjectFileHandler.getLatestVersionId(
+            bucketName: bucketName, key: key)
+        let (versionId, _, versionedMeta) = try ObjectFileHandler.prepareVersionedWrite(
+            metadata: metadata, bucketName: bucketName, key: key, versioningStatus: versioningStatus)
+        ErasureCodedObjectHandler.markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
+        return (versionId, versionedMeta, priorLatestVersionId)
+    }
+
+    /// Shared in-place metadata rewrite for tagging PUT/DELETE and the admin console's metadata
+    /// editor (`InternalBucketController.setObjectMetadata`): EC-aware first (checked directly
+    /// against local disk, like GET/DELETE's own EC detection), falling through to the plain
+    /// `.obj` `ObjectFileHandler.rewriteMetadata` + best-effort peer push unchanged when the
+    /// target isn't erasure-coded. `static`, not instance-private - `S3Controller` has no stored
+    /// state, so this is safely callable from other controllers too.
+    static func rewriteObjectMetadata(
+        req: Request, bucketName: String, key: String, versionId: String?,
+        peers: [ClusterNodeInfo], transform: @escaping @Sendable (inout ObjectMeta) -> Void
+    ) async throws -> ObjectMeta {
+        if let placement = await ErasureCodedDeleteCoordinator.ecPlacement(
+            app: req.application, bucketName: bucketName, key: key),
+            let selfRank = placement.responsible.firstIndex(where: { $0.id == placement.selfNodeId }),
+            ErasureCodedDeleteCoordinator.localShardExists(
+                bucketName: bucketName, key: key, versionId: versionId, selfRank: selfRank)
+        {
+            return try await ErasureCodedWriteCoordinator.rewriteMetadata(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+                responsible: placement.responsible, selfNodeId: placement.selfNodeId,
+                transform: transform)
+        }
+
+        guard
+            let path = try ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId)
+        else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        // Metadata-only rewrite - the payload is window-copied from the file to itself, never
+        // buffered, so this doesn't cost a full read+rewrite of a potentially huge object.
+        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.rewriteMetadata(at: path, transform: transform)
+        }
+
+        // Cluster peers physically hold the exact same version file, so a change must be pushed
+        // to them too - an in-place metadata edit has no outbox task backing it the way an
+        // object write/delete does, so without this a peer would silently serve stale metadata
+        // forever rather than just temporarily lagging behind.
+        await ClusterReplicationService.replicateWrite(
+            app: req.application, bucketName: bucketName, key: key,
+            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+
+        return updatedMeta
     }
 
     /// Handles PUT /:bucket/:key?tagging - sets the tag-set of a specific object version (or
@@ -903,31 +1161,12 @@ struct S3Controller: RouteCollection {
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: versionId)
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchKey",
-                message: "The specified key does not exist.", requestId: req.id)
-        }
-
         let xml = try await S3Service.collectBodyString(req: req)
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
-        // Metadata-only rewrite - the payload is window-copied from the file to itself, never
-        // buffered, so this doesn't cost a full read+rewrite of a potentially huge object.
-        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = tagging.tags }
-        }
-
-        // Cluster peers physically hold the exact same version file, so a tag change must be
-        // pushed to them too - an in-place metadata edit has no outbox task backing it the way
-        // an object write/delete does, so without this a peer would silently serve stale tags
-        // forever rather than just temporarily lagging behind.
-        await ClusterReplicationService.replicateWrite(
-            app: req.application, bucketName: bucketName, key: key,
-            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+        let updatedMeta = try await Self.rewriteObjectMetadata(
+            req: req, bucketName: bucketName, key: key, versionId: versionId, peers: peers
+        ) { $0.tags = tagging.tags }
 
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
@@ -945,21 +1184,35 @@ struct S3Controller: RouteCollection {
     {
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
-        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: key) {
-            return forwarded
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
+        if !isLocal {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
         }
 
         let versionId = req.query[String.self, at: "versionId"]
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: versionId)
-        else {
+        // See handleObjectHead's identical fallthrough: isLocal only proves membership in the
+        // wider top-(k+m) set, not the legacy top-3 a plain (non-EC) object actually replicates
+        // to.
+        if !(await Self.hasLocalECShard(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            responsible: responsible)),
+            let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: key)
+        {
+            return forwarded
+        }
+        let meta = try await Self.resolveObjectMetaEitherFormat(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            responsible: responsible)
+        // A key whose latest version is a delete marker has no current tag-set - 404, matching
+        // GetObject/HeadObject. `resolveObjectMetaEitherFormat` returns the marker's own meta
+        // (unlike the plain `resolvePath`, which nils delete markers), so the guard lives here.
+        if meta.isDeleteMarker && versionId == nil {
             throw S3Error(
                 status: .notFound, code: "NoSuchKey",
                 message: "The specified key does not exist.", requestId: req.id)
         }
-
-        let (meta, _) = try ObjectFileHandler.read(from: path, loadData: false)
         let tagging = Tagging(tags: meta.tags ?? [:])
 
         let response = S3Service.buildXMLResponse(data: Data(tagging.toXML().utf8))
@@ -979,24 +1232,10 @@ struct S3Controller: RouteCollection {
         async throws -> Response
     {
         let versionId = req.query[String.self, at: "versionId"]
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: versionId)
-        else {
-            throw S3Error(
-                status: .notFound, code: "NoSuchKey",
-                message: "The specified key does not exist.", requestId: req.id)
-        }
 
-        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
-        }
-
-        // See handleObjectTaggingPut - an in-place metadata edit has no outbox task backing it,
-        // so cluster peers must be pushed the change directly here.
-        await ClusterReplicationService.replicateWrite(
-            app: req.application, bucketName: bucketName, key: key,
-            versionId: updatedMeta.versionId, operation: .put, peers: peers)
+        let updatedMeta = try await Self.rewriteObjectMetadata(
+            req: req, bucketName: bucketName, key: key, versionId: versionId, peers: peers
+        ) { $0.tags = nil }
 
         var headers = HTTPHeaders()
         if let versionId = updatedMeta.versionId {
@@ -1020,8 +1259,59 @@ struct S3Controller: RouteCollection {
     ) async throws -> (
         meta: ObjectMeta, path: String, payloadOffset: Int, payloadSize: Int, cleanup: () -> Void
     ) {
-        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
-            req: req, bucketName: bucketName, key: key)
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
+
+        // EC-aware: a copy source can be any unrelated bucket/key, so it may be erasure-coded
+        // even when the destination isn't (or vice versa) - checked directly against disk
+        // (locally, or via one network probe to rank-0), never assumed from the destination's
+        // own routing.
+        if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
+            req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+            !responsible.isEmpty
+        {
+            let effectiveVersionId: String?
+            if let versionId {
+                effectiveVersionId = versionId
+            } else if isLocal, ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
+                effectiveVersionId = try ObjectFileHandler.getLatestVersionId(
+                    bucketName: bucketName, key: key)
+            } else if !isLocal {
+                effectiveVersionId = await ClusterReplicationClient.resolveLatestVersionId(
+                    app: req.application, candidates: responsible, bucketName: bucketName, key: key)
+            } else {
+                effectiveVersionId = nil
+            }
+
+            if await isSourceErasureCoded(
+                req: req, responsible: responsible, bucketName: bucketName, key: key,
+                versionId: effectiveVersionId)
+            {
+                let (meta, stream) = try await ErasureCodedReadCoordinator.read(
+                    app: req.application, bucketName: bucketName, key: key,
+                    versionId: effectiveVersionId, responsible: responsible,
+                    selfNodeId: clusterConfig.nodeId, requestId: req.id)
+                let tempPath = try await Self.drainToTempFile(stream: stream, app: req.application)
+                return (meta, tempPath, 0, meta.size, { _ = POSIXFile.unlink(tempPath) })
+            }
+        }
+
+        // isLocal only proves membership in the wider top-(k+m) set - the EC check above already
+        // confirmed this source isn't erasure-coded, so a genuine local read is only valid when
+        // this node also holds the legacy top-3 plain replica. Once k+m > 3 a node can be local
+        // under the wide check without ever having received this plain object at all.
+        if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
+            isLocal,
+            !ObjectRoutingService.isLegacyReplica(
+                responsible: responsible, selfNodeId: clusterConfig.nodeId)
+        {
+            let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
+                app: req.application, candidates: Array(responsible.prefix(PlacementService.replicationFactor)),
+                bucketName: bucketName, key: key, versionId: versionId, requestId: req.id)
+            return (meta, tempPath, 0, meta.size, { _ = POSIXFile.unlink(tempPath) })
+        }
+
         if isLocal {
             let (meta, path, offset, size) = try await S3Service.offloadBlockingIO(req) {
                 try S3Service.resolveObjectForCopy(
@@ -1035,13 +1325,80 @@ struct S3Controller: RouteCollection {
         return (meta, tempPath, 0, meta.size, { _ = POSIXFile.unlink(tempPath) })
     }
 
+    /// Single rank-0 probe, matching the plan's "rank-0 always self-describes" design: rank-0
+    /// physically holds either the plain `.obj` or shard index 0 for every version, so asking it
+    /// alone (locally if it's us, one network call otherwise) is enough to know the format -
+    /// no need to probe all `k+m` candidates just to answer "is this EC or not".
+    private func isSourceErasureCoded(
+        req: Request, responsible: [ClusterNodeInfo], bucketName: String, key: String,
+        versionId: String?
+    ) async -> Bool {
+        guard let rank0 = responsible.first else { return false }
+        if let config = req.application.storage[ClusterConfigurationKey.self],
+            rank0.id == config.nodeId
+        {
+            let path =
+                versionId != nil
+                ? ErasureCodedObjectHandler.versionedShardPath(
+                    bucketName: bucketName, key: key, versionId: versionId!, shardIndex: 0)
+                : ErasureCodedObjectHandler.shardPath(bucketName: bucketName, key: key, shardIndex: 0)
+            return FileManager.default.fileExists(atPath: path)
+        }
+        return await ClusterReplicationClient.shardExists(
+            app: req.application, node: rank0, bucketName: bucketName, key: key,
+            versionId: versionId, shardIndex: 0)
+    }
+
+    /// Drains an `ErasureCodedReadCoordinator.read` stream into a local temp file - CopyObject's
+    /// downstream logic (ETag computation, metadata merge, writing the destination) already
+    /// expects a plain `(path, offset, size)` source, the same shape every other copy-source
+    /// resolution in this handler produces. Caller must unlink the returned path once done.
+    /// `static`, not instance-private - reused by `InternalBucketController`'s console download.
+    static func drainToTempFile(
+        stream: AsyncThrowingStream<ByteBuffer, any Error>, app: Application
+    ) async throws -> String {
+        let threadPool = app.threadPool
+        let tempPath = Constants.spoolDirectory + ".ec-copy-source-" + UUID().uuidString
+        let fd = try await threadPool.runIfActive { () -> Int32 in
+            var fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            if fd < 0 && errno == ENOENT {
+                try FileManager.default.createDirectory(
+                    atPath: Constants.spoolDirectory, withIntermediateDirectories: true)
+                fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            }
+            guard fd >= 0 else {
+                throw S3Error(
+                    status: .internalServerError, code: "InternalError",
+                    message: "Failed to open EC copy-source temp file")
+            }
+            return fd
+        }
+        do {
+            for try await buffer in stream {
+                let chunk = buffer
+                try await threadPool.runIfActive {
+                    try chunk.withUnsafeReadableBytes { raw in
+                        try StreamingIOLoops.writeFully(fd: fd, raw)
+                    }
+                }
+            }
+            _ = try await threadPool.runIfActive { POSIXFile.close(fd) }
+        } catch {
+            _ = try? await threadPool.runIfActive { POSIXFile.close(fd) }
+            _ = POSIXFile.unlink(tempPath)
+            throw error
+        }
+        return tempPath
+    }
+
     private func handleCopyObject(
         req: Request,
         destinationBucket: String,
         destinationKey: String,
         copySource: CopySource,
         versioningStatus: VersioningStatus,
-        peers: [ClusterNodeInfo] = []
+        peers: [ClusterNodeInfo] = [],
+        ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)? = nil
     ) async throws -> Response {
         try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
 
@@ -1133,21 +1490,50 @@ struct S3Controller: RouteCollection {
         let copySources = [
             (path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
         ]
-        let versionId: String? = try await S3Service.offloadBlockingIO(req) {
-            if versioningStatus != .disabled {
-                return try ObjectFileHandler.writeVersionedStreamed(
-                    metadata: destinationMeta,
-                    payloadSources: copySources,
-                    bucketName: destinationBucket,
-                    key: destinationKey,
-                    versioningStatus: versioningStatus
-                )
-            } else {
-                let destinationPath = ObjectFileHandler.storagePath(
-                    for: destinationBucket, key: destinationKey)
-                try ObjectFileHandler.writeStreamed(
-                    metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
-                return nil
+
+        let versionId: String?
+        if let ecWriteFanOut {
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+                metadata: destinationMeta, bucketName: destinationBucket, key: destinationKey,
+                versioningStatus: versioningStatus)
+
+            do {
+                try await ErasureCodedWriteCoordinator.write(
+                    app: req.application, bucketName: destinationBucket, key: destinationKey,
+                    objectMeta: versionedMeta, payloadSources: copySources,
+                    peers: ecWriteFanOut.peers, ecConfig: ecWriteFanOut.config,
+                    priorLatestVersionId: priorLatestVersionId)
+            } catch let error as ErasureCodedCoordinatorError {
+                throw S3Error(
+                    status: .serviceUnavailable, code: "ServiceUnavailable",
+                    message: "\(error)", requestId: req.id)
+            }
+
+            if let mintedVersionId {
+                try await S3Service.offloadBlockingIO(req) {
+                    try ObjectFileHandler.updateLatestPointer(
+                        bucketName: destinationBucket, key: destinationKey,
+                        versionId: mintedVersionId)
+                }
+            }
+            versionId = mintedVersionId
+        } else {
+            versionId = try await S3Service.offloadBlockingIO(req) {
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersionedStreamed(
+                        metadata: destinationMeta,
+                        payloadSources: copySources,
+                        bucketName: destinationBucket,
+                        key: destinationKey,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let destinationPath = ObjectFileHandler.storagePath(
+                        for: destinationBucket, key: destinationKey)
+                    try ObjectFileHandler.writeStreamed(
+                        metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
+                    return nil
+                }
             }
         }
         if let versionId {
@@ -1164,10 +1550,13 @@ struct S3Controller: RouteCollection {
             size: destinationMeta.size, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
-            bucketName: destinationBucket, key: destinationKey, versionId: versionId, on: req.db)
-        await ClusterReplicationService.replicateWrite(
             app: req.application, bucketName: destinationBucket, key: destinationKey,
-            versionId: versionId, operation: .put, peers: peers)
+            versionId: versionId, on: req.db)
+        if ecWriteFanOut == nil {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: destinationBucket, key: destinationKey,
+                versionId: versionId, operation: .put, peers: peers)
+        }
 
         // Build copy result response (S3 returns XML for copy operations)
         let copyResult = """
@@ -1222,7 +1611,125 @@ struct S3Controller: RouteCollection {
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
 
-        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath) {
+        // EC-aware locality: any of the wider top-(k+m) responsible nodes can serve a read
+        // (no pinning needed, unlike writes) - a strict superset of the plain top-3 check
+        // `forwardIfNeeded` does, so this replaces it entirely for this handler rather than
+        // running both.
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: keyPath)
+        if !isLocal {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+
+        // Resolve the effective version id the same way every version-aware lookup in this
+        // codebase does - works identically for EC and plain versions, since both share the
+        // same `.latest` pointer / `.versions` directory convention; only the payload format
+        // (shards vs a single file) differs.
+        let effectiveVersionId: String?
+        if let versionId {
+            effectiveVersionId = versionId
+        } else if ObjectFileHandler.isVersioned(bucketName: bucketName, key: keyPath) {
+            effectiveVersionId = try ObjectFileHandler.getLatestVersionId(
+                bucketName: bucketName, key: keyPath)
+        } else {
+            effectiveVersionId = nil
+        }
+
+        // Is this an erasure-coded object? Discover it location-independently: this node holds a
+        // shard (fast path, no network), or - only when there's no local plain object either, so
+        // plain reads never pay for it - a responsible peer holds one (the mid-reindex window
+        // where this coordinating node hasn't received its own shard yet). Either way the read is
+        // a gather-and-decode across the responsible set; falling through to the plain path is
+        // reserved for genuinely plain-replicated objects and true 404s.
+        if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
+            req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+            responsible.contains(where: { $0.id == clusterConfig.nodeId })
+        {
+            let localHeld = ErasureCodedObjectHandler.locallyHeldShardIndices(
+                bucketName: bucketName, key: keyPath, versionId: effectiveVersionId)
+            var isErasureCoded = !localHeld.isEmpty
+            if !isErasureCoded {
+                let plainResolvesLocally =
+                    ((try? ObjectFileHandler.resolvePath(
+                        bucketName: bucketName, key: keyPath, versionId: versionId)) ?? nil) != nil
+                if !plainResolvesLocally {
+                    isErasureCoded = await Self.anyPeerHoldsShard(
+                        req: req, responsible: responsible, selfNodeId: clusterConfig.nodeId,
+                        bucketName: bucketName, key: keyPath, versionId: effectiveVersionId)
+                }
+            }
+
+            if isErasureCoded {
+                // Gather + resolve metadata first (no body streamed yet), so the delete-marker
+                // 404, conditional-header checks, and Range parsing/validation all happen before
+                // committing to decode - and a ranged request only reconstructs the stripes it
+                // actually needs.
+                let prepared = try await ErasureCodedReadCoordinator.prepare(
+                    app: req.application, bucketName: bucketName, key: keyPath,
+                    versionId: effectiveVersionId, responsible: responsible,
+                    selfNodeId: clusterConfig.nodeId, requestId: req.id)
+                let meta = prepared.meta
+
+                if meta.isDeleteMarker && versionId == nil {
+                    prepared.discard()
+                    throw S3Error(
+                        status: .notFound, code: "NoSuchKey",
+                        message: "The specified key does not exist.", requestId: req.id)
+                }
+                do {
+                    try S3Service.validateConditionalHeaders(req: req, meta: meta)
+                } catch {
+                    prepared.discard()
+                    throw error
+                }
+
+                let byteRange: ByteRange?
+                do {
+                    byteRange =
+                        req.headers.first(name: .range) != nil
+                        ? try S3RangeParser.parseRange(from: req, fileSize: meta.size) : nil
+                } catch {
+                    prepared.discard()
+                    throw error
+                }
+
+                let body = ErasureCodedReadCoordinator.streamBody(
+                    app: req.application, prepared: prepared,
+                    range: byteRange.map { ($0.start, $0.end) })
+
+                let response = S3Service.buildObjectMetadataResponse(
+                    meta: meta, includeBody: false, data: nil, range: nil)
+                let bodyLength = byteRange?.length ?? meta.size
+                response.status = byteRange != nil ? .partialContent : .ok
+                response.headers.replaceOrAdd(name: .contentLength, value: String(bodyLength))
+                if let byteRange {
+                    response.headers.replaceOrAdd(
+                        name: "Content-Range", value: byteRange.contentRange(fileSize: meta.size))
+                }
+                S3Service.addVersionHeaders(to: response, meta: meta)
+                if let tagCount = meta.tags?.count, tagCount > 0 {
+                    response.headers.add(name: "x-amz-tagging-count", value: String(tagCount))
+                }
+                response.body = Response.Body(
+                    managedAsyncStream: { writer in
+                        for try await chunk in body {
+                            try await writer.writeBuffer(chunk)
+                        }
+                    }, count: bodyLength)
+                return response
+            }
+        }
+
+        // No local EC shard - the target is either plain-format or doesn't exist. Top-3 being
+        // a *prefix* of the wider top-(k+m) list `isLocal` above already passed doesn't mean
+        // this node is also IN that top-3: a plain object replicated only to ranks 0-2 must
+        // still forward when this node is rank 3+ (a real case whenever k+m exceeds 3, e.g.
+        // k=2/m=2). Reusing the legacy top-3 routing check here restores exactly the
+        // forwarding `erasureCodedReadPlacement`'s wider locality check bypassed for this
+        // handler.
+        if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath)
+        {
             return forwarded
         }
 
@@ -1298,17 +1805,48 @@ struct S3Controller: RouteCollection {
         let isAbortMultipart =
             req.query[String.self, at: "uploadId"] != nil
             && req.query[String.self, at: "versionId"] == nil
+        let isTaggingDelete = S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging")
+
+        // Only a DELETE that will actually *create* a fresh EC delete marker needs the rank-0-pinned,
+        // admission-gated EC write routing: marker creation is a write
+        // (`ErasureCodedDeleteCoordinator.createDeleteMarker` places shard 0 on the coordinator),
+        // so it must land on rank-0 and requires a full k+m-node cluster. Every other DELETE -
+        // a specific-version byte removal, a non-versioned/suspended removal, or a plain (non-EC)
+        // legacy object - places no new shards and must NOT be blocked by EC admission when the
+        // cluster is temporarily below k+m (a drained/lost node). Those route via plain
+        // `routeForWrite`; `coordinateDelete` still fans byte-removal to every responsible node
+        // regardless of which one coordinates.
+        let deleteVersionId = req.query[String.self, at: "versionId"]
+        let deleteVersioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let createsErasureCodedMarker =
+            deleteVersionId == nil && deleteVersioningStatus == .enabled
+        let usesECDestinationRouting =
+            !isAbortMultipart && !isTaggingDelete && createsErasureCodedMarker
+        let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self]
 
         // Cluster routing: one check covers this handler's dispatch tree (AbortMultipartUpload,
         // tagging DELETE, plain object DELETE) - all key off this same (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
-        switch try await ObjectRoutingService.routeForWrite(
-            req: req, bucketName: bucketName, key: keyPath, requirePrimary: isAbortMultipart)
-        {
-        case .local(let localPeers):
-            peers = localPeers
-        case .forwarded(let response):
-            return response
+        if usesECDestinationRouting, ecConfig != nil {
+            switch try await ObjectRoutingService.routeForErasureCodedWrite(
+                req: req, bucketName: bucketName, key: keyPath)
+            {
+            case .notClustered:
+                peers = []
+            case .local(let localPeers):
+                peers = localPeers
+            case .forwarded(let response):
+                return response
+            }
+        } else {
+            switch try await ObjectRoutingService.routeForWrite(
+                req: req, bucketName: bucketName, key: keyPath, requirePrimary: isAbortMultipart)
+            {
+            case .local(let localPeers):
+                peers = localPeers
+            case .forwarded(let response):
+                return response
+            }
         }
 
         // Check if this is AbortMultipartUpload (DELETE with uploadId, no versionId)
@@ -1324,13 +1862,13 @@ struct S3Controller: RouteCollection {
         }
 
         // DeleteObjectTagging - distinct from deleting the object/version itself
-        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging") {
+        if isTaggingDelete {
             return try await handleObjectTaggingDelete(
                 req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
-        let versionId = req.query[String.self, at: "versionId"]
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versionId = deleteVersionId
+        let versioningStatus = deleteVersioningStatus
 
         // Unlike external replication (below), cluster peers physically hold the exact same
         // version files as this node, so an explicit historical-version delete DOES need to
@@ -1357,7 +1895,8 @@ struct S3Controller: RouteCollection {
         // so only replicate when this deleted the *current* object.
         if versionId == nil {
             await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: keyPath, versionId: outcome.versionId, on: req.db)
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: outcome.versionId, on: req.db)
         }
 
         return Response(status: .noContent, headers: headers)
@@ -1425,8 +1964,8 @@ struct S3Controller: RouteCollection {
                 // historical version, which has no replicable equivalent on the target.
                 if object.versionId == nil {
                     await ReplicationService.enqueueDelete(
-                        bucketName: bucketName, key: object.key, versionId: outcome.versionId,
-                        on: req.db)
+                        app: req.application, bucketName: bucketName, key: object.key,
+                        versionId: outcome.versionId, on: req.db)
                 }
             } catch {
                 errors.append(
@@ -1619,25 +2158,67 @@ struct S3Controller: RouteCollection {
         // Get versioning status
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        // Complete the upload - streams every part into the final .obj in fixed windows and
+        // Complete the upload - streams every part into the final object in fixed windows and
         // fsyncs before returning, all real blocking file IO, so it's offloaded to the
         // blocking-IO thread pool rather than tying up the async executor for the whole
-        // (potentially multi-gigabyte) assembly.
+        // (potentially multi-gigabyte) assembly. Every request in this upload's lifecycle
+        // already landed on the identical node (multipartRoutingDecision's pin - see
+        // handleObjectPost), and that pinned node is always rank-0 under both the plain top-3
+        // and the wider EC top-(k+m) placement (same ranked list, different truncation), so
+        // this can check EC eligibility fresh right here without any extra forwarding.
+        var usedEC = false
         let etag: String
         let versionId: String?
         let finalSize: Int
         do {
-            let result = try await S3Service.offloadBlockingIO(req) {
-                try MultipartFileHandler.completeUpload(
-                    bucketName: bucketName,
-                    uploadId: uploadId,
-                    parts: parts,
-                    versioningStatus: versioningStatus
-                )
+            if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self],
+                case .local(let ecPeers) = try await ObjectRoutingService.erasureCodedRoutingDecision(
+                    req: req, bucketName: bucketName, key: key)
+            {
+                let plan = try await S3Service.offloadBlockingIO(req) {
+                    try MultipartFileHandler.prepareCompletion(
+                        bucketName: bucketName, uploadId: uploadId, parts: parts)
+                }
+                let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+                    metadata: plan.objectMeta, bucketName: bucketName, key: key,
+                    versioningStatus: versioningStatus)
+                do {
+                    try await ErasureCodedWriteCoordinator.write(
+                        app: req.application, bucketName: bucketName, key: key,
+                        objectMeta: versionedMeta, payloadSources: plan.payloadSources,
+                        peers: ecPeers, ecConfig: ecConfig,
+                        priorLatestVersionId: priorLatestVersionId)
+                } catch let error as ErasureCodedCoordinatorError {
+                    throw S3Error(
+                        status: .serviceUnavailable, code: "ServiceUnavailable",
+                        message: "\(error)", requestId: req.id)
+                }
+                if let mintedVersionId {
+                    try await S3Service.offloadBlockingIO(req) {
+                        try ObjectFileHandler.updateLatestPointer(
+                            bucketName: bucketName, key: key, versionId: mintedVersionId)
+                    }
+                }
+                versionId = mintedVersionId
+                try await S3Service.offloadBlockingIO(req) {
+                    try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
+                }
+                etag = plan.etag
+                finalSize = plan.totalSize
+                usedEC = true
+            } else {
+                let result = try await S3Service.offloadBlockingIO(req) {
+                    try MultipartFileHandler.completeUpload(
+                        bucketName: bucketName,
+                        uploadId: uploadId,
+                        parts: parts,
+                        versioningStatus: versioningStatus
+                    )
+                }
+                etag = result.etag
+                versionId = result.versionId
+                finalSize = result.size
             }
-            etag = result.etag
-            versionId = result.versionId
-            finalSize = result.size
         } catch let error as NSError {
             // Convert NSError to S3Error
             let code = error.domain == "InvalidPartOrder" ? "InvalidPartOrder" : "InvalidPart"
@@ -1651,10 +2232,13 @@ struct S3Controller: RouteCollection {
             size: finalSize, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
-            bucketName: bucketName, key: key, versionId: versionId, on: req.db)
-        await ClusterReplicationService.replicateWrite(
             app: req.application, bucketName: bucketName, key: key, versionId: versionId,
-            operation: .put, peers: peers)
+            on: req.db)
+        if !usedEC {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+                operation: .put, peers: peers)
+        }
 
         // Build response headers
         var headers = HTTPHeaders()

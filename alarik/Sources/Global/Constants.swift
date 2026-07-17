@@ -46,4 +46,13 @@ public enum Constants {
     /// Directory that holds in-flight upload spool files. Lives under Storage/ so renaming a
     /// finished spool into Storage/multipart is a same-filesystem move in the common case.
     public static let spoolDirectory = "Storage/spool/"
+
+    /// Per-shard bytes encoded together in one Reed-Solomon stripe. Mid-range of MinIO/RustFS
+    /// precedent (128-256 KiB) - large enough to amortize ISA-L call overhead, small enough to
+    /// keep per-stripe memory (`dataShards * stripeUnitSize`) bounded for wide k.
+    public static let erasureCodingStripeUnitSize = 256 * 1024
+
+    /// Scratch directory for shard files mid-encode, before fan-out to their destination nodes.
+    /// Lives under Storage/ for the same same-filesystem-move reason as `spoolDirectory`.
+    public static let erasureCodingScratchDirectory = "Storage/ecscratch/"
 }

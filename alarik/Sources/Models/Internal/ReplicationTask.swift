@@ -129,3 +129,5 @@ final class ReplicationTask: Model, @unchecked Sendable {
         self.createdAt = Date()
     }
 }
+
+extension ReplicationTask: OutboxRow {}

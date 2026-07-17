@@ -22,6 +22,11 @@ PG_PORT=5434
 DATABASE_URL="postgres://alarik:alarik@localhost:$PG_PORT/alarik_cluster_test"
 CLUSTER_SECRET="test-cluster-secret"
 JWT_SECRET="test-secret"
+# k=2/m=2 uses all 4 nodes with zero slack - matches this harness's node count exactly (the
+# app's own default, k=4/m=2, needs 6 nodes minimum and would hard-fail every write here via
+# admission control).
+CLUSTER_EC_DATA_SHARDS=2
+CLUSTER_EC_PARITY_SHARDS=2
 
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -73,6 +78,8 @@ restart_node() {
                 DATABASE_URL="$DATABASE_URL" \
                 CLUSTER_NODE_ADDRESS="http://localhost:$port" \
                 CLUSTER_SECRET="$CLUSTER_SECRET" \
+                CLUSTER_EC_DATA_SHARDS="$CLUSTER_EC_DATA_SHARDS" \
+                CLUSTER_EC_PARITY_SHARDS="$CLUSTER_EC_PARITY_SHARDS" \
                 exec env $extra_env "$BINARY" serve --hostname 127.0.0.1 --port "$port"
     ) >"$LOG_DIR/node-$i-restart.log" 2>&1 &
     PIDS[$i]="$!"
@@ -265,6 +272,8 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
                 DATABASE_URL="$DATABASE_URL" \
                 CLUSTER_NODE_ADDRESS="http://localhost:$port" \
                 CLUSTER_SECRET="$CLUSTER_SECRET" \
+                CLUSTER_EC_DATA_SHARDS="$CLUSTER_EC_DATA_SHARDS" \
+                CLUSTER_EC_PARITY_SHARDS="$CLUSTER_EC_PARITY_SHARDS" \
                 exec "$BINARY" serve --hostname 127.0.0.1 --port "$port"
     ) >"$LOG_DIR/node-$i.log" 2>&1 &
     PIDS+=("$!")
@@ -539,24 +548,35 @@ if [ -z "$DRAIN_INDEX" ]; then
     fail "Could not find a node responsible for reclaim.txt to drain."
 else
     DRAIN_NODE_ID=$(echo "$NODES_RESP" | jq -r ".[$DRAIN_INDEX].id")
-    DRAIN_OBJ_PATH="${STATE_DIRS[$DRAIN_INDEX]}/Storage/buckets/cluster-reclaim-test/reclaim.txt.obj"
+    # Every write is erasure-coded by default now - a "responsible" node holds one shard file
+    # under key.ecshards/<index>.ecshard (index depends on this node's current HRW rank, not
+    # fixed), not a plain key.obj copy. `ErasureCodedRebalanceService.rebalanceOne`/
+    # `reclaimIfSafe` mirror `ClusterRebalanceService`'s exact reclaim-after-drain gate, just for
+    # shard files instead of whole-object copies.
+    DRAIN_SHARD_DIR="${STATE_DIRS[$DRAIN_INDEX]}/Storage/buckets/cluster-reclaim-test/reclaim.txt.ecshards"
+    DRAIN_OBJ_PATH=$(find "$DRAIN_SHARD_DIR" -name "*.ecshard" 2>/dev/null | head -1)
 
-    if [ ! -f "$DRAIN_OBJ_PATH" ]; then
-        fail "Expected node $DRAIN_INDEX to hold a local copy of reclaim.txt before draining (not found at $DRAIN_OBJ_PATH)."
+    if [ -z "$DRAIN_OBJ_PATH" ] || [ ! -f "$DRAIN_OBJ_PATH" ]; then
+        fail "Expected node $DRAIN_INDEX to hold a local EC shard of reclaim.txt before draining (not found under $DRAIN_SHARD_DIR)."
     else
         curl -s -X POST "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes/$DRAIN_NODE_ID/drain" -H "Authorization: Bearer $TOKEN" >/dev/null
 
-        # The first rebalance pass (triggered by the drain) copies the object to its new owner
-        # but finds reclaim gated on that just-enqueued copy task, so it self-schedules a
-        # follow-up pass ~30s later (ClusterRebalanceService.gatedReclaimFollowUpDelay) once the
-        # copy has actually been confirmed delivered. That 30s is a hard floor with no slack for
-        # this run's own DB/dispatcher latency, so poll well past it rather than right up against it.
+        # The first rebalance pass (triggered by the drain) reconstructs each surviving shard onto
+        # its new rank-holder, then self-schedules a follow-up ~30s later
+        # (*RebalanceService.gatedReclaimFollowUpDelay) to reclaim the drained node's now-stale
+        # local shard once the redistribution is confirmed. Self-healing here is asynchronous and
+        # eventually-consistent, so poll for both conditions (stale shard reclaimed AND object
+        # still readable) rather than checking once at a fixed deadline.
         RECLAIMED=0
-        for _ in $(seq 1 90); do
-            if [ ! -f "$DRAIN_OBJ_PATH" ]; then
-                RECLAIMED=1
-                break
+        CONTENT_STILL_OK=0
+        for _ in $(seq 1 150); do
+            [ ! -f "$DRAIN_OBJ_PATH" ] && RECLAIMED=1
+            if aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-reclaim-test/reclaim.txt - 2>/dev/null | cmp -s - "$CONTENT_FILE"; then
+                CONTENT_STILL_OK=1
+            else
+                CONTENT_STILL_OK=0
             fi
+            [ "$RECLAIMED" -eq 1 ] && [ "$CONTENT_STILL_OK" -eq 1 ] && break
             sleep 1
         done
 
@@ -565,14 +585,21 @@ else
         STILL_LISTED=0
         echo "$NEW_RESPONSIBLE_IDS" | grep -q "^$DRAIN_NODE_ID$" && STILL_LISTED=1
 
-        CONTENT_STILL_OK=1
-        aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-reclaim-test/reclaim.txt - 2>/dev/null | cmp -s - "$CONTENT_FILE" || CONTENT_STILL_OK=0
-
         if [ "$RECLAIMED" -eq 1 ] && [ "$STILL_LISTED" -eq 0 ] && [ "$CONTENT_STILL_OK" -eq 1 ]; then
             pass "Draining a node excludes it from placement and reclaims its local copy once the new owner has one, without losing the object."
         else
             fail "Reclaim did not complete as expected (reclaimed=$RECLAIMED still_listed=$STILL_LISTED content_ok=$CONTENT_STILL_OK)."
         fi
+
+        # Every write is erasure-coded by default now with k+m == NODE_COUNT (zero slack) - unlike
+        # the old plain-replication world, where a drained node just meant one less of several
+        # interchangeable replicas, EC's hard admission control means a permanently-drained node
+        # here would fail every write for the rest of this run. Restore it (mirrors Test 16's own
+        # drain/kill/restart/reactivate flow) before any later test relies on a full 4-node
+        # cluster.
+        kill_node "$DRAIN_INDEX"
+        restart_node "$DRAIN_INDEX" >/dev/null
+        wait_for_full_membership
     fi
 fi
 
@@ -1373,11 +1400,15 @@ RG_NR=$(non_responsible_index cluster-range-test range.bin)
 if [ -z "$RG_NR" ]; then
     fail "Could not find a node not responsible for range.bin."
 else
-    RG_OUT=$(mktemp)
-    aws --endpoint-url "${ENDPOINTS[$RG_NR]}" s3api get-object --bucket cluster-range-test --key range.bin --range "bytes=0-4" "$RG_OUT" >/dev/null 2>&1
-    RG_GOT=$(cat "$RG_OUT")
+    # Ranged GET on an erasure-coded object is fully supported (reconstructs only the covered
+    # stripes and slices them), and here it's forwarded through a node that isn't responsible for
+    # the key - so this checks both the range correctness AND that forwarding preserves the Range
+    # header. A presigned URL (same mechanism Test 34 uses) sidesteps a separate raw-curl SigV4
+    # signer; Range isn't part of what's signed, so adding the header afterward is valid, as in S3.
+    RG_URL=$(aws --endpoint-url "${ENDPOINTS[$RG_NR]}" s3 presign s3://cluster-range-test/range.bin)
+    RG_GOT=$(curl -s "$RG_URL" -H "Range: bytes=0-4")
     if [ "$RG_GOT" == "ABCDE" ]; then
-        pass "A ranged GET (bytes=0-4) forwarded through a non-responsible node returns exactly the requested slice."
+        pass "A ranged GET forwarded through a non-responsible node returns exactly the requested slice (bytes 0-4 = 'ABCDE')."
     else
         fail "Ranged GET via a non-responsible node returned '$RG_GOT', expected 'ABCDE'."
     fi
@@ -1459,20 +1490,27 @@ else
     fail "Force-deleting a bucket left ghost objects behind (listing_clean=$GHOST_LISTING_CLEAN disk_clean=$GHOST_DISK_CLEAN) - they reappeared after recreating it under the same name."
 fi
 
-# ── Test 38: new-write coordination prefers a non-full peer over a near-full node ──
-# Regression coverage for ClusterCapacityPolicy. All 4 nodes in this suite run on ONE physical
-# disk (different subdirectories, same volume), so they always report virtually identical real
-# free space - there's no threshold value that can make node 3 look "near-full" while its peers
-# (with the SAME real numbers) look "fine" to it, since preferredCoordinator judges peers using
-# self's own threshold. CLUSTER_DEBUG_TOTAL_BYTES/CLUSTER_DEBUG_AVAILABLE_BYTES (DiskSpace's
-# test-only override) sidestep this: node 3 reports an artificially tiny free-space reading while
-# its peers keep reporting their real (much higher) numbers, so the default 10% threshold
-# correctly finds node 3 near-full and its peers not. There's no admin-API signal for "which
-# physical node coordinated this write" - the responsible set is deliberately unaffected by
-# capacity - so the "Cluster capacity redirect" log line ObjectRoutingService emits is the only
-# way to observe the redirect actually firing.
+# ── Test 38: a near-full node still coordinates an EC write itself (no capacity redirect) ──
+# Originally regression coverage for ClusterCapacityPolicy's capacity-based coordinator
+# hand-off - but every write is erasure-coded by default now, and EC's write routing
+# (ObjectRoutingService.routeForErasureCodedWrite) deliberately has no capacity-redirect
+# concept at all: only rank-0 may assign shard placement for a write, a hard requirement, not
+# the soft any-of-top-3 preference the redirect exists for on the legacy plain-replication path.
+# This test now asserts the *absence* of a redirect under the same near-full setup that used to
+# trigger one, proving that intentional design decision holds rather than silently regressing.
+#
+# All 4 nodes in this suite run on ONE physical disk (different subdirectories, same volume), so
+# they always report virtually identical real free space - there's no threshold value that can
+# make node 3 look "near-full" while its peers (with the SAME real numbers) look "fine" to it.
+# CLUSTER_DEBUG_TOTAL_BYTES/CLUSTER_DEBUG_AVAILABLE_BYTES (DiskSpace's test-only override)
+# sidestep this: node 3 reports an artificially tiny free-space reading while its peers keep
+# reporting their real (much higher) numbers, so the default 10% threshold correctly finds node
+# 3 near-full and its peers not. There's no admin-API signal for "which physical node
+# coordinated this write" - the responsible set is deliberately unaffected by capacity - so the
+# "Cluster capacity redirect" log line ObjectRoutingService emits is the only way to observe
+# whether a redirect fired.
 echo ""
-echo "=== Test: new-write coordination prefers a non-full peer over a near-full node ==="
+echo "=== Test: a near-full node still coordinates an EC write itself (no capacity redirect) ==="
 CAP_INDEX=3
 kill_node "$CAP_INDEX"
 if ! restart_node "$CAP_INDEX" "CLUSTER_DEBUG_TOTAL_BYTES=1000000000 CLUSTER_DEBUG_AVAILABLE_BYTES=1000"; then
@@ -1549,10 +1587,17 @@ else
                 sleep 1
             done
 
-            if [ "$CAP_ALL_CORRECT" -eq 1 ] && [ "$CAP_PLACEMENT_UNCHANGED" -eq 1 ] && [ "$CAP_REDIRECT_LOGGED" -eq 1 ]; then
-                pass "A near-full node hands off write coordination to a non-full peer, without changing placement or losing data."
+            # Every write is erasure-coded by default now, and routeForErasureCodedWrite
+            # deliberately has no capacity-redirect concept at all (unlike plain replication's
+            # routeForWrite): only rank-0 may assign shard placement for a given write, a hard
+            # placement requirement, not the soft any-of-top-3 preference the redirect exists
+            # for elsewhere. So the correct, intentional behavior here is the *opposite* of the
+            # original (pre-EC) assertion - the near-full node must still coordinate the write
+            # itself, unredirected, and it must still succeed correctly.
+            if [ "$CAP_ALL_CORRECT" -eq 1 ] && [ "$CAP_PLACEMENT_UNCHANGED" -eq 1 ] && [ "$CAP_REDIRECT_LOGGED" -eq 0 ]; then
+                pass "A near-full node still coordinates an EC write itself (no capacity redirect - EC's rank-0 pinning is a hard requirement), without losing data."
             else
-                fail "Capacity-aware redirect did not behave as expected (correct_content=$CAP_ALL_CORRECT placement_unchanged=$CAP_PLACEMENT_UNCHANGED redirect_logged=$CAP_REDIRECT_LOGGED)."
+                fail "EC write under a near-full coordinator did not behave as expected (correct_content=$CAP_ALL_CORRECT placement_unchanged=$CAP_PLACEMENT_UNCHANGED redirect_logged=$CAP_REDIRECT_LOGGED, expected redirect_logged=0)."
             fi
         fi
     fi
@@ -1562,6 +1607,233 @@ else
     restart_node "$CAP_INDEX"
     wait_for_full_membership
 fi
+
+# ── Test: erasure-coded reads tolerate node loss down to the quorum, then fail cleanly ──
+# The core durability promise of EC: with k=2/m=2, ANY 2 of the 4 shards reconstruct the object.
+# Nodes are killed (not drained - a hard crash, so they stay "active" in every peer's cache until
+# heartbeat staleness, exactly the unreachable-holder case shard gathering must tolerate), reading
+# always via node 0 (kept alive; with k+m == NODE_COUNT every node is responsible for every key,
+# so node 0 always holds a shard and coordinates the gather locally). A multi-stripe object
+# (1.5 MiB over 256 KiB*k = 512 KiB stripes) exercises the real streaming reconstruct path, not
+# just a single-stripe concatenate. Restores every killed node afterward.
+echo ""
+echo "=== Test: erasure-coded read tolerates node loss down to quorum, fails cleanly below it ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-tolerance-test >/dev/null 2>&1
+EC_TOL_FILE=$(mktemp)
+head -c 1572864 /dev/urandom >"$EC_TOL_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$EC_TOL_FILE" s3://cluster-ec-tolerance-test/big.bin >/dev/null 2>&1
+sleep 2
+
+ec_tol_read_ok() {
+    # Reads via node 0 and compares to the original. Echoes "1" on byte-identical, "0" otherwise.
+    local out
+    out=$(mktemp)
+    if aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-tolerance-test/big.bin "$out" >/dev/null 2>&1 \
+        && cmp -s "$out" "$EC_TOL_FILE"; then
+        echo 1
+    else
+        echo 0
+    fi
+    rm -f "$out"
+}
+
+EC_TOL_BASE=$(ec_tol_read_ok)
+
+# Find two responsible nodes other than node 0 to kill (killing node 0 would remove the endpoint
+# we read through). With every node responsible, indices 1..3 all qualify.
+EC_TOL_KILL_1=1
+EC_TOL_KILL_2=2
+kill_node "$EC_TOL_KILL_1"
+sleep 1
+EC_TOL_ONE_LOSS=$(ec_tol_read_ok)   # 3 shards remain (>= k): still reconstructs
+kill_node "$EC_TOL_KILL_2"
+sleep 1
+EC_TOL_TWO_LOSS=$(ec_tol_read_ok)   # 2 shards remain (== k): real matrix-solve decode
+
+# Drop below quorum: kill node 3 too, leaving only node 0's single shard (< k). The read must
+# fail with a clean error, never hang or return corrupt/truncated bytes.
+kill_node 3
+sleep 1
+EC_TOL_BELOW=$(ec_tol_read_ok)
+
+if [ "$EC_TOL_BASE" == "1" ] && [ "$EC_TOL_ONE_LOSS" == "1" ] && [ "$EC_TOL_TWO_LOSS" == "1" ] && [ "$EC_TOL_BELOW" == "0" ]; then
+    pass "EC read survives losing 2 of 4 nodes (down to the k=2 quorum) and fails cleanly at 1 survivor (below quorum)."
+else
+    fail "EC node-loss tolerance wrong (base=$EC_TOL_BASE one_loss=$EC_TOL_ONE_LOSS two_loss=$EC_TOL_TWO_LOSS below_quorum_readable=$EC_TOL_BELOW; expected 1/1/1/0)."
+fi
+rm -f "$EC_TOL_FILE"
+
+# Restore the three killed nodes before the remaining tests rely on a full cluster.
+restart_node "$EC_TOL_KILL_1" >/dev/null
+restart_node "$EC_TOL_KILL_2" >/dev/null
+restart_node 3 >/dev/null
+wait_for_full_membership
+
+# ── Test: erasure-coded round trip for a zero-byte object and a re-PUT over a delete marker ──
+# Confirms the write/read pipeline has no size-based special case
+echo ""
+echo "=== Test: zero-byte EC object round trip + re-PUT over a delete marker ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-edge-test >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[0]}" s3api put-bucket-versioning \
+    --bucket cluster-ec-edge-test --versioning-configuration Status=Enabled >/dev/null 2>&1
+
+EMPTY_FILE=$(mktemp)
+: >"$EMPTY_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$EMPTY_FILE" s3://cluster-ec-edge-test/empty.bin >/dev/null 2>&1
+sleep 2
+EC_EDGE_ZERO_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    ZOUT=$(mktemp)
+    if aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp s3://cluster-ec-edge-test/empty.bin "$ZOUT" >/dev/null 2>&1 \
+        && [ ! -s "$ZOUT" ]; then :; else EC_EDGE_ZERO_OK=0; echo "  node $i did not return an empty body for empty.bin"; fi
+    rm -f "$ZOUT"
+done
+
+# Delete (creates a marker), then re-PUT: the key must read back as the new content everywhere,
+# with the delete marker correctly superseded.
+aws --endpoint-url "${ENDPOINTS[0]}" s3api delete-object --bucket cluster-ec-edge-test --key empty.bin >/dev/null 2>&1
+sleep 2
+echo "resurrected after delete marker" >"$EMPTY_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$EMPTY_FILE" s3://cluster-ec-edge-test/empty.bin >/dev/null 2>&1
+sleep 2
+EC_EDGE_RESURRECT_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    if ! aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp s3://cluster-ec-edge-test/empty.bin - 2>/dev/null | cmp -s - "$EMPTY_FILE"; then
+        EC_EDGE_RESURRECT_OK=0; echo "  node $i did not return the resurrected content"
+    fi
+done
+rm -f "$EMPTY_FILE"
+
+if [ "$EC_EDGE_ZERO_OK" -eq 1 ] && [ "$EC_EDGE_RESURRECT_OK" -eq 1 ]; then
+    pass "Zero-byte object round-trips through EC on every node, and a re-PUT over a delete marker resurrects the key cluster-wide."
+else
+    fail "EC edge-case round trip failed (zero_byte_ok=$EC_EDGE_ZERO_OK resurrect_ok=$EC_EDGE_RESURRECT_OK)."
+fi
+
+# Finds the on-disk path of any one shard file for <bucket>/<key> across all node state dirs, and
+# echoes "<node_index> <path>". Empty if none found. Used by the repair/scrub tests to reach in and
+# damage a shard directly on disk.
+find_one_shard() {
+    local bucket="$1" key="$2" i shard
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        shard=$(find "${STATE_DIRS[$i]}/Storage/buckets/$bucket/$key.ecshards" -name "*.ecshard" 2>/dev/null | head -1)
+        if [ -n "$shard" ]; then
+            echo "$i $shard"
+            return 0
+        fi
+    done
+}
+
+# ── Test: ranged GET on an erasure-coded object returns exactly the requested slice ──
+# EC objects are reconstructed, not stored whole, so a Range request has to decode only the stripes
+# the range covers and slice them precisely. A multi-stripe object (1 MiB over 256 KiB*k=512 KiB
+# stripes) is fetched with byte ranges that straddle stripe boundaries, via a node that isn't
+# necessarily a holder (exercises forwarding of the range too).
+echo ""
+echo "=== Test: ranged GET on an erasure-coded object ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-range-test >/dev/null 2>&1
+EC_RANGE_FILE=$(mktemp)
+head -c 1048576 /dev/urandom >"$EC_RANGE_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$EC_RANGE_FILE" s3://cluster-ec-range-test/ranged.bin >/dev/null 2>&1
+sleep 2
+EC_RANGE_URL=$(aws --endpoint-url "${ENDPOINTS[3]}" s3 presign s3://cluster-ec-range-test/ranged.bin)
+EC_RANGE_OK=1
+# (start,end) inclusive pairs: within one stripe, exactly a stripe, across a boundary, the tail.
+for pair in "0:99" "524287:524288" "500000:600000" "1048275:1048575"; do
+    start="${pair%%:*}"; end="${pair##*:}"
+    got=$(curl -s "$EC_RANGE_URL" -H "Range: bytes=$start-$end" | xxd -p | tr -d '\n')
+    want=$(dd if="$EC_RANGE_FILE" bs=1 skip="$start" count=$((end - start + 1)) 2>/dev/null | xxd -p | tr -d '\n')
+    if [ "$got" != "$want" ] || [ -z "$got" ]; then
+        EC_RANGE_OK=0
+        echo "  range $start-$end mismatched (got ${#got} hex chars, want ${#want})"
+    fi
+done
+rm -f "$EC_RANGE_FILE"
+if [ "$EC_RANGE_OK" -eq 1 ]; then
+    pass "Ranged GET on an erasure-coded object returns exactly the requested byte slice across stripe boundaries."
+else
+    fail "Ranged GET on an erasure-coded object returned wrong bytes for at least one range."
+fi
+
+# ── Test: read-repair rebuilds a missing shard on access ──
+# Deleting one node's shard, then GETting the object, must (a) still return correct content -
+# reconstructed from survivors - and (b) trigger read-repair that rebuilds the deleted shard from
+# the survivors, without any manual resync.
+echo ""
+echo "=== Test: read-repair rebuilds a missing shard on GET ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-readrepair-test >/dev/null 2>&1
+RR_FILE=$(mktemp)
+echo "read repair rebuilds a missing shard $(date +%s)" >"$RR_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$RR_FILE" s3://cluster-ec-readrepair-test/rr.txt >/dev/null 2>&1
+sleep 2
+RR_SHARD_INFO=$(find_one_shard cluster-ec-readrepair-test rr.txt)
+if [ -z "$RR_SHARD_INFO" ]; then
+    fail "Could not locate an on-disk shard for rr.txt to delete."
+else
+    RR_SHARD_PATH="${RR_SHARD_INFO#* }"
+    rm -f "$RR_SHARD_PATH"
+    # GET (reconstructs + should schedule the repair). Content must be correct despite the gap.
+    RR_CONTENT_OK=0
+    aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-readrepair-test/rr.txt - 2>/dev/null | cmp -s - "$RR_FILE" && RR_CONTENT_OK=1
+    # Poll for the deleted shard file to reappear (reconstructed onto its node).
+    RR_REBUILT=0
+    for _ in $(seq 1 60); do
+        [ -f "$RR_SHARD_PATH" ] && { RR_REBUILT=1; break; }
+        # A repeated GET keeps read-repair kicking even if the first scheduling raced the delete.
+        aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-readrepair-test/rr.txt - >/dev/null 2>&1
+        sleep 1
+    done
+    if [ "$RR_CONTENT_OK" -eq 1 ] && [ "$RR_REBUILT" -eq 1 ]; then
+        pass "A GET with a missing shard returns correct content and read-repair rebuilds the shard from survivors."
+    else
+        fail "Read-repair did not behave as expected (content_ok=$RR_CONTENT_OK shard_rebuilt=$RR_REBUILT)."
+    fi
+fi
+rm -f "$RR_FILE"
+
+# ── Test: the bit-rot scrubber detects and heals a corrupted shard ──
+# Flipping bytes inside a shard file simulates silent bit-rot. The on-demand scrub endpoint must
+# detect the bad checksum, delete the damaged copy, and rebuild it from healthy survivors - all
+# without the object ever being read (isolating the scrubber from read-repair).
+echo ""
+echo "=== Test: bit-rot scrubber detects and heals a corrupted shard ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-scrub-test >/dev/null 2>&1
+SCRUB_FILE=$(mktemp)
+head -c 65536 /dev/urandom >"$SCRUB_FILE"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$SCRUB_FILE" s3://cluster-ec-scrub-test/scrub.bin >/dev/null 2>&1
+sleep 2
+SCRUB_SHARD_INFO=$(find_one_shard cluster-ec-scrub-test scrub.bin)
+if [ -z "$SCRUB_SHARD_INFO" ]; then
+    fail "Could not locate an on-disk shard for scrub.bin to corrupt."
+else
+    SCRUB_SHARD_PATH="${SCRUB_SHARD_INFO#* }"
+    # Overwrite 64 bytes deep inside the shard file (well past its header) with zeros - lands in a
+    # stripe payload, breaking that stripe's per-stripe checksum without changing the file length.
+    dd if=/dev/zero of="$SCRUB_SHARD_PATH" bs=1 seek=10000 count=64 conv=notrunc >/dev/null 2>&1
+    SCRUB_DAMAGED_SUM=$(shasum "$SCRUB_SHARD_PATH" | awk '{print $1}')
+    # Trigger a cluster-wide scrub.
+    curl -s -X POST "${ENDPOINTS[0]}/api/v1/admin/cluster/erasure-coding/scrub" -H "Authorization: Bearer $TOKEN" >/dev/null
+    # Poll until the shard is rebuilt (its checksum changes away from the damaged one AND it is
+    # readable - i.e. matches neither the damaged version; a fresh reconstruct restores valid bytes).
+    SCRUB_HEALED=0
+    for _ in $(seq 1 60); do
+        NOW_SUM=$(shasum "$SCRUB_SHARD_PATH" 2>/dev/null | awk '{print $1}')
+        if [ -n "$NOW_SUM" ] && [ "$NOW_SUM" != "$SCRUB_DAMAGED_SUM" ]; then
+            SCRUB_HEALED=1
+            break
+        fi
+        sleep 1
+    done
+    # The object must also still read back correctly after healing.
+    SCRUB_CONTENT_OK=0
+    aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-scrub-test/scrub.bin - 2>/dev/null | cmp -s - "$SCRUB_FILE" && SCRUB_CONTENT_OK=1
+    if [ "$SCRUB_HEALED" -eq 1 ] && [ "$SCRUB_CONTENT_OK" -eq 1 ]; then
+        pass "The scrubber detected a corrupted shard and rebuilt it from survivors, object still intact."
+    else
+        fail "Scrubber did not heal the corrupted shard (healed=$SCRUB_HEALED content_ok=$SCRUB_CONTENT_OK)."
+    fi
+fi
+rm -f "$SCRUB_FILE"
 
 # ── Test 39: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-

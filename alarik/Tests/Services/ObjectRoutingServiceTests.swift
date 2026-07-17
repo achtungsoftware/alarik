@@ -95,4 +95,38 @@ struct ObjectRoutingServiceTests {
             #expect(responsible.isEmpty)
         }
     }
+
+    @Test("erasureCodedRoutingDecision is .notClustered when cluster mode is off")
+    func erasureCodedRoutingNonClusteredIsNotClustered() async throws {
+        try await withApp { app in
+            let req = Request(
+                application: app, method: .PUT, url: URI(string: "/my-bucket/my-key"),
+                on: app.eventLoopGroup.next())
+
+            let decision = try await ObjectRoutingService.erasureCodedRoutingDecision(
+                req: req, bucketName: "my-bucket", key: "my-key")
+
+            guard case .notClustered = decision else {
+                Issue.record("Expected .notClustered, got \(decision)")
+                return
+            }
+        }
+    }
+
+    @Test("routeForErasureCodedWrite is .notClustered when cluster mode is off")
+    func routeForErasureCodedWriteNonClusteredIsNotClustered() async throws {
+        try await withApp { app in
+            let req = Request(
+                application: app, method: .PUT, url: URI(string: "/my-bucket/my-key"),
+                on: app.eventLoopGroup.next())
+
+            let routing = try await ObjectRoutingService.routeForErasureCodedWrite(
+                req: req, bucketName: "my-bucket", key: "my-key")
+
+            guard case .notClustered = routing else {
+                Issue.record("Expected .notClustered, got \(routing)")
+                return
+            }
+        }
+    }
 }

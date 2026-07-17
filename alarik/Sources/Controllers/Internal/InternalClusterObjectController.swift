@@ -41,6 +41,29 @@ struct InternalClusterObjectController: RouteCollection {
         cluster.delete(use: handleDelete)
         cluster.get("fetch", use: handleFetch)
         cluster.get("exists", use: handleExists)
+        cluster.get("latest-version", use: handleLatestVersion)
+    }
+
+    /// Resolves "what's the latest version id of this key" using this node's own local
+    /// `.latest` pointer - format-agnostic (the same pointer convention backs both `.obj` and
+    /// `.ecshard` storage), so callers use this regardless of which format the key turns out to
+    /// use. Needed because a copy source can be a key this node isn't itself responsible for -
+    /// only a node actually responsible for the source can resolve "latest" from local state.
+    @Sendable
+    func handleLatestVersion(req: Request) async throws -> Response {
+        guard
+            let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
+        }
+
+        guard ObjectFileHandler.isVersioned(bucketName: bucketName, key: key),
+            let versionId = try ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: key)
+        else {
+            return Response(status: .noContent)
+        }
+        return Response(status: .ok, body: .init(string: versionId))
     }
 
     /// Header-only existence probe (the read-side counterpart to `handleFetch`) - resolves the

@@ -68,6 +68,10 @@ public func configure(_ app: Application) async throws {
     // clustering requires `DATABASE_URL` (membership + cache invalidation need the shared
     // Postgres control plane) - a single Postgres-mode node without these vars stays a plain
     // single-node deployment with a shared control plane, never joining any cluster.
+    // Validated unconditionally (not just in cluster mode) so a typo in these vars fails boot
+    // immediately, even before the operator flips on CLUSTER_NODE_ADDRESS/CLUSTER_SECRET.
+    let erasureCodingConfig = try ClusterErasureCodingConfig.resolve()
+
     let clusterNodeAddress = Environment.sanitizedGet("CLUSTER_NODE_ADDRESS")
     let clusterSecret = Environment.sanitizedGet("CLUSTER_SECRET")
     if clusterNodeAddress != nil || clusterSecret != nil {
@@ -86,6 +90,7 @@ public func configure(_ app: Application) async throws {
         let nodeId = try ClusterNodeIdentity.loadOrCreate()
         app.storage[ClusterConfigurationKey.self] = ClusterConfiguration(
             nodeId: nodeId, address: clusterNodeAddress, secret: clusterSecret)
+        app.storage[ClusterErasureCodingConfigKey.self] = erasureCodingConfig
     }
 
     // Spool files are per-request transients; anything still here is an orphan from an
@@ -112,6 +117,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateClusterNode())
     app.migrations.add(CreateClusterReplicationTask())
     app.migrations.add(AddClusterNodeCapacity())
+    app.migrations.add(CreateErasureCodedReplicationTask())
 
     app.migrations.add(CreateDefaultUser())
 
@@ -171,6 +177,7 @@ public func configure(_ app: Application) async throws {
     await NotificationDispatcher.shared.configure(app: app)
     await ReplicationDispatcher.shared.configure(app: app)
     await ClusterReplicationDispatcher.shared.configure(app: app)
+    await ErasureCodedDispatcher.shared.configure(app: app)
 
     try routes(app)
 
@@ -268,6 +275,39 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Erasure-coded shard-repair outbox tick - same reasoning as the three ticks above, and
+        // just as necessary: fresh shard-fanout catch-up, rebalance, and reconstruction tasks are
+        // woken near-instantly via the explicit wake() in ErasureCodedWriteCoordinator/
+        // ErasureCodedRebalanceService, but a task whose delivery attempt failed (a peer down
+        // during a quorum write) backs off and MUST be re-drained once that backoff elapses.
+        // Without this tick that retry only ever fired if some unrelated later write happened to
+        // wake the dispatcher after the backoff window - so a shard a down replica missed could
+        // sit un-repaired indefinitely, purely on timing luck.
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .seconds(2),
+            delay: .seconds(2)
+        ) { task in
+            Task {
+                await ErasureCodedDispatcher.shared.drain()
+            }
+        }
+
+        // Erasure-coding bit-rot scrubber - only scheduled when this node is in cluster mode with
+        // scrubbing enabled (`CLUSTER_EC_SCRUB_INTERVAL_HOURS` > 0, defaults to weekly). Each node
+        // re-verifies its own shards' checksums and heals any it finds corrupt; the initial delay
+        // matches the interval so a fresh boot doesn't immediately scrub. On-demand scrubs go
+        // through the admin endpoint / cache NOTIFY instead of this tick.
+        if app.storage[ClusterConfigurationKey.self] != nil,
+            let ecConfig = app.storage[ClusterErasureCodingConfigKey.self], ecConfig.scrubbingEnabled
+        {
+            let interval = TimeAmount.hours(Int64(ecConfig.scrubIntervalHours))
+            app.eventLoopGroup.next().scheduleRepeatedTask(
+                initialDelay: interval, delay: interval
+            ) { task in
+                Task { await ErasureCodedScrubber.scrub(app: app) }
+            }
+        }
+
         // Bucket lifecycle rules - a separate, much less frequent task than the minute-based
         // cleanup above, since expiring objects/versions/multipart uploads is never time-critical
         // the way short-lived access keys/share links are. Matches S3, which evaluates
@@ -299,6 +339,12 @@ public func configure(_ app: Application) async throws {
                     try await ClusterReplicationDispatcher.purgeExpiredFailures(on: app.db)
                 } catch {
                     app.logger.error("Failed to purge expired cluster replication failures: \(error)")
+                }
+
+                do {
+                    try await ErasureCodedDispatcher.purgeExpiredFailures(on: app.db)
+                } catch {
+                    app.logger.error("Failed to purge expired EC shard replication failures: \(error)")
                 }
             }
         }

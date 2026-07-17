@@ -19,185 +19,75 @@ import Foundation
 import Vapor
 
 /// Drains the `cluster_replication_tasks` outbox: pushes/deletes each due row on its target
-/// node via `ClusterReplicationClient` and applies retry bookkeeping on failure. Structural clone of
-/// `ReplicationDispatcher` - identical actor shape, re-entrancy coalescing, bounded-concurrency
-/// drain loop, same-key mutex, and backoff formula - just re-targeted at an internal peer node
-/// (`ClusterReplicationClient.pushObject`/`deleteObject`) instead of an external S3-compatible
-/// endpoint (`ReplicationClient`).
-final actor ClusterReplicationDispatcher {
-    static let shared = ClusterReplicationDispatcher()
-
+/// node via `ClusterReplicationClient`.
+enum ClusterReplicationDispatcher {
     static let maxAttempts = 8
-    static let batchSize = 50
-    static let maxConcurrentDeliveries = 4
 
-    private var app: Application?
-    private var isDraining = false
-    private var pendingWake = false
-
-    func configure(app: Application) {
-        self.app = app
-    }
-
-    nonisolated func wake() {
-        Task { await self.drain() }
-    }
-
-    func drain() async {
-        guard let app else { return }
-        if isDraining {
-            pendingWake = true
-            return
-        }
-        isDraining = true
-        defer {
-            isDraining = false
-            if pendingWake {
-                pendingWake = false
-                wake()
+    static let shared = GenericOutboxDispatcher<ClusterReplicationTask>(
+        maxAttempts: maxAttempts,
+        maxConcurrentDeliveries: 4,
+        logContext: "Cluster replication",
+        failedStateValue: ClusterReplicationTask.State.failed.rawValue,
+        fetchDue: { db, limit in
+            try await ClusterReplicationTask.query(on: db)
+                .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
+                .filter(\.$nextAttemptAt <= Date())
+                .sort(\.$nextAttemptAt, .ascending)
+                .limit(limit)
+                .all()
+        },
+        dedupKey: { row in "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.targetNodeId)" },
+        attemptDelivery: { row, app in
+            // Any node's tick can pick up any pending row, so a `.put` this node doesn't
+            // physically have would just be a guaranteed failure - skip instead of burning
+            // the shared attempts budget; the node that actually has it retries on its own tick.
+            if row.operation == ClusterReplicationTask.Operation.put.rawValue {
+                let hasLocalCopy =
+                    (try? await app.threadPool.runIfActive {
+                        try ObjectFileHandler.resolvePath(
+                            bucketName: row.bucketName, key: row.key, versionId: row.versionId)
+                    }) != nil
+                guard hasLocalCopy else { return .skip }
             }
-        }
 
-        while true {
-            let due: [ClusterReplicationTask]
             do {
-                due = try await ClusterReplicationTask.query(on: app.db)
-                    .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
-                    .filter(\.$nextAttemptAt <= Date())
-                    .sort(\.$nextAttemptAt, .ascending)
-                    .limit(Self.batchSize)
-                    .all()
+                guard let node = await ClusterNodeCache.shared.get(id: row.targetNodeId) else {
+                    throw ClusterReplicationDispatcherError.unknownTarget(row.targetNodeId)
+                }
+                switch row.operation {
+                case ClusterReplicationTask.Operation.put.rawValue:
+                    try await ClusterReplicationClient.pushObject(
+                        app: app, to: node, bucketName: row.bucketName, key: row.key,
+                        versionId: row.versionId)
+                case ClusterReplicationTask.Operation.delete.rawValue:
+                    try await ClusterReplicationClient.deleteObject(
+                        app: app, to: node, bucketName: row.bucketName, key: row.key,
+                        versionId: row.versionId)
+                default:
+                    throw ClusterReplicationDispatcherError.unknownOperation(row.operation)
+                }
+                return .success
             } catch {
-                app.logger.error("Cluster replication dispatcher failed to query outbox: \(error)")
-                return
+                return .failure(error)
             }
-
-            guard !due.isEmpty else { return }
-
-            var remaining = due
-            var inFlightKeys: Set<String> = []
-
-            func popNextEligible() -> ClusterReplicationTask? {
-                guard let index = remaining.firstIndex(where: { !inFlightKeys.contains(Self.taskKey($0)) })
-                else { return nil }
-                let row = remaining.remove(at: index)
-                inFlightKeys.insert(Self.taskKey(row))
-                return row
-            }
-
-            await withTaskGroup(of: String.self) { group in
-                var inFlight = 0
-                while inFlight < Self.maxConcurrentDeliveries, let row = popNextEligible() {
-                    let key = Self.taskKey(row)
-                    group.addTask {
-                        await Self.deliver(row, app: app)
-                        return key
-                    }
-                    inFlight += 1
-                }
-                while let finishedKey = await group.next() {
-                    inFlightKeys.remove(finishedKey)
-                    guard let row = popNextEligible() else { continue }
-                    let key = Self.taskKey(row)
-                    group.addTask {
-                        await Self.deliver(row, app: app)
-                        return key
-                    }
-                }
-            }
-
-            if due.count < Self.batchSize && remaining.isEmpty {
-                return
-            }
+        },
+        describeFailure: { row in
+            "\(row.key) to node \(row.targetNodeId) (bucket: \(row.bucketName), reason: \(row.reason))"
+        },
+        purgeExpired: { db in
+            try await ClusterReplicationTask.query(on: db)
+                .filter(\.$state == ClusterReplicationTask.State.failed.rawValue)
+                .filter(\.$createdAt < Date().addingTimeInterval(-7 * 24 * 3600))
+                .delete()
         }
-    }
-
-    private static func taskKey(_ row: ClusterReplicationTask) -> String {
-        "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.targetNodeId)"
-    }
-
-    private static func deliver(_ row: ClusterReplicationTask, app: Application) async {
-        // Every node runs this same dispatcher independently against the same shared table (no
-        // leader election, no row claiming), so any node's tick can pick up any pending row - not
-        // just the one that actually holds the object. A `.put` only makes sense for whichever
-        // node physically has it: `pushObject` resolves the local path first and would throw
-        // immediately otherwise, and treating that guaranteed failure as a real delivery attempt
-        // would burn the shared `attempts` budget with failures that were never going to succeed,
-        // risking premature dead-lettering of a push some *other* node could deliver just fine.
-        // Skip silently instead - the node that actually has the object still retries normally on
-        // its own tick, so this doesn't weaken the eventual dead-letter safety net for a push
-        // that's genuinely undeliverable by everyone. `.delete` needs no such check: it's a plain
-        // "tell the target to delete its copy" HTTP call that requires no local state at all, so
-        // any node can correctly relay it regardless of which one happens to be executing.
-        if row.operation == ClusterReplicationTask.Operation.put.rawValue {
-            // `resolvePath` makes several blocking filesystem syscalls (stat, open, read) -
-            // routed through the thread pool like every other disk access in this codebase,
-            // rather than run directly on a Swift concurrency cooperative thread, which only has
-            // as many threads as CPU cores and would otherwise be starved by this on every
-            // `.put` row drained (up to `maxConcurrentDeliveries` at once, every batch).
-            let hasLocalCopy =
-                (try? await app.threadPool.runIfActive {
-                    try ObjectFileHandler.resolvePath(
-                        bucketName: row.bucketName, key: row.key, versionId: row.versionId)
-                }) != nil
-            guard hasLocalCopy else { return }
-        }
-
-        var succeeded = false
-        var failureReason: String?
-        do {
-            guard let node = await ClusterNodeCache.shared.get(id: row.targetNodeId) else {
-                throw DispatcherError.unknownTarget(row.targetNodeId)
-            }
-            switch row.operation {
-            case ClusterReplicationTask.Operation.put.rawValue:
-                try await ClusterReplicationClient.pushObject(
-                    app: app, to: node, bucketName: row.bucketName, key: row.key,
-                    versionId: row.versionId)
-            case ClusterReplicationTask.Operation.delete.rawValue:
-                try await ClusterReplicationClient.deleteObject(
-                    app: app, to: node, bucketName: row.bucketName, key: row.key,
-                    versionId: row.versionId)
-            default:
-                throw DispatcherError.unknownOperation(row.operation)
-            }
-            succeeded = true
-        } catch {
-            succeeded = false
-            failureReason = "\(error)"
-        }
-
-        do {
-            if succeeded {
-                try await row.delete(on: app.db)
-            } else {
-                row.attempts += 1
-                row.lastError = failureReason
-                if row.attempts >= maxAttempts {
-                    row.state = ClusterReplicationTask.State.failed.rawValue
-                    app.logger.warning(
-                        "Cluster replication of \(row.key) to node \(row.targetNodeId) failed permanently after \(row.attempts) attempts (bucket: \(row.bucketName), reason: \(row.reason))"
-                    )
-                } else {
-                    let backoff = min(30.0 * pow(2.0, Double(row.attempts)), 3600.0)
-                    row.nextAttemptAt = Date().addingTimeInterval(backoff)
-                }
-                try await row.save(on: app.db)
-            }
-        } catch {
-            app.logger.error("Cluster replication dispatcher failed to update outbox row: \(error)")
-        }
-    }
+    )
 
     static func purgeExpiredFailures(on db: any Database) async throws {
-        try await ClusterReplicationTask.query(on: db)
-            .filter(\.$state == ClusterReplicationTask.State.failed.rawValue)
-            .filter(\.$createdAt < Date().addingTimeInterval(-7 * 24 * 3600))
-            .delete()
+        try await shared.purgeExpiredFailures(on: db)
     }
 }
 
-private enum DispatcherError: Error, CustomStringConvertible {
+private enum ClusterReplicationDispatcherError: Error, CustomStringConvertible {
     case unknownOperation(String)
     case unknownTarget(UUID)
 

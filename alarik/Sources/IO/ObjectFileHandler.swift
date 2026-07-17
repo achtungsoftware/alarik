@@ -374,9 +374,11 @@ struct ObjectFileHandler {
             return false
         }
 
-        // Check if there's at least one .obj file (either versioned or non-versioned)
+        // Check if there's at least one .obj or .ecshard file (either versioned or non-versioned) -
+        // any single shard is enough here (unlike stats counting, existence doesn't need to
+        // dedupe against the other k+m-1 shards of the same object).
         for case let fileURL as URL in enumerator {
-            if fileURL.pathExtension == "obj" {
+            if fileURL.pathExtension == "obj" || fileURL.pathExtension == "ecshard" {
                 return true
             }
         }
@@ -535,6 +537,29 @@ struct ObjectFileHandler {
             }
         }
 
+        // EC objects never appear in the `.obj` walk above - shard index 0's header already
+        // carries the current `isLatest`/`isDeleteMarker` state directly (no separate pointer
+        // read needed), so this is a straight filter over local shard-0 headers, applying the
+        // same prefix/marker/delimiter rules the `.obj` pass applies.
+        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName)
+        where meta.isLatest {
+            let key = meta.key
+            if !prefix.isEmpty && !key.hasPrefix(prefix) { continue }
+            if let marker, key <= marker { continue }
+            if let delimiter, !delimiter.isEmpty {
+                guard delimiter.count == 1, let delimChar = delimiter.first else { continue }
+                let keyAfterPrefix = String(key.dropFirst(prefix.count))
+                if let delimiterIndex = keyAfterPrefix.firstIndex(of: delimChar) {
+                    let prefixSlice = String(keyAfterPrefix[..<delimiterIndex])
+                    let commonPrefix = prefix + prefixSlice + delimiter
+                    commonPrefixesSet.insert(commonPrefix)
+                    continue
+                }
+            }
+            if meta.isDeleteMarker { continue }
+            latestByKey[key] = meta
+        }
+
         // Convert to array and sort
         var allObjects: [(key: String, meta: ObjectMeta)] = latestByKey.map { ($0.key, $0.value) }
         allObjects.sort { $0.key < $1.key }
@@ -672,7 +697,11 @@ struct ObjectFileHandler {
 
     /// Shared setup for both versioned-write flavors: picks the version ID and target path
     /// for the bucket's versioning state, demotes existing versions, and stamps the metadata.
-    private static func prepareVersionedWrite(
+    /// Not private: `ErasureCodedWriteCoordinator`'s caller reuses the identical version-id-
+    /// minting/demote-versions logic - the `path` it returns is just unused there, since an EC
+    /// write's shard base path is a different, independently-computed scheme keyed by the same
+    /// version id.
+    static func prepareVersionedWrite(
         metadata: ObjectMeta,
         bucketName: String,
         key: String,
@@ -908,6 +937,13 @@ struct ObjectFileHandler {
             }
         }
 
+        // EC versions of this key - shard index 0 is this node's one-hit-per-version signal,
+        // no re-read needed (see `listAllVersions`'s identical reasoning).
+        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName, key: key)
+        where !versions.contains(where: { $0.versionId == meta.versionId }) {
+            versions.append(meta)
+        }
+
         // Sort by updatedAt descending (newest first)
         versions.sort { $0.updatedAt > $1.updatedAt }
 
@@ -1013,6 +1049,45 @@ struct ObjectFileHandler {
                 }
             } catch {
                 continue
+            }
+        }
+
+        // EC versions never appear in the `.obj` walk above - shard index 0 is this node's
+        // one-hit-per-version signal (see `ErasureCodedObjectHandler.listLocalShardZeroEntries`),
+        // so every entry here is already exactly one `ObjectMeta`, no re-read needed. Same
+        // prefix/delimiter/marker filtering as the `.obj` pass, duplicated rather than shared -
+        // this function already favors that style over extracting a filter closure.
+        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName) {
+            let objectKey = meta.key
+
+            if !prefix.isEmpty && !objectKey.hasPrefix(prefix) {
+                continue
+            }
+
+            if let delimiter, !delimiter.isEmpty, let delimiterChar = delimiter.first {
+                let afterPrefix = String(objectKey.dropFirst(prefix.count))
+                if let delimiterIndex = afterPrefix.firstIndex(of: delimiterChar) {
+                    let folderPrefix = prefix + String(afterPrefix[..<afterPrefix.index(after: delimiterIndex)])
+                    commonPrefixSet.insert(folderPrefix)
+                    continue
+                }
+            }
+
+            if let keyMarker {
+                if meta.key < keyMarker {
+                    continue
+                }
+                if meta.key == keyMarker, let versionIdMarker {
+                    if let versionId = meta.versionId, versionId <= versionIdMarker {
+                        continue
+                    }
+                }
+            }
+
+            if meta.isDeleteMarker {
+                allDeleteMarkers.append(meta)
+            } else {
+                allVersions.append(meta)
             }
         }
 
@@ -1243,10 +1318,12 @@ struct ObjectFileHandler {
 
         let contents = try FileManager.default.contentsOfDirectory(at: baseURL, includingPropertiesForKeys: nil)
 
-        // Check if only .latest file remains or directory is empty
+        // Only safe to remove the whole .versions directory once neither format has anything
+        // left in it - a key's version history could be a mix of pre-EC `.obj` versions and
+        // later `.ecshards` ones sharing this same parent directory.
         let objFiles = contents.filter { $0.pathExtension == "obj" }
-        if objFiles.isEmpty {
-            // Remove the entire .versions directory
+        let ecshardDirs = contents.filter { $0.pathExtension == "ecshards" }
+        if objFiles.isEmpty && ecshardDirs.isEmpty {
             try? FileManager.default.removeItem(at: baseURL)
         }
     }

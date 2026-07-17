@@ -80,6 +80,42 @@ struct InternalClusterController: RouteCollection {
         let lastError: String?
     }
 
+    /// Deployment-wide erasure-coding health. `enabled` is false when this cluster runs plain
+    /// 3x replication (no `CLUSTER_EC_*` config) - the console shows the k/m parameters and shard-
+    /// repair backlog only then. `pendingReconstructCount` is broken out from the general pending
+    /// tally because a `.reconstruct` task means a shard was *permanently lost* and is being
+    /// rebuilt from survivors (a genuine durability event), distinct from a `.write`/`.rebalance`
+    /// task that just moves or catches up an existing shard.
+    struct ErasureCodingStatusDTO: Content {
+        let enabled: Bool
+        let dataShards: Int
+        let parityShards: Int
+        let totalShards: Int
+        let quorumThreshold: Int
+        let pendingCount: Int
+        let failedCount: Int
+        let pendingReconstructCount: Int
+        let pendingByReason: [String: Int]
+    }
+
+    /// One EC shard-repair outbox row's full detail - the shard-level counterpart of
+    /// `ReplicationTaskDetailDTO`, adding the `shardIndex`/`versionId` a shard task carries that a
+    /// whole-object replication task doesn't.
+    struct ErasureCodedTaskDetailDTO: Content {
+        let id: UUID
+        let bucketName: String
+        let key: String
+        let versionId: String?
+        let shardIndex: Int
+        let operation: String
+        let targetNodeId: UUID
+        let reason: String
+        let attempts: Int
+        let nextAttemptAt: Date
+        let state: String
+        let lastError: String?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         let cluster = routes.grouped("admin").grouped("cluster")
         cluster.grouped("nodes").get(use: listNodes)
@@ -87,6 +123,9 @@ struct InternalClusterController: RouteCollection {
         cluster.grouped("resync").post(use: resync)
         cluster.grouped("rebalance", "status").get(use: rebalanceStatus)
         cluster.grouped("rebalance", "tasks").get(use: rebalanceTasks)
+        cluster.grouped("erasure-coding", "status").get(use: erasureCodingStatus)
+        cluster.grouped("erasure-coding", "tasks").get(use: erasureCodingTasks)
+        cluster.grouped("erasure-coding", "scrub").post(use: erasureCodingScrub)
         cluster.grouped("placement").get(use: placement)
         cluster.grouped("storage").get(use: storage)
     }
@@ -230,6 +269,97 @@ struct InternalClusterController: RouteCollection {
             guard let id = task.id else { return nil }
             return ReplicationTaskDetailDTO(
                 id: id, bucketName: task.bucketName, key: task.key, operation: task.operation,
+                targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
+                nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
+        }
+    }
+
+    /// Deployment-wide erasure-coding health: the configured k/m parameters plus the shard-repair
+    /// backlog (the EC counterpart of `rebalanceStatus`). The counts come from the
+    /// `erasure_coded_replication_tasks` outbox, counted-not-loaded exactly like `rebalanceStatus`,
+    /// so a cluster mid-reconstruction with a huge backlog doesn't pull every row into memory.
+    @Sendable
+    func erasureCodingStatus(req: Request) async throws -> ErasureCodingStatusDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self] else {
+            return ErasureCodingStatusDTO(
+                enabled: false, dataShards: 0, parityShards: 0, totalShards: 0, quorumThreshold: 0,
+                pendingCount: 0, failedCount: 0, pendingReconstructCount: 0, pendingByReason: [:])
+        }
+
+        var byReason: [String: Int] = [:]
+        var pendingCount = 0
+        for reason in ErasureCodedReplicationTask.Reason.allCases {
+            let count = try await ErasureCodedReplicationTask.query(on: req.db)
+                .filter(\.$state == ErasureCodedReplicationTask.State.pending.rawValue)
+                .filter(\.$reason == reason.rawValue)
+                .count()
+            pendingCount += count
+            if count > 0 {
+                byReason[reason.rawValue] = count
+            }
+        }
+        let failedCount = try await ErasureCodedReplicationTask.query(on: req.db)
+            .filter(\.$state == ErasureCodedReplicationTask.State.failed.rawValue)
+            .count()
+
+        return ErasureCodingStatusDTO(
+            enabled: true,
+            dataShards: ecConfig.dataShards,
+            parityShards: ecConfig.parityShards,
+            totalShards: ecConfig.totalShards,
+            quorumThreshold: PlacementService.ecQuorumThreshold(
+                dataShards: ecConfig.dataShards, parityShards: ecConfig.parityShards),
+            pendingCount: pendingCount,
+            failedCount: failedCount,
+            pendingReconstructCount: byReason[ErasureCodedReplicationTask.Reason.reconstruct.rawValue] ?? 0,
+            pendingByReason: byReason)
+    }
+
+    /// Full detail for outstanding (pending or failed) EC shard-repair rows - the drill-down behind
+    /// `erasureCodingStatus`, mirroring `rebalanceTasks` but shard-scoped (which shard index of
+    /// which version is stuck, targeting which node, and why). Sorted most-stuck-first, capped at
+    /// 200 - a diagnostic view, not a paginated browser.
+    /// Triggers an immediate bit-rot scrub on **every** node - the EC counterpart of
+    /// [`resync`](#resync), and needed for the same reason: a scrub only ever sees a node's own
+    /// local shards, so verifying the whole cluster requires every node to run its own pass. The
+    /// automatic scheduled scrub (`CLUSTER_EC_SCRUB_INTERVAL_HOURS`) covers the routine case; this
+    /// is for on-demand verification after a suspected disk problem. Returns immediately - the scrub
+    /// runs in the background and reports through the erasure-coding status endpoint's repair counts.
+    @Sendable
+    func erasureCodingScrub(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        CacheInvalidationService.notify(
+            on: req.db, cache: "clusterScrub", op: .upsert, key: "scrub")
+        return .ok
+    }
+
+    @Sendable
+    func erasureCodingTasks(req: Request) async throws -> [ErasureCodedTaskDetailDTO] {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        let tasks = try await ErasureCodedReplicationTask.query(on: req.db)
+            .filter(
+                \.$state
+                    ~~ [
+                        ErasureCodedReplicationTask.State.pending.rawValue,
+                        ErasureCodedReplicationTask.State.failed.rawValue,
+                    ]
+            )
+            .sort(\.$attempts, .descending)
+            .limit(200)
+            .all()
+
+        return tasks.compactMap { task in
+            guard let id = task.id else { return nil }
+            return ErasureCodedTaskDetailDTO(
+                id: id, bucketName: task.bucketName, key: task.key, versionId: task.versionId,
+                shardIndex: task.shardIndex, operation: task.operation,
                 targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
                 nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
         }

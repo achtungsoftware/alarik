@@ -50,6 +50,11 @@ services:
       - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-1:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
+      # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
+      # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
+      - CLUSTER_EC_DATA_SHARDS=2
+      - CLUSTER_EC_PARITY_SHARDS=2
       # Providing default keys is optional but necessary for testing
       - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
       - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
@@ -89,6 +94,11 @@ services:
       - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-2:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
+      # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
+      # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
+      - CLUSTER_EC_DATA_SHARDS=2
+      - CLUSTER_EC_PARITY_SHARDS=2
       - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
       - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     volumes:
@@ -129,6 +139,11 @@ services:
       - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-3:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
+      # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
+      # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
+      - CLUSTER_EC_DATA_SHARDS=2
+      - CLUSTER_EC_PARITY_SHARDS=2
       - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
       - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     volumes:
@@ -169,6 +184,11 @@ services:
       - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-4:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
+      # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
+      # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
+      - CLUSTER_EC_DATA_SHARDS=2
+      - CLUSTER_EC_PARITY_SHARDS=2
       - DEFAULT_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
       - DEFAULT_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     volumes:

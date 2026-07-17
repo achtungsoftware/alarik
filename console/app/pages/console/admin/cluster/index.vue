@@ -74,6 +74,27 @@ const {
     default: () => ({ pendingCount: 0, failedCount: 0, pendingByReason: {}, replicationFactor: 0 }),
 });
 
+// Erasure-coding health: k/m parameters plus the shard-repair backlog. `enabled` is false on a
+// plain 3x-replication cluster, in which case the EC card and stat are hidden entirely (nothing
+// EC-specific to show). Polled alongside the other cheap status endpoints below.
+const {
+    data: erasureCodingStatus,
+    refresh: refreshErasureCodingStatus,
+} = await useFetch<ClusterErasureCodingStatus>(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/status`, {
+    headers: authHeaders.value,
+    default: () => ({
+        enabled: false,
+        dataShards: 0,
+        parityShards: 0,
+        totalShards: 0,
+        quorumThreshold: 0,
+        pendingCount: 0,
+        failedCount: 0,
+        pendingReconstructCount: 0,
+        pendingByReason: {},
+    }),
+});
+
 // Storage breakdown is a full multi-bucket disk walk on every node - expensive, so unlike the
 // two fetches above it is fetched once on load and otherwise only on manual refresh, never
 // added to the poll timer below.
@@ -107,6 +128,26 @@ async function loadTaskDetails() {
     }
 }
 
+// Drill-down behind the EC "Shard Repair by Reason" card - the shard-level counterpart of
+// loadTaskDetails, on demand only (same reasoning: the summary counts are enough at a glance).
+const ecTaskDetails = ref<ClusterErasureCodedTaskDetail[]>([]);
+const isLoadingEcTaskDetails = ref(false);
+const hasLoadedEcTaskDetails = ref(false);
+
+async function loadEcTaskDetails() {
+    isLoadingEcTaskDetails.value = true;
+    try {
+        ecTaskDetails.value = await $fetch<ClusterErasureCodedTaskDetail[]>(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/tasks`, {
+            headers: authHeaders.value,
+        });
+        hasLoadedEcTaskDetails.value = true;
+    } catch (err: any) {
+        toast.add({ title: "Failed to Load", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } finally {
+        isLoadingEcTaskDetails.value = false;
+    }
+}
+
 // Cheap endpoints (a small table each) - poll like the dashboard's systemStats, so node health
 // and rebalance progress stay live without a manual refresh.
 let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -114,6 +155,7 @@ onMounted(() => {
     pollTimer = setInterval(() => {
         refreshNodes();
         refreshRebalanceStatus();
+        refreshErasureCodingStatus();
     }, 10000);
 });
 onUnmounted(() => {
@@ -123,16 +165,28 @@ onUnmounted(() => {
 function refreshAll() {
     refreshNodes();
     refreshRebalanceStatus();
+    refreshErasureCodingStatus();
 }
 
 const healthyCount = computed(() => nodes.value.filter((n) => n.isHealthy).length);
 
-const isDegraded = computed(() => nodes.value.some((n) => !n.isHealthy) || rebalanceStatus.value.failedCount > 0);
+const isDegraded = computed(
+    () =>
+        nodes.value.some((n) => !n.isHealthy) ||
+        rebalanceStatus.value.failedCount > 0 ||
+        erasureCodingStatus.value.failedCount > 0 ||
+        erasureCodingStatus.value.pendingReconstructCount > 0
+);
 const degradedDescription = computed(() => {
     const parts: string[] = [];
     const unhealthy = nodes.value.filter((n) => !n.isHealthy).length;
     if (unhealthy > 0) parts.push(`${unhealthy} node${unhealthy === 1 ? "" : "s"} unhealthy`);
     if (rebalanceStatus.value.failedCount > 0) parts.push(`${rebalanceStatus.value.failedCount} replication task${rebalanceStatus.value.failedCount === 1 ? "" : "s"} failed`);
+    // A reconstruct means a shard was permanently lost and is being rebuilt from survivors - a
+    // genuine durability event worth surfacing at the top of the page, not just in the EC card.
+    if (erasureCodingStatus.value.pendingReconstructCount > 0)
+        parts.push(`${erasureCodingStatus.value.pendingReconstructCount} shard${erasureCodingStatus.value.pendingReconstructCount === 1 ? "" : "s"} reconstructing`);
+    if (erasureCodingStatus.value.failedCount > 0) parts.push(`${erasureCodingStatus.value.failedCount} shard repair${erasureCodingStatus.value.failedCount === 1 ? "" : "s"} failed`);
     return parts.join(" · ");
 });
 
@@ -205,6 +259,32 @@ async function resyncCluster() {
         toast.add({ title: "Resync Failed", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
     } finally {
         isResyncing.value = false;
+    }
+}
+
+// On-demand bit-rot scrub - every node re-verifies its shard checksums and rebuilds any corrupt
+// ones. Only offered on an erasure-coded cluster (nothing to scrub under plain replication).
+const isScrubbing = ref(false);
+async function scrubCluster() {
+    const confirmed = await confirm({
+        title: "Scrub Shards",
+        message: "Trigger an immediate bit-rot scrub on every node? Each node re-verifies its erasure-coded shards' checksums and rebuilds any it finds corrupt. Runs in the background - progress shows under Shard Repair.",
+        confirmLabel: "Scrub",
+    });
+    if (!confirmed) return;
+
+    isScrubbing.value = true;
+    try {
+        await $fetch(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/scrub`, {
+            method: "POST",
+            headers: authHeaders.value,
+        });
+        toast.add({ title: "Scrub Started", description: "A cluster-wide bit-rot scrub has been triggered.", icon: "i-lucide-circle-check", color: "success" });
+        await refreshErasureCodingStatus();
+    } catch (err: any) {
+        toast.add({ title: "Scrub Failed", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } finally {
+        isScrubbing.value = false;
     }
 }
 
@@ -355,6 +435,75 @@ const taskDetailColumns: TableColumn<ClusterReplicationTaskDetail>[] = [
     },
 ];
 
+// Drill-down table behind "Shard Repair by Reason" - the EC counterpart of taskDetailColumns,
+// adding the shard index / version a shard task carries. `reconstruct` is coloured distinctly:
+// it means a shard was permanently lost and is being rebuilt, not merely moved or caught up.
+const ecTaskDetailColumns: TableColumn<ClusterErasureCodedTaskDetail>[] = [
+    {
+        id: "object",
+        header: "Object",
+        cell: ({ row }) =>
+            h("div", { class: "flex flex-col" }, [
+                h("span", { class: "font-medium truncate max-w-64" }, row.original.key),
+                h("span", { class: "text-xs text-muted truncate max-w-64" }, row.original.bucketName),
+            ]),
+    },
+    {
+        id: "shard",
+        header: "Shard",
+        cell: ({ row }) => h("span", { class: "text-sm tabular-nums" }, `#${row.original.shardIndex}`),
+    },
+    {
+        id: "target",
+        header: "Target Node",
+        cell: ({ row }) =>
+            h("div", { class: "flex items-center gap-1.5" }, [
+                h("span", {
+                    class: "inline-block w-1.5 h-1.5 rounded-full shrink-0",
+                    style: { backgroundColor: nodeColor(row.original.targetNodeId) },
+                }),
+                h("span", { class: "text-sm whitespace-nowrap" }, shortAddress(nodeAddress(row.original.targetNodeId))),
+            ]),
+    },
+    {
+        accessorKey: "reason",
+        header: "Reason",
+        cell: ({ row }) =>
+            h(
+                resolveComponent("UBadge"),
+                { color: row.original.reason === "reconstruct" ? "warning" : "neutral", variant: "subtle", size: "sm" },
+                () => row.original.reason
+            ),
+    },
+    {
+        accessorKey: "state",
+        header: "State",
+        cell: ({ row }) =>
+            h(
+                resolveComponent("UBadge"),
+                { color: row.original.state === "failed" ? "error" : "warning", variant: "subtle", size: "sm" },
+                () => row.original.state
+            ),
+    },
+    { accessorKey: "attempts", header: "Attempts" },
+    {
+        id: "nextAttempt",
+        header: "Next Retry",
+        cell: ({ row }) =>
+            row.original.state === "failed"
+                ? h("span", { class: "text-xs text-muted" }, "—")
+                : h("span", { class: "text-xs whitespace-nowrap" }, formatEta(row.original.nextAttemptAt)),
+    },
+    {
+        id: "lastError",
+        header: "Last Error",
+        cell: ({ row }) =>
+            row.original.lastError
+                ? h("span", { class: "text-xs text-muted truncate max-w-72 block", title: row.original.lastError }, row.original.lastError)
+                : h("span", { class: "text-xs text-muted" }, "—"),
+    },
+];
+
 // ── Placement browser ───────────────────────────────────────────────────────
 
 const placementBucket = ref("");
@@ -460,6 +609,16 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
             <UDashboardNavbar title="Cluster">
                 <template #right>
                     <UButton
+                        v-if="erasureCodingStatus.enabled"
+                        @click="scrubCluster"
+                        icon="i-lucide-shield-check"
+                        color="neutral"
+                        variant="ghost"
+                        :loading="isScrubbing"
+                    >
+                        Scrub
+                    </UButton>
+                    <UButton
                         @click="resyncCluster"
                         icon="i-lucide-rotate-cw"
                         color="neutral"
@@ -486,7 +645,16 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
 
                 <div class="grid grid-cols-2 lg:grid-cols-4 gap-6">
                     <DetailKeyValueCard title="Healthy Nodes" icon="i-lucide-server" :value="`${healthyCount}/${nodes.length}`" />
-                    <DetailKeyValueCard title="Replication Factor" icon="i-lucide-copy" :value="rebalanceStatus.replicationFactor" />
+                    <!-- On an erasure-coded cluster the durability parameter that matters is k+m,
+                         not the legacy 3x replication factor (which only governs pre-EC .obj data).
+                         Fall back to the replication factor only when EC isn't configured. -->
+                    <DetailKeyValueCard
+                        v-if="erasureCodingStatus.enabled"
+                        title="Erasure Coding (k + m)"
+                        icon="i-lucide-shield-check"
+                        :value="`${erasureCodingStatus.dataShards} + ${erasureCodingStatus.parityShards}`"
+                    />
+                    <DetailKeyValueCard v-else title="Replication Factor" icon="i-lucide-copy" :value="rebalanceStatus.replicationFactor" />
                     <DetailKeyValueCard title="Pending Replication" icon="i-lucide-loader" :value="rebalanceStatus.pendingCount" />
                     <DetailKeyValueCard title="Failed Replication" icon="i-lucide-triangle-alert" :value="rebalanceStatus.failedCount" />
                 </div>
@@ -525,6 +693,57 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                             Sorted by attempt count - the most-stuck tasks first. Capped at 200 rows.
                         </p>
                         <UTable :data="taskDetails" :columns="taskDetailColumns" :ui="{ th: 'cursor-default' }" />
+                    </template>
+                </UCard>
+
+                <!-- Erasure-coding shard-repair backlog - the EC counterpart of the replication
+                     card above. Shown only on an EC cluster with something outstanding: a healthy,
+                     fully-placed EC cluster has nothing here, so the card stays hidden rather than
+                     showing a permanent empty state. -->
+                <UCard
+                    v-if="erasureCodingStatus.enabled && (Object.keys(erasureCodingStatus.pendingByReason).length > 0 || erasureCodingStatus.failedCount > 0)"
+                    variant="subtle"
+                    :ui="{ body: ecTaskDetails.length > 0 ? '!p-0' : undefined }"
+                >
+                    <template #header>
+                        <CardHeader title="Shard Repair by Reason" size="sm">
+                            <template #rightContent>
+                                <UButton
+                                    @click="loadEcTaskDetails"
+                                    icon="i-lucide-list"
+                                    color="neutral"
+                                    variant="ghost"
+                                    size="sm"
+                                    :loading="isLoadingEcTaskDetails"
+                                >
+                                    {{ hasLoadedEcTaskDetails ? "Refresh Details" : "View Details" }}
+                                </UButton>
+                            </template>
+                        </CardHeader>
+                    </template>
+                    <div v-if="!hasLoadedEcTaskDetails" class="flex flex-wrap gap-2">
+                        <UBadge
+                            v-for="(count, reason) in erasureCodingStatus.pendingByReason"
+                            :key="reason"
+                            :color="reason === 'reconstruct' ? 'warning' : 'neutral'"
+                            variant="subtle"
+                            >{{ reason }}: {{ count }}</UBadge
+                        >
+                    </div>
+                    <UEmpty
+                        v-else-if="ecTaskDetails.length === 0"
+                        title="Nothing Outstanding"
+                        description="No pending or failed shard-repair tasks right now."
+                        icon="i-lucide-circle-check"
+                        size="sm"
+                        variant="naked"
+                        class="py-6"
+                    />
+                    <template v-else>
+                        <p class="px-4 pt-4 pb-2 text-xs text-muted">
+                            A <strong>reconstruct</strong> means a shard was lost and is being rebuilt from survivors. Sorted by attempt count - the most-stuck tasks first. Capped at 200 rows.
+                        </p>
+                        <UTable :data="ecTaskDetails" :columns="ecTaskDetailColumns" :ui="{ th: 'cursor-default' }" />
                     </template>
                 </UCard>
 
