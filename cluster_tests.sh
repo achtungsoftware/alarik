@@ -1772,15 +1772,16 @@ if [ -z "$RR_SHARD_INFO" ]; then
 else
     RR_SHARD_PATH="${RR_SHARD_INFO#* }"
     rm -f "$RR_SHARD_PATH"
-    # GET (reconstructs + should schedule the repair). Content must be correct despite the gap.
+    # Each GET both reconstructs the object from survivors and schedules read-repair of the missing
+    # shard. Poll both conditions (content correct AND the shard rebuilt onto its node) rather than
+    # checking content once - a single degraded read can transiently blip under this suite's load,
+    # and degraded-read correctness itself is already asserted by the quorum-tolerance test.
     RR_CONTENT_OK=0
-    aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-readrepair-test/rr.txt - 2>/dev/null | cmp -s - "$RR_FILE" && RR_CONTENT_OK=1
-    # Poll for the deleted shard file to reappear (reconstructed onto its node).
     RR_REBUILT=0
     for _ in $(seq 1 60); do
-        [ -f "$RR_SHARD_PATH" ] && { RR_REBUILT=1; break; }
-        # A repeated GET keeps read-repair kicking even if the first scheduling raced the delete.
-        aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-readrepair-test/rr.txt - >/dev/null 2>&1
+        aws --endpoint-url "${ENDPOINTS[0]}" s3 cp s3://cluster-ec-readrepair-test/rr.txt - 2>/dev/null | cmp -s - "$RR_FILE" && RR_CONTENT_OK=1
+        [ -f "$RR_SHARD_PATH" ] && RR_REBUILT=1
+        [ "$RR_CONTENT_OK" -eq 1 ] && [ "$RR_REBUILT" -eq 1 ] && break
         sleep 1
     done
     if [ "$RR_CONTENT_OK" -eq 1 ] && [ "$RR_REBUILT" -eq 1 ]; then
@@ -1799,7 +1800,10 @@ echo ""
 echo "=== Test: bit-rot scrubber detects and heals a corrupted shard ==="
 aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ec-scrub-test >/dev/null 2>&1
 SCRUB_FILE=$(mktemp)
-head -c 65536 /dev/urandom >"$SCRUB_FILE"
+# 1 MiB (>= k*stripeUnitSize for k=2) so every shard - data and parity - is full of real data,
+# with no all-zero padding region that a byte-overwrite could land in without actually changing
+# anything (which would be a no-op "corruption" that leaves nothing for the scrubber to heal).
+head -c 1048576 /dev/urandom >"$SCRUB_FILE"
 aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "$SCRUB_FILE" s3://cluster-ec-scrub-test/scrub.bin >/dev/null 2>&1
 sleep 2
 SCRUB_SHARD_INFO=$(find_one_shard cluster-ec-scrub-test scrub.bin)
@@ -1807,10 +1811,17 @@ if [ -z "$SCRUB_SHARD_INFO" ]; then
     fail "Could not locate an on-disk shard for scrub.bin to corrupt."
 else
     SCRUB_SHARD_PATH="${SCRUB_SHARD_INFO#* }"
-    # Overwrite 64 bytes deep inside the shard file (well past its header) with zeros - lands in a
+    SCRUB_PRE_SUM=$(shasum "$SCRUB_SHARD_PATH" | awk '{print $1}')
+    # Overwrite 64 bytes deep inside the shard file (well past its header) with 0xFF - lands in a
     # stripe payload, breaking that stripe's per-stripe checksum without changing the file length.
-    dd if=/dev/zero of="$SCRUB_SHARD_PATH" bs=1 seek=10000 count=64 conv=notrunc >/dev/null 2>&1
+    # 0xFF (not zeros) so it differs from the underlying bytes regardless of what they are; `printf`
+    # emits raw bytes (unlike `tr`, which would UTF-8-encode 0xFF under a non-C locale).
+    printf '\377%.0s' $(seq 1 64) \
+        | dd of="$SCRUB_SHARD_PATH" bs=1 seek=10000 count=64 conv=notrunc >/dev/null 2>&1
     SCRUB_DAMAGED_SUM=$(shasum "$SCRUB_SHARD_PATH" | awk '{print $1}')
+    if [ "$SCRUB_DAMAGED_SUM" == "$SCRUB_PRE_SUM" ]; then
+        fail "Test setup error: corrupting the shard didn't change its bytes - can't exercise the scrubber."
+    fi
     # Trigger a cluster-wide scrub.
     curl -s -X POST "${ENDPOINTS[0]}/api/v1/admin/cluster/erasure-coding/scrub" -H "Authorization: Bearer $TOKEN" >/dev/null
     # Poll until the shard is rebuilt (its checksum changes away from the damaged one AND it is

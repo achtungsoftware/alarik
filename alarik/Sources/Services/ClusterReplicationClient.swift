@@ -467,6 +467,25 @@ enum ClusterReplicationClient {
             outbound, timeout: requestTimeout, logger: app.logger)
     }
 
+    /// Asks `node` to verify the shard(s) it holds for (bucketName, key, versionId) against their
+    /// on-disk checksums and heal any genuinely corrupt - the safe corruption side of read-repair.
+    /// Best-effort: a node that can't be reached simply doesn't verify this pass; the next read,
+    /// scrub, or rebalance covers it.
+    static func requestVerifyHeal(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/ecshards/verify-heal" + suffix)
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        _ = try? await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+    }
+
     /// Fetches shard `shardIndex` of (bucketName, key, versionId) from one of `candidates` into a
     /// local temp file - tried in order, same fallback semantics as `fetchObjectToTempFile`.
     /// Callers own the returned temp file and must unlink it themselves once done.

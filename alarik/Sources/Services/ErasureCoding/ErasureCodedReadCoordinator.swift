@@ -79,10 +79,14 @@ enum ErasureCodedReadCoordinator {
         }
         let result = gathered!
 
-        // Indices no reachable responsible node holds - a missing shard, detected for free from the
-        // gather's own discovery. Combined with any shard the decode finds corrupt, these drive
-        // read-repair once the read completes.
-        let missingIndices = Set(0..<totalShards).subtracting(result.heldIndices)
+        // Indices genuinely missing - not held anywhere AND whose rank-holder was reachable during
+        // discovery (so we know it's actually gone, not merely on a briefly-unreachable node whose
+        // shard is very likely fine). Detected for free from the gather's own discovery; drives
+        // missing-shard read-repair once the read completes. (Shards the decode finds corrupt are
+        // handled separately, via per-holder verify-heal.)
+        let missingIndices = Set(0..<totalShards)
+            .subtracting(result.heldIndices)
+            .intersection(result.reachableRanks)
 
         return PreparedRead(
             meta: result.meta, gathered: result, bucketName: bucketName, key: key,
@@ -113,17 +117,35 @@ enum ErasureCodedReadCoordinator {
                     }
                     gathered.cleanup()
                     continuation.finish()
-                    // Read-repair, best-effort and off the response path: rebuild any shard that was
-                    // missing cluster-wide or failed a checksum during this read, so silently-rotted
-                    // or lost copies self-heal on access rather than waiting for
-                    // the next rebalance or scrub.
-                    let toRepair = missingIndices.union(decodeResult.corruptShardIndices)
-                    if !toRepair.isEmpty {
+                    // Read-repair, best-effort and off the response path, so silently-rotted or lost
+                    // copies self-heal on access rather than waiting for the next rebalance or scrub.
+                    // Two distinct paths, deliberately:
+                    //  - MISSING shards (held by no responsible node) are reconstructed directly -
+                    //    definitively gone, safe to rebuild onto their rank-holders.
+                    //  - CORRUPT shards (a checksum failed during decode) are NOT deleted from here:
+                    //    the failure could be transit damage on a fetched copy, not on-disk rot.
+                    //    Instead each responsible node is asked to verify its OWN copy and heal only
+                    //    if it's genuinely corrupt locally - so a healthy peer shard is never
+                    //    destroyed on the strength of a bad transfer.
+                    let corrupt = decodeResult.corruptShardIndices
+                    if !missingIndices.isEmpty {
                         Task.detached {
                             await ErasureCodedRebalanceService.healObject(
                                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                                responsible: responsible, missingIndices: missingIndices,
-                                corruptIndices: decodeResult.corruptShardIndices)
+                                responsible: responsible, missingIndices: missingIndices)
+                        }
+                    }
+                    if !corrupt.isEmpty {
+                        Task.detached {
+                            await withTaskGroup(of: Void.self) { group in
+                                for node in responsible {
+                                    group.addTask {
+                                        await ClusterReplicationClient.requestVerifyHeal(
+                                            app: app, to: node, bucketName: bucketName, key: key,
+                                            versionId: versionId)
+                                    }
+                                }
+                            }
                         }
                     }
                 } catch {

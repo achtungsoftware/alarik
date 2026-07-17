@@ -69,7 +69,10 @@ enum ErasureCodedScrubber {
                 (try? await S3Service.offloadBlockingIO(app) { verifyShard(path: path) }) ?? true
             if isCorrupt {
                 corruptCount += 1
-                await heal(app: app, header: header, ecConfig: ecConfig)
+                await healLocalShard(
+                    app: app, bucketName: header.objectMeta.bucketName, key: header.objectMeta.key,
+                    versionId: header.objectMeta.versionId == "null" ? nil : header.objectMeta.versionId,
+                    shardIndex: header.shardIndex, ecConfig: ecConfig)
             }
             try? await Task.sleep(for: interShardPause)
         }
@@ -79,6 +82,34 @@ enum ErasureCodedScrubber {
                 "EC scrub found and queued repair for \(corruptCount) corrupt shard(s) across \(localShards.count) checked."
             )
         }
+    }
+
+    /// Verifies the shard(s) THIS node holds for one specific (bucket, key, version) and heals any
+    /// that are actually corrupt on local disk - the targeted, one-object counterpart of the full
+    /// `scrub`. This is what makes read-repair safe for corruption: a checksum failure a reader saw
+    /// while decoding a *fetched* copy might be transit damage, so rather than the reader deleting a
+    /// peer's shard, the peer runs this against its own on-disk copy - authoritative, no transit
+    /// ambiguity. Returns whether anything was healed. Never throws.
+    @discardableResult
+    static func verifyAndHealObjectShards(
+        app: Application, bucketName: String, key: String, versionId: String?
+    ) async -> Bool {
+        guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else { return false }
+        let indices = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: versionId)
+        var healedAny = false
+        for index in indices {
+            let path = ErasureCodedObjectHandler.shardPath(
+                bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
+            let isCorrupt =
+                (try? await S3Service.offloadBlockingIO(app) { verifyShard(path: path) }) ?? true
+            guard isCorrupt else { continue }
+            healedAny = true
+            await healLocalShard(
+                app: app, bucketName: bucketName, key: key, versionId: versionId,
+                shardIndex: index, ecConfig: ecConfig)
+        }
+        return healedAny
     }
 
     /// Reads every stripe of the shard at `path`, verifying its checksum. Returns `true` if the
@@ -97,19 +128,17 @@ enum ErasureCodedScrubber {
         return false
     }
 
-    /// Deletes the corrupt local shard and queues a reconstruction of this node's correct-rank
-    /// shard from healthy survivors. Reuses the read-repair path (`healObject`) so the outbox dedup
-    /// and reconstruction machinery are shared.
-    private static func heal(
-        app: Application, header: ErasureCodedShardHeader, ecConfig: ClusterErasureCodingConfig
+    /// Deletes the confirmed-corrupt local shard and queues a reconstruction of this node's
+    /// correct-rank shard from healthy survivors. Reuses the read-repair path (`healObject`) so the
+    /// outbox dedup and reconstruction machinery are shared. Local-only deletion - a node only ever
+    /// deletes its OWN corrupt copy, never a peer's.
+    private static func healLocalShard(
+        app: Application, bucketName: String, key: String, versionId: String?, shardIndex: Int,
+        ecConfig: ClusterErasureCodingConfig
     ) async {
-        let bucketName = header.objectMeta.bucketName
-        let key = header.objectMeta.key
-        let versionId = header.objectMeta.versionId == "null" ? nil : header.objectMeta.versionId
-
         // Remove the damaged copy up front so the rebuild has a genuine gap to fill.
         ErasureCodedObjectHandler.removeLocalShard(
-            bucketName: bucketName, key: key, versionId: versionId, shardIndex: header.shardIndex)
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
 
         let active = await ClusterNodeCache.shared.activeNodes()
         guard let config = app.storage[ClusterConfigurationKey.self], !active.isEmpty else { return }
@@ -122,6 +151,6 @@ enum ErasureCodedScrubber {
         }
         await ErasureCodedRebalanceService.healObject(
             app: app, bucketName: bucketName, key: key, versionId: versionId,
-            responsible: responsible, missingIndices: [selfRank], corruptIndices: [])
+            responsible: responsible, missingIndices: [selfRank])
     }
 }

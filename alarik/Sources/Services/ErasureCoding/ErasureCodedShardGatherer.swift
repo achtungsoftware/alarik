@@ -52,6 +52,11 @@ struct GatheredShards {
     /// phase, across the whole responsible set - not just the shards actually fetched). Lets the
     /// read path spot indices missing cluster-wide and trigger read-repair, without a second probe.
     var heldIndices: Set<Int>
+    /// The responsible *ranks* whose node answered discovery. A shard index is only safe to treat
+    /// as "missing" (and reconstruct) when its rank-holder was reachable-but-not-holding it - if
+    /// the holder was simply unreachable, its shard is very likely still there, so reconstructing
+    /// would be wasted churn against a node that's merely briefly down.
+    var reachableRanks: Set<Int>
 
     func cleanup() {
         for entry in shards.values where entry.isTemp {
@@ -106,9 +111,13 @@ enum ErasureCodedShardGatherer {
 
         var anyUnreachable = false
         var reportedIndices: Set<Int> = []
+        var reachableRanks: Set<Int> = []
         for entry in discovered {
             if let indices = entry.indices {
                 reportedIndices.formUnion(indices)
+                if let rank = responsible.firstIndex(where: { $0.id == entry.node.id }) {
+                    reachableRanks.insert(rank)
+                }
             } else {
                 anyUnreachable = true
             }
@@ -201,6 +210,8 @@ enum ErasureCodedShardGatherer {
             throw ErasureCodedGatherError.inconsistent
         }
 
-        return GatheredShards(shards: gathered, meta: reference, heldIndices: allHeldIndices)
+        return GatheredShards(
+            shards: gathered, meta: reference, heldIndices: allHeldIndices,
+            reachableRanks: reachableRanks)
     }
 }

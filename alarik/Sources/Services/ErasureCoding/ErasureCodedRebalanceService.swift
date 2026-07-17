@@ -341,30 +341,21 @@ enum ErasureCodedRebalanceService {
             candidates: candidates, reason: .rebalance)
     }
 
-    /// Read-repair: rebuild the shards a read found unhealthy so silently-rotted or lost copies
-    /// self-heal on access, rather than waiting for the next membership change or scrub. `missing`
-    /// indices weren't held by any responsible node; `corrupt` indices existed but failed a
-    /// checksum (their damaged copy is deleted first so reconstruction actually replaces it, since
-    /// the delivery path's idempotency check would otherwise see a file already present). Purely
-    /// best-effort and off the response path - any failure just leaves the repair to the next read,
-    /// rebalance, or scrub. Enqueues via the same deduped outbox `sweepGaps` uses, so a shard
-    /// already being repaired isn't queued twice.
+    /// Rebuilds shards that are *genuinely missing* - held by no responsible node - onto their
+    /// current rank-holders, reconstructing from `k` survivors. Drives read-repair of missing
+    /// shards and the scrubber's post-delete rebuild. Deliberately does NOT act on "corrupt"
+    /// shards reported by a read's decode: a checksum failure seen while decoding a *fetched* copy
+    /// can be transit damage rather than on-disk rot, so deleting the source would risk destroying
+    /// a healthy shard. Corruption is instead confirmed and healed by the node that actually holds
+    /// the copy (`ErasureCodedScrubber.verifyAndHealObjectShards`, via the scrubber or a read-
+    /// triggered verify-heal request) - authoritative, with no transit ambiguity. Best-effort and
+    /// off the response path; enqueues via the same deduped outbox `sweepGaps` uses.
     static func healObject(
         app: Application, bucketName: String, key: String, versionId: String?,
-        responsible: [ClusterNodeInfo], missingIndices: Set<Int>, corruptIndices: Set<Int>
+        responsible: [ClusterNodeInfo], missingIndices: Set<Int>
     ) async {
-        // A corrupt shard exists on its rank-holder; delete that damaged copy so the reconstruct
-        // has a genuine gap to fill (reconstructAndPlaceShard skips a target that already holds a
-        // shard for a versioned object, and for a non-versioned one would otherwise overwrite it
-        // anyway - deleting first makes both paths uniformly rebuild).
-        for index in corruptIndices where index < responsible.count {
-            try? await ClusterReplicationClient.deleteShard(
-                app: app, to: responsible[index], bucketName: bucketName, key: key,
-                versionId: versionId)
-        }
-
         let candidates: [(shardIndex: Int, targetNodeId: UUID)] =
-            missingIndices.union(corruptIndices)
+            missingIndices
             .filter { $0 < responsible.count }
             .sorted()
             .map { ($0, responsible[$0].id) }

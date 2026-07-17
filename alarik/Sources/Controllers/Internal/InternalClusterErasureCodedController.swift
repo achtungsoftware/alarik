@@ -41,6 +41,26 @@ struct InternalClusterErasureCodedController: RouteCollection {
         cluster.delete(use: handleDelete)
         cluster.on(.PATCH, "metadata", use: handleMetadataPatch)
         cluster.on(.POST, "restore-latest", use: handleRestoreLatest)
+        cluster.on(.POST, "verify-heal", use: handleVerifyHeal)
+    }
+
+    /// Verifies the shard(s) THIS node holds for (bucket, key, version) against their on-disk
+    /// checksums and heals any that are genuinely corrupt - the safe, authoritative side of
+    /// read-repair for corruption. A reader that hit a checksum failure while decoding a fetched
+    /// copy asks the holder to check its own copy here, so a peer's healthy shard is never deleted
+    /// on the strength of what might have been transit damage.
+    @Sendable
+    func handleVerifyHeal(req: Request) async throws -> HTTPStatus {
+        guard
+            let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"]
+        else {
+            throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
+        }
+        let versionId = req.query[String.self, at: "versionId"]
+        await ErasureCodedScrubber.verifyAndHealObjectShards(
+            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
+        return .ok
     }
 
     private func bucketKey(req: Request) throws -> (bucketName: String, key: String, versionId: String?) {
