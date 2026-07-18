@@ -463,19 +463,40 @@ struct InternalBucketController: RouteCollection {
 
         // The object may live on any node, but this handler must NOT forward - the share URL it
         // returns is built from this node's own base address, so it has to be the one that
-        // answers. Check locally first, then (only if this node isn't responsible) confirm
+        // answers. Check locally first (either format), then (only if not local) confirm
         // existence on a responsible peer with a header-only probe rather than pulling the bytes.
         let localResult = try? ObjectFileHandler.readCurrentObject(
             bucketName: input.bucket, key: input.key, loadData: false)
-        let existsLocally = (localResult ?? nil) != nil
+        var existsLocally = (localResult ?? nil) != nil
+        let (isLocal, _, responsible) = await ObjectRoutingService.erasureCodedReadPlacement(
+            req: req, bucketName: input.bucket, key: input.key)
+        if !existsLocally, isLocal, let config = req.application.storage[ClusterConfigurationKey.self],
+            let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId })
+        {
+            existsLocally = ErasureCodedDeleteCoordinator.localShardExists(
+                bucketName: input.bucket, key: input.key, versionId: nil, selfRank: selfRank)
+        }
         if !existsLocally {
-            let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
-                req: req, bucketName: input.bucket, key: input.key)
             var existsRemotely = false
-            if !isLocal && !candidates.isEmpty {
+            // Deliberately not gated on `!isLocal`: that only means self is within the *wider*
+            // top-(k+m) set, not that a plain (non-EC) object actually replicated here - once
+            // k+m > 3 those diverge, and `existsLocally` above already checked disk directly
+            // (both formats), so it's the accurate signal for whether a remote probe is needed.
+            if !responsible.isEmpty {
                 existsRemotely = await ClusterReplicationClient.objectExists(
-                    app: req.application, candidates: candidates, bucketName: input.bucket,
+                    app: req.application, candidates: responsible, bucketName: input.bucket,
                     key: input.key, versionId: nil)
+                if !existsRemotely {
+                    for (rank, node) in responsible.enumerated() {
+                        if await ClusterReplicationClient.shardExists(
+                            app: req.application, node: node, bucketName: input.bucket,
+                            key: input.key, versionId: nil, shardIndex: rank)
+                        {
+                            existsRemotely = true
+                            break
+                        }
+                    }
+                }
             }
             guard existsRemotely else {
                 throw Abort(.notFound, reason: "Object not found")
@@ -656,7 +677,8 @@ struct InternalBucketController: RouteCollection {
             size: meta.size, etag: etag, versionId: meta.versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
         await ReplicationService.enqueuePut(
-            bucketName: bucketName, key: keyPath, versionId: meta.versionId, on: req.db)
+            app: req.application, bucketName: bucketName, key: keyPath,
+            versionId: meta.versionId, on: req.db)
 
         return ObjectMeta.ResponseDTO(from: meta)
     }
@@ -736,7 +758,8 @@ struct InternalBucketController: RouteCollection {
                         size: nil, etag: nil, versionId: outcome.versionId,
                         requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
                     await ReplicationService.enqueueDelete(
-                        bucketName: bucketName, key: object.key, versionId: nil, on: req.db)
+                        app: req.application, bucketName: bucketName, key: object.key,
+                        versionId: nil, on: req.db)
                 }
                 marker = isTruncated ? nextMarker : nil
             } while marker != nil
@@ -759,7 +782,8 @@ struct InternalBucketController: RouteCollection {
                 versionId: outcome.versionId,
                 requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
             await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: key, versionId: outcome.versionId, on: req.db)
+                app: req.application, bucketName: bucketName, key: key,
+                versionId: outcome.versionId, on: req.db)
         }
 
         return .noContent
@@ -793,39 +817,65 @@ struct InternalBucketController: RouteCollection {
     ) async throws
         -> Response
     {
-        // Resolve to the on-disk file so large objects can stream straight from it - a
-        // console download of a multi-GB object must not buffer it in memory (same pattern
-        // as SharedLinkController and the S3 GET handler).
-        var path = try? ObjectFileHandler.resolvePath(
-            bucketName: bucketName, key: key, versionId: versionId)
-        if path == nil, versionId == "null" {
-            // The "null" version of a never-versioned key lives at the plain path
-            let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
-            if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
-                path = plainPath
-            }
-        }
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
 
-        if let path, let location = try? ObjectFileHandler.payloadLocation(path: path),
-            !location.meta.isDeleteMarker
-        {
-            let meta = location.meta
-            let response: Response
-            if location.payloadSize > Constants.streamingThreshold {
-                response = S3Service.buildStreamingObjectResponse(
-                    req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
-            } else {
-                // Headers and body from the same read - one consistent snapshot of the file
-                guard
-                    let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
-                    let data
-                else {
-                    throw Abort(.internalServerError, reason: "Failed to read object data")
+        if isLocal {
+            // EC-aware: check this node's own local shard first, falling through to the plain
+            // `.obj` path unchanged when the target isn't erasure-coded.
+            if let config = req.application.storage[ClusterConfigurationKey.self],
+                req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+                let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId }),
+                ErasureCodedDeleteCoordinator.localShardExists(
+                    bucketName: bucketName, key: key, versionId: versionId, selfRank: selfRank)
+            {
+                let (meta, body) = try await ErasureCodedReadCoordinator.read(
+                    app: req.application, bucketName: bucketName, key: key,
+                    versionId: versionId, responsible: responsible, selfNodeId: config.nodeId,
+                    requestId: req.id)
+                guard !meta.isDeleteMarker else {
+                    throw Abort(.notFound, reason: "Object not found")
                 }
-                response = S3Service.buildVersionedObjectMetadataResponse(
-                    meta: freshMeta, includeBody: true, data: data)
+                let tempPath = try await S3Controller.drainToTempFile(
+                    stream: body, app: req.application)
+                return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key)
             }
-            return Self.attachDownloadHeaders(to: response, key: key)
+
+            // Resolve to the on-disk file so large objects can stream straight from it - a
+            // console download of a multi-GB object must not buffer it in memory (same pattern
+            // as SharedLinkController and the S3 GET handler).
+            var path = try? ObjectFileHandler.resolvePath(
+                bucketName: bucketName, key: key, versionId: versionId)
+            if path == nil, versionId == "null" {
+                // The "null" version of a never-versioned key lives at the plain path
+                let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
+                if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
+                    path = plainPath
+                }
+            }
+
+            if let path, let location = try? ObjectFileHandler.payloadLocation(path: path),
+                !location.meta.isDeleteMarker
+            {
+                let meta = location.meta
+                let response: Response
+                if location.payloadSize > Constants.streamingThreshold {
+                    response = S3Service.buildStreamingObjectResponse(
+                        req: req, meta: meta, path: path, payloadOffset: location.payloadOffset)
+                } else {
+                    // Headers and body from the same read - one consistent snapshot of the file
+                    guard
+                        let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                        let data
+                    else {
+                        throw Abort(.internalServerError, reason: "Failed to read object data")
+                    }
+                    response = S3Service.buildVersionedObjectMetadataResponse(
+                        meta: freshMeta, includeBody: true, data: data)
+                }
+                return Self.attachDownloadHeaders(to: response, key: key)
+            }
         }
 
         // Not physically on this node - the object may still exist cluster-wide (any
@@ -835,13 +885,18 @@ struct InternalBucketController: RouteCollection {
         // downloadAsZip's per-file fallback already do, then stream that temp file straight to
         // the client (windowed, never buffering the whole object in memory - a console download
         // of a multi-GB object that lands on the wrong node must not OOM this node).
-        let (isLocal, candidates) = await ObjectRoutingService.isResponsible(
-            req: req, bucketName: bucketName, key: key)
-        guard !isLocal, !candidates.isEmpty else {
+        //
+        // `candidates` is empty whenever `isLocal` was true (wider top-(k+m) membership) - but
+        // once k+m > 3 that doesn't guarantee legacy top-3 membership too, so a plain object can
+        // fall through both local branches above and still need a cross-node fetch. Fall back to
+        // the legacy top-3 in that case.
+        let fetchCandidates =
+            candidates.isEmpty ? Array(responsible.prefix(PlacementService.replicationFactor)) : candidates
+        guard !fetchCandidates.isEmpty else {
             throw Abort(.notFound, reason: "Object not found")
         }
         let (tempPath, meta) = try await ClusterReplicationClient.fetchObjectToTempFile(
-            app: req.application, candidates: candidates, bucketName: bucketName, key: key,
+            app: req.application, candidates: fetchCandidates, bucketName: bucketName, key: key,
             versionId: versionId, requestId: req.id)
         guard !meta.isDeleteMarker else {
             _ = POSIXFile.unlink(tempPath)
@@ -1768,16 +1823,35 @@ struct InternalBucketController: RouteCollection {
         // Tags live in the object's own metadata, so this must run on a node that physically
         // holds the key - forward to a responsible node when this one doesn't (mirrors
         // getObjectMetadata, which this was inconsistent with before).
-        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
-            req: req, bucketName: bucketName, key: key)
-        {
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
+        if !isLocal {
             return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
         }
 
-        guard
-            let (meta, _) = try ObjectFileHandler.readCurrentObject(
-                bucketName: bucketName, key: key, loadData: false)
-        else {
+        // isLocal only proves membership in the wider top-(k+m) set - once k+m > 3 a plain
+        // (non-EC) object's legacy top-3 placement can exclude this node entirely, so a missing
+        // local EC shard needs the legacy top-3 forward before falling into a local plain read.
+        if !(await S3Controller.hasLocalECShard(
+            req: req, bucketName: bucketName, key: key, versionId: nil, responsible: responsible)),
+            let config = req.application.storage[ClusterConfigurationKey.self],
+            !ObjectRoutingService.isLegacyReplica(responsible: responsible, selfNodeId: config.nodeId),
+            !responsible.isEmpty
+        {
+            return try await ClusterForwardingClient.forward(
+                req: req, candidates: Array(responsible.prefix(PlacementService.replicationFactor)))
+        }
+
+        let meta: ObjectMeta
+        do {
+            meta = try await S3Controller.resolveObjectMetaEitherFormat(
+                req: req, bucketName: bucketName, key: key, versionId: nil,
+                responsible: responsible)
+        } catch is S3Error {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+        guard !meta.isDeleteMarker else {
             throw Abort(.notFound, reason: "Object not found")
         }
 
@@ -1815,22 +1889,13 @@ struct InternalBucketController: RouteCollection {
             return response
         }
 
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: nil)
-        else {
-            throw Abort(.notFound, reason: "Object not found")
+        do {
+            _ = try await S3Controller.rewriteObjectMetadata(
+                req: req, bucketName: bucketName, key: key, versionId: nil, peers: peers
+            ) { $0.tags = input.tags }
+        } catch let error as S3Error {
+            throw Abort(error.status, reason: error.message)
         }
-
-        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = input.tags }
-        }
-
-        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
-        // task backing it, so cluster peers must be pushed the change directly here.
-        await ClusterReplicationService.replicateWrite(
-            app: req.application, bucketName: bucketName, key: key,
-            versionId: updatedMeta.versionId, operation: .put, peers: peers)
 
         return try await TagsDTO(tags: input.tags).encodeResponse(for: req)
     }
@@ -1847,16 +1912,33 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        if case .forward(let candidates) = await ObjectRoutingService.routingDecision(
-            req: req, bucketName: bucketName, key: key)
-        {
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
+        if !isLocal {
             return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
         }
 
-        guard
-            let (meta, _) = try ObjectFileHandler.readCurrentObject(
-                bucketName: bucketName, key: key, loadData: false)
-        else {
+        // See getObjectTags's identical fallthrough.
+        if !(await S3Controller.hasLocalECShard(
+            req: req, bucketName: bucketName, key: key, versionId: nil, responsible: responsible)),
+            let config = req.application.storage[ClusterConfigurationKey.self],
+            !ObjectRoutingService.isLegacyReplica(responsible: responsible, selfNodeId: config.nodeId),
+            !responsible.isEmpty
+        {
+            return try await ClusterForwardingClient.forward(
+                req: req, candidates: Array(responsible.prefix(PlacementService.replicationFactor)))
+        }
+
+        let meta: ObjectMeta
+        do {
+            meta = try await S3Controller.resolveObjectMetaEitherFormat(
+                req: req, bucketName: bucketName, key: key, versionId: nil,
+                responsible: responsible)
+        } catch is S3Error {
+            throw Abort(.notFound, reason: "Object not found")
+        }
+        guard !meta.isDeleteMarker else {
             throw Abort(.notFound, reason: "Object not found")
         }
 
@@ -1894,29 +1976,22 @@ struct InternalBucketController: RouteCollection {
             return response
         }
 
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: nil)
-        else {
-            throw Abort(.notFound, reason: "Object not found")
-        }
-
         // Lowercase keys, same normalization handleObjectPut applies to x-amz-meta-* headers
         let normalizedMetadata = Dictionary(
             uniqueKeysWithValues: input.metadata.map { ($0.key.lowercased(), $0.value) })
 
-        let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path) {
+        do {
+            _ = try await S3Controller.rewriteObjectMetadata(
+                req: req, bucketName: bucketName, key: key, versionId: nil, peers: peers
+            ) {
                 $0.contentType = input.contentType
                 $0.metadata = normalizedMetadata
             }
+        } catch let error as S3Error {
+            // This admin endpoint speaks Abort/JSON, not S3Error/XML - translate rather than
+            // letting an S3-shaped error leak through and lose its status code to a generic 500.
+            throw Abort(error.status, reason: error.message)
         }
-
-        // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox
-        // task backing it, so cluster peers must be pushed the change directly here.
-        await ClusterReplicationService.replicateWrite(
-            app: req.application, bucketName: bucketName, key: key,
-            versionId: updatedMeta.versionId, operation: .put, peers: peers)
 
         return try await ObjectMetadataDTO(
             contentType: input.contentType, metadata: normalizedMetadata

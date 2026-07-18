@@ -18,6 +18,7 @@ import AsyncHTTPClient
 import Foundation
 import NIOCore
 import SotoS3
+import Vapor
 
 /// Performs the actual outbound PUT/DELETE against a replication target, using SotoS3 - a full
 /// SigV4-signing AWS S3 client This is deliberate: hand-writing outbound request signing would duplicate work Soto
@@ -73,13 +74,29 @@ enum ReplicationClient {
     }
 
     /// Replicates one object version to `target`. Reads the object's current size to decide
-    /// single-PUT vs. multipart, then transfers it.
+    /// single-PUT vs. multipart, then transfers it. EC-aware: the source object may be
+    /// erasure-coded (every write is, by default, once a cluster has EC configured) - checked
+    /// via a local shard probe first, falling through to the plain `.obj` read unchanged when
+    /// it isn't. `app` is only needed for the EC path (gather-and-decode needs the thread pool
+    /// and cluster storage keys); the plain path remains pure disk I/O, matching how every other
+    /// EC-aware read in this codebase layers on top of the existing plain path rather than
+    /// replacing it.
     static func replicatePut(
+        app: Application,
         target: any ReplicationTaskConnection,
         bucketName: String,
         key: String,
         versionId: String?
     ) async throws {
+        if let ecPlacement = await erasureCodedSourcePlacement(
+            app: app, bucketName: bucketName, key: key, versionId: versionId)
+        {
+            try await replicatePutErasureCoded(
+                app: app, target: target, bucketName: bucketName, key: key, versionId: versionId,
+                responsible: ecPlacement.responsible, selfNodeId: ecPlacement.selfNodeId)
+            return
+        }
+
         let (meta, _) = try ObjectFileHandler.readVersion(
             bucketName: bucketName, key: key, versionId: versionId, loadData: false)
 
@@ -99,6 +116,138 @@ enum ReplicationClient {
             throw error
         }
         try? await awsClient.shutdown()
+    }
+
+    /// Resolves EC placement and confirms this node actually holds a local shard for
+    /// (bucketName, key, versionId) - `nil` when EC isn't configured, membership hasn't
+    /// populated, or (most commonly) the object is simply plain-format. This dispatcher always
+    /// runs on the node that originally coordinated the write (the request path that calls
+    /// `ReplicationService.enqueuePut`/`attemptImmediateDelivery` only ever runs on the node
+    /// that just wrote locally), which for an EC write is always rank-0 - but resolving full
+    /// placement rather than assuming "self is shard 0" also keeps this correct for the async
+    /// outbox case, where membership may have shifted since the write.
+    private static func erasureCodedSourcePlacement(
+        app: Application, bucketName: String, key: String, versionId: String?
+    ) async -> (responsible: [ClusterNodeInfo], selfNodeId: UUID)? {
+        guard let clusterConfig = app.storage[ClusterConfigurationKey.self],
+            let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
+        else { return nil }
+        let active = await ClusterNodeCache.shared.activeNodes()
+        guard !active.isEmpty else { return nil }
+
+        let responsible = PlacementService.responsibleNodes(
+            bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
+        guard let selfRank = responsible.firstIndex(where: { $0.id == clusterConfig.nodeId })
+        else { return nil }
+
+        let shardPath =
+            versionId != nil
+            ? ErasureCodedObjectHandler.versionedShardPath(
+                bucketName: bucketName, key: key, versionId: versionId!, shardIndex: selfRank)
+            : ErasureCodedObjectHandler.shardPath(
+                bucketName: bucketName, key: key, shardIndex: selfRank)
+        guard FileManager.default.fileExists(atPath: shardPath) else { return nil }
+
+        return (responsible, clusterConfig.nodeId)
+    }
+
+    /// Gathers and decodes the EC source into a local scratch file (reusing the same drain
+    /// primitive CopyObject's cross-node source resolution uses), then uploads from that file -
+    /// letting `putSmall`/`putLarge`'s exact windowed-range shape stay unchanged by handing them
+    /// a plain temp-file read closure instead of `ObjectFileHandler.readVersion`.
+    private static func replicatePutErasureCoded(
+        app: Application, target: any ReplicationTaskConnection, bucketName: String, key: String,
+        versionId: String?, responsible: [ClusterNodeInfo], selfNodeId: UUID
+    ) async throws {
+        let (meta, stream) = try await ErasureCodedReadCoordinator.read(
+            app: app, bucketName: bucketName, key: key, versionId: versionId,
+            responsible: responsible, selfNodeId: selfNodeId, requestId: UUID().uuidString)
+        let tempPath = try await S3Controller.drainToTempFile(stream: stream, app: app)
+        defer { _ = POSIXFile.unlink(tempPath) }
+
+        let (awsClient, s3) = makeClient(for: target)
+        do {
+            if meta.size <= multipartThreshold {
+                let data = try Data(contentsOf: URL(fileURLWithPath: tempPath))
+                _ = try await s3.putObject(
+                    .init(
+                        body: AWSHTTPBody(buffer: ByteBuffer(data: data)),
+                        bucket: target.targetBucket,
+                        contentType: meta.contentType,
+                        key: key,
+                        metadata: meta.metadata,
+                        tagging: taggingQuery(from: meta.tags)
+                    ))
+            } else {
+                try await putLargeFromFile(
+                    s3: s3, target: target, path: tempPath, key: key, meta: meta)
+            }
+        } catch {
+            try? await awsClient.shutdown()
+            throw error
+        }
+        try? await awsClient.shutdown()
+    }
+
+    private static func putLargeFromFile(
+        s3: S3, target: any ReplicationTaskConnection, path: String, key: String, meta: ObjectMeta
+    ) async throws {
+        let created = try await s3.createMultipartUpload(
+            .init(
+                bucket: target.targetBucket,
+                contentType: meta.contentType,
+                key: key,
+                metadata: meta.metadata,
+                tagging: taggingQuery(from: meta.tags)
+            ))
+        guard let uploadId = created.uploadId else {
+            throw ReplicationError.multipartInitFailed
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+            defer { try? handle.close() }
+
+            var completedParts: [S3.CompletedPart] = []
+            var offset = 0
+            var partNumber = 1
+
+            while offset < meta.size {
+                let length = min(partSize, meta.size - offset)
+                try handle.seek(toOffset: UInt64(offset))
+                guard let chunk = try handle.read(upToCount: length), !chunk.isEmpty else {
+                    throw ReplicationError.objectUnreadable
+                }
+
+                let uploaded = try await s3.uploadPart(
+                    .init(
+                        body: AWSHTTPBody(buffer: ByteBuffer(data: chunk)),
+                        bucket: target.targetBucket,
+                        key: key,
+                        partNumber: partNumber,
+                        uploadId: uploadId
+                    ))
+                guard let eTag = uploaded.eTag else {
+                    throw ReplicationError.multipartPartFailed(partNumber: partNumber)
+                }
+                completedParts.append(.init(eTag: eTag, partNumber: partNumber))
+
+                offset += chunk.count
+                partNumber += 1
+            }
+
+            _ = try await s3.completeMultipartUpload(
+                .init(
+                    bucket: target.targetBucket,
+                    key: key,
+                    multipartUpload: .init(parts: completedParts),
+                    uploadId: uploadId
+                ))
+        } catch {
+            _ = try? await s3.abortMultipartUpload(
+                .init(bucket: target.targetBucket, key: key, uploadId: uploadId))
+            throw error
+        }
     }
 
     private static func putSmall(

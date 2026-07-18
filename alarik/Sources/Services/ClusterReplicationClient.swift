@@ -44,6 +44,14 @@ enum ClusterReplicationClient {
     /// transfers must have room to complete, not just connect.
     static let requestTimeout: TimeAmount = .minutes(10)
 
+    /// Deadline for a small, metadata-only probe (does this node hold a shard, what does its
+    /// header say) - deliberately much shorter than `requestTimeout`. Several of these calls sit
+    /// directly on a client-facing GET/HEAD's synchronous path (shard discovery fans out to
+    /// every responsible node and waits for all of them), so a peer that's merely hanging - not
+    /// erroring, which would return quickly, but genuinely unresponsive - must not be able to
+    /// stall every read of a key it's responsible for for `requestTimeout`'s full 10 minutes.
+    static let probeTimeout: TimeAmount = .seconds(5)
+
     private static let objectMetaHeaderName = "X-Alarik-Object-Meta"
 
     /// Streams the local object at `bucketName`/`key`/`versionId` to `node`'s internal push
@@ -127,6 +135,42 @@ enum ClusterReplicationClient {
             }
         }
         return false
+    }
+
+    /// Asks `candidates` (tried in order) to resolve "what's the latest version id of this key"
+    /// from their own local `.latest` pointer - format-agnostic, works whether the key turns
+    /// out to be `.obj`- or `.ecshard`-backed. `nil` means either no candidate could answer, or
+    /// the key genuinely has no versions (the caller can't tell which from this alone, matching
+    /// how a plain local `getLatestVersionId` also can't distinguish those cases).
+    static func resolveLatestVersionId(
+        app: Application, candidates: [ClusterNodeInfo], bucketName: String, key: String
+    ) async -> String? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        let urlSuffix = "?bucket=\(encodedBucket)&key=\(encodedKey)"
+
+        for node in candidates {
+            var outbound = HTTPClientRequest(
+                url: node.address + "/internal/cluster/objects/latest-version" + urlSuffix)
+            outbound.method = .GET
+            outbound.headers.replaceOrAdd(
+                name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+            do {
+                let response = try await app.http.client.shared.execute(
+                    outbound, timeout: requestTimeout, logger: app.logger)
+                guard response.status == .ok else { continue }
+                let body = try await response.body.collect(upTo: 1024)
+                guard let versionId = body.getString(at: 0, length: body.readableBytes) else {
+                    continue
+                }
+                return versionId
+            } catch {
+                continue
+            }
+        }
+        return nil
     }
 
     /// Tells `node` to delete its copy of `bucketName`/`key`/`versionId` (or the current object,
@@ -318,6 +362,345 @@ enum ClusterReplicationClient {
                 }
             }
         }
+    }
+
+    // MARK: - Erasure-coded shards
+
+    /// Streams `sourcePath` (a local `.ecshard` file - typically fresh scratch output from
+    /// `StripeEncoder`) to `node`'s internal shard-push endpoint. The `.ecshard` format is
+    /// already fully self-describing (header + per-stripe checksums), so this is a raw byte
+    /// copy - no repacking needed, unlike `pushObject`'s JSON-meta-header dance.
+    static func pushShard(
+        app: Application, to node: ClusterNodeInfo, sourcePath: String, bucketName: String,
+        key: String, versionId: String?, shardIndex: Int
+    ) async throws {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        let fd = POSIXFile.open(sourcePath, O_RDONLY)
+        guard fd >= 0 else { throw ClusterProxyError.objectNotFound }
+        var statInfo = stat()
+        guard POSIXFile.fstat(fd, &statInfo) == 0 else {
+            _ = POSIXFile.close(fd)
+            throw ClusterProxyError.objectNotFound
+        }
+        let fileSize = Int(statInfo.st_size)
+        
+        let suffix = shardQuerySuffix(
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/push" + suffix)
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        outbound.headers.replaceOrAdd(name: .contentType, value: "application/octet-stream")
+        outbound.body = .stream(
+            fileByteStream(threadPool: app.threadPool, fd: fd, offset: 0, length: fileSize),
+            length: .known(Int64(fileSize)))
+
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard (200..<300).contains(response.status.code) else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+    }
+
+    /// Best-effort "does `node` already hold shard `shardIndex`" probe - mirrors `objectExists`.
+    static func shardExists(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?, shardIndex: Int
+    ) async -> Bool {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return false }
+        let suffix = shardQuerySuffix(
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/exists" + suffix)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: requestTimeout, logger: app.logger)
+            return response.status == .ok
+        } catch {
+            return false
+        }
+    }
+
+    /// Discovers which shard indices `node` physically holds for (bucketName, key, versionId).
+    /// Returns `nil` when the node is unreachable/errored (distinct from `[]` = reachable but holds
+    /// no shard), so the gatherer can tell "object genuinely absent" from "can't currently reach a
+    /// holder" - the difference between a correct 404 and a correct 503.
+    static func heldShards(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String, versionId: String?
+    ) async -> [Int]? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/held" + suffix)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: probeTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 64 * 1024)
+            return try JSONDecoder().decode([Int].self, from: body)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Tells `node` to repoint its `.latest` for (bucketName, key) back to `priorVersionId` (or
+    /// remove it when nil) - the peer side of a coordinator's failed-quorum rollback. Best-effort:
+    /// a peer that can't be reached simply keeps whatever pointer it had; the failing PUT already
+    /// returns an error to the client regardless.
+    static func restoreShardLatest(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
+        priorVersionId: String?
+    ) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        var url =
+            "\(node.address)/internal/cluster/ecshards/restore-latest?bucket=\(encodedBucket)&key=\(encodedKey)"
+        if let priorVersionId {
+            let encoded = priorVersionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? priorVersionId
+            url += "&priorVersionId=\(encoded)"
+        }
+        var outbound = HTTPClientRequest(url: url)
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        _ = try? await app.http.client.shared.execute(
+            outbound, timeout: probeTimeout, logger: app.logger)
+    }
+
+    /// Fetches the `ObjectMeta` of whatever shard `node` holds for (bucketName, key, versionId) -
+    /// a header-only probe (no stripe data crosses the wire), for HEAD-shaped metadata resolution
+    /// on a node that hasn't received its own shard yet. `nil` when the node is unreachable or
+    /// holds nothing for it.
+    static func fetchShardMeta(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async -> ObjectMeta? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/meta" + suffix)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: probeTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
+            return try JSONDecoder().decode(ObjectMeta.self, from: body)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Asks `node` to verify the shard(s) it holds for (bucketName, key, versionId) against their
+    /// on-disk checksums and heal any genuinely corrupt - the safe corruption side of read-repair.
+    /// Best-effort: a node that can't be reached simply doesn't verify this pass; the next read,
+    /// scrub, or rebalance covers it.
+    static func requestVerifyHeal(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/ecshards/verify-heal" + suffix)
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        _ = try? await app.http.client.shared.execute(
+            outbound, timeout: probeTimeout, logger: app.logger)
+    }
+
+    /// Fetches shard `shardIndex` of (bucketName, key, versionId) from one of `candidates` into a
+    /// local temp file - tried in order, same fallback semantics as `fetchObjectToTempFile`.
+    /// Callers own the returned temp file and must unlink it themselves once done.
+    static func fetchShard(
+        app: Application, candidates: [ClusterNodeInfo], bucketName: String, key: String,
+        versionId: String?, shardIndex: Int, requestId: String
+    ) async throws -> String {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        guard !candidates.isEmpty else {
+            throw S3Error(
+                status: .serviceUnavailable, code: "ServiceUnavailable",
+                message: "No cluster peer is currently available for this shard.",
+                requestId: requestId)
+        }
+        let suffix = shardQuerySuffix(
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+
+        var lastError: any Error = S3Error(
+            status: .serviceUnavailable, code: "ServiceUnavailable",
+            message: "No cluster peer could serve this shard.", requestId: requestId)
+        for node in candidates {
+            do {
+                return try await fetchShardOnce(
+                    app: app, secret: config.secret,
+                    url: node.address + "/internal/cluster/ecshards/fetch" + suffix,
+                    requestId: requestId)
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        throw lastError
+    }
+
+    private static func fetchShardOnce(
+        app: Application, secret: String, url: String, requestId: String
+    ) async throws -> String {
+        var outbound = HTTPClientRequest(url: url)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard response.status == .ok else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+
+        let threadPool = app.threadPool
+        let tempPath = Constants.spoolDirectory + ".ecshard-fetch-" + UUID().uuidString
+        let fd = try await threadPool.runIfActive { () -> Int32 in
+            var fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            if fd < 0 && errno == ENOENT {
+                try FileManager.default.createDirectory(
+                    atPath: Constants.spoolDirectory, withIntermediateDirectories: true)
+                fd = POSIXFile.openWrite(tempPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            }
+            guard fd >= 0 else {
+                throw S3Error(
+                    status: .internalServerError, code: "InternalError",
+                    message: "Failed to open shard fetch temp file", requestId: requestId)
+            }
+            return fd
+        }
+
+        do {
+            for try await buffer in response.body {
+                let chunk = buffer
+                try await threadPool.runIfActive {
+                    try chunk.withUnsafeReadableBytes { raw in
+                        do {
+                            try StreamingIOLoops.writeFully(fd: fd, raw)
+                        } catch {
+                            throw S3Error(
+                                status: .internalServerError, code: "InternalError",
+                                message: "Failed writing shard fetch temp file", requestId: requestId)
+                        }
+                    }
+                }
+            }
+            _ = try await threadPool.runIfActive { POSIXFile.close(fd) }
+        } catch {
+            _ = try? await threadPool.runIfActive { POSIXFile.close(fd) }
+            _ = POSIXFile.unlink(tempPath)
+            throw error
+        }
+
+        return tempPath
+    }
+
+    /// Tells `node` to delete whatever shard(s) it locally holds for (bucketName, key,
+    /// versionId) - no `shardIndex` needed: a node only ever holds the one shard index it's
+    /// currently responsible for, so "delete my shard for this version" is unambiguous. Used for
+    /// genuine object deletes and for rebalance reclaim (see `ClusterRebalanceService`'s
+    /// `.reclaim` pattern, which this mirrors exactly, including targeting `node == self`).
+    static func deleteShard(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async throws {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        var url = "\(node.address)/internal/cluster/ecshards?bucket=\(encodedBucket)&key=\(encodedKey)"
+        if let versionId {
+            let encodedVersionId =
+                versionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? versionId
+            url += "&versionId=\(encodedVersionId)"
+        }
+        var outbound = HTTPClientRequest(url: url)
+        outbound.method = .DELETE
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard (200..<300).contains(response.status.code) else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+    }
+
+    /// Tells `node` to overwrite the `ObjectMeta` in whatever local shard it holds for
+    /// (bucketName, key, versionId), leaving payload bytes untouched - the shard counterpart of
+    /// pushing a plain object's updated metadata. Best-effort: callers already treat this
+    /// fan-out as non-durable, matching `ClusterReplicationService.replicateWrite`'s handling of
+    /// the equivalent plain-object metadata push.
+    static func patchShardMetadata(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?, shardIndex: Int, meta: ObjectMeta
+    ) async throws {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        let suffix = shardQuerySuffix(
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/metadata" + suffix)
+        outbound.method = .PATCH
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        outbound.body = .bytes(try JSONEncoder().encode(meta))
+
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard (200..<300).contains(response.status.code) else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+    }
+
+    private static func shardQuerySuffix(
+        bucketName: String, key: String, versionId: String?, shardIndex: Int
+    ) -> String {
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        var suffix = "?bucket=\(encodedBucket)&key=\(encodedKey)&shardIndex=\(shardIndex)"
+        if let versionId {
+            let encodedVersionId =
+                versionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? versionId
+            suffix += "&versionId=\(encodedVersionId)"
+        }
+        return suffix
+    }
+
+    /// Same as `shardQuerySuffix` without a `shardIndex` - for endpoints scoped to a whole
+    /// (bucket, key, version) rather than one shard (`held`).
+    private static func shardVersionQuerySuffix(
+        bucketName: String, key: String, versionId: String?
+    ) -> String {
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        var suffix = "?bucket=\(encodedBucket)&key=\(encodedKey)"
+        if let versionId {
+            let encodedVersionId =
+                versionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? versionId
+            suffix += "&versionId=\(encodedVersionId)"
+        }
+        return suffix
     }
 }
 

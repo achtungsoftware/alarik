@@ -167,6 +167,10 @@ struct BucketHandler {
             }
             if fileURL.pathExtension == "obj" {
                 objectCount += 1
+            } else if fileURL.pathExtension == "ecshard" && fileURL.lastPathComponent == "0.ecshard" {
+                // A node only ever holds one shard per version - counting index 0 specifically
+                // (rather than every `.ecshard` file) avoids overcounting an EC object k+m times.
+                objectCount += 1
             }
         }
         return (totalSize, objectCount)

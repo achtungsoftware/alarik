@@ -92,7 +92,8 @@ struct LifecycleService {
                 bucketName: bucketName, key: object.key, size: nil, etag: nil,
                 versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, on: db)
             await ReplicationService.enqueueDelete(
-                bucketName: bucketName, key: object.key, versionId: outcome.versionId, on: db)
+                app: app, bucketName: bucketName, key: object.key, versionId: outcome.versionId,
+                on: db)
         }
     }
 

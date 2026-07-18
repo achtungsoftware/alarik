@@ -206,6 +206,33 @@ declare global {
         lastError: string | null;
     }
 
+    export interface ClusterErasureCodingStatus {
+        enabled: boolean;
+        dataShards: number;
+        parityShards: number;
+        totalShards: number;
+        quorumThreshold: number;
+        pendingCount: number;
+        failedCount: number;
+        pendingReconstructCount: number;
+        pendingByReason: Record<string, number>;
+    }
+
+    export interface ClusterErasureCodedTaskDetail {
+        id: string;
+        bucketName: string;
+        key: string;
+        versionId: string | null;
+        shardIndex: number;
+        operation: string;
+        targetNodeId: string;
+        reason: string;
+        attempts: number;
+        nextAttemptAt: string;
+        state: "pending" | "failed";
+        lastError: string | null;
+    }
+
     // Fluent Page
     export interface Page<T> {
         items: T[];

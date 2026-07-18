@@ -32,6 +32,7 @@ struct ReplicationService {
     /// disabled) is a no-op - a replication rule can't be enabled on an unversioned bucket in
     /// the first place (enforced at rule-save time).
     static func enqueuePut(
+        app: Application,
         bucketName: String,
         key: String,
         versionId: String?,
@@ -39,7 +40,8 @@ struct ReplicationService {
     ) async {
         guard let versionId else { return }
         await enqueue(
-            operation: .put, bucketName: bucketName, key: key, versionId: versionId, on: db)
+            app: app, operation: .put, bucketName: bucketName, key: key, versionId: versionId,
+            on: db)
     }
 
     /// Enqueues a `delete` replication task for every enabled rule that opted into
@@ -51,13 +53,15 @@ struct ReplicationService {
     /// identify anything on the target). `versionId` is kept only for display/traceability on
     /// the task row - it is never sent to the target.
     static func enqueueDelete(
+        app: Application,
         bucketName: String,
         key: String,
         versionId: String?,
         on db: any Database
     ) async {
         await enqueue(
-            operation: .delete, bucketName: bucketName, key: key, versionId: versionId, on: db)
+            app: app, operation: .delete, bucketName: bucketName, key: key, versionId: versionId,
+            on: db)
     }
 
     /// Walks every current object under `rule.prefix` and enqueues a `put` replication task
@@ -106,6 +110,7 @@ struct ReplicationService {
     static let synchronousTimeout: Duration = .seconds(20)
 
     private static func enqueue(
+        app: Application,
         operation: ReplicationTask.Operation,
         bucketName: String,
         key: String,
@@ -149,7 +154,7 @@ struct ReplicationService {
                 for (rule, target) in synchronousRules {
                     group.addTask {
                         let delivered = await attemptImmediateDelivery(
-                            operation: operation, target: target, bucketName: bucketName,
+                            app: app, operation: operation, target: target, bucketName: bucketName,
                             key: key, versionId: versionId, logger: db.logger)
                         return (rule, target, delivered)
                     }
@@ -188,6 +193,7 @@ struct ReplicationService {
     /// by `synchronousTimeout`. Returns whether it succeeded; never throws - a failure here just
     /// means the caller falls back to the normal async outbox.
     private static func attemptImmediateDelivery(
+        app: Application,
         operation: ReplicationTask.Operation,
         target: ReplicationTarget,
         bucketName: String,
@@ -200,7 +206,8 @@ struct ReplicationService {
                 switch operation {
                 case .put:
                     try await ReplicationClient.replicatePut(
-                        target: target, bucketName: bucketName, key: key, versionId: versionId)
+                        app: app, target: target, bucketName: bucketName, key: key,
+                        versionId: versionId)
                 case .delete:
                     try await ReplicationClient.replicateDelete(target: target, key: key)
                 }

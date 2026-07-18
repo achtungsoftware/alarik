@@ -290,12 +290,25 @@ struct MultipartFileHandler {
     }
 
     /// Completes the multipart upload by concatenating parts and returns the final ETag
-    static func completeUpload(
+    /// Everything `completeUpload` does short of the actual write: validates/orders parts,
+    /// verifies each part's ETag, computes the S3-style multipart ETag, and builds the final
+    /// `ObjectMeta` plus the `payloadSources` list the write step streams from. Split out so an
+    /// erasure-coded completion (`ErasureCodedWriteCoordinator.write`, driven by
+    /// `S3Controller.handleCompleteMultipartUpload`) can reuse this identical
+    /// validation/assembly logic instead of duplicating it - only the final write step differs.
+    struct CompletionPlan {
+        let key: String
+        let objectMeta: ObjectMeta
+        let payloadSources: [(path: String, offset: Int, size: Int)]
+        let etag: String
+        let totalSize: Int
+    }
+
+    static func prepareCompletion(
         bucketName: String,
         uploadId: String,
-        parts: [(partNumber: Int, etag: String)],
-        versioningStatus: VersioningStatus
-    ) throws -> (etag: String, size: Int, versionId: String?) {
+        parts: [(partNumber: Int, etag: String)]
+    ) throws -> CompletionPlan {
         // Read upload metadata
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
@@ -393,7 +406,6 @@ struct MultipartFileHandler {
         let etagHash = S3Service.computeETag(binaryEtags)
         let finalEtag = "\(etagHash)-\(sortedParts.count)"
 
-        // Create the final object using ObjectFileHandler
         let objectMeta = ObjectMeta(
             bucketName: bucketName,
             key: uploadMeta.key,
@@ -404,28 +416,38 @@ struct MultipartFileHandler {
             updatedAt: Date()
         )
 
-        // Write object with versioning support - parts are stream-concatenated into the
-        // final .obj in fixed-size windows
-        var versionId: String? = nil
+        return CompletionPlan(
+            key: uploadMeta.key, objectMeta: objectMeta, payloadSources: payloadSources,
+            etag: finalEtag, totalSize: totalSize)
+    }
 
+    /// Plain (non-EC) completion: writes the assembled object as a single `.obj` file, streamed
+    /// from the part files in fixed-size windows, then cleans up the upload directory.
+    static func completeUpload(
+        bucketName: String,
+        uploadId: String,
+        parts: [(partNumber: Int, etag: String)],
+        versioningStatus: VersioningStatus
+    ) throws -> (etag: String, size: Int, versionId: String?) {
+        let plan = try prepareCompletion(bucketName: bucketName, uploadId: uploadId, parts: parts)
+
+        var versionId: String? = nil
         if versioningStatus != .disabled {
             versionId = try ObjectFileHandler.writeVersionedStreamed(
-                metadata: objectMeta,
-                payloadSources: payloadSources,
+                metadata: plan.objectMeta,
+                payloadSources: plan.payloadSources,
                 bucketName: bucketName,
-                key: uploadMeta.key,
+                key: plan.key,
                 versioningStatus: versioningStatus
             )
         } else {
-            let objectPath = ObjectFileHandler.storagePath(for: bucketName, key: uploadMeta.key)
+            let objectPath = ObjectFileHandler.storagePath(for: bucketName, key: plan.key)
             try ObjectFileHandler.writeStreamed(
-                metadata: objectMeta, payloadSources: payloadSources, to: objectPath)
+                metadata: plan.objectMeta, payloadSources: plan.payloadSources, to: objectPath)
         }
 
-        // Clean up multipart upload directory
         try abortUpload(bucketName: bucketName, uploadId: uploadId)
-
-        return (finalEtag, totalSize, versionId)
+        return (plan.etag, plan.totalSize, versionId)
     }
 
     /// Aborts (deletes) a multipart upload and all its parts

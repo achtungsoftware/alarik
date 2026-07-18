@@ -40,15 +40,33 @@ enum PlacementService {
         key: String,
         activeNodes: [ClusterNodeInfo]
     ) -> [ClusterNodeInfo] {
-        guard !activeNodes.isEmpty else { return [] }
+        responsibleNodes(
+            bucketName: bucketName, key: key, activeNodes: activeNodes, count: replicationFactor)
+    }
 
-        let ranked = activeNodes
+    /// Same ranking as the 3-arg overload, truncated to `count` instead of `replicationFactor` -
+    /// used for erasure-coded placement across `k+m` nodes. Both overloads sort from the same
+    /// `(bucketName, key, activeNodes)` input, so top-3 is always a prefix of top-`count`: rank-0
+    /// is simultaneously "primary of the top-3" and "primary of the top-`count`" for every key.
+    static func responsibleNodes(
+        bucketName: String,
+        key: String,
+        activeNodes: [ClusterNodeInfo],
+        count: Int
+    ) -> [ClusterNodeInfo] {
+        guard !activeNodes.isEmpty else { return [] }
+        return Array(rankedNodes(bucketName: bucketName, key: key, activeNodes: activeNodes).prefix(min(count, activeNodes.count)))
+    }
+
+    private static func rankedNodes(
+        bucketName: String, key: String, activeNodes: [ClusterNodeInfo]
+    ) -> [ClusterNodeInfo] {
+        activeNodes
             .map { node in (node: node, weight: weight(nodeId: node.id, bucketName: bucketName, key: key)) }
             .sorted { lhs, rhs in
                 lhs.weight != rhs.weight ? lhs.weight > rhs.weight : lhs.node.id.uuidString > rhs.node.id.uuidString
             }
-
-        return ranked.prefix(min(replicationFactor, activeNodes.count)).map(\.node)
+            .map(\.node)
     }
 
     /// Minimum number of acks (including the coordinating node's own local write) required
@@ -60,6 +78,27 @@ enum PlacementService {
         guard replicaCount > 0 else { return 0 }
         let majority = (replicationFactor / 2) + 1
         return min(majority, replicaCount)
+    }
+
+    /// Minimum acked shards before an erasure-coded write is told "success": all `k` data
+    /// shards, plus one parity shard of slack when `m >= 2` allows it (mirrors plain
+    /// replication's quorum never acking early). Capped at `k+m` for degenerate inputs.
+    static func ecQuorumThreshold(dataShards: Int, parityShards: Int) -> Int {
+        guard dataShards > 0 else { return 0 }
+        let threshold = parityShards >= 2 ? dataShards + 1 : dataShards
+        return min(threshold, dataShards + parityShards)
+    }
+
+    /// A cluster that has shrunk below `k+m` active nodes has nowhere left to place every shard -
+    /// throws rather than silently writing a degraded/incomplete stripe.
+    static func ensureErasureCodingAdmission(
+        activeNodeCount: Int, dataShards: Int, parityShards: Int
+    ) throws {
+        let required = dataShards + parityShards
+        guard activeNodeCount >= required else {
+            throw PlacementServiceError.insufficientNodesForErasureCoding(
+                required: required, active: activeNodeCount)
+        }
     }
 
     /// HRW weight: SHA256 of `nodeId|bucketName|key`, taken as the first 8 bytes interpreted as
@@ -74,5 +113,16 @@ enum PlacementService {
             value = (value << 8) | UInt64(byte)
         }
         return value
+    }
+}
+
+enum PlacementServiceError: Error, CustomStringConvertible {
+    case insufficientNodesForErasureCoding(required: Int, active: Int)
+
+    var description: String {
+        switch self {
+        case .insufficientNodesForErasureCoding(let required, let active):
+            "Erasure coding requires at least \(required) active cluster nodes, only \(active) are active"
+        }
     }
 }

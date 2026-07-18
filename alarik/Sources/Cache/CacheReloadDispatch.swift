@@ -158,10 +158,12 @@ enum CacheReloadDispatch {
             // off a rebalance walk. Cheap no-op when nothing actually needs to move: the walk
             // only enqueues tasks for objects whose responsible set changed.
             await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+            await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
         case ("clusterNode", .remove):
             if let uuid = UUID(uuidString: message.key) {
                 await ClusterNodeCache.shared.remove(id: uuid)
                 await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+                await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
             }
 
         case ("clusterRebalance", _):
@@ -171,6 +173,13 @@ enum CacheReloadDispatch {
             // cluster-wide - the walk only ever sees this node's local disk, so a node holding an
             // under-replicated object must run its own walk to push the missing copies out.
             await ClusterRebalanceService.scheduleRebalance(app: app, reason: .manualResync)
+            await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .manualResync)
+
+        case ("clusterScrub", _):
+            // Operator-triggered bit-rot scrub, broadcast to every node for the same reason as a
+            // resync: a scrub only sees this node's own local shards, so cluster-wide verification
+            // needs every node to run its own pass.
+            Task { await ErasureCodedScrubber.scrub(app: app) }
 
         default:
             app.logger.error("Unknown cache invalidation message: \(message)")

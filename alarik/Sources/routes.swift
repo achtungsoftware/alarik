@@ -41,6 +41,7 @@ func routes(_ app: Application) throws {
     // client-facing) - kept top-level, not under /api/v1, since it's never part of the public
     // API surface.
     try app.register(collection: InternalClusterObjectController())
+    try app.register(collection: InternalClusterErasureCodedController())
     try app.register(collection: InternalClusterListingController())
 
     // S3

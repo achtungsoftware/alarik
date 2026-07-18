@@ -124,4 +124,59 @@ struct PlacementServiceTests {
         #expect(PlacementService.quorumThreshold(replicaCount: 3) == 2)
         #expect(PlacementService.quorumThreshold(replicaCount: 10) == 2)
     }
+
+    @Test("responsibleNodes(count:) never returns more nodes than are active or requested")
+    func countOverloadRespectsBounds() {
+        let nodes = (0..<10).map { node("node-\($0)") }
+        #expect(
+            PlacementService.responsibleNodes(
+                bucketName: "b", key: "k", activeNodes: nodes, count: 6
+            ).count == 6)
+        // Fewer active nodes than requested - never invents nodes.
+        let three = Array(nodes.prefix(3))
+        #expect(
+            PlacementService.responsibleNodes(
+                bucketName: "b", key: "k", activeNodes: three, count: 6
+            ).count == 3)
+    }
+
+    @Test("top-3 is always a prefix of top-(k+m) - same ranked list, different truncation")
+    func top3IsPrefixOfTopKPlusM() {
+        let nodes = (0..<12).map { node("node-\($0)") }
+        for i in 0..<50 {
+            let key = "key-\(i)"
+            let top3 = PlacementService.responsibleNodes(
+                bucketName: "b", key: key, activeNodes: nodes
+            ).map(\.id)
+            let topKM = PlacementService.responsibleNodes(
+                bucketName: "b", key: key, activeNodes: nodes, count: 8
+            ).map(\.id)
+            #expect(Array(topKM.prefix(3)) == top3)
+        }
+    }
+
+    @Test("ecQuorumThreshold requires all k data shards, plus one parity shard of slack when m >= 2")
+    func ecQuorumThresholdMatchesDesign() {
+        #expect(PlacementService.ecQuorumThreshold(dataShards: 0, parityShards: 2) == 0)
+        #expect(PlacementService.ecQuorumThreshold(dataShards: 4, parityShards: 1) == 4)
+        #expect(PlacementService.ecQuorumThreshold(dataShards: 4, parityShards: 2) == 5)
+        // Capped at k+m even in degenerate cases.
+        #expect(PlacementService.ecQuorumThreshold(dataShards: 4, parityShards: 2) <= 6)
+    }
+
+    @Test("ensureErasureCodingAdmission throws when the cluster has fewer than k+m active nodes")
+    func admissionThrowsWhenClusterTooSmall() {
+        #expect(throws: PlacementServiceError.self) {
+            try PlacementService.ensureErasureCodingAdmission(
+                activeNodeCount: 5, dataShards: 4, parityShards: 2)
+        }
+    }
+
+    @Test("ensureErasureCodingAdmission succeeds when the cluster has at least k+m active nodes")
+    func admissionSucceedsWhenClusterLargeEnough() throws {
+        try PlacementService.ensureErasureCodingAdmission(
+            activeNodeCount: 6, dataShards: 4, parityShards: 2)
+        try PlacementService.ensureErasureCodingAdmission(
+            activeNodeCount: 10, dataShards: 4, parityShards: 2)
+    }
 }

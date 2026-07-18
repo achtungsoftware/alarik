@@ -217,4 +217,128 @@ enum ObjectRoutingService {
             bucketName: bucketName, key: key, activeNodes: active)
         return (responsible, config)
     }
+
+    /// Erasure-coded write routing, over the full `k+m` responsible set (not `replicationFactor`'s
+    /// top-3), pinned to rank-0 - the write-path counterpart to `multipartRoutingDecision`, and
+    /// for the identical reason: only one node can safely assign shard indices to nodes for a
+    /// given write, or two nodes racing to coordinate the same key could produce conflicting
+    /// shard-index-to-node mappings. Reads don't go through this - gather-and-decode is naturally
+    /// idempotent from any of the `k+m` nodes, so `routingDecision` (unpinned) is enough for GET.
+    enum ErasureCodedRoutingDecision {
+        /// Not clustered, or clustering is on but no erasure coding config resolved - erasure
+        /// coding never applies here; caller falls back to a plain single-node local write.
+        case notClustered
+        case local(peers: [ClusterNodeInfo])
+        case forward(candidates: [ClusterNodeInfo])
+    }
+
+    /// Unlike `placement`'s "membership hasn't populated yet, just serve locally" fallback, an
+    /// undersized cluster is a hard failure here: silently writing to fewer than `k+m` nodes
+    /// would mean writing a durability guarantee the deployment doesn't actually have. Never
+    /// falls back to a plain local write in cluster mode - that would silently produce a single
+    /// non-redundant copy where every reader expects `k+m`-way erasure-coded redundancy.
+    static func erasureCodedRoutingDecision(
+        req: Request, bucketName: String, key: String
+    ) async throws -> ErasureCodedRoutingDecision {
+        guard let config = req.application.storage[ClusterConfigurationKey.self],
+            let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self]
+        else {
+            return .notClustered
+        }
+
+        let isTrustedForward = ClusterForwardAuthenticator.isTrustedForward(req)
+        let active = await ClusterNodeCache.shared.activeNodes()
+
+        do {
+            try PlacementService.ensureErasureCodingAdmission(
+                activeNodeCount: active.count, dataShards: ecConfig.dataShards,
+                parityShards: ecConfig.parityShards)
+        } catch let error as PlacementServiceError {
+            throw S3Error(
+                status: .serviceUnavailable, code: "ServiceUnavailable",
+                message: "\(error)", requestId: req.id)
+        }
+
+        let responsible = PlacementService.responsibleNodes(
+            bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
+        guard let primary = responsible.first else {
+            // Unreachable in practice - admission above already guarantees
+            // activeNodeCount >= totalShards >= 1 - but never silently treat this as success.
+            throw S3Error(
+                status: .serviceUnavailable, code: "ServiceUnavailable",
+                message: "No cluster node is currently available to coordinate this write.",
+                requestId: req.id)
+        }
+
+        let peers = responsible.filter { $0.id != config.nodeId }
+
+        if isTrustedForward || primary.id == config.nodeId {
+            return .local(peers: peers)
+        }
+        return .forward(candidates: [primary])
+    }
+
+    /// `erasureCodedRoutingDecision` combined with the actual forward call - the EC counterpart
+    /// of `routeForWrite`. No capacity-redirect: like multipart's primary pinning, EC coordination
+    /// is a hard requirement (only rank-0 may assign shard placement for this write), not the
+    /// soft any-of-top-3 preference plain replication's redirect exists for.
+    enum ErasureCodedWriteRouting {
+        case notClustered
+        case local(peers: [ClusterNodeInfo])
+        case forwarded(Response)
+    }
+
+    /// Read-side EC awareness: is self within the *wider* top-(k+m) responsible set, a strict
+    /// superset of the plain top-3 set (top-3 is always the first 3 elements of top-(k+m), same
+    /// ranked list, different truncation)? Falls back to plain top-3 `isResponsible`-shaped
+    /// behavior when EC isn't configured. Unlike write routing, no pinning here - any of the
+    /// `k+m` nodes can independently coordinate a read (gather-and-decode is naturally
+    /// idempotent), so this is a locality check, not a routing decision with a single target.
+    static func erasureCodedReadPlacement(req: Request, bucketName: String, key: String) async -> (
+        isLocal: Bool, candidates: [ClusterNodeInfo], responsible: [ClusterNodeInfo]
+    ) {
+        guard let config = req.application.storage[ClusterConfigurationKey.self] else {
+            return (true, [], [])
+        }
+        let active = await ClusterNodeCache.shared.activeNodes()
+        guard !active.isEmpty else { return (true, [], []) }
+
+        let count: Int
+        if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self] {
+            count = Swift.max(PlacementService.replicationFactor, ecConfig.totalShards)
+        } else {
+            count = PlacementService.replicationFactor
+        }
+        let responsible = PlacementService.responsibleNodes(
+            bucketName: bucketName, key: key, activeNodes: active, count: count)
+        if responsible.contains(where: { $0.id == config.nodeId }) {
+            return (true, [], responsible)
+        }
+        return (false, responsible, responsible)
+    }
+
+    /// True when self is among the *legacy* top-3 plain-replication placement for the key -
+    /// always exactly `responsible`'s first 3 entries (the top-3-is-a-prefix-of-top-(k+m)
+    /// invariant every placement decision in this codebase relies on). `erasureCodedReadPlacement`
+    /// only proves membership in the wider top-(k+m) set; once k+m > 3, a node can be in that
+    /// wider set without holding a legacy plain replica at all, so read-side handlers that fall
+    /// through to the plain `.obj` path (nothing erasure-coded found locally) need this check
+    /// before trusting a local read.
+    static func isLegacyReplica(responsible: [ClusterNodeInfo], selfNodeId: UUID) -> Bool {
+        responsible.prefix(PlacementService.replicationFactor).contains { $0.id == selfNodeId }
+    }
+
+    static func routeForErasureCodedWrite(
+        req: Request, bucketName: String, key: String
+    ) async throws -> ErasureCodedWriteRouting {
+        switch try await erasureCodedRoutingDecision(req: req, bucketName: bucketName, key: key) {
+        case .notClustered:
+            return .notClustered
+        case .local(let peers):
+            return .local(peers: peers)
+        case .forward(let candidates):
+            return .forwarded(
+                try await ClusterForwardingClient.forward(req: req, candidates: candidates))
+        }
+    }
 }

@@ -9,7 +9,7 @@ FROM swift:6.2-noble AS build
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q dist-upgrade -y \
-    && apt-get install -y libjemalloc-dev \
+    && apt-get install -y libjemalloc-dev libisal-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up working directory
@@ -45,6 +45,7 @@ RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
       ca-certificates \
       tzdata \
       libjemalloc2 \
+      libisal2 \
       libxml2 \
       curl \
     && rm -rf /var/lib/apt/lists/*

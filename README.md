@@ -102,12 +102,15 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Feature | Notes |
 | --- | --- |
 | Postgres-backed control plane | Opt-in multi-node HA for buckets, users, access keys, and policies behind a load balancer |
-| Sharded, replicated object data | Rendezvous (HRW) hashing places each object on 3 nodes cluster-wide, no range-sharding hotspots |
+| Erasure-coded object data | Reed-Solomon `k` data + `m` parity shards across nodes (MinIO/Ceph-style), rebuildable from any `k` - the durability of replication at ~1.3-1.5x overhead instead of 3x |
+| Coordination-free placement | Rendezvous (HRW) hashing places each object's shards deterministically, no range-sharding hotspots or coordinator |
 | Any node serves any request | An entry node forwards to a responsible node transparently - no client-visible routing logic |
-| Quorum writes | A write acks once a majority of replicas confirm, with async catch-up for stragglers |
-| Automatic rebalancing | Node join/drain/removal triggers copy + safe reclaim, including historical versions and delete markers |
+| Quorum writes | A write acks once a quorum of shards land durably, with async catch-up for stragglers |
+| Read-repair & bit-rot scrubbing | Missing or silently-corrupted shards are rebuilt from survivors automatically - on read, and on a periodic background scrub |
+| Automatic rebalancing & reconstruction | Node join/drain/loss redistributes shards and reconstructs any that were lost, including historical versions and delete markers |
+| Ranged reads | `Range` requests on erasure-coded objects reconstruct only the stripes they cover (`206 Partial Content`) |
 | Cluster-aware listing | `ListObjects`, `ListObjectVersions`, `ListMultipartUploads`, and `DeleteBucket` safety checks work correctly across every node |
-| Admin console | Live node health, storage distribution, and an object placement browser under Admin → Cluster |
+| Admin console | Live node health, `k`/`m` and shard-repair status, storage distribution, and an object placement browser under Admin → Cluster |
 
 See the [documentation](https://alarik.io/docs) for the full API reference.
 

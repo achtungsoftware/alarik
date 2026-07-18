@@ -361,6 +361,13 @@ enum ClusterListingService {
             keyMarker = isTruncated ? nextKeyMarker : nil
             versionIdMarker = isTruncated ? nextVersionIdMarker : nil
         } while keyMarker != nil
+
+        // listAllVersions above already folds in this node's local EC shard-0 entries (its
+        // one-hit-per-version signal), and the top-3-is-a-prefix-of-top-(k+m) invariant means
+        // `responsible.first?.id == selfNodeId` correctly identifies the EC rank-0 owner too -
+        // no separate EC pass needed here (a prior version of this function double-counted by
+        // adding one).
+
         return (sizeBytes, objectCount)
     }
 

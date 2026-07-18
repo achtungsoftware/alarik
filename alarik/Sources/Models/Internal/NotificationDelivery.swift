@@ -92,3 +92,5 @@ final class NotificationDelivery: Model, @unchecked Sendable {
         self.createdAt = Date()
     }
 }
+
+extension NotificationDelivery: OutboxRow {}
