@@ -60,6 +60,72 @@ struct ErasureCodedObjectHandlerTests {
         #expect(!path.contains(".."))
     }
 
+    @Test("versionedShardBasePath sanitizes path traversal in a client-supplied versionId")
+    func versionedPathSanitizesVersionIdTraversal() {
+        // A client can pass an arbitrary ?versionId= on GET/DELETE; it must never escape the
+        // key's .versions/ directory (this path is removeItem'd recursively on delete).
+        let base = ErasureCodedObjectHandler.versionedShardBasePath(
+            bucketName: "b", key: "k", versionId: "../../other-bucket/victim")
+        #expect(!base.contains(".."))
+        #expect(base.contains("k.versions/"))
+        // The sanitized remainder stays inside the .versions directory.
+        #expect(base.hasSuffix(".ecshards/"))
+
+        // The legacy .obj path builder shares the same guarantee.
+        let legacy = ObjectFileHandler.versionedPath(
+            for: "b", key: "k", versionId: "../../../etc/passwd")
+        #expect(!legacy.contains(".."))
+        #expect(legacy.contains("k.versions/"))
+        #expect(legacy.hasSuffix(".obj"))
+
+        // Legitimate ids (32-hex, and the literal "null" sentinel) pass through untouched.
+        #expect(ObjectFileHandler.sanitizedVersionId("null") == "null")
+        let real = ObjectMeta.generateVersionId()
+        #expect(ObjectFileHandler.sanitizedVersionId(real) == real)
+    }
+
+    @Test("a corrupt 4-byte length prefix is rejected as an invalid header, not a giant allocation")
+    func corruptLengthPrefixRejected() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+
+        // 0xFFFFFFFF length prefix + a little garbage - simulates bit rot in the first bytes.
+        // Without the cap this attempted a ~4 GiB allocation on open (and the scrubber opens
+        // every local shard, so one rotted byte could OOM the process).
+        var bytes = Data([0xFF, 0xFF, 0xFF, 0xFF])
+        bytes.append(Data(repeating: 0xAB, count: 64))
+        try bytes.write(to: URL(fileURLWithPath: path))
+
+        #expect(throws: ErasureCodedObjectHandlerError.self) {
+            _ = try ErasureCodedShardReader(path: path)
+        }
+    }
+
+    @Test("a decodable header with out-of-band field values is rejected as invalid")
+    func corruptHeaderFieldsRejected() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+
+        // Valid JSON, hostile values: a negative stripeUnitSize would crash readStripe's
+        // allocation; a huge one would OOM it. Both must read as "this copy can't be trusted".
+        let badHeader = ErasureCodedShardHeader(
+            shardIndex: 0, dataShards: 2, parityShards: 2, stripeUnitSize: -64, stripeCount: 1,
+            objectMeta: testMeta(size: 128))
+        let json = try JSONEncoder().encode(badHeader)
+        var bytes = Data()
+        withUnsafeBytes(of: UInt32(json.count).bigEndian) { bytes.append(contentsOf: $0) }
+        bytes.append(json)
+        try bytes.write(to: URL(fileURLWithPath: path))
+
+        #expect(throws: ErasureCodedObjectHandlerError.self) {
+            _ = try ErasureCodedShardReader(path: path)
+        }
+    }
+
     @Test("the version-aware path overloads select the plain vs versioned path by nil-ness")
     func versionAwarePathOverloads() {
         // nil versionId -> the plain, non-versioned path (identical to the base overload).

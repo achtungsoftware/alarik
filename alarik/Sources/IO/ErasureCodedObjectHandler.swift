@@ -81,9 +81,13 @@ enum ErasureCodedObjectHandler {
 
     /// Directory holding every shard file for one specific version - the EC counterpart of
     /// `ObjectFileHandler.versionedPath`, under the same `.versions/` parent directory.
+    /// `versionId` is sanitized (see `ObjectFileHandler.sanitizedVersionId`): a client-supplied id
+    /// containing path metacharacters must never escape the `.versions/` directory, especially
+    /// here where delete paths remove this directory recursively.
     static func versionedShardBasePath(bucketName: String, key: String, versionId: String) -> String {
         let encodedBucket = BucketHandler.encodedBucketName(bucketName)
-        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey(key)).versions/\(versionId).ecshards/"
+        let safeVersionId = ObjectFileHandler.sanitizedVersionId(versionId)
+        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey(key)).versions/\(safeVersionId).ecshards/"
     }
 
     static func versionedShardPath(
@@ -297,11 +301,33 @@ enum ErasureCodedObjectHandler {
     /// node happens to be rank-0 for - never a fraction, never duplicated by the other `k+m-1`
     /// shards, and the header's `ObjectMeta` is already complete (no separate re-read needed the
     /// way a bare `.obj` path requires).
+    ///
+    /// Runs on every S3 listing/stats request, so cost matters: the walk is scoped to this one
+    /// bucket's directory (never the whole store the way the rebalance/scrub walk is), and only
+    /// files literally named `0.ecshard` are opened - the shard index is the filename, so the
+    /// other `k+m-1` shards are skipped without paying their header parse.
     static func listLocalShardZeroEntries(bucketName: String, key: String? = nil) -> [ObjectMeta] {
-        listAllLocalShards()
-            .filter { $0.header.shardIndex == 0 && $0.header.objectMeta.bucketName == bucketName }
-            .filter { key == nil || $0.header.objectMeta.key == key }
-            .map(\.header.objectMeta)
+        let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: bucketPath),
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])
+        else { return [] }
+
+        var results: [ObjectMeta] = []
+        for case let fileURL as URL in enumerator {
+            guard fileURL.lastPathComponent == "0.ecshard" else { continue }
+            guard let reader = try? ErasureCodedShardReader(path: fileURL.path) else { continue }
+            let header = reader.header
+            reader.close()
+            // Belt-and-braces: trust the header over the filename, and never leak another
+            // bucket's meta if a file was somehow misplaced.
+            guard header.shardIndex == 0, header.objectMeta.bucketName == bucketName else { continue }
+            if let key, header.objectMeta.key != key { continue }
+            results.append(header.objectMeta)
+        }
+        return results
     }
 }
 
@@ -362,6 +388,17 @@ final class ErasureCodedShardReader {
     private let stripeRecordSize: Int
     private var closed = false
 
+    /// Upper bound on the JSON header's declared length. The header is a small `ObjectMeta` plus
+    /// a few ints - even pathological tag/metadata sets stay far under this. The cap exists so a
+    /// bit-rotted length prefix (4 raw bytes, e.g. flipped to 0xFFFFFFFF) is rejected as a corrupt
+    /// header instead of triggering a multi-gigabyte allocation - the scrubber opens every local
+    /// shard, so without this a single corrupt byte on disk could OOM the whole process.
+    static let maxHeaderLength = 1 << 20  // 1 MiB
+    /// Upper bound on a header's declared stripe unit. Real deployments use
+    /// `Constants.erasureCodingStripeUnitSize` (256 KiB); the cap only rejects corrupt headers
+    /// whose decoded value would drive giant (or, negative, crashing) per-stripe allocations.
+    static let maxStripeUnitSize = 64 << 20  // 64 MiB
+
     init(path: String) throws {
         let fd = POSIXFile.open(path, O_RDONLY)
         guard fd >= 0 else {
@@ -375,6 +412,9 @@ final class ErasureCodedShardReader {
             }
             let headerLength = Int(
                 UInt32(bigEndian: lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self) }))
+            guard headerLength > 0, headerLength <= Self.maxHeaderLength else {
+                throw ErasureCodedObjectHandlerError.invalidHeader(path: path)
+            }
 
             var jsonBytes = [UInt8](repeating: 0, count: headerLength)
             guard POSIXFile.read(fd, &jsonBytes, headerLength) == headerLength else {
@@ -383,6 +423,17 @@ final class ErasureCodedShardReader {
             let header = try jsonBytes.withUnsafeBufferPointer { buffer in
                 try ErasureCodedObjectHandler.jsonDecoder.decode(
                     ErasureCodedShardHeader.self, from: Data(buffer))
+            }
+            // Field sanity: valid JSON isn't proof of a healthy header - bit rot inside the JSON
+            // itself can decode to values (negative, absurdly large) whose downstream allocations
+            // (`readStripe` allocates `stripeUnitSize` per call) would crash or OOM. Treat any
+            // out-of-band value exactly like an unreadable header: this copy can't be trusted.
+            guard header.dataShards >= 1, header.parityShards >= 1,
+                header.stripeUnitSize >= 1, header.stripeUnitSize <= Self.maxStripeUnitSize,
+                header.stripeCount >= 0,
+                header.shardIndex >= 0, header.shardIndex < header.dataShards + header.parityShards
+            else {
+                throw ErasureCodedObjectHandlerError.invalidHeader(path: path)
             }
 
             self.path = path

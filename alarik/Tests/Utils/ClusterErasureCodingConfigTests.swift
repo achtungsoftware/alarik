@@ -96,6 +96,21 @@ struct ClusterErasureCodingConfigTests {
         }
     }
 
+    @Test("rejects k+m beyond the GF(256) Reed-Solomon limit of 255 total shards")
+    func rejectsBeyondGaloisFieldLimit() throws {
+        // 200 + 100 = 300 > 255: individually valid counts whose total would produce a
+        // degenerate Cauchy matrix and silently corrupt every encode - must fail boot loudly.
+        withEnv(["CLUSTER_EC_DATA_SHARDS": "200", "CLUSTER_EC_PARITY_SHARDS": "100"]) {
+            #expect(throws: ClusterErasureCodingConfigError.self) {
+                try ClusterErasureCodingConfig.resolve()
+            }
+        }
+        // Exactly at the limit is allowed.
+        withEnv(["CLUSTER_EC_DATA_SHARDS": "200", "CLUSTER_EC_PARITY_SHARDS": "55"]) {
+            #expect(throws: Never.self) { try ClusterErasureCodingConfig.resolve() }
+        }
+    }
+
     // MARK: - Scrub interval
 
     @Test("scrub interval defaults to weekly (168h) and reports scrubbing enabled")

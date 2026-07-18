@@ -45,6 +45,28 @@ enum ErasureCodedDispatcher {
             "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.versionId ?? "")\u{0}\(row.shardIndex)\u{0}\(row.targetNodeId)"
         },
         attemptDelivery: { row, app in
+            // Target-only delivery: every node's dispatcher drains this same shared table, and
+            // unlike legacy replication - where only a node physically holding the object can
+            // deliver, so `.skip` naturally leaves each row to its one capable node - ANY node
+            // can reconstruct a shard. Without this gate, several nodes would race to gather `k`
+            // shards and RS-decode the same repair redundantly on every drain tick. The target
+            // itself is the one node whose delivery is always both possible and useful: it
+            // rebuilds its own missing shard from survivors, and a *down* target simply leaves
+            // the row pending (correct - the shard can't land on a down node anyway) until the
+            // target's own 2s tick drains it on return.
+            guard let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId else {
+                return .skip
+            }
+            if row.targetNodeId != selfNodeId {
+                // A target that's left the membership entirely will never drain its own row -
+                // burn an attempt so the row dead-letters and gets purged instead of sitting
+                // pending forever (the rebalance sweep re-detects the gap under the new
+                // membership with a fresh, correctly-targeted task).
+                if await ClusterNodeCache.shared.get(id: row.targetNodeId) == nil {
+                    return .failure(ErasureCodedDispatcherError.unknownTarget(row.targetNodeId))
+                }
+                return .skip
+            }
             do {
                 switch row.operation {
                 case ErasureCodedReplicationTask.Operation.put.rawValue:

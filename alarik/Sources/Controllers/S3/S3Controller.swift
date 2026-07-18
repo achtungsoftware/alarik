@@ -294,6 +294,33 @@ struct S3Controller: RouteCollection {
         } catch {
             let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
             guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
+                // Nothing local in either format - before concluding 404, ask responsible peers
+                // for a shard header (a cheap, header-only probe). Covers the fresh-write
+                // straggler window: this node is responsible but hasn't received its shard yet,
+                // while peers already hold the object - without this, a HEAD/tagging read racing
+                // a just-acked PUT would wrongly 404. Parallel, first hit wins; a true 404 costs
+                // one round-trip of parallel probes, matching handleObjectGet's identical
+                // `anyPeerHoldsShard` trade-off.
+                if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
+                    req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+                    let peerMeta = await withTaskGroup(
+                        of: ObjectMeta?.self, returning: ObjectMeta?.self, body: { group in
+                        for node in responsible where node.id != clusterConfig.nodeId {
+                            group.addTask {
+                                await ClusterReplicationClient.fetchShardMeta(
+                                    app: req.application, node: node, bucketName: bucketName,
+                                    key: key, versionId: versionId)
+                            }
+                        }
+                        for await meta in group where meta != nil {
+                            group.cancelAll()
+                            return meta
+                        }
+                        return nil
+                    })
+                {
+                    return peerMeta
+                }
                 throw S3Error(
                     status: .notFound, code: "NoSuchKey",
                     message: "The specified key does not exist.", requestId: req.id)

@@ -37,6 +37,13 @@ struct ClusterErasureCodingConfig: Sendable, Equatable {
     var totalShards: Int { dataShards + parityShards }
     var scrubbingEnabled: Bool { scrubIntervalHours > 0 }
 
+    /// Hard mathematical ceiling on `k + m`: the Reed-Solomon code runs over GF(256) with a
+    /// Cauchy matrix, which needs `k + m` distinct field elements out of the 255 usable ones - a
+    /// larger total silently produces a degenerate matrix and corrupts every encode. Real
+    /// deployments sit far below this (MinIO caps a set at 16 drives); the bound only exists so a
+    /// wildly wrong value fails boot loudly instead of destroying data.
+    static let maxTotalShards = 255
+
     /// Reads `CLUSTER_EC_DATA_SHARDS`/`CLUSTER_EC_PARITY_SHARDS`/`CLUSTER_EC_SCRUB_INTERVAL_HOURS`,
     /// defaulting whichever is unset. Throws (fails boot) on a nonsensical explicit value - same
     /// loud-not-silent treatment `CLUSTER_SECRET` misconfiguration already gets in `configure.swift`.
@@ -45,6 +52,12 @@ struct ClusterErasureCodingConfig: Sendable, Equatable {
             envVar: "CLUSTER_EC_DATA_SHARDS", minimum: 2, defaultValue: `default`.dataShards)
         let parityShards = try parseShardCount(
             envVar: "CLUSTER_EC_PARITY_SHARDS", minimum: 1, defaultValue: `default`.parityShards)
+        guard dataShards + parityShards <= maxTotalShards else {
+            throw ClusterErasureCodingConfigError(
+                description:
+                    "CLUSTER_EC_DATA_SHARDS + CLUSTER_EC_PARITY_SHARDS = \(dataShards + parityShards) exceeds the Reed-Solomon GF(256) limit of \(maxTotalShards) total shards."
+            )
+        }
         // Scrub interval may be 0 (disabled), so its floor is 0, not the >= 1 the shard counts need.
         let scrubIntervalHours = try parseShardCount(
             envVar: "CLUSTER_EC_SCRUB_INTERVAL_HOURS", minimum: 0,

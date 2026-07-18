@@ -38,6 +38,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
         cluster.get("fetch", use: handleFetch)
         cluster.get("exists", use: handleExists)
         cluster.get("held", use: handleHeld)
+        cluster.get("meta", use: handleMeta)
         cluster.delete(use: handleDelete)
         cluster.on(.PATCH, "metadata", use: handleMetadataPatch)
         cluster.on(.POST, "restore-latest", use: handleRestoreLatest)
@@ -49,6 +50,11 @@ struct InternalClusterErasureCodedController: RouteCollection {
     /// read-repair for corruption. A reader that hit a checksum failure while decoding a fetched
     /// copy asks the holder to check its own copy here, so a peer's healthy shard is never deleted
     /// on the strength of what might have been transit damage.
+    ///
+    /// Responds 202 and verifies detached: reading every stripe of a large shard can outlast the
+    /// caller's request timeout, and the caller is fire-and-forget anyway (`requestVerifyHeal`
+    /// ignores the response body) - tying the verify to the request's lifetime would only risk it
+    /// being cancelled halfway through for no one's benefit.
     @Sendable
     func handleVerifyHeal(req: Request) async throws -> HTTPStatus {
         guard
@@ -58,9 +64,12 @@ struct InternalClusterErasureCodedController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
         }
         let versionId = req.query[String.self, at: "versionId"]
-        await ErasureCodedScrubber.verifyAndHealObjectShards(
-            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
-        return .ok
+        let app = req.application
+        Task.detached {
+            await ErasureCodedScrubber.verifyAndHealObjectShards(
+                app: app, bucketName: bucketName, key: key, versionId: versionId)
+        }
+        return .accepted
     }
 
     private func bucketKey(req: Request) throws -> (bucketName: String, key: String, versionId: String?) {
@@ -82,6 +91,45 @@ struct InternalClusterErasureCodedController: RouteCollection {
         let (bucketName, key, versionId) = try bucketKey(req: req)
         return ErasureCodedObjectHandler.locallyHeldShardIndices(
             bucketName: bucketName, key: key, versionId: versionId)
+    }
+
+    /// The `ObjectMeta` from any shard this node holds for (bucket, key[, versionId]) - a
+    /// header-only read, no stripe data touched. Lets a HEAD-shaped handler on a node that hasn't
+    /// received its own shard yet (the fresh-write straggler window) resolve the object's metadata
+    /// from a peer without downloading a whole shard. A nil versionId resolves to this node's own
+    /// view of the latest version, mirroring how local metadata resolution works. 404 when this
+    /// node holds nothing for it.
+    @Sendable
+    func handleMeta(req: Request) async throws -> Response {
+        let (bucketName, key, versionId) = try bucketKey(req: req)
+
+        let effectiveVersionId: String?
+        if let versionId {
+            effectiveVersionId = versionId
+        } else if ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
+            effectiveVersionId = try? ObjectFileHandler.getLatestVersionId(
+                bucketName: bucketName, key: key)
+        } else {
+            effectiveVersionId = nil
+        }
+
+        let held = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: effectiveVersionId)
+        guard let index = held.first else {
+            throw Abort(.notFound, reason: "No shard held for this object")
+        }
+        let path = ErasureCodedObjectHandler.shardPath(
+            bucketName: bucketName, key: key, versionId: effectiveVersionId, shardIndex: index)
+        let meta = try await req.application.threadPool.runIfActive {
+            let reader = try ErasureCodedShardReader(path: path)
+            defer { reader.close() }
+            return reader.header.objectMeta
+        }
+
+        let response = Response(status: .ok)
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        response.body = try Response.Body(data: JSONEncoder().encode(meta))
+        return response
     }
 
     /// Repoints this node's `.latest` pointer for (bucket, key) back to `priorVersionId` and

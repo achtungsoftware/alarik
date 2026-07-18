@@ -467,6 +467,31 @@ enum ClusterReplicationClient {
             outbound, timeout: requestTimeout, logger: app.logger)
     }
 
+    /// Fetches the `ObjectMeta` of whatever shard `node` holds for (bucketName, key, versionId) -
+    /// a header-only probe (no stripe data crosses the wire), for HEAD-shaped metadata resolution
+    /// on a node that hasn't received its own shard yet. `nil` when the node is unreachable or
+    /// holds nothing for it.
+    static func fetchShardMeta(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async -> ObjectMeta? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/meta" + suffix)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: requestTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
+            return try JSONDecoder().decode(ObjectMeta.self, from: body)
+        } catch {
+            return nil
+        }
+    }
+
     /// Asks `node` to verify the shard(s) it holds for (bucketName, key, versionId) against their
     /// on-disk checksums and heal any genuinely corrupt - the safe corruption side of read-repair.
     /// Best-effort: a node that can't be reached simply doesn't verify this pass; the next read,
