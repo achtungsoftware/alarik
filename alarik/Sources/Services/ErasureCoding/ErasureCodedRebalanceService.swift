@@ -116,11 +116,12 @@ enum ErasureCodedRebalanceService {
                 required: shardIndex + 1, found: responsible.count)
         }
 
+        let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id
         let gathered: GatheredShards
         do {
             gathered = try await ErasureCodedShardGatherer.gather(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                responsible: responsible, selfNodeId: (app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id),
+                responsible: responsible, selfNodeId: selfNodeId,
                 needed: ecConfig.dataShards, wantSpare: true, excludingIndex: shardIndex,
                 requestId: UUID().uuidString)
         } catch ErasureCodedGatherError.notFound {
@@ -142,9 +143,25 @@ enum ErasureCodedRebalanceService {
                 outputPath: scratchPath)
         }
 
-        try await ClusterReplicationClient.pushShard(
-            app: app, to: target, sourcePath: scratchPath, bucketName: bucketName, key: key,
-            versionId: versionId, shardIndex: shardIndex)
+        if target.id == selfNodeId {
+            // The dispatcher's target-only delivery gate (`ErasureCodedDispatcher`) means this is
+            // now the common case: the node reconstructing the shard IS its destination. Commit
+            // directly instead of looping the bytes through an HTTP push to itself - skips a
+            // redundant network round trip and a second full spool-then-copy of the same file.
+            let finalPath = ErasureCodedObjectHandler.shardPath(
+                bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+            try await S3Service.offloadBlockingIO(app) {
+                try ErasureCodedObjectHandler.commitShardFile(
+                    sourcePath: scratchPath, finalPath: finalPath, bucketName: bucketName, key: key)
+            }
+        } else {
+            // Reachable via a manual resync or a future non-dispatcher caller, where the
+            // reconstructing node genuinely differs from the target - falls back to the network
+            // push exactly as before.
+            try await ClusterReplicationClient.pushShard(
+                app: app, to: target, sourcePath: scratchPath, bucketName: bucketName, key: key,
+                versionId: versionId, shardIndex: shardIndex)
+        }
     }
 
     /// Reads every gathered survivor stripe by stripe, reconstructing just `missingIndex` at

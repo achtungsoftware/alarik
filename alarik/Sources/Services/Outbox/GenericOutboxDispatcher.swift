@@ -139,29 +139,40 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
 
             let state = DrainState(remaining: due)
 
-            await withTaskGroup(of: String?.self) { group in
+            // Tracks whether this batch changed anything - a `.skip` leaves its row completely
+            // untouched (still due, same nextAttemptAt), so a batch that's ENTIRELY skips would
+            // be fetched again byte-for-byte identical on the next `while true` iteration below.
+            // Without this guard, a node whose outbox is dominated by rows it can't act on right
+            // now (e.g. every EC dispatcher sees every shard-repair row cluster-wide, but only
+            // ever delivers the ones targeting itself) would spin in a tight, sleepless
+            // re-SELECT loop for as long as that domination holds - a real, synchronous CPU/DB
+            // busy-loop, not just wasted work.
+            let madeProgress = Progress()
+
+            await withTaskGroup(of: (key: String?, skipped: Bool).self) { group in
                 var inFlight = 0
                 while inFlight < maxConcurrentDeliveries, let row = state.popNextEligible(dedupKey: dedupKey) {
                     let key = dedupKey?(row)
                     group.addTask {
-                        await Self.deliver(
+                        let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
                             failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
                             describeFailure: describeFailure)
-                        return key
+                        return (key, skipped)
                     }
                     inFlight += 1
                 }
-                while let finishedKey = await group.next() {
-                    if let finishedKey { state.inFlightKeys.remove(finishedKey) }
+                while let finished = await group.next() {
+                    if !finished.skipped { await madeProgress.markTrue() }
+                    if let finishedKey = finished.key { state.inFlightKeys.remove(finishedKey) }
                     guard let row = state.popNextEligible(dedupKey: dedupKey) else { continue }
                     let key = dedupKey?(row)
                     group.addTask {
-                        await Self.deliver(
+                        let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
                             failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
                             describeFailure: describeFailure)
-                        return key
+                        return (key, skipped)
                     }
                 }
             }
@@ -169,18 +180,30 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
             if due.count < batchSize && state.remaining.isEmpty {
                 return
             }
+            guard await madeProgress.value else { return }
         }
     }
 
+    /// A single `Bool` flipped from multiple `withTaskGroup` child tasks - `@unchecked Sendable`
+    /// would race here (unlike `DrainState`, this IS mutated from inside `group.addTask`), so a
+    /// tiny actor is used instead of a plain var.
+    private actor Progress {
+        private(set) var value = false
+        func markTrue() { value = true }
+    }
+
+    /// Delivers one row, returning whether the outcome was `.skip` (untouched - the caller uses
+    /// this to detect an all-skip batch, which must not be re-fetched with no delay).
+    @discardableResult
     private static func deliver(
         _ row: Row, app: Application, maxAttempts: Int, logContext: String,
         failedStateValue: String,
         attemptDelivery: @Sendable (Row, Application) async -> OutboxDeliveryOutcome,
         describeFailure: @Sendable (Row) -> String
-    ) async {
+    ) async -> Bool {
         switch await attemptDelivery(row, app) {
         case .skip:
-            return
+            return true
         case .success:
             do {
                 try await row.delete(on: app.db)
@@ -205,6 +228,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                 app.logger.error("\(logContext) dispatcher failed to update outbox row: \(error)")
             }
         }
+        return false
     }
 
     func purgeExpiredFailures(on db: any Database) async throws {

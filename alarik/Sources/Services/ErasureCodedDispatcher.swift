@@ -74,12 +74,16 @@ enum ErasureCodedDispatcher {
                         app: app, bucketName: row.bucketName, key: row.key, versionId: row.versionId,
                         shardIndex: row.shardIndex, targetNodeId: row.targetNodeId)
                 case ErasureCodedReplicationTask.Operation.delete.rawValue:
-                    guard let node = await ClusterNodeCache.shared.get(id: row.targetNodeId) else {
-                        throw ErasureCodedDispatcherError.unknownTarget(row.targetNodeId)
-                    }
-                    try await ClusterReplicationClient.deleteShard(
-                        app: app, to: node, bucketName: row.bucketName, key: row.key,
-                        versionId: row.versionId)
+                    // The gate above already confirmed row.targetNodeId == selfNodeId, so this is
+                    // always this node's own shard directory - remove it directly rather than
+                    // looping an HTTP DELETE through to itself. Whole-directory, not a specific
+                    // index: `shardIndex` on a delete task is the `-1` sentinel (a node only ever
+                    // holds the one shard it's currently responsible for, so there's nothing
+                    // index-specific to target) - mirrors `handleDelete`'s exact behavior for the
+                    // network-received case.
+                    try? FileManager.default.removeItem(
+                        atPath: ErasureCodedObjectHandler.shardBasePath(
+                            bucketName: row.bucketName, key: row.key, versionId: row.versionId))
                 default:
                     throw ErasureCodedDispatcherError.unknownOperation(row.operation)
                 }

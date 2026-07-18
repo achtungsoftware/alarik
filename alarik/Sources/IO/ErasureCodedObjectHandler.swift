@@ -256,6 +256,61 @@ enum ErasureCodedObjectHandler {
         }
     }
 
+    /// Commits an already fully-formed `.ecshard` file (header + every stripe already written -
+    /// scratch output from `StripeEncoder` or shard reconstruction) into its final on-disk shard
+    /// path, atomically, with the same isLatest demote-then-write-then-repoint-pointer sequence
+    /// every shard-arrival path needs (`InternalClusterErasureCodedController.handlePush` runs
+    /// the network-received equivalent of this after spooling). Used for a *local* commit - when
+    /// the node producing the shard bytes is itself the final destination, this skips the
+    /// otherwise-redundant HTTP round trip through `pushShard` entirely (spool to a temp file,
+    /// POST it to localhost, re-spool on receipt, copy into place) in favor of one direct copy.
+    static func commitShardFile(
+        sourcePath: String, finalPath: String, bucketName: String, key: String
+    ) throws {
+        let incomingMeta = try? ErasureCodedShardReader(path: sourcePath).header.objectMeta
+        // Demoting any prior local latest must happen BEFORE the new file lands - mirrors
+        // handlePush's exact ordering (never demote the file we're about to write).
+        if incomingMeta?.isLatest == true {
+            markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
+        }
+
+        var writer = try AtomicObjectWriter(finalPath: finalPath)
+        do {
+            let sourceFd = POSIXFile.open(sourcePath, O_RDONLY)
+            guard sourceFd >= 0 else {
+                throw ErasureCodedObjectHandlerError.openFailed(path: sourcePath, errno: errno)
+            }
+            defer { _ = POSIXFile.close(sourceFd) }
+            var statInfo = stat()
+            guard POSIXFile.fstat(sourceFd, &statInfo) == 0 else {
+                throw ErasureCodedObjectHandlerError.openFailed(path: sourcePath, errno: errno)
+            }
+            var remaining = Int(statInfo.st_size)
+            let windowSize = Constants.fileCopyWindowSize
+            var window = [UInt8](repeating: 0, count: windowSize)
+            while remaining > 0 {
+                let toRead = Swift.min(windowSize, remaining)
+                let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
+                guard bytesRead > 0 else {
+                    throw ErasureCodedObjectHandlerError.shortRead(path: sourcePath)
+                }
+                try window.withUnsafeBytes { raw in
+                    try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
+                }
+                remaining -= bytesRead
+            }
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
+        }
+
+        if let incomingMeta, incomingMeta.isLatest, let versionId = incomingMeta.versionId {
+            try? ObjectFileHandler.updateLatestPointer(
+                bucketName: bucketName, key: key, versionId: versionId)
+        }
+    }
+
     /// Undoes a rolled-back latest promotion for one node: repoints `.latest` to `priorVersionId`
     /// (re-promoting that version's local shard), or removes the pointer entirely when there was
     /// no prior version. Called on every responsible node after a coordinator's EC write fails

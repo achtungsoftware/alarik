@@ -183,6 +183,20 @@ struct InternalClusterController: RouteCollection {
             .filter(\.$reason != ClusterReplicationTask.Reason.reclaim.rawValue)
             .delete()
 
+        // Same cleanup for the EC shard-repair outbox - a stale `.put`/`.reconstruct` row aimed
+        // at this node's now-obsolete rank is equally pointless (the next rebalance walk assigns
+        // a fresh, correctly-targeted task to whichever node the current ranking actually gives
+        // that shard index to). Unlike legacy replication, EC has no `.reclaim`-reason rows to
+        // preserve at all - reclaiming a stale local shard is done inline, never via the outbox
+        // (see `ErasureCodedRebalanceService.reclaimIfSafe`) - so every row targeting this node is
+        // cleared. Skipping this cleanup would let such rows linger indefinitely once the target-
+        // only outbox delivery gate (`ErasureCodedDispatcher`) means only the row's own target may
+        // ever act on it: if that node's process is later stopped without its `ClusterNode` row
+        // ever being deleted, nothing would ever again attempt (let alone dead-letter) the row.
+        try await ErasureCodedReplicationTask.query(on: req.db)
+            .filter(\.$targetNodeId == nodeId)
+            .delete()
+
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
                 id: nodeId, address: node.address, status: .draining,

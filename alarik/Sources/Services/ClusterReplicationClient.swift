@@ -44,6 +44,14 @@ enum ClusterReplicationClient {
     /// transfers must have room to complete, not just connect.
     static let requestTimeout: TimeAmount = .minutes(10)
 
+    /// Deadline for a small, metadata-only probe (does this node hold a shard, what does its
+    /// header say) - deliberately much shorter than `requestTimeout`. Several of these calls sit
+    /// directly on a client-facing GET/HEAD's synchronous path (shard discovery fans out to
+    /// every responsible node and waits for all of them), so a peer that's merely hanging - not
+    /// erroring, which would return quickly, but genuinely unresponsive - must not be able to
+    /// stall every read of a key it's responsible for for `requestTimeout`'s full 10 minutes.
+    static let probeTimeout: TimeAmount = .seconds(5)
+
     private static let objectMetaHeaderName = "X-Alarik-Object-Meta"
 
     /// Streams the local object at `bucketName`/`key`/`versionId` to `node`'s internal push
@@ -432,7 +440,7 @@ enum ClusterReplicationClient {
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
             let response = try await app.http.client.shared.execute(
-                outbound, timeout: requestTimeout, logger: app.logger)
+                outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 64 * 1024)
             return try JSONDecoder().decode([Int].self, from: body)
@@ -464,7 +472,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         _ = try? await app.http.client.shared.execute(
-            outbound, timeout: requestTimeout, logger: app.logger)
+            outbound, timeout: probeTimeout, logger: app.logger)
     }
 
     /// Fetches the `ObjectMeta` of whatever shard `node` holds for (bucketName, key, versionId) -
@@ -483,7 +491,7 @@ enum ClusterReplicationClient {
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
             let response = try await app.http.client.shared.execute(
-                outbound, timeout: requestTimeout, logger: app.logger)
+                outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
             return try JSONDecoder().decode(ObjectMeta.self, from: body)
@@ -508,7 +516,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         _ = try? await app.http.client.shared.execute(
-            outbound, timeout: requestTimeout, logger: app.logger)
+            outbound, timeout: probeTimeout, logger: app.logger)
     }
 
     /// Fetches shard `shardIndex` of (bucketName, key, versionId) from one of `candidates` into a
