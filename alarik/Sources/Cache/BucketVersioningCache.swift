@@ -50,6 +50,12 @@ final actor BucketVersioningCache {
         map.removeValue(forKey: bucketName)
     }
 
+    /// Whether a bucket with this name exists at all - unlike the access-key -> bucket map, this
+    /// covers every bucket (added on create, removed on delete, loaded from all buckets at boot).
+    func exists(_ bucketName: String) -> Bool {
+        map[bucketName] != nil
+    }
+
     /// Check if versioning is enabled for a bucket
     func isVersioningEnabled(for bucketName: String) -> Bool {
         map[bucketName] == .enabled

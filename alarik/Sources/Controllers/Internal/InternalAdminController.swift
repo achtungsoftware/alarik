@@ -77,6 +77,9 @@ struct InternalAdminController: RouteCollection {
         let creationDate: Date?
         let versioningStatus: String
         let user: User.ResponseDTO?
+        /// Raw JSON bucket policy document, or nil if no policy is set - drives the admin list's
+        /// public/private badge and pre-fills the policy editor.
+        let policy: String?
     }
 
     func boot(routes: any RoutesBuilder) throws {
@@ -233,7 +236,8 @@ struct InternalAdminController: RouteCollection {
         return page.map {
             AdminBucketDTO(
                 id: $0.id, name: $0.name, creationDate: $0.creationDate,
-                versioningStatus: $0.versioningStatus, user: $0.user.toResponseDTO())
+                versioningStatus: $0.versioningStatus, user: $0.user.toResponseDTO(),
+                policy: $0.policy)
         }
     }
 

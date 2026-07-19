@@ -215,4 +215,29 @@ struct BucketServiceTests {
             #expect(remaining == 0)
         }
     }
+
+    @Test("verifyBucketExists succeeds for a bucket owned by a user with no access keys (regression: anonymous public-read must not 404)")
+    func testVerifyBucketExistsWithoutAccessKey() async throws {
+        try await withApp { app in
+            // A user who has never created an S3 access key - the exact situation of someone who
+            // creates and manages a bucket entirely through the web console.
+            let userId = try await createUser(app)
+            let bucketName = "no-access-key-bucket"
+
+            try await BucketService.create(on: app.db, bucketName: bucketName, userId: userId)
+
+            // Precondition that reproduces the original bug: no access key maps to this bucket,
+            // so the old existence check (AccessKeyBucketMapCache) would have reported it missing.
+            #expect(await AccessKeyBucketMapCache.shared.bucket(for: bucketName) == nil)
+
+            // The fix: existence is access-key-independent, so this must NOT throw NoSuchBucket.
+            try await S3Service.verifyBucketExists(bucketName, requestId: "test-request")
+
+            // A genuinely absent bucket still throws NoSuchBucket.
+            await #expect(throws: S3Error.self) {
+                try await S3Service.verifyBucketExists(
+                    "definitely-missing-bucket", requestId: "test-request")
+            }
+        }
+    }
 }

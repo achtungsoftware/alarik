@@ -130,7 +130,8 @@ final class Bucket: Content, Model, @unchecked Sendable {
             id: self.id,
             name: self.$name.value,
             creationDate: self.creationDate,
-            versioningStatus: self.versioningStatus
+            versioningStatus: self.versioningStatus,
+            policy: self.policy
         )
     }
 
@@ -156,6 +157,9 @@ extension Bucket {
         var name: String?
         var creationDate: Date?
         var versioningStatus: String?
+        /// Raw JSON bucket policy document, or nil if no policy is set - lets the console pre-fill
+        /// the policy editor and show a public/private indicator instead of always looking empty.
+        var policy: String?
 
         func toModel() -> Bucket {
             let model = Bucket()
@@ -170,6 +174,7 @@ extension Bucket {
             if let versioningStatus = self.versioningStatus {
                 model.versioningStatus = versioningStatus
             }
+            model.policy = self.policy
             return model
         }
     }

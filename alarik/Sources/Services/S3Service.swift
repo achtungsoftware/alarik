@@ -78,7 +78,12 @@ struct S3Service {
     }
 
     static func verifyBucketExists(_ bucketName: String, requestId: String) async throws {
-        guard await AccessKeyBucketMapCache.shared.bucket(for: bucketName) != nil else {
+        // Existence must NOT come from the access-key -> bucket map: that map only covers buckets
+        // some access key is mapped to, so a bucket owned by a user who never created an access key
+        // (e.g. one created + managed entirely through the console) reads as missing. That 404s the
+        // anonymous public-read path before it ever consults the bucket policy. Authorization is
+        // still enforced separately (canAccess / bucket policy).
+        guard await BucketVersioningCache.shared.exists(bucketName) else {
             throw S3Error(
                 status: .notFound, code: "NoSuchBucket",
                 message: "The specified bucket does not exist.", requestId: requestId)
