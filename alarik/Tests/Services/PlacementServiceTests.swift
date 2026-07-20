@@ -20,9 +20,9 @@ import Testing
 
 @testable import Alarik
 
-/// `PlacementService` is a pure function of `(bucketName, key, activeNodes)` - no DB, no actor,
-/// no cluster required, so this suite runs everywhere `swift test` runs, unlike the Postgres/
-/// multi-node cluster tests.
+/// `PlacementService` is a pure function of `(bucketName, key, activeNodes)` - no actor, no
+/// running cluster required, so this suite runs everywhere `swift test` runs, unlike the real
+/// multi-node cluster tests (`cluster_tests.sh`).
 @Suite("PlacementService tests")
 struct PlacementServiceTests {
     private func node(_ label: String, status: ClusterNode.Status = .active, heartbeatAge: TimeInterval = 0)

@@ -14,41 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 import struct Foundation.UUID
 
-final class User: Model, @unchecked Sendable {
-    static let schema = "users"
-
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "name")
+/// Backed by `MetadataStore`, not Fluent - primary record at `users/<id>`. Usernames are unique
+/// but editable, unlike the immutable id, so uniqueness is enforced through a separate pointer
+/// object (`users/by-username/<username>` -> `{"userId": "<uuid>"}`) rather than the primary key
+/// itself - see `findByUsername`/`create`/`rename` below.
+final class User: @unchecked Sendable, Codable, Authenticatable {
+    let id: UUID
     var name: String
-
-    @Field(key: "username")
     var username: String
-
-    @Field(key: "password_hash")
     var passwordHash: String
-
-    @Field(key: "is_admin")
     var isAdmin: Bool
-
-    @Field(key: "oidc_subject")
-    var oidcSubject: String?
 
     // Subject values are only unique within a single provider's namespace, not globally - so
     // matching/linking a user to an OIDC identity always keys on this pair together, never on
     // oidcSubject alone.
-    @Field(key: "oidc_provider_id")
+    var oidcSubject: String?
     var oidcProviderId: UUID?
 
-    init() {}
-
-    init(id: UUID? = nil, name: String, username: String, passwordHash: String, isAdmin: Bool) {
+    init(
+        id: UUID = UUID(), name: String, username: String, passwordHash: String, isAdmin: Bool
+    ) {
         self.id = id
         self.name = name
         self.username = username
@@ -61,10 +50,105 @@ final class User: Model, @unchecked Sendable {
     func toResponseDTO() -> User.ResponseDTO {
         .init(
             id: self.id,
-            name: self.$name.value,
-            username: self.$username.value,
-            isAdmin: self.$isAdmin.value,
+            name: self.name,
+            username: self.username,
+            isAdmin: self.isAdmin,
         )
+    }
+
+    func verify(password: String) throws -> Bool {
+        try Bcrypt.verify(password, created: self.passwordHash)
+    }
+}
+
+// MARK: - MetadataStore access
+
+extension User {
+    struct UsernamePointer: Codable {
+        let userId: UUID
+    }
+
+    enum UserError: Error {
+        /// Another user already holds this username - `putIfAbsent` on the secondary index
+        /// failed closed.
+        case usernameTaken
+    }
+
+    static func find(app: Application, id: UUID) async throws -> User? {
+        try await MetadataStore.get(
+            User.self, app: app, collection: MetadataCollections.users, id: id.uuidString)
+    }
+
+    /// Resolves the username pointer, then the primary record - self-healing if either half is
+    /// stale (target deleted, or the primary record has since been renamed away from this
+    /// username, e.g. a crash between steps in `rename` below).
+    static func findByUsername(app: Application, username: String) async throws -> User? {
+        guard
+            let pointer = try await MetadataStore.get(
+                UsernamePointer.self, app: app, collection: MetadataCollections.usersByUsername,
+                id: username)
+        else { return nil }
+
+        guard let user = try await find(app: app, id: pointer.userId), user.username == username
+        else {
+            try? await MetadataStore.delete(
+                app: app, collection: MetadataCollections.usersByUsername, id: username)
+            return nil
+        }
+        return user
+    }
+
+    /// Creates a brand-new user, atomically claiming `username`. Throws `UserError.usernameTaken`
+    /// if another user already holds it.
+    func create(app: Application) async throws {
+        let claimed = try await MetadataStore.putIfAbsent(
+            app: app, collection: MetadataCollections.usersByUsername, id: username,
+            value: UsernamePointer(userId: id))
+        guard claimed else { throw UserError.usernameTaken }
+
+        do {
+            try await MetadataStore.put(
+                app: app, collection: MetadataCollections.users, id: id.uuidString, value: self)
+        } catch {
+            try? await MetadataStore.delete(
+                app: app, collection: MetadataCollections.usersByUsername, id: username)
+            throw error
+        }
+    }
+
+    /// Overwrites the primary record in place - callers whose edit might also change `username`
+    /// must go through `rename` first (that's the only field with a secondary index to keep
+    /// consistent); every other field is safe to mutate and `save` directly.
+    func save(app: Application) async throws {
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.users, id: id.uuidString, value: self)
+    }
+
+    /// Retargets the username pointer before updating the primary record, in that order, so a
+    /// crash mid-way leaves at worst a harmless stale pointer (self-healed by `findByUsername`)
+    /// rather than a primary record no pointer resolves to. No-op (falls through to a plain
+    /// `save`) when `username` is unchanged.
+    func rename(app: Application, from previousUsername: String) async throws {
+        guard previousUsername != username else {
+            try await save(app: app)
+            return
+        }
+        let claimed = try await MetadataStore.putIfAbsent(
+            app: app, collection: MetadataCollections.usersByUsername, id: username,
+            value: UsernamePointer(userId: id))
+        guard claimed else { throw UserError.usernameTaken }
+
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.users, id: id.uuidString, value: self)
+        try? await MetadataStore.delete(
+            app: app, collection: MetadataCollections.usersByUsername, id: previousUsername)
+    }
+
+    func delete(app: Application) async throws {
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.users, id: id.uuidString)
+        try? await MetadataStore.delete(
+            app: app, collection: MetadataCollections.usersByUsername, id: username)
     }
 }
 
@@ -117,22 +201,6 @@ extension User {
         var name: String?
         var username: String?
         var isAdmin: Bool?
-
-        func toModel() -> User {
-            let model = User()
-
-            model.id = self.id
-            if let name = self.name {
-                model.name = name
-            }
-            if let username = self.username {
-                model.username = username
-            }
-            if let isAdmin = self.isAdmin {
-                model.isAdmin = isAdmin
-            }
-            return model
-        }
     }
 }
 
@@ -165,19 +233,5 @@ extension User.Edit: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: !.empty)
         validations.add("username", as: String.self, is: !.empty)
-    }
-}
-
-extension User: ModelAuthenticatable, ModelCredentialsAuthenticatable {
-    static var usernameKey: KeyPath<User, FluentKit.FieldProperty<User, String>> {
-        \User.$username
-    }
-
-    static var passwordHashKey: KeyPath<User, FluentKit.FieldProperty<User, String>> {
-        \User.$passwordHash
-    }
-
-    func verify(password: String) throws -> Bool {
-        try Bcrypt.verify(password, created: self.passwordHash)
     }
 }

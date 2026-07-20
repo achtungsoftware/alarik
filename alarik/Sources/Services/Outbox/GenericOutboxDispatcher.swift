@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
@@ -62,15 +61,18 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
     private let maxConcurrentDeliveries: Int
     private let logContext: String
     private let failedStateValue: String
-    private let fetchDue: @Sendable (any Database, Int) async throws -> [Row]
+    private let fetchDue: @Sendable (Application, Int) async throws -> [Row]
     private let dedupKey: (@Sendable (Row) -> String)?
     private let attemptDelivery: @Sendable (Row, Application) async -> OutboxDeliveryOutcome
+    private let persist: @Sendable (Row, Application) async throws -> Void
+    private let remove: @Sendable (Row, Application) async throws -> Void
     private let describeFailure: @Sendable (Row) -> String
-    private let purgeExpired: @Sendable (any Database) async throws -> Void
+    private let purgeExpired: @Sendable (Application) async throws -> Void
 
     private var app: Application?
     private var isDraining = false
     private var pendingWake = false
+    private var isShuttingDown = false
 
     init(
         maxAttempts: Int = 8,
@@ -78,11 +80,13 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         maxConcurrentDeliveries: Int,
         logContext: String,
         failedStateValue: String,
-        fetchDue: @escaping @Sendable (any Database, Int) async throws -> [Row],
+        fetchDue: @escaping @Sendable (Application, Int) async throws -> [Row],
         dedupKey: (@Sendable (Row) -> String)? = nil,
         attemptDelivery: @escaping @Sendable (Row, Application) async -> OutboxDeliveryOutcome,
+        persist: @escaping @Sendable (Row, Application) async throws -> Void,
+        remove: @escaping @Sendable (Row, Application) async throws -> Void,
         describeFailure: @escaping @Sendable (Row) -> String,
-        purgeExpired: @escaping @Sendable (any Database) async throws -> Void
+        purgeExpired: @escaping @Sendable (Application) async throws -> Void
     ) {
         self.maxAttempts = maxAttempts
         self.batchSize = batchSize
@@ -92,12 +96,33 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         self.fetchDue = fetchDue
         self.dedupKey = dedupKey
         self.attemptDelivery = attemptDelivery
+        self.persist = persist
+        self.remove = remove
         self.describeFailure = describeFailure
         self.purgeExpired = purgeExpired
     }
 
     func configure(app: Application) {
         self.app = app
+        // Reset the shutdown latch (and any stale drain-in-progress bookkeeping) whenever a new
+        // `Application` is attached. `shared` outlives any single `Application` - it's one
+        // instance for the whole process, reused by every test that boots its own app and tears
+        // it down again. Without this reset, `isShuttingDown` is a one-way latch: the first
+        // app-shutdown anywhere in the run permanently wedges `drain()`'s guard for every
+        // subsequent test, leaving later tests' enqueued tasks stuck forever.
+        isShuttingDown = false
+        isDraining = false
+        pendingWake = false
+    }
+
+    /// Stops accepting new drain work - called from a `LifecycleHandler.shutdownAsync` registered
+    /// for exactly this purpose, which Vapor guarantees runs to completion before
+    /// `app.storage.clear()`. Without this, `wake()`'s detached `Task { await self.drain() }` is
+    /// invisible to the shutdown sequence - nothing cancels or waits for it - so a drain already
+    /// in flight can keep running through storage being cleared and crash the process the moment
+    /// it next touches an `app`-scoped service.
+    func prepareForShutdown() {
+        isShuttingDown = true
     }
 
     nonisolated func wake() {
@@ -105,7 +130,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
     }
 
     func drain() async {
-        guard let app else { return }
+        guard let app, !isShuttingDown else { return }
         if isDraining {
             pendingWake = true
             return
@@ -123,30 +148,28 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         let logContext = self.logContext
         let failedStateValue = self.failedStateValue
         let attemptDelivery = self.attemptDelivery
+        let persist = self.persist
+        let remove = self.remove
         let describeFailure = self.describeFailure
         let dedupKey = self.dedupKey
 
         while true {
             let due: [Row]
             do {
-                due = try await fetchDue(app.db, batchSize)
+                due = try await fetchDue(app, batchSize)
             } catch {
                 app.logger.error("\(logContext) dispatcher failed to query outbox: \(error)")
                 return
             }
-
             guard !due.isEmpty else { return }
 
             let state = DrainState(remaining: due)
 
             // Tracks whether this batch changed anything - a `.skip` leaves its row completely
-            // untouched (still due, same nextAttemptAt), so a batch that's ENTIRELY skips would
-            // be fetched again byte-for-byte identical on the next `while true` iteration below.
-            // Without this guard, a node whose outbox is dominated by rows it can't act on right
-            // now (e.g. every EC dispatcher sees every shard-repair row cluster-wide, but only
-            // ever delivers the ones targeting itself) would spin in a tight, sleepless
-            // re-SELECT loop for as long as that domination holds - a real, synchronous CPU/DB
-            // busy-loop, not just wasted work.
+            // untouched, so a batch that's ENTIRELY skips would be re-fetched identically next
+            // iteration. Without this guard, a node whose outbox is dominated by rows it can't
+            // act on (e.g. shard-repair rows targeting other nodes) would spin in a tight,
+            // sleepless busy-loop instead of just wasting work.
             let madeProgress = Progress()
 
             await withTaskGroup(of: (key: String?, skipped: Bool).self) { group in
@@ -157,7 +180,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                         let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
                             failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
-                            describeFailure: describeFailure)
+                            persist: persist, remove: remove, describeFailure: describeFailure)
                         return (key, skipped)
                     }
                     inFlight += 1
@@ -171,7 +194,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                         let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
                             failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
-                            describeFailure: describeFailure)
+                            persist: persist, remove: remove, describeFailure: describeFailure)
                         return (key, skipped)
                     }
                 }
@@ -199,6 +222,8 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         _ row: Row, app: Application, maxAttempts: Int, logContext: String,
         failedStateValue: String,
         attemptDelivery: @Sendable (Row, Application) async -> OutboxDeliveryOutcome,
+        persist: @Sendable (Row, Application) async throws -> Void,
+        remove: @Sendable (Row, Application) async throws -> Void,
         describeFailure: @Sendable (Row) -> String
     ) async -> Bool {
         switch await attemptDelivery(row, app) {
@@ -206,7 +231,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
             return true
         case .success:
             do {
-                try await row.delete(on: app.db)
+                try await remove(row, app)
             } catch {
                 app.logger.error("\(logContext) dispatcher failed to delete outbox row: \(error)")
             }
@@ -223,7 +248,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                 row.nextAttemptAt = Date().addingTimeInterval(backoff)
             }
             do {
-                try await row.save(on: app.db)
+                try await persist(row, app)
             } catch {
                 app.logger.error("\(logContext) dispatcher failed to update outbox row: \(error)")
             }
@@ -231,7 +256,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         return false
     }
 
-    func purgeExpiredFailures(on db: any Database) async throws {
-        try await purgeExpired(db)
+    func purgeExpiredFailures(app: Application) async throws {
+        try await purgeExpired(app)
     }
 }

@@ -18,15 +18,12 @@ import Crypto
 import Foundation
 import Vapor
 
-/// The console's single-file upload endpoint (`InternalBucketController.uploadObject`) used to
-/// decode its whole `multipart/form-data` body via `Content.decode`, which buffers the entire
-/// file in memory (Vapor's own multipart decode, plus a second `Data(buffer:)` copy on top) -
-/// unbounded, unlike every object-payload path in the S3 API, which streams to disk once a body
-/// exceeds `Constants.streamingThreshold` (see `StreamingBodySpooler`). This does the same for
-/// the one file part this endpoint's form ever sends: `MultipartParser` (from Vapor's
-/// re-exported `MultipartKit`) is fed the request body chunk by chunk as it arrives (the route
-/// must be registered `body: .stream` for that), and each decoded body slice is written straight
-/// through to memory-or-spool-file rather than accumulated into one big buffer first.
+/// Streams and spools the console's single-file upload endpoint's `multipart/form-data` body
+/// with bounded memory, matching every object-payload path in the S3 API that streams to disk
+/// once a body exceeds `Constants.streamingThreshold` (see `StreamingBodySpooler`).
+/// `MultipartParser` (from Vapor's re-exported `MultipartKit`) is fed the request body chunk by
+/// chunk as it arrives (the route must be registered `body: .stream`), and each decoded body
+/// slice is written straight through to memory-or-spool-file rather than accumulated in full.
 enum AdminUploadSpooler {
     struct SpooledFile {
         let filename: String

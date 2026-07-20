@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
-/// Drains the `cluster_replication_tasks` outbox: pushes/deletes each due row on its target
-/// node via `ClusterReplicationClient`.
+/// Drains this node's own `cluster-replication-tasks` mailbox: pushes/deletes each due row on
+/// its target node via `ClusterReplicationClient`. Ownership is the *enqueuing* node (the one
+/// with the local copy to push), not `targetNodeId` - see `ClusterReplicationTask`'s doc comment.
 enum ClusterReplicationDispatcher {
     static let maxAttempts = 8
 
@@ -28,19 +28,22 @@ enum ClusterReplicationDispatcher {
         maxConcurrentDeliveries: 4,
         logContext: "Cluster replication",
         failedStateValue: ClusterReplicationTask.State.failed.rawValue,
-        fetchDue: { db, limit in
-            try await ClusterReplicationTask.query(on: db)
-                .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
-                .filter(\.$nextAttemptAt <= Date())
-                .sort(\.$nextAttemptAt, .ascending)
-                .limit(limit)
-                .all()
+        fetchDue: { app, limit in
+            await OutboxMailbox.retryPendingEnqueues(
+                ClusterReplicationTask.self, app: app,
+                collection: OutboxCollections.clusterReplicationTasks)
+            return OutboxMailbox.dueTasks(
+                ClusterReplicationTask.self, app: app,
+                collection: OutboxCollections.clusterReplicationTasks, limit: limit)
         },
         dedupKey: { row in "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.targetNodeId)" },
         attemptDelivery: { row, app in
-            // Any node's tick can pick up any pending row, so a `.put` this node doesn't
-            // physically have would just be a guaranteed failure - skip instead of burning
-            // the shared attempts budget; the node that actually has it retries on its own tick.
+            // The local copy this node had at enqueue time may since have been reclaimed (a
+            // later rebalance pass, or this node losing responsibility for the key) - skip
+            // rather than burning an attempt on a guaranteed failure; if the copy is genuinely
+            // gone, nothing else will ever retry this exact row (ownership means only this node
+            // ever sees it), so it will skip harmlessly forever, same as the old shared-table
+            // design already tolerated for this exact scenario.
             if row.operation == ClusterReplicationTask.Operation.put.rawValue {
                 let hasLocalCopy =
                     (try? await app.threadPool.runIfActive {
@@ -71,19 +74,25 @@ enum ClusterReplicationDispatcher {
                 return .failure(error)
             }
         },
+        persist: { row, _ in
+            try OutboxMailbox.update(row, collection: OutboxCollections.clusterReplicationTasks)
+        },
+        remove: { row, _ in
+            OutboxMailbox.remove(row, collection: OutboxCollections.clusterReplicationTasks)
+        },
         describeFailure: { row in
             "\(row.key) to node \(row.targetNodeId) (bucket: \(row.bucketName), reason: \(row.reason))"
         },
-        purgeExpired: { db in
-            try await ClusterReplicationTask.query(on: db)
-                .filter(\.$state == ClusterReplicationTask.State.failed.rawValue)
-                .filter(\.$createdAt < Date().addingTimeInterval(-7 * 24 * 3600))
-                .delete()
+        purgeExpired: { app in
+            OutboxMailbox.purgeExpiredFailures(
+                ClusterReplicationTask.self, app: app,
+                collection: OutboxCollections.clusterReplicationTasks,
+                failedStateValue: ClusterReplicationTask.State.failed.rawValue)
         }
     )
 
-    static func purgeExpiredFailures(on db: any Database) async throws {
-        try await shared.purgeExpiredFailures(on: db)
+    static func purgeExpiredFailures(app: Application) async throws {
+        try await shared.purgeExpiredFailures(app: app)
     }
 }
 

@@ -19,10 +19,8 @@ import NIOHTTP1
 import Vapor
 
 extension HTTPMediaType {
-    /// Attempts to parse a raw Content-Type string into an HTTPMediaType struct.
-    ///
-    /// The parser handles the main type/subtype and extracts case-insensitive parameters.
-    /// Example: "application/json; charset=utf-8; foo=bar"
+    /// Attempts to parse a raw Content-Type string into an HTTPMediaType struct, e.g.
+    /// "application/json; charset=utf-8; foo=bar".
     ///
     /// - Parameter string: The raw Content-Type string.
     /// - Returns: An initialized `HTTPMediaType` struct, or `nil` if parsing fails.

@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
-/// Drains the `notification_deliveries` outbox: POSTs each due row to its webhook URL.
+/// Drains this node's own `notification-deliveries` mailbox: POSTs each due row to its webhook
+/// URL. `fetchDue` only ever returns tasks this node itself owns (see `OutboxMailbox`) - no
+/// target-gating needed, unlike the old shared-table design.
 enum NotificationDispatcher {
     static let maxAttempts = 8
 
@@ -27,13 +28,12 @@ enum NotificationDispatcher {
         maxConcurrentDeliveries: 8,
         logContext: "Webhook delivery",
         failedStateValue: NotificationDelivery.State.failed.rawValue,
-        fetchDue: { db, limit in
-            try await NotificationDelivery.query(on: db)
-                .filter(\.$state == NotificationDelivery.State.pending.rawValue)
-                .filter(\.$nextAttemptAt <= Date())
-                .sort(\.$nextAttemptAt, .ascending)
-                .limit(limit)
-                .all()
+        fetchDue: { app, limit in
+            await OutboxMailbox.retryPendingEnqueues(
+                NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
+            return OutboxMailbox.dueTasks(
+                NotificationDelivery.self, app: app,
+                collection: OutboxCollections.notificationDeliveries, limit: limit)
         },
         attemptDelivery: { row, app in
             do {
@@ -56,17 +56,18 @@ enum NotificationDispatcher {
                 return .failure(error)
             }
         },
+        persist: { row, _ in try OutboxMailbox.update(row, collection: OutboxCollections.notificationDeliveries) },
+        remove: { row, _ in OutboxMailbox.remove(row, collection: OutboxCollections.notificationDeliveries) },
         describeFailure: { row in "\(row.url) (bucket: \(row.bucketName))" },
-        purgeExpired: { db in
-            try await NotificationDelivery.query(on: db)
-                .filter(\.$state == NotificationDelivery.State.failed.rawValue)
-                .filter(\.$createdAt < Date().addingTimeInterval(-7 * 24 * 3600))
-                .delete()
+        purgeExpired: { app in
+            OutboxMailbox.purgeExpiredFailures(
+                NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries,
+                failedStateValue: NotificationDelivery.State.failed.rawValue)
         }
     )
 
-    static func purgeExpiredFailures(on db: any Database) async throws {
-        try await shared.purgeExpiredFailures(on: db)
+    static func purgeExpiredFailures(app: Application) async throws {
+        try await shared.purgeExpiredFailures(app: app)
     }
 }
 

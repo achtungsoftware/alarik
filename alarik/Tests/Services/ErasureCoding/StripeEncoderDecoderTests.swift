@@ -86,6 +86,23 @@ struct StripeEncoderDecoderTests {
         #expect(decoded == data)
     }
 
+    @Test(
+        "k=1/m=0 (zero parity shards - MetadataStore's standalone, non-networked case) round-trips",
+        arguments: [0, 1, 7, 1000]
+    )
+    func zeroParityShardsRoundTrips(size: Int) throws {
+        let scratchDir = tempDir("shards-zero-parity")
+        defer { try? FileManager.default.removeItem(atPath: scratchDir) }
+
+        let data = randomData(size, seed: 5)
+        let shardPaths = try encodeAndCollectPaths(
+            data: data, dataShards: 1, parityShards: 0, stripeUnitSize: 64, scratchDir: scratchDir)
+
+        #expect(shardPaths.count == 1)
+        let decoded = try decodeAll(shardPaths)
+        #expect(decoded == data)
+    }
+
     @Test("multi-source payload (simulating CompleteMultipartUpload) round-trips correctly")
     func multiSourcePayloadRoundTrips() throws {
         let srcDir = tempDir("src")

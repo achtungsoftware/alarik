@@ -65,24 +65,29 @@ final actor ClusterNodeCache {
         nodes = Dictionary(uniqueKeysWithValues: initialData.map { ($0.id, $0) })
     }
 
-    /// Like `load`, but for the periodic membership refresh rather than the boot-time bulk load:
-    /// a full replace would race with concurrent event-driven `upsert`/`remove` calls (a NOTIFY
-    /// landing between the refresh's DB read and this write), silently reverting them to the
-    /// snapshot's older view. Instead, keep the existing cached entry whenever it's strictly
-    /// fresher than the snapshot's row - a newer heartbeat, or (on an equal heartbeat) a
+    /// Like `load`, but for the periodic membership refresh rather than the boot-time bulk load -
+    /// and, critically, additive-only: a node whose record is simply absent from `snapshot` is
+    /// left untouched, never dropped. `snapshot` comes from `ClusterNode.all`, a best-effort
+    /// cluster-wide fan-out (`MetadataListingService`), so a peer that's merely slow to answer
+    /// (or whose record sits on a node this one fan-out couldn't reach) is indistinguishable from
+    /// a genuine departure. Staleness is handled independently by `activeNodes()`'s own
+    /// heartbeat-age check, and genuine removal already has its own authoritative signal via the
+    /// explicit `remove(id:)` call from `CacheReloadDispatch`'s `("clusterNode", .remove)` case -
+    /// `reconcile` doesn't need to duplicate either of those by also treating
+    /// "not in this particular fan-out" as removal.
+    ///
+    /// For nodes that *are* present in `snapshot`, still prefer the existing cached entry
+    /// whenever it's strictly fresher - a newer heartbeat, or (on an equal heartbeat) a
     /// non-`active` status the snapshot was read just before it committed, so an in-flight drain
-    /// is never resurrected as active. Nodes absent from the snapshot are still dropped (the
-    /// authoritative "row removed" signal).
+    /// is never resurrected as active by a stale snapshot row racing a concurrent
+    /// `upsert`/`remove`.
     func reconcile(snapshot: [ClusterNodeInfo]) {
-        var merged: [UUID: ClusterNodeInfo] = [:]
         for node in snapshot {
             if let existing = nodes[node.id], Self.prefersExisting(existing, over: node) {
-                merged[node.id] = existing
-            } else {
-                merged[node.id] = node
+                continue
             }
+            nodes[node.id] = node
         }
-        nodes = merged
     }
 
     private static func prefersExisting(_ existing: ClusterNodeInfo, over snapshot: ClusterNodeInfo)

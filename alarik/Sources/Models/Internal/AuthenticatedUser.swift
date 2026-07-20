@@ -28,7 +28,7 @@ struct AuthenticatedUser: Authenticatable {
     let authMethod: AuthMethod
 
     var userId: UUID {
-        user.id!
+        user.id
     }
 
     var isAdmin: Bool {

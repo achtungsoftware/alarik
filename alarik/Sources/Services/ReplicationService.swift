@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
-/// Enqueues replication work into the persistent outbox (`replication_tasks`). Delivery itself
-/// happens asynchronously in `ReplicationDispatcher` - the request path only ever pays for a
-/// cache lookup, and, when rules match, one SQLite insert per matching rule. Mirrors
-/// `NotificationService.emit`'s call shape exactly.
+/// Enqueues replication work into the persistent outbox (`OutboxMailbox`, collection
+/// `replication-tasks`). Delivery itself happens asynchronously in `ReplicationDispatcher` - the
+/// request path only ever pays for a cache lookup, and, when rules match, one local file write
+/// per matching rule. Mirrors `NotificationService.emit`'s call shape exactly.
 struct ReplicationService {
 
     /// Enqueues a `put` replication task for every enabled rule (with a resolvable, enabled
@@ -35,48 +34,40 @@ struct ReplicationService {
         app: Application,
         bucketName: String,
         key: String,
-        versionId: String?,
-        on db: any Database
+        versionId: String?
     ) async {
         guard let versionId else { return }
         await enqueue(
-            app: app, operation: .put, bucketName: bucketName, key: key, versionId: versionId,
-            on: db)
+            app: app, operation: .put, bucketName: bucketName, key: key, versionId: versionId)
     }
 
     /// Enqueues a `delete` replication task for every enabled rule that opted into
     /// `replicateDeletes` and whose prefix matches `key`. Only call this for a delete of the
-    /// *current* object (delete-marker creation, or a permanent delete because the bucket
-    /// isn't versioned) - never for a client-specified historical-version delete, which has no
-    /// meaningful equivalent on the target (see `ReplicationClient.replicateDelete`: version
-    /// ids are assigned independently by each S3 endpoint, so a source version id can't
-    /// identify anything on the target). `versionId` is kept only for display/traceability on
-    /// the task row - it is never sent to the target.
+    /// *current* object - never for a client-specified historical-version delete, which has no
+    /// meaningful equivalent on the target (version ids are assigned independently by each S3
+    /// endpoint). `versionId` is kept only for display/traceability - never sent to the target.
     static func enqueueDelete(
         app: Application,
         bucketName: String,
         key: String,
-        versionId: String?,
-        on db: any Database
+        versionId: String?
     ) async {
         await enqueue(
-            app: app, operation: .delete, bucketName: bucketName, key: key, versionId: versionId,
-            on: db)
+            app: app, operation: .delete, bucketName: bucketName, key: key, versionId: versionId)
     }
 
     /// Walks every current object under `rule.prefix` and enqueues a `put` replication task
-    /// for each, batching inserts one page at a time (Fluent's `Collection.create(on:)`, a
-    /// single statement per page rather than one awaited insert per object) and waking the
-    /// dispatcher after every page so replication starts flowing before the whole walk
-    /// finishes. Callers must run this off the request path (see `resyncReplicationRule`) - a
-    /// bucket with hundreds of thousands of objects can take a long time to enumerate, and nothing
-    /// here is bounded by request/HTTP timeouts.
+    /// for each, one page at a time, waking the dispatcher after every page so replication
+    /// starts flowing before the whole walk finishes. Callers must run this off the request path
+    /// (see `resyncReplicationRule`) - a bucket with hundreds of thousands of objects can take a
+    /// long time to enumerate, and nothing here is bounded by request/HTTP timeouts.
     static func resync(
+        app: Application,
         bucketName: String,
         rule: ReplicationRule,
-        target: ReplicationTarget,
-        on db: any Database
+        target: ReplicationTarget
     ) async throws -> Int {
+        let ownerNodeId = OutboxMailbox.selfNodeId(app: app)
         var enqueued = 0
         var marker: String?
         repeat {
@@ -87,10 +78,13 @@ struct ReplicationService {
             let tasks = objects.map { object in
                 ReplicationTask(
                     bucketName: bucketName, ruleId: rule.id, target: target, key: object.key,
-                    versionId: object.versionId, operation: .put)
+                    versionId: object.versionId, operation: .put, ownerNodeId: ownerNodeId)
             }
             if !tasks.isEmpty {
-                try await tasks.create(on: db)
+                for task in tasks {
+                    await OutboxMailbox.enqueue(
+                        app: app, collection: OutboxCollections.replicationTasks, row: task)
+                }
                 enqueued += tasks.count
                 ReplicationDispatcher.shared.wake()
             }
@@ -114,8 +108,7 @@ struct ReplicationService {
         operation: ReplicationTask.Operation,
         bucketName: String,
         key: String,
-        versionId: String?,
-        on db: any Database
+        versionId: String?
     ) async {
         guard let config = await ReplicationConfigCache.shared.config(for: bucketName) else {
             return
@@ -141,12 +134,9 @@ struct ReplicationService {
         var needsOutbox = resolved.filter { !$0.rule.synchronous }
 
         // Synchronous rules are attempted inline, concurrently, before this function returns -
-        // every caller already awaits `enqueuePut`/`enqueueDelete` within the request path, so
-        // holding the response here for the duration of this task group is exactly what makes
-        // a rule "synchronous". A rule that fails or times out falls back to the same async
-        // outbox path as any other rule below - the write that triggered this already
-        // succeeded unconditionally before this function was ever called, so a slow or
-        // unreachable target only ever costs latency here, never correctness.
+        // holding the response here for the duration of this task group is what makes a rule
+        // "synchronous". A rule that fails or times out falls back to the async outbox path like
+        // any other rule below, so a slow/unreachable target only ever costs latency here.
         if !synchronousRules.isEmpty {
             let deliveries = await withTaskGroup(
                 of: (rule: ReplicationRule, target: ReplicationTarget, delivered: Bool).self
@@ -155,7 +145,7 @@ struct ReplicationService {
                     group.addTask {
                         let delivered = await attemptImmediateDelivery(
                             app: app, operation: operation, target: target, bucketName: bucketName,
-                            key: key, versionId: versionId, logger: db.logger)
+                            key: key, versionId: versionId, logger: app.logger)
                         return (rule, target, delivered)
                     }
                 }
@@ -169,6 +159,7 @@ struct ReplicationService {
 
         guard !needsOutbox.isEmpty else { return }
 
+        let ownerNodeId = OutboxMailbox.selfNodeId(app: app)
         for (rule, target) in needsOutbox {
             let task = ReplicationTask(
                 bucketName: bucketName,
@@ -176,14 +167,11 @@ struct ReplicationService {
                 target: target,
                 key: key,
                 versionId: versionId,
-                operation: operation
+                operation: operation,
+                ownerNodeId: ownerNodeId
             )
-            do {
-                try await task.save(on: db)
-            } catch {
-                db.logger.error(
-                    "Failed to enqueue replication task for bucket '\(bucketName)': \(error)")
-            }
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.replicationTasks, row: task)
         }
 
         ReplicationDispatcher.shared.wake()

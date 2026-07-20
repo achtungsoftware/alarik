@@ -14,29 +14,41 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import XMLCoder
 
 struct BucketService {
     static func create(
-        on database: any Database,
+        app: Application,
         bucketName: String,
         userId: UUID,
         versioningEnabled: Bool = false
     )
         async throws
     {
+        // Defense in depth: `.alarik.sys` is already unreachable via the bucket-name validator's
+        // character class (it can't start with `.`), but this is the single low-level chokepoint
+        // every bucket creation path funnels through, so it's guarded explicitly here too rather
+        // than relying solely on validation upstream.
+        guard !MetadataNamespace.isReserved(bucketName) else {
+            throw S3Error(
+                status: .forbidden, code: "InvalidBucketName",
+                message: "This bucket name is reserved.")
+        }
+
         let bucket: Bucket = Bucket(
             name: bucketName, userId: userId,
             versioningStatus: versioningEnabled ? .enabled : .disabled)
 
-        // Deliberately outside the do/catch below: if this fails (e.g. the name already
-        // exists - `name` has a unique DB constraint), nothing has been created yet, so there
-        // is nothing to roll back. Rolling back here would otherwise delete an *existing*
-        // bucket's directory that this call never created, just because it shares the
-        // requested name.
-        try await bucket.save(on: database)
+        // Deliberately outside the do/catch below: if this fails (the name is already taken -
+        // `create` is a `putIfAbsent`), nothing has been created yet, so there is nothing to
+        // roll back. Rolling back here would otherwise delete an *existing* bucket's directory
+        // that this call never created, just because it shares the requested name.
+        guard try await bucket.create(app: app) else {
+            throw S3Error(
+                status: .conflict, code: "BucketAlreadyExists",
+                message: "The requested bucket name is not available.")
+        }
 
         do {
             try BucketHandler.create(name: bucketName)
@@ -44,30 +56,32 @@ struct BucketService {
             // Get all access keys for this user
             let userAccessKeys = await AccessKeyUserMapCache.shared.accessKeys(for: userId)
 
-            // Map the bucket to ALL of the user's access keys - each key's set gets its own
-            // notify (not one per bucket), since each iteration here touches a different key.
+            // Map the bucket to ALL of the user's access keys. Uses `notifyAndWait`, not the
+            // fire-and-forget `notify`: a brand-new bucket is routinely accessed from every node
+            // within milliseconds of this call returning, so this broadcast needs to actually
+            // land before this function returns, not just be attempted.
             for accessKey in userAccessKeys {
                 await AccessKeyBucketMapCache.shared.add(
                     accessKey: accessKey,
                     bucketName: bucketName
                 )
-                CacheInvalidationService.notify(
-                    on: database, cache: "accessKeyBucket", op: .upsert, key: accessKey)
+                await CacheInvalidationService.notifyAndWait(
+                    app: app, cache: "accessKeyBucket", op: .upsert, key: accessKey)
             }
 
             await BucketVersioningCache.shared.addBucket(
                 bucketName, versioningStatus: versioningEnabled ? .enabled : .disabled)
             CacheInvalidationService.notify(
-                on: database, cache: "bucketVersioning", op: .upsert, key: bucketName)
+                app: app, cache: "bucketVersioning", op: .upsert, key: bucketName)
         } catch {
             // Best-effort: each step rolls back independently, so a failure in one (e.g. the
             // directory was never created) doesn't prevent the others from running, and the
             // original error - not a secondary rollback failure - is always what's thrown.
-            try? await bucket.delete(on: database)
+            try? await bucket.delete(app: app)
             try? BucketHandler.delete(name: bucketName, force: true)
             await BucketVersioningCache.shared.removeBucket(bucketName)
             CacheInvalidationService.notify(
-                on: database, cache: "bucketVersioning", op: .remove, key: bucketName)
+                app: app, cache: "bucketVersioning", op: .remove, key: bucketName)
             throw error
         }
     }
@@ -80,58 +94,54 @@ struct BucketService {
     )
         async throws
     {
-        let database = req.db
-
-        // A force delete may be removing a genuinely non-empty bucket (unlike the S3-protocol
-        // DeleteBucket path, which requires cluster-wide emptiness *before* ever reaching this
-        // function) - every object, across every version and delete marker, on every node, has
-        // to be explicitly deleted first. Skipping this and only wiping this node's own local
-        // directory (the previous behavior) left every other node's physical copies completely
-        // orphaned: invisible while no Bucket row existed to reach them through the API, but
-        // immediately visible again the moment a bucket with the same name was recreated, since
-        // the on-disk path is derived purely from the bucket name, not any unique bucket id.
-        // Propagates (doesn't swallow) a per-object failure - if any object can't be confirmed
-        // deleted everywhere, the Bucket row below must not be dropped, or whatever's left would
-        // become unreachably orphaned exactly like before. Safe to retry: already-deleted
-        // objects simply won't reappear in the next listing.
+        // A force delete may remove a genuinely non-empty bucket - every object, across every
+        // version and delete marker, on every node, must be explicitly deleted first, or other
+        // nodes' physical copies would be left orphaned. Propagates a per-object failure: if any
+        // object can't be confirmed deleted everywhere, the Bucket row below must not be dropped.
         if force {
             try await Self.deleteAllObjectsClusterWide(req: req, bucketName: bucketName)
         }
 
-        try await Bucket.query(on: database)
-            .filter(\.$name == bucketName)
-            .filter(\.$user.$id == userId)
-            .delete()
+        if let bucket = try await Bucket.find(app: req.application, name: bucketName),
+            bucket.userId == userId
+        {
+            try await bucket.delete(app: req.application)
+        }
 
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
         CacheInvalidationService.notify(
-            on: database, cache: "accessKeyBucket", op: .removeBucket, key: bucketName)
+            app: req.application, cache: "accessKeyBucket", op: .removeBucket, key: bucketName)
         await BucketVersioningCache.shared.removeBucket(bucketName)
         CacheInvalidationService.notify(
-            on: database, cache: "bucketVersioning", op: .remove, key: bucketName)
+            app: req.application, cache: "bucketVersioning", op: .remove, key: bucketName)
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
-        CacheInvalidationService.notify(on: database, cache: "bucketPolicy", op: .remove, key: bucketName)
+        CacheInvalidationService.notify(
+            app: req.application, cache: "bucketPolicy", op: .remove, key: bucketName)
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
         CacheInvalidationService.notify(
-            on: database, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
+            app: req.application, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
         await NotificationConfigCache.shared.removeBucket(bucketName)
         CacheInvalidationService.notify(
-            on: database, cache: "notificationConfig", op: .remove, key: bucketName)
+            app: req.application, cache: "notificationConfig", op: .remove, key: bucketName)
         await ReplicationConfigCache.shared.removeBucket(bucketName)
         CacheInvalidationService.notify(
-            on: database, cache: "replicationConfig", op: .remove, key: bucketName)
+            app: req.application, cache: "replicationConfig", op: .remove, key: bucketName)
 
         // Drop any queued webhook deliveries / replication tasks for the deleted bucket -
-        // retrying them would announce or push objects for a bucket that no longer exists
-        try await NotificationDelivery.query(on: database)
-            .filter(\.$bucketName == bucketName)
-            .delete()
-        try await ReplicationTask.query(on: database)
-            .filter(\.$bucketName == bucketName)
-            .delete()
-        try await ClusterReplicationTask.query(on: database)
-            .filter(\.$bucketName == bucketName)
-            .delete()
+        // retrying them would announce or push objects for a bucket that no longer exists.
+        // Cluster-wide: each of the 3 task types can be owned by any node, not just this one.
+        await OutboxMailbox.purgeBucketAcrossCluster(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries, bucketName: bucketName
+        ) { $0.bucketName == bucketName }
+        await OutboxMailbox.purgeBucketAcrossCluster(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
+            bucketName: bucketName
+        ) { $0.bucketName == bucketName }
+        await OutboxMailbox.purgeBucketAcrossCluster(
+            ClusterReplicationTask.self, app: req.application,
+            collection: OutboxCollections.clusterReplicationTasks, bucketName: bucketName
+        ) { $0.bucketName == bucketName }
 
         try BucketHandler.delete(name: bucketName, force: force)
     }

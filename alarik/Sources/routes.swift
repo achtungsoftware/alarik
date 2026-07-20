@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 func routes(_ app: Application) throws {
@@ -43,6 +42,8 @@ func routes(_ app: Application) throws {
     try app.register(collection: InternalClusterObjectController())
     try app.register(collection: InternalClusterErasureCodedController())
     try app.register(collection: InternalClusterListingController())
+    try app.register(collection: InternalClusterMetadataController())
+    try app.register(collection: InternalClusterOutboxController())
 
     // S3
     try app.register(collection: S3Controller())

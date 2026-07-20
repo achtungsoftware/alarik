@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import NIOCore
 import Vapor
@@ -865,12 +864,8 @@ struct S3Service {
         authInfo: S3AuthInfo
     ) async throws -> AccessKey {
         guard
-            let key =
-                try await AccessKey
-                .query(on: req.db)
-                .filter(\.$accessKey == authInfo.accessKey)
-                .with(\.$user)
-                .first()
+            let key = try await AccessKey.find(
+                app: req.application, accessKey: authInfo.accessKey)
         else {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
@@ -878,7 +873,6 @@ struct S3Service {
         let validator = SigV4Validator(secretKey: key.secretKey)
         guard try validator.validate(request: req, authInfo: authInfo) else {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
-            // HIER HIER
         }
 
         return key

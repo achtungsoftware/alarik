@@ -39,6 +39,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
         cluster.get("exists", use: handleExists)
         cluster.get("held", use: handleHeld)
         cluster.get("meta", use: handleMeta)
+        cluster.get("encoding", use: handleEncoding)
         cluster.delete(use: handleDelete)
         cluster.on(.PATCH, "metadata", use: handleMetadataPatch)
         cluster.on(.POST, "restore-latest", use: handleRestoreLatest)
@@ -130,6 +131,35 @@ struct InternalClusterErasureCodedController: RouteCollection {
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")
         response.body = try Response.Body(data: JSONEncoder().encode(meta))
         return response
+    }
+
+    /// The `(dataShards, parityShards)` this node's held shard was actually encoded with, read
+    /// straight from its on-disk header - never recomputed from live cluster state. Metadata
+    /// records (`MetadataStore`) can be written under a smaller effective k/m than a later read
+    /// would otherwise assume (e.g. the very first write on a cluster's founding node, before any
+    /// peers are known), so a read must discover the encoding actually used rather than guess from
+    /// current membership size. 404 when this node holds nothing for it.
+    @Sendable
+    func handleEncoding(req: Request) async throws -> EncodingDTO {
+        let (bucketName, key, versionId) = try bucketKey(req: req)
+        let held = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: versionId)
+        guard let index = held.first else {
+            throw Abort(.notFound, reason: "No shard held for this object")
+        }
+        let path = ErasureCodedObjectHandler.shardPath(
+            bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
+        return try await req.application.threadPool.runIfActive {
+            let reader = try ErasureCodedShardReader(path: path)
+            defer { reader.close() }
+            return EncodingDTO(
+                dataShards: reader.header.dataShards, parityShards: reader.header.parityShards)
+        }
+    }
+
+    struct EncodingDTO: Content {
+        let dataShards: Int
+        let parityShards: Int
     }
 
     /// Repoints this node's `.latest` pointer for (bucket, key) back to `priorVersionId` and

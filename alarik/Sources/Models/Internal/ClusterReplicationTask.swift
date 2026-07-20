@@ -14,19 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
-import Vapor
-
-import struct Foundation.Date
-import struct Foundation.UUID
+import Foundation
 
 /// One pending (or dead-lettered) internal-cluster object push/delete - the persistent outbox
-/// row that makes cluster replication survive restarts and peer-node outages. Structurally
-/// identical to `ReplicationTask`; never holds the object's bytes, only enough to re-read the
-/// exact payload from `ObjectFileHandler` at delivery time (`bucketName`+`key`+`versionId`).
-final class ClusterReplicationTask: Model, @unchecked Sendable {
-    static let schema = "cluster_replication_tasks"
-
+/// row that makes cluster replication survive restarts and peer-node outages. Never holds the
+/// object's bytes, only enough to re-read the exact payload from `ObjectFileHandler` at delivery
+/// time. Backed by `OutboxMailbox`, not Fluent. `ownerNodeId` is a REAL stored field, not a
+/// `targetNodeId` alias: delivery pushes the object FROM the node holding the local copy TO
+/// `targetNodeId`, so the mailbox owner is always the *enqueuing* node, never the target.
+final class ClusterReplicationTask: @unchecked Sendable, Codable {
     enum State: String {
         case pending
         /// Retries exhausted - kept for a few days so failures are inspectable, then purged by
@@ -49,43 +45,23 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         case reclaim
     }
 
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "bucket_name")
+    let id: UUID
     var bucketName: String
-
-    @Field(key: "key")
     var key: String
-
-    @Field(key: "version_id")
     var versionId: String?
-
-    @Field(key: "operation")
     var operation: String
-
-    @Field(key: "target_node_id")
     var targetNodeId: UUID
-
-    @Field(key: "reason")
     var reason: String
-
-    @Field(key: "attempts")
     var attempts: Int
-
-    @Field(key: "next_attempt_at")
     var nextAttemptAt: Date
-
-    @Field(key: "state")
     var state: String
-
-    @Field(key: "last_error")
     var lastError: String?
+    let createdAt: Date
 
-    @Field(key: "created_at")
-    var createdAt: Date
-
-    init() {}
+    /// The node whose local mailbox directory this task's file lives in - the node that
+    /// enqueued it (and holds the local copy to push), not `targetNodeId`. See the type's own
+    /// doc comment for why.
+    var ownerNodeId: UUID
 
     init(
         bucketName: String,
@@ -93,8 +69,10 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         versionId: String?,
         operation: Operation,
         targetNodeId: UUID,
-        reason: Reason
+        reason: Reason,
+        ownerNodeId: UUID
     ) {
+        self.id = UUID()
         self.bucketName = bucketName
         self.key = key
         self.versionId = versionId
@@ -105,7 +83,8 @@ final class ClusterReplicationTask: Model, @unchecked Sendable {
         self.nextAttemptAt = Date()
         self.state = State.pending.rawValue
         self.createdAt = Date()
+        self.ownerNodeId = ownerNodeId
     }
 }
 
-extension ClusterReplicationTask: OutboxRow {}
+extension ClusterReplicationTask: OutboxMailboxRow {}

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 /// Admin-only console API for cluster visibility/control - node list + health, object placement
@@ -135,15 +134,15 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let nodes = try await ClusterNode.query(on: req.db).sort(\.$joinedAt, .ascending).all()
+        let nodes = try await ClusterNode.all(app: req.application)
+            .sorted { $0.joinedAt < $1.joinedAt }
         let now = Date()
-        return nodes.compactMap { node -> ClusterNodeDTO? in
-            guard let id = node.id else { return nil }
+        return nodes.map { node -> ClusterNodeDTO in
             let isHealthy =
                 node.status == ClusterNode.Status.active.rawValue
                 && now.timeIntervalSince(node.lastHeartbeatAt) <= ClusterNodeCache.heartbeatStaleness
             return ClusterNodeDTO(
-                id: id, address: node.address, status: node.status, joinedAt: node.joinedAt,
+                id: node.id, address: node.address, status: node.status, joinedAt: node.joinedAt,
                 lastHeartbeatAt: node.lastHeartbeatAt, isHealthy: isHealthy,
                 totalBytes: node.totalBytes, availableBytes: node.availableBytes,
                 isNearFull: ClusterCapacityPolicy.isNearFull(
@@ -161,41 +160,42 @@ struct InternalClusterController: RouteCollection {
         try auth.requireAdmin()
 
         guard let nodeId = req.parameters.get("nodeId", as: UUID.self),
-            let node = try await ClusterNode.find(nodeId, on: req.db)
+            let node = try await ClusterNode.find(app: req.application, id: nodeId)
         else {
             throw Abort(.notFound, reason: "Cluster node not found")
         }
 
         node.status = ClusterNode.Status.draining.rawValue
-        try await node.save(on: req.db)
+        try await node.save(app: req.application)
 
         // Any outstanding task that exists to keep this node in sync as a *responsible* replica
-        // (a `write` straggler catch-up, or a `rebalance` copy) is now pointless - draining
-        // excludes it from placement, so nothing should keep retrying to push it data, and a
-        // `pending` row that was just going to sit in growing backoff against a node that'll never
-        // become responsible again is exactly the "why is this stuck" confusion operators hit.
-        // Deliberately NOT touching `reclaim` tasks: those are the drained node cleaning up its
-        // own now-unowned copies, which is still wanted and still runs (draining doesn't stop the
-        // node's process) - only rows this node itself enqueues, so `targetNodeId` for a reclaim
-        // task is always this same node, never confusable with the copy/catch-up tasks above.
-        try await ClusterReplicationTask.query(on: req.db)
-            .filter(\.$targetNodeId == nodeId)
-            .filter(\.$reason != ClusterReplicationTask.Reason.reclaim.rawValue)
-            .delete()
+        // is now pointless - draining excludes it from placement. Deliberately NOT touching
+        // `reclaim` tasks: those are the drained node cleaning up its own now-unowned copies,
+        // which still runs. Cluster-wide broadcast, not a local delete: `ClusterReplicationTask`'s
+        // mailbox owner is the *sender*, not `targetNodeId`, so stale tasks can live anywhere.
+        await OutboxMailbox.purgeByTargetNodeAcrossCluster(
+            ClusterReplicationTask.self, app: req.application,
+            collection: OutboxCollections.clusterReplicationTasks, targetNodeId: nodeId
+        ) { $0.targetNodeId == nodeId && $0.reason != ClusterReplicationTask.Reason.reclaim.rawValue }
 
-        // Same cleanup for the EC shard-repair outbox - a stale `.put`/`.reconstruct` row aimed
-        // at this node's now-obsolete rank is equally pointless (the next rebalance walk assigns
-        // a fresh, correctly-targeted task to whichever node the current ranking actually gives
-        // that shard index to). Unlike legacy replication, EC has no `.reclaim`-reason rows to
-        // preserve at all - reclaiming a stale local shard is done inline, never via the outbox
-        // (see `ErasureCodedRebalanceService.reclaimIfSafe`) - so every row targeting this node is
-        // cleared. Skipping this cleanup would let such rows linger indefinitely once the target-
-        // only outbox delivery gate (`ErasureCodedDispatcher`) means only the row's own target may
-        // ever act on it: if that node's process is later stopped without its `ClusterNode` row
-        // ever being deleted, nothing would ever again attempt (let alone dead-letter) the row.
-        try await ErasureCodedReplicationTask.query(on: req.db)
-            .filter(\.$targetNodeId == nodeId)
-            .delete()
+        // Same cleanup for the EC shard-repair outbox - a stale row aimed at this node's now-
+        // obsolete rank is equally pointless. Unlike legacy replication, EC has no `.reclaim`-
+        // reason rows to preserve (reclaiming a stale local shard is done inline, never via the
+        // outbox), so every row targeting this node is cleared.
+        await OutboxMailbox.purgeByTargetNodeAcrossCluster(
+            ErasureCodedReplicationTask.self, app: req.application,
+            collection: OutboxCollections.erasureCodedReplicationTasks, targetNodeId: nodeId
+        ) { $0.targetNodeId == nodeId }
+
+        // Webhook/external-replication tasks have no independent ground truth to regenerate them
+        // (unlike the two collections above) - if this node owns any, they must be reassigned to
+        // a still-active peer *before* it's allowed to leave, or they'd simply never be delivered.
+        await OutboxMailbox.reassignOwnedTasks(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries, departingNodeId: nodeId)
+        await OutboxMailbox.reassignOwnedTasks(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
+            departingNodeId: nodeId)
 
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
@@ -203,25 +203,44 @@ struct InternalClusterController: RouteCollection {
                 lastHeartbeatAt: node.lastHeartbeatAt,
                 totalBytes: node.totalBytes, availableBytes: node.availableBytes))
         CacheInvalidationService.notify(
-            on: req.db, cache: "clusterNode", op: .upsert, key: nodeId.uuidString)
+            app: req.application, cache: "clusterNode", op: .upsert, key: nodeId.uuidString,
+            nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
+                id: nodeId, address: node.address, status: ClusterNode.Status.draining.rawValue,
+                lastHeartbeatAt: node.lastHeartbeatAt, totalBytes: node.totalBytes,
+                availableBytes: node.availableBytes))
+        // `CacheReloadDispatch`'s `("clusterNode", .upsert)` case triggers a rebalance walk on
+        // every node that RECEIVES the broadcast above - but `notify` deliberately excludes the
+        // caller itself (see `resync`'s identical doc comment), so without this explicit call,
+        // whichever admin node happens to field this drain request would never run its own walk,
+        // even if it physically holds shards that now need to move off the just-drained node.
+        await ClusterRebalanceService.scheduleRebalance(
+            app: req.application, reason: .membershipChange)
+        await ErasureCodedRebalanceService.scheduleRebalance(
+            app: req.application, reason: .membershipChange)
 
         return .ok
     }
 
     /// Manually triggers a rebalance walk on **every** node - the recovery path after a node has
-    /// crashed (a silent failure emits no membership NOTIFY, so nothing re-replicates its data
-    /// automatically) or recovered past the outbox's dead-letter point. A rebalance walk only
-    /// ever sees the node's own local disk, so re-replicating an under-replicated object requires
-    /// the node that still holds it to run its own walk - hence this broadcasts a `clusterRebalance`
-    /// NOTIFY that fans the walk out to all nodes, rather than rebalancing only whichever node
-    /// happened to field this request.
+    /// crashed or recovered past the outbox's dead-letter point. A rebalance walk only sees the
+    /// node's own local disk, so re-replicating an under-replicated object requires the node that
+    /// still holds it to run its own walk - hence this broadcasts a `clusterRebalance` NOTIFY.
     @Sendable
     func resync(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
+        // `CacheInvalidationService.notify`'s broadcast deliberately excludes the caller itself
+        // (every other invalidation type re-reads/re-derives its OWN state locally before
+        // broadcasting, so self was never a target to begin with) - but a resync has no such
+        // local step of its own, so without this explicit call, whichever node happens to field
+        // this admin request would broadcast the walk to every OTHER node while never running its
+        // own. Both calls are required for genuine "every node" coverage.
+        await ClusterRebalanceService.scheduleRebalance(app: req.application, reason: .manualResync)
+        await ErasureCodedRebalanceService.scheduleRebalance(
+            app: req.application, reason: .manualResync)
         CacheInvalidationService.notify(
-            on: req.db, cache: "clusterRebalance", op: .upsert, key: "resync")
+            app: req.application, cache: "clusterRebalance", op: .upsert, key: "resync")
         return .ok
     }
 
@@ -230,26 +249,20 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        // A cluster mid-rebalance can have an enormous number of pending rows - counted here,
-        // not loaded (the previous version pulled every single one into memory just to tally
-        // `pending.count` and a per-reason breakdown in a Swift loop). `Reason` is a small,
-        // closed enum, so one COUNT query per reason is both simpler and more portable across
-        // this codebase's Postgres/SQLite backends than a raw SQL GROUP BY.
+        // Cluster-wide fan-out (`OutboxMailbox`'s mailboxes are per-owner-node, not a shared
+        // table) then tallied in Swift - matches the "full-scan-then-filter" idiom already used
+        // for every other cluster-wide outbox view in this migration.
+        let tasks = await OutboxMailbox.listAllAcrossCluster(
+            ClusterReplicationTask.self, app: req.application,
+            collection: OutboxCollections.clusterReplicationTasks)
+
         var byReason: [String: Int] = [:]
         var pendingCount = 0
-        for reason in ClusterReplicationTask.Reason.allCases {
-            let count = try await ClusterReplicationTask.query(on: req.db)
-                .filter(\.$state == ClusterReplicationTask.State.pending.rawValue)
-                .filter(\.$reason == reason.rawValue)
-                .count()
-            pendingCount += count
-            if count > 0 {
-                byReason[reason.rawValue] = count
-            }
+        for task in tasks where task.state == ClusterReplicationTask.State.pending.rawValue {
+            pendingCount += 1
+            byReason[task.reason, default: 0] += 1
         }
-        let failedCount = try await ClusterReplicationTask.query(on: req.db)
-            .filter(\.$state == ClusterReplicationTask.State.failed.rawValue)
-            .count()
+        let failedCount = tasks.filter { $0.state == ClusterReplicationTask.State.failed.rawValue }.count
 
         return RebalanceStatusDTO(
             pendingCount: pendingCount, failedCount: failedCount, pendingByReason: byReason,
@@ -267,22 +280,19 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let tasks = try await ClusterReplicationTask.query(on: req.db)
-            .filter(
-                \.$state
-                    ~~ [
-                        ClusterReplicationTask.State.pending.rawValue,
-                        ClusterReplicationTask.State.failed.rawValue,
-                    ]
-            )
-            .sort(\.$attempts, .descending)
-            .limit(200)
-            .all()
+        let tasks = await OutboxMailbox.listAllAcrossCluster(
+            ClusterReplicationTask.self, app: req.application,
+            collection: OutboxCollections.clusterReplicationTasks
+        ).filter {
+            $0.state == ClusterReplicationTask.State.pending.rawValue
+                || $0.state == ClusterReplicationTask.State.failed.rawValue
+        }
+        .sorted { $0.attempts > $1.attempts }
+        .prefix(200)
 
-        return tasks.compactMap { task in
-            guard let id = task.id else { return nil }
-            return ReplicationTaskDetailDTO(
-                id: id, bucketName: task.bucketName, key: task.key, operation: task.operation,
+        return tasks.map { task in
+            ReplicationTaskDetailDTO(
+                id: task.id, bucketName: task.bucketName, key: task.key, operation: task.operation,
                 targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
                 nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
         }
@@ -303,21 +313,18 @@ struct InternalClusterController: RouteCollection {
                 pendingCount: 0, failedCount: 0, pendingReconstructCount: 0, pendingByReason: [:])
         }
 
+        let tasks = await OutboxMailbox.listAllAcrossCluster(
+            ErasureCodedReplicationTask.self, app: req.application,
+            collection: OutboxCollections.erasureCodedReplicationTasks)
+
         var byReason: [String: Int] = [:]
         var pendingCount = 0
-        for reason in ErasureCodedReplicationTask.Reason.allCases {
-            let count = try await ErasureCodedReplicationTask.query(on: req.db)
-                .filter(\.$state == ErasureCodedReplicationTask.State.pending.rawValue)
-                .filter(\.$reason == reason.rawValue)
-                .count()
-            pendingCount += count
-            if count > 0 {
-                byReason[reason.rawValue] = count
-            }
+        for task in tasks where task.state == ErasureCodedReplicationTask.State.pending.rawValue {
+            pendingCount += 1
+            byReason[task.reason, default: 0] += 1
         }
-        let failedCount = try await ErasureCodedReplicationTask.query(on: req.db)
-            .filter(\.$state == ErasureCodedReplicationTask.State.failed.rawValue)
-            .count()
+        let failedCount = tasks.filter { $0.state == ErasureCodedReplicationTask.State.failed.rawValue }
+            .count
 
         return ErasureCodingStatusDTO(
             enabled: true,
@@ -332,23 +339,25 @@ struct InternalClusterController: RouteCollection {
             pendingByReason: byReason)
     }
 
-    /// Full detail for outstanding (pending or failed) EC shard-repair rows - the drill-down behind
-    /// `erasureCodingStatus`, mirroring `rebalanceTasks` but shard-scoped (which shard index of
-    /// which version is stuck, targeting which node, and why). Sorted most-stuck-first, capped at
-    /// 200 - a diagnostic view, not a paginated browser.
-    /// Triggers an immediate bit-rot scrub on **every** node - the EC counterpart of
-    /// [`resync`](#resync), and needed for the same reason: a scrub only ever sees a node's own
-    /// local shards, so verifying the whole cluster requires every node to run its own pass. The
-    /// automatic scheduled scrub (`CLUSTER_EC_SCRUB_INTERVAL_HOURS`) covers the routine case; this
-    /// is for on-demand verification after a suspected disk problem. Returns immediately - the scrub
-    /// runs in the background and reports through the erasure-coding status endpoint's repair counts.
+    /// Full detail for outstanding EC shard-repair rows - the drill-down behind
+    /// `erasureCodingStatus`, shard-scoped. Sorted most-stuck-first, capped at 200.
+    ///
+    /// Triggers an immediate bit-rot scrub on **every** node - the EC counterpart of `resync`,
+    /// needed since a scrub only ever sees a node's own local shards. Returns immediately; the
+    /// scrub runs in the background and reports through the erasure-coding status endpoint.
     @Sendable
     func erasureCodingScrub(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
+        // See `resync`'s identical doc comment: `CacheInvalidationService.notify`'s broadcast
+        // deliberately excludes the caller itself, so without this explicit local call, whichever
+        // node happens to field this admin request would trigger every OTHER node's scrub while
+        // never scrubbing its own local shards - the exact gap that let a corrupted shard on the
+        // fielding node itself go undetected no matter how many times this endpoint was called.
+        Task { await ErasureCodedScrubber.scrub(app: req.application) }
         CacheInvalidationService.notify(
-            on: req.db, cache: "clusterScrub", op: .upsert, key: "scrub")
+            app: req.application, cache: "clusterScrub", op: .upsert, key: "scrub")
         return .ok
     }
 
@@ -357,22 +366,19 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let tasks = try await ErasureCodedReplicationTask.query(on: req.db)
-            .filter(
-                \.$state
-                    ~~ [
-                        ErasureCodedReplicationTask.State.pending.rawValue,
-                        ErasureCodedReplicationTask.State.failed.rawValue,
-                    ]
-            )
-            .sort(\.$attempts, .descending)
-            .limit(200)
-            .all()
+        let tasks = await OutboxMailbox.listAllAcrossCluster(
+            ErasureCodedReplicationTask.self, app: req.application,
+            collection: OutboxCollections.erasureCodedReplicationTasks
+        ).filter {
+            $0.state == ErasureCodedReplicationTask.State.pending.rawValue
+                || $0.state == ErasureCodedReplicationTask.State.failed.rawValue
+        }
+        .sorted { $0.attempts > $1.attempts }
+        .prefix(200)
 
-        return tasks.compactMap { task in
-            guard let id = task.id else { return nil }
-            return ErasureCodedTaskDetailDTO(
-                id: id, bucketName: task.bucketName, key: task.key, versionId: task.versionId,
+        return tasks.map { task in
+            ErasureCodedTaskDetailDTO(
+                id: task.id, bucketName: task.bucketName, key: task.key, versionId: task.versionId,
                 shardIndex: task.shardIndex, operation: task.operation,
                 targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
                 nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
@@ -395,8 +401,7 @@ struct InternalClusterController: RouteCollection {
         // BucketHandler.bucketURL) - confirming it names a real, previously-validated bucket
         // (CreateBucket already enforces safe S3 bucket-naming rules) rules out an admin-authed
         // caller passing an arbitrary string through to disk I/O.
-        guard try await Bucket.query(on: req.db).filter(\.$name == bucketName).first() != nil
-        else {
+        guard try await Bucket.find(app: req.application, name: bucketName) != nil else {
             throw Abort(.notFound, reason: "Bucket not found")
         }
         let prefix = req.query[String.self, at: "prefix"] ?? ""

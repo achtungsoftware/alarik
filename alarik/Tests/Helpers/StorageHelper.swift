@@ -19,55 +19,34 @@ import Testing
 import Vapor
 import VaporTesting
 
+@testable import Alarik
+
 struct StorageHelper {
     public static func cleanStorage() throws {
-        try cleanBucketsFolder()
-        try cleanMultipartFolder()
-        try cleanDatabase()
+        try cleanDirectoryContents("Storage/buckets/")
+        try cleanDirectoryContents("Storage/multipart/")
+        // Outbox task files live outside Storage/buckets/ (deliberately - they're node-affine,
+        // not key-affine, see OutboxMailbox's doc comments) so they need their own cleanup, or
+        // one test's leftover rows silently leak into the next test's counts.
+        try cleanDirectoryContents(OutboxMailboxFileHandler.rootPath)
+        try cleanDirectoryContents(OutboxMailboxFileHandler.backupRootPath)
+        try cleanDirectoryContents(OutboxMailboxFileHandler.pendingEnqueueRootPath)
     }
 
-    private static func cleanMultipartFolder() throws {
+    private static func cleanDirectoryContents(_ path: String) throws {
         let fm = FileManager.default
-        let multipartURL = URL(filePath: "Storage/multipart/")
+        let url = URL(filePath: path)
 
-        guard fm.fileExists(atPath: multipartURL.path) else { return }
+        guard fm.fileExists(atPath: url.path) else { return }
 
         let contents = try fm.contentsOfDirectory(
-            at: multipartURL, includingPropertiesForKeys: nil, options: [])
+            at: url, includingPropertiesForKeys: nil, options: [])
 
         for item in contents {
             if item.lastPathComponent == ".gitkeep" {
                 continue
             }
             try fm.removeItem(at: item)
-        }
-    }
-
-    private static func cleanBucketsFolder() throws {
-        let fm = FileManager.default
-        let bucketsURL = URL(filePath: "Storage/buckets/")
-
-        // Ensure the directory exists
-        guard fm.fileExists(atPath: bucketsURL.path) else { return }
-
-        let contents = try fm.contentsOfDirectory(
-            at: bucketsURL, includingPropertiesForKeys: nil, options: [])
-
-        for item in contents {
-            // Skip .gitkeep
-            if item.lastPathComponent == ".gitkeep" {
-                continue
-            }
-            try fm.removeItem(at: item)
-        }
-    }
-
-    private static func cleanDatabase() throws {
-        let fm = FileManager.default
-        let dbURL = URL(filePath: "db.sqlite")
-
-        if fm.fileExists(atPath: dbURL.path) {
-            try fm.removeItem(at: dbURL)
         }
     }
 }

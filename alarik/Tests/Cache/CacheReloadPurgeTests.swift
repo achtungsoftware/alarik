@@ -19,13 +19,10 @@ import Testing
 
 @testable import Alarik
 
-/// `LoadCacheLifecycle.reloadAll` runs both at boot and as the safety-net reload after a
-/// Postgres LISTEN reconnect - in the latter case, a row deleted/revoked while disconnected must
-/// actually disappear from the cache, not just have currently-existing rows re-upserted on top
-/// of a map that still remembers the stale one forever. Each test below simulates that exact
-/// sequence directly against a fresh (non-`.shared`) cache instance: `load` with an initial
-/// dataset, then `load` again with a strict subset, and confirms the removed entry is gone -
-/// pure in-memory actor tests, no DB/app required.
+/// A row deleted/revoked between reloads must actually disappear from the cache, not just have
+/// surviving rows re-upserted on top of a map that still remembers the stale one. Each test
+/// simulates that against a fresh (non-`.shared`) cache instance: `load` an initial dataset,
+/// then `load` a strict subset, and confirm the removed entry is gone.
 @Suite("Cache reload purges stale entries, not just merges")
 struct CacheReloadPurgeTests {
     @Test("AccessKeySecretKeyMapCache.load replaces rather than merges")

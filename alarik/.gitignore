@@ -19,3 +19,8 @@ Storage/multipart/*
 
 Storage/spool/*
 !Storage/spool/.gitkeep
+
+Storage/outbox/*
+!Storage/outbox/.gitkeep
+
+Storage/cluster_node_id

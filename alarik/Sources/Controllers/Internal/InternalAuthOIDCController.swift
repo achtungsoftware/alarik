@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 /// OIDC SSO login - sits alongside the existing local username/password login
@@ -40,12 +39,11 @@ struct InternalAuthOIDCController: RouteCollection {
 
     @Sendable
     func providers(req: Request) async throws -> [OIDCProvider.PublicDTO] {
-        let providers = try await OIDCProvider.query(on: req.db)
-            .filter(\.$enabled == true)
-            .sort(\.$createdAt, .ascending)
-            .all()
+        let providers = try await OIDCProvider.all(app: req.application)
+            .filter { $0.enabled }
+            .sorted { $0.createdAt < $1.createdAt }
 
-        return try providers.map { OIDCProvider.PublicDTO(id: try $0.requireID(), name: $0.name) }
+        return providers.map { OIDCProvider.PublicDTO(id: $0.id, name: $0.name) }
     }
 
     @Sendable
@@ -54,10 +52,8 @@ struct InternalAuthOIDCController: RouteCollection {
             throw Abort(.notFound)
         }
         guard
-            let provider = try await OIDCProvider.query(on: req.db)
-                .filter(\.$id == providerId)
-                .filter(\.$enabled == true)
-                .first()
+            let provider = try await OIDCProvider.find(app: req.application, id: providerId),
+            provider.enabled
         else {
             throw Abort(.notFound)
         }
@@ -70,8 +66,8 @@ struct InternalAuthOIDCController: RouteCollection {
         let codeVerifier = OIDCPKCE.randomURLSafeString()
         let codeChallenge = OIDCPKCE.codeChallenge(forVerifier: codeVerifier)
 
-        try await OIDCStateCache.shared.store(
-            on: req.db, state: state, providerId: providerId, nonce: nonce,
+        try await OIDCStateCache.store(
+            app: req.application, state: state, providerId: providerId, nonce: nonce,
             codeVerifier: codeVerifier)
 
         var components = URLComponents(string: discovery.authorizationEndpoint)
@@ -160,12 +156,13 @@ struct InternalAuthOIDCController: RouteCollection {
             return errorRedirect("missing_or_mismatched_state_cookie")
         }
 
-        guard let stateEntry = try await OIDCStateCache.shared.consume(on: req.db, state: state)
+        guard let stateEntry = try await OIDCStateCache.consume(app: req.application, state: state)
         else {
             return errorRedirect("invalid_or_expired_state")
         }
 
-        guard let provider = try await OIDCProvider.find(stateEntry.providerId, on: req.db) else {
+        guard let provider = try await OIDCProvider.find(app: req.application, id: stateEntry.providerId)
+        else {
             return errorRedirect("invalid_or_expired_state")
         }
 
@@ -222,14 +219,19 @@ struct InternalAuthOIDCController: RouteCollection {
             return errorRedirect("missing_email_claim")
         }
 
-        let providerId = try provider.requireID()
+        let providerId = provider.id
+
+        // Not a hot path (one lookup per OIDC login, never per-S3-request) - a full scan of the
+        // shallow `users` collection filtered in memory, same reasoning as every other
+        // rarely-used lookup in this migration (see `MetadataListingService`'s doc comment).
+        let existingByLink = await MetadataListingService.list(
+            app: req.application, collection: MetadataCollections.users
+        )
+        .compactMap { try? JSONDecoder().decode(User.self, from: $0.value) }
+        .first { $0.oidcProviderId == providerId && $0.oidcSubject == idToken.sub.value }
 
         let user: User
-        if let existingByLink = try await User.query(on: req.db)
-            .filter(\.$oidcProviderId == providerId)
-            .filter(\.$oidcSubject == idToken.sub.value)
-            .first()
-        {
+        if let existingByLink {
             // Already an established link from a prior verified login - re-trusting `email`
             // isn't necessary here, the link itself is the trust anchor.
             user = existingByLink
@@ -242,13 +244,12 @@ struct InternalAuthOIDCController: RouteCollection {
             guard idToken.emailVerified == true else {
                 return errorRedirect("email_not_verified")
             }
-            if let existingByUsername = try await User.query(on: req.db)
-                .filter(\.$username == email)
-                .first()
+            if let existingByUsername = try await User.findByUsername(
+                app: req.application, username: email)
             {
                 existingByUsername.oidcProviderId = providerId
                 existingByUsername.oidcSubject = idToken.sub.value
-                try await existingByUsername.save(on: req.db)
+                try await existingByUsername.save(app: req.application)
                 user = existingByUsername
             } else if Environment.sanitizedGet("ALLOW_ACCOUNT_CREATION") == "true" {
                 // Auto-provision, gated by the same env switch as the console's local signup
@@ -266,14 +267,11 @@ struct InternalAuthOIDCController: RouteCollection {
                 newUser.oidcProviderId = providerId
                 newUser.oidcSubject = idToken.sub.value
                 do {
-                    try await newUser.save(on: req.db)
-                } catch {
-                    // Unique-constraint race: another request created this username between our
-                    // lookup and save. Surface a retryable error rather than a 500.
-                    if let dbError = error as? any DatabaseError, dbError.isConstraintFailure {
-                        return errorRedirect("account_creation_failed")
-                    }
-                    throw error
+                    try await newUser.create(app: req.application)
+                } catch is User.UserError {
+                    // Race: another request created this username between our lookup and create.
+                    // Surface a retryable error rather than a 500.
+                    return errorRedirect("account_creation_failed")
                 }
                 user = newUser
             } else {

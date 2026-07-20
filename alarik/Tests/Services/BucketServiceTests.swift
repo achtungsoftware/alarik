@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -30,12 +29,9 @@ struct BucketServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -46,8 +42,8 @@ struct BucketServiceTests {
         let user = User(
             name: "Bucket Service Test User", username: UUID().uuidString,
             passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
-        try await user.save(on: app.db)
-        return user.id!
+        try await user.create(app: app)
+        return user.id
     }
 
     @Test("create - Succeeds and registers the versioning cache entry")
@@ -56,11 +52,9 @@ struct BucketServiceTests {
             let userId = try await createUser(app)
 
             try await BucketService.create(
-                on: app.db, bucketName: "create-success-bucket", userId: userId)
+                app: app, bucketName: "create-success-bucket", userId: userId)
 
-            let bucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "create-success-bucket")
-                .first()
+            let bucket = try await Bucket.find(app: app, name: "create-success-bucket")
             #expect(bucket != nil)
             #expect(
                 await BucketVersioningCache.shared.getStatus(for: "create-success-bucket")
@@ -78,7 +72,7 @@ struct BucketServiceTests {
         try await withApp { app in
             let userId = try await createUser(app)
 
-            try await BucketService.create(on: app.db, bucketName: "dup-bucket", userId: userId)
+            try await BucketService.create(app: app, bucketName: "dup-bucket", userId: userId)
 
             // Put a real file in the legitimately-created bucket
             let path = ObjectFileHandler.storagePath(for: "dup-bucket", key: "important.txt")
@@ -95,7 +89,7 @@ struct BucketServiceTests {
             // controller-level pre-check and hits the DB's unique constraint on `name`
             // directly, which is exactly the failure this regression covers.
             await #expect(throws: (any Error).self) {
-                try await BucketService.create(on: app.db, bucketName: "dup-bucket", userId: userId)
+                try await BucketService.create(app: app, bucketName: "dup-bucket", userId: userId)
             }
 
             // The original bucket and its file must be completely untouched
@@ -103,9 +97,7 @@ struct BucketServiceTests {
             let readBack = try ObjectFileHandler.read(from: path, loadData: true)
             #expect(readBack.1 == data)
 
-            let buckets = try await Bucket.query(on: app.db)
-                .filter(\.$name == "dup-bucket")
-                .all()
+            let buckets = try await Bucket.all(app: app).filter { $0.name == "dup-bucket" }
             #expect(buckets.count == 1)
         }
     }
@@ -126,13 +118,11 @@ struct BucketServiceTests {
 
             await #expect(throws: (any Error).self) {
                 try await BucketService.create(
-                    on: app.db, bucketName: "rollback-fail-bucket", userId: userId)
+                    app: app, bucketName: "rollback-fail-bucket", userId: userId)
             }
 
             // The bucket row must have been rolled back, not left dangling
-            let bucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "rollback-fail-bucket")
-                .first()
+            let bucket = try await Bucket.find(app: app, name: "rollback-fail-bucket")
             #expect(bucket == nil)
 
             // The versioning cache must not retain an entry for a bucket that doesn't exist
@@ -148,7 +138,7 @@ struct BucketServiceTests {
         try await withApp { app in
             let userId = try await createUser(app)
 
-            try await BucketService.create(on: app.db, bucketName: "ghost-bucket", userId: userId)
+            try await BucketService.create(app: app, bucketName: "ghost-bucket", userId: userId)
 
             // A real object in the bucket before force-deleting it - the exact scenario this
             // regression covers: force-delete used to only wipe this node's local directory via
@@ -171,13 +161,11 @@ struct BucketServiceTests {
                 req: req, bucketName: "ghost-bucket", userId: userId, force: true)
 
             #expect(!FileManager.default.fileExists(atPath: path))
-            let deletedBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "ghost-bucket")
-                .first()
+            let deletedBucket = try await Bucket.find(app: app, name: "ghost-bucket")
             #expect(deletedBucket == nil)
 
             // Recreate a bucket under the exact same name - it must start genuinely empty.
-            try await BucketService.create(on: app.db, bucketName: "ghost-bucket", userId: userId)
+            try await BucketService.create(app: app, bucketName: "ghost-bucket", userId: userId)
 
             #expect(!FileManager.default.fileExists(atPath: path))
             let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: "ghost-bucket")
@@ -192,7 +180,7 @@ struct BucketServiceTests {
         try await withApp { app in
             let userId = try await createUser(app)
 
-            try await BucketService.create(on: app.db, bucketName: "straggler-bucket", userId: userId)
+            try await BucketService.create(app: app, bucketName: "straggler-bucket", userId: userId)
 
             // Simulates the completely normal (not an error case) outcome of a quorum write: 2 of
             // 3 responsible nodes ack in time, satisfying quorum, while the 3rd is left with a
@@ -202,16 +190,17 @@ struct BucketServiceTests {
             // directly stops the dispatcher from delivering it after the bucket is gone.
             let task = ClusterReplicationTask(
                 bucketName: "straggler-bucket", key: "in-flight.txt", versionId: nil,
-                operation: .put, targetNodeId: UUID(), reason: .write)
-            try await task.save(on: app.db)
+                operation: .put, targetNodeId: UUID(), reason: .write,
+                ownerNodeId: OutboxMailbox.selfNodeId(app: app))
+            try OutboxMailbox.update(task, collection: OutboxCollections.clusterReplicationTasks)
 
             let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
                 req: req, bucketName: "straggler-bucket", userId: userId, force: true)
 
-            let remaining = try await ClusterReplicationTask.query(on: app.db)
-                .filter(\.$bucketName == "straggler-bucket")
-                .count()
+            let remaining = OutboxMailbox.allOwnedTasks(
+                ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
+            ).filter { $0.bucketName == "straggler-bucket" }.count
             #expect(remaining == 0)
         }
     }

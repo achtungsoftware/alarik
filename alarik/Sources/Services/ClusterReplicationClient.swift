@@ -475,6 +475,33 @@ enum ClusterReplicationClient {
             outbound, timeout: probeTimeout, logger: app.logger)
     }
 
+    /// Fetches the `(dataShards, parityShards)` whatever shard `node` holds for (bucketName, key,
+    /// versionId) was actually encoded with, read straight from its on-disk header - the
+    /// network-visible counterpart of `handleEncoding`'s local read. `nil` when the node is
+    /// unreachable or holds nothing for it. See `MetadataStore.discoverShardCounts`.
+    static func fetchShardEncoding(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String,
+        versionId: String?
+    ) async -> (dataShards: Int, parityShards: Int)? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/encoding" + suffix)
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: probeTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 64 * 1024)
+            let dto = try JSONDecoder().decode(
+                InternalClusterErasureCodedController.EncodingDTO.self, from: body)
+            return (dto.dataShards, dto.parityShards)
+        } catch {
+            return nil
+        }
+    }
+
     /// Fetches the `ObjectMeta` of whatever shard `node` holds for (bucketName, key, versionId) -
     /// a header-only probe (no stripe data crosses the wire), for HEAD-shaped metadata resolution
     /// on a node that hasn't received its own shard yet. `nil` when the node is unreachable or

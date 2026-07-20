@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import XMLCoder
 
@@ -47,11 +46,7 @@ struct S3Controller: RouteCollection {
     /// 404 shape needed by every bucket subresource handler (policy/tagging/lifecycle/public
     /// access block) once authentication has already established the caller may act on it.
     private func fetchBucket(req: Request, bucketName: String) async throws -> Bucket {
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
+        guard let bucket = try await Bucket.find(app: req.application, name: bucketName) else {
             throw S3Error(
                 status: .notFound, code: "NoSuchBucket",
                 message: "The specified bucket does not exist.", requestId: req.id)
@@ -91,9 +86,7 @@ struct S3Controller: RouteCollection {
         let shouldHandle = S3Service.shouldHandleSubresource(query: query)
         if shouldHandle {
             _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
+            let bucket = try await Bucket.find(app: req.application, name: bucketName)
             if let response = try await S3Service.handleSubresourceQuery(
                 query: query, req: req, bucket: bucket)
             {
@@ -295,12 +288,9 @@ struct S3Controller: RouteCollection {
             let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
             guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
                 // Nothing local in either format - before concluding 404, ask responsible peers
-                // for a shard header (a cheap, header-only probe). Covers the fresh-write
-                // straggler window: this node is responsible but hasn't received its shard yet,
-                // while peers already hold the object - without this, a HEAD/tagging read racing
-                // a just-acked PUT would wrongly 404. Parallel, first hit wins; a true 404 costs
-                // one round-trip of parallel probes, matching handleObjectGet's identical
-                // `anyPeerHoldsShard` trade-off.
+                // for a shard header (cheap, header-only). Covers the fresh-write straggler
+                // window: this node is responsible but hasn't received its shard yet, while peers
+                // already hold the object. Parallel, first hit wins.
                 if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
                     req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
                     let peerMeta = await withTaskGroup(
@@ -354,12 +344,9 @@ struct S3Controller: RouteCollection {
         }
 
         // isLocal above only proves membership in the *wider* top-(k+m) set - when k+m > 3 a
-        // node can be in that set without holding a legacy plain replica at all, so a plain
-        // (non-EC) object with no local EC shard still needs the legacy top-3 forward, exactly
-        // like handleObjectGet's identical fallthrough. Only forward when there's genuinely no
-        // local EC shard to serve - `hasLocalECShard` mirrors the exact check
-        // `resolveObjectMetaEitherFormat` runs internally, so a real shard holder outside the
-        // legacy top-3 is never wrongly redirected away from data it actually has.
+        // node can be in that set without holding a legacy plain replica, so a plain (non-EC)
+        // object with no local EC shard still needs the legacy top-3 forward. Only forward when
+        // there's genuinely no local EC shard to serve.
         if !(await Self.hasLocalECShard(
             req: req, bucketName: bucketName, key: keyPath, versionId: versionId,
             responsible: responsible)),
@@ -389,14 +376,9 @@ struct S3Controller: RouteCollection {
     @Sendable
     func listBuckets(req: Request) async throws -> Response {
         let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
+        let userId = key.userId
 
-        guard let userId = key.user.id else {
-            throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
-        }
-
-        let buckets = try await Bucket.query(on: req.db)
-            .filter(\.$user.$id == userId)
-            .all()
+        let buckets = try await Bucket.all(app: req.application).filter { $0.userId == userId }
 
         let xmlData: Data = try ListAllMyBucketsResultDTO.s3XMLContainer(buckets)
         return S3Service.buildXMLResponse(data: xmlData)
@@ -471,9 +453,8 @@ struct S3Controller: RouteCollection {
         // would let anyone enumerate bucket names without credentials
         let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
 
-        if let existing = try await Bucket.query(on: req.db).filter(\.$name == bucketName).first()
-        {
-            if existing.$user.id == key.user.id {
+        if let existing = try await Bucket.find(app: req.application, name: bucketName) {
+            if existing.userId == key.userId {
                 // S3 only no-ops re-creating your own bucket as a 200 OK in us-east-1,
                 // for legacy compatibility - every other region returns 409
                 // BucketAlreadyOwnedByYou instead (verified against the CreateBucket API
@@ -496,7 +477,8 @@ struct S3Controller: RouteCollection {
             )
         }
 
-        try await BucketService.create(on: req.db, bucketName: bucketName, userId: key.user.id!)
+        try await BucketService.create(
+            app: req.application, bucketName: bucketName, userId: key.userId)
 
         let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
         response.headers.replaceOrAdd(name: "Location", value: "/\(bucketName)")
@@ -531,10 +513,10 @@ struct S3Controller: RouteCollection {
         }
 
         bucket.versioningStatus = newStatus.rawValue
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -566,10 +548,10 @@ struct S3Controller: RouteCollection {
             rawJSON: rawJSON, bucketName: bucketName, requestId: req.id)
 
         bucket.policy = rawJSON
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
@@ -591,12 +573,12 @@ struct S3Controller: RouteCollection {
         bucket.ignorePublicAcls = configuration.ignorePublicAcls
         bucket.blockPublicPolicy = configuration.blockPublicPolicy
         bucket.restrictPublicBuckets = configuration.restrictPublicBuckets
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.setPublicAccessBlock(
             for: bucketName, configuration: configuration)
         CacheInvalidationService.notify(
-            on: req.db, cache: "bucketPublicAccessBlock", op: .upsert, key: bucketName)
+            app: req.application, cache: "bucketPublicAccessBlock", op: .upsert, key: bucketName)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -615,11 +597,11 @@ struct S3Controller: RouteCollection {
         bucket.ignorePublicAcls = false
         bucket.blockPublicPolicy = false
         bucket.restrictPublicBuckets = false
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
         CacheInvalidationService.notify(
-            on: req.db, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
+            app: req.application, cache: "bucketPublicAccessBlock", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -639,7 +621,7 @@ struct S3Controller: RouteCollection {
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
         bucket.tags = tagging.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
     }
@@ -655,7 +637,7 @@ struct S3Controller: RouteCollection {
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.tags = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return .noContent
     }
@@ -673,7 +655,7 @@ struct S3Controller: RouteCollection {
         let configuration = try LifecycleConfiguration.parse(xml: xml, requestId: req.id)
 
         bucket.lifecycleRules = configuration.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
     }
@@ -689,7 +671,7 @@ struct S3Controller: RouteCollection {
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.lifecycleRules = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return .noContent
     }
@@ -707,10 +689,10 @@ struct S3Controller: RouteCollection {
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.replicationConfig = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await ReplicationConfigCache.shared.removeBucket(bucketName)
-        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .remove, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "replicationConfig", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -747,12 +729,7 @@ struct S3Controller: RouteCollection {
             return try await handleReplicationDelete(req: req, bucketName: bucketName)
         }
 
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .with(\.$user)
-                .first()
-        else {
+        guard let bucket = try await Bucket.find(app: req.application, name: bucketName) else {
             throw S3Error(
                 status: .notFound,
                 code: "NoSuchBucket",
@@ -762,11 +739,7 @@ struct S3Controller: RouteCollection {
 
         let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
 
-        guard let userId = key.user.id else {
-            throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
-        }
-
-        if bucket.user.id != userId {
+        if bucket.userId != key.userId {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 
@@ -794,7 +767,7 @@ struct S3Controller: RouteCollection {
         // BucketHandler.delete's own redundant *local-only* re-check is skipped rather than left
         // in as a second, incomplete gate.
         try await BucketService.delete(
-            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
+            req: req, bucketName: bucketName, userId: bucket.userId, force: true)
 
         return .noContent
     }
@@ -810,10 +783,10 @@ struct S3Controller: RouteCollection {
         let bucket = try await fetchBucket(req: req, bucketName: bucketName)
 
         bucket.policy = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketPolicy", op: .remove, key: bucketName)
 
         return .noContent
     }
@@ -821,6 +794,11 @@ struct S3Controller: RouteCollection {
     // PUT /:bucketName/*key
     @Sendable
     func handleObjectPut(req: Request) async throws -> Response {
+        // Every early-throw path below (routing/admission-control rejection, auth failure, a
+        // conditional-header precondition failure) can fire before the body is ever read - see
+        // `StreamingBodySpooler.withGuaranteedBodyDrain`'s doc comment for why that would
+        // otherwise crash the process.
+        try await StreamingBodySpooler.withGuaranteedBodyDrain(req: req) {
         let bucketName = try S3Service.extractBucketName(from: req)
         let keyPath = S3Service.extractObjectKey(from: req)
 
@@ -833,12 +811,9 @@ struct S3Controller: RouteCollection {
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // Computed once and reused for both the routing decision below and the dispatch check
-        // further down - previously these were two independently-written conditions (routing
-        // only checked presence of the two params; dispatch also required partNumber to parse
-        // as an Int) that could disagree: a non-numeric partNumber (e.g. ?partNumber=abc) was
-        // routed as an UploadPart for cluster purposes, but then fell through past the dispatch
-        // check into the plain-PUT branch below, silently overwriting the destination object
-        // with the request body instead of returning InvalidArgument.
+        // further down, so the two can never disagree on whether `partNumber` actually parses -
+        // a non-numeric `partNumber` must return InvalidArgument, never silently fall through to
+        // a plain-PUT overwrite of the destination object.
         let partNumberStr = req.query[String.self, at: "partNumber"]
         let uploadIdParam = req.query[String.self, at: "uploadId"]
         let isUploadPart = partNumberStr != nil && uploadIdParam != nil
@@ -1025,7 +1000,8 @@ struct S3Controller: RouteCollection {
                 try await ErasureCodedWriteCoordinator.write(
                     app: req.application, bucketName: bucketName, key: keyPath,
                     objectMeta: versionedMeta, payloadSources: payloadSources,
-                    peers: ecWriteFanOut.peers, ecConfig: ecWriteFanOut.config,
+                    peers: ecWriteFanOut.peers,
+                    ecConfig: (ecWriteFanOut.config.dataShards, ecWriteFanOut.config.parityShards),
                     priorLatestVersionId: priorLatestVersionId)
             } catch let error as ErasureCodedCoordinatorError {
                 throw S3Error(
@@ -1090,10 +1066,10 @@ struct S3Controller: RouteCollection {
         await NotificationService.emit(
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: spooled.size, etag: etag, versionId: writtenVersionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         await ReplicationService.enqueuePut(
             app: req.application, bucketName: bucketName, key: keyPath,
-            versionId: writtenVersionId, on: req.db)
+            versionId: writtenVersionId)
         if ecWriteFanOut == nil {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: bucketName, key: keyPath,
@@ -1101,17 +1077,13 @@ struct S3Controller: RouteCollection {
         }
 
         return Response(status: .ok, headers: headers)
+        }
     }
 
-    /// `ObjectFileHandler.prepareVersionedWrite`, but correct for EC path selection: leaves
-    /// `versionId` as true Swift `nil` for `.disabled` buckets, instead of
-    /// `prepareVersionedWrite`'s own `"null"`-string sentinel. EC shard path selection
-    /// (`ErasureCodedObjectHandler.shardPath` vs `versionedShardPath`) keys off `versionId ==
-    /// nil`, and the plain path never mints a `"null"` string for `.disabled` either - it simply
-    /// never touches `versionId` at all for that case (the caller-supplied `metadata` already
-    /// has `versionId == nil` from its own default init). `.suspended` is unaffected: it
-    /// genuinely uses versioned storage under the literal name `"null"`, so it still needs
-    /// `prepareVersionedWrite`'s real behavior.
+    /// Like `ObjectFileHandler.prepareVersionedWrite`, but correct for EC path selection: leaves
+    /// `versionId` as true Swift `nil` for `.disabled` buckets instead of the `"null"`-string
+    /// sentinel, since EC shard path selection keys off `versionId == nil`. `.suspended` is
+    /// unaffected - it genuinely uses versioned storage under the literal name `"null"`.
     private func prepareErasureCodedVersionedWrite(
         metadata: ObjectMeta, bucketName: String, key: String, versioningStatus: VersioningStatus
     ) throws -> (versionId: String?, versionedMeta: ObjectMeta, priorLatestVersionId: String?) {
@@ -1275,12 +1247,9 @@ struct S3Controller: RouteCollection {
     @Sendable
     /// Resolves a CopyObject/UploadPartCopy source - locally if this node holds it, otherwise
     /// fetches it from a responsible peer into a local temp file first. Source and destination
-    /// of a copy can be arbitrary, unrelated buckets/keys with no placement relationship to each
-    /// other, so the source may live elsewhere even though this node is already correctly
-    /// responsible for the destination (that's what the caller's own top-level routing check
-    /// already established). Returns the same shape `S3Service.resolveObjectForCopy` does
-    /// either way; callers must call `cleanup` once done reading (a no-op when the source was
-    /// local - that path never allocates a temp file).
+    /// of a copy can be arbitrary, unrelated buckets/keys, so the source may live elsewhere even
+    /// though this node is correctly responsible for the destination. Callers must call `cleanup`
+    /// once done reading (a no-op when the source was local).
     private func resolveCopySource(
         req: Request, bucketName: String, key: String, versionId: String?
     ) async throws -> (
@@ -1528,7 +1497,8 @@ struct S3Controller: RouteCollection {
                 try await ErasureCodedWriteCoordinator.write(
                     app: req.application, bucketName: destinationBucket, key: destinationKey,
                     objectMeta: versionedMeta, payloadSources: copySources,
-                    peers: ecWriteFanOut.peers, ecConfig: ecWriteFanOut.config,
+                    peers: ecWriteFanOut.peers,
+                    ecConfig: (ecWriteFanOut.config.dataShards, ecWriteFanOut.config.parityShards),
                     priorLatestVersionId: priorLatestVersionId)
             } catch let error as ErasureCodedCoordinatorError {
                 throw S3Error(
@@ -1575,10 +1545,10 @@ struct S3Controller: RouteCollection {
         await NotificationService.emit(
             event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
             size: destinationMeta.size, etag: etag, versionId: versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         await ReplicationService.enqueuePut(
             app: req.application, bucketName: destinationBucket, key: destinationKey,
-            versionId: versionId, on: req.db)
+            versionId: versionId)
         if ecWriteFanOut == nil {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: destinationBucket, key: destinationKey,
@@ -1748,13 +1718,10 @@ struct S3Controller: RouteCollection {
             }
         }
 
-        // No local EC shard - the target is either plain-format or doesn't exist. Top-3 being
-        // a *prefix* of the wider top-(k+m) list `isLocal` above already passed doesn't mean
-        // this node is also IN that top-3: a plain object replicated only to ranks 0-2 must
-        // still forward when this node is rank 3+ (a real case whenever k+m exceeds 3, e.g.
-        // k=2/m=2). Reusing the legacy top-3 routing check here restores exactly the
-        // forwarding `erasureCodedReadPlacement`'s wider locality check bypassed for this
-        // handler.
+        // No local EC shard - the target is either plain-format or doesn't exist. Top-3 being a
+        // *prefix* of the wider top-(k+m) list `isLocal` above passed doesn't mean this node is
+        // also IN that top-3: a plain object replicated only to ranks 0-2 must still forward when
+        // this node is rank 3+. Reusing the legacy top-3 check here restores that forwarding.
         if let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: keyPath)
         {
             return forwarded
@@ -1834,15 +1801,11 @@ struct S3Controller: RouteCollection {
             && req.query[String.self, at: "versionId"] == nil
         let isTaggingDelete = S3Service.queryParameterNames(from: req.url.query ?? "").contains("tagging")
 
-        // Only a DELETE that will actually *create* a fresh EC delete marker needs the rank-0-pinned,
-        // admission-gated EC write routing: marker creation is a write
-        // (`ErasureCodedDeleteCoordinator.createDeleteMarker` places shard 0 on the coordinator),
-        // so it must land on rank-0 and requires a full k+m-node cluster. Every other DELETE -
-        // a specific-version byte removal, a non-versioned/suspended removal, or a plain (non-EC)
-        // legacy object - places no new shards and must NOT be blocked by EC admission when the
-        // cluster is temporarily below k+m (a drained/lost node). Those route via plain
-        // `routeForWrite`; `coordinateDelete` still fans byte-removal to every responsible node
-        // regardless of which one coordinates.
+        // Only a DELETE that will actually *create* a fresh EC delete marker needs the
+        // rank-0-pinned, admission-gated EC write routing, since marker creation places a new
+        // shard. Every other DELETE - a specific-version removal, a non-versioned/suspended
+        // removal, or a plain legacy object - places no new shards and must NOT be blocked by EC
+        // admission when the cluster is temporarily below k+m; those route via plain `routeForWrite`.
         let deleteVersionId = req.query[String.self, at: "versionId"]
         let deleteVersioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
         let createsErasureCodedMarker =
@@ -1916,14 +1879,14 @@ struct S3Controller: RouteCollection {
             event: outcome.isDeleteMarker ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
             bucketName: bucketName, key: keyPath, size: nil, etag: nil,
             versionId: outcome.versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         // A client-specified versionId permanently prunes one historical version - there's no
         // matching version on the replication target to remove (see ReplicationClient.replicateDelete),
         // so only replicate when this deleted the *current* object.
         if versionId == nil {
             await ReplicationService.enqueueDelete(
                 app: req.application, bucketName: bucketName, key: keyPath,
-                versionId: outcome.versionId, on: req.db)
+                versionId: outcome.versionId)
         }
 
         return Response(status: .noContent, headers: headers)
@@ -1986,13 +1949,13 @@ struct S3Controller: RouteCollection {
                         ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
                     bucketName: bucketName, key: object.key, size: nil, etag: nil,
                     versionId: outcome.versionId,
-                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                    requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
                 // See the single-object DELETE handler: a client-specified versionId prunes one
                 // historical version, which has no replicable equivalent on the target.
                 if object.versionId == nil {
                     await ReplicationService.enqueueDelete(
                         app: req.application, bucketName: bucketName, key: object.key,
-                        versionId: outcome.versionId, on: req.db)
+                        versionId: outcome.versionId)
                 }
             } catch {
                 errors.append(
@@ -2185,14 +2148,11 @@ struct S3Controller: RouteCollection {
         // Get versioning status
         let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
 
-        // Complete the upload - streams every part into the final object in fixed windows and
-        // fsyncs before returning, all real blocking file IO, so it's offloaded to the
-        // blocking-IO thread pool rather than tying up the async executor for the whole
-        // (potentially multi-gigabyte) assembly. Every request in this upload's lifecycle
-        // already landed on the identical node (multipartRoutingDecision's pin - see
-        // handleObjectPost), and that pinned node is always rank-0 under both the plain top-3
-        // and the wider EC top-(k+m) placement (same ranked list, different truncation), so
-        // this can check EC eligibility fresh right here without any extra forwarding.
+        // Complete the upload - streams every part into the final object and fsyncs before
+        // returning, real blocking file IO, so it's offloaded to the blocking-IO thread pool
+        // rather than tying up the async executor for a potentially multi-gigabyte assembly.
+        // Every request in this upload's lifecycle already landed on the identical (rank-0) node,
+        // so EC eligibility can be checked fresh here without any extra forwarding.
         var usedEC = false
         let etag: String
         let versionId: String?
@@ -2213,7 +2173,7 @@ struct S3Controller: RouteCollection {
                     try await ErasureCodedWriteCoordinator.write(
                         app: req.application, bucketName: bucketName, key: key,
                         objectMeta: versionedMeta, payloadSources: plan.payloadSources,
-                        peers: ecPeers, ecConfig: ecConfig,
+                        peers: ecPeers, ecConfig: (ecConfig.dataShards, ecConfig.parityShards),
                         priorLatestVersionId: priorLatestVersionId)
                 } catch let error as ErasureCodedCoordinatorError {
                     throw S3Error(
@@ -2257,10 +2217,9 @@ struct S3Controller: RouteCollection {
         await NotificationService.emit(
             event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
             size: finalSize, etag: etag, versionId: versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         await ReplicationService.enqueuePut(
-            app: req.application, bucketName: bucketName, key: key, versionId: versionId,
-            on: req.db)
+            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
         if !usedEC {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: bucketName, key: key, versionId: versionId,

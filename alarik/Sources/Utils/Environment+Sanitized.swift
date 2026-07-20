@@ -20,12 +20,9 @@ extension Environment {
     /// Reads an environment variable with one matching pair of surrounding quotes stripped -
     /// every Alarik configuration read goes through this instead of the raw `get`.
     ///
-    /// Why: docker-compose's list-style `environment:` entries pass quotes through literally -
-    /// `- ADMIN_PASSWORD="alarik"` sets the value to `"alarik"`, quotes included - while the
-    /// same line in a `.env` file has its quotes consumed by the parser. Users write one syntax
-    /// expecting the other's behavior and end up locked out with a password that secretly has
-    /// quotes in it (GitHub issue #8). Stripping exactly one matching pair on read makes both
-    /// spellings mean the same thing.
+    /// Why: docker-compose's list-style `environment:` entries pass quotes through literally,
+    /// while a `.env` file has its quotes consumed by the parser. Stripping exactly one matching
+    /// pair on read makes both spellings mean the same thing.
     static func sanitizedGet(_ key: String) -> String? {
         get(key).map(stripSurroundingQuotes)
     }

@@ -20,10 +20,9 @@ import Vapor
 
 @testable import Alarik
 
-/// No cluster vars set, no Postgres - exercises the "cluster mode is off" fast path that every
-/// non-clustered node (the overwhelming majority of deployments) must take on every single
-/// request. This must stay byte-for-byte inert, the same guarantee the SQLite-only control
-/// plane holds when Postgres isn't configured.
+/// No cluster vars set - exercises the "cluster mode is off" fast path that every non-clustered
+/// node (the overwhelming majority of deployments) must take on every single request. This must
+/// stay byte-for-byte inert.
 @Suite("ObjectRoutingService tests (non-clustered)", .serialized)
 struct ObjectRoutingServiceTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -32,12 +31,9 @@ struct ObjectRoutingServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }

@@ -3,7 +3,6 @@ name: Swift
 
 on:
   push:
-    branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
 
@@ -13,10 +12,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Swift 6.2
-      uses: swift-actions/setup-swift@v3
-      with:
-        swift-version: '6.2'
+    - name: Swift version
+      run: swift --version
     - name: Run tests
       working-directory: alarik
       run: swift test --no-parallel

@@ -23,9 +23,8 @@ import Vapor
 /// `coordinateDelete` with an empty `peers` list never touches cluster configuration or the
 /// network at all (`replicateWrite` returns immediately when `peers.isEmpty`), so its local
 /// delete-marker-vs-permanent-delete branching - the logic `S3Controller.handleObjectDelete` and
-/// the Multi-Object-Delete per-key routing now share - is fully testable against plain SQLite,
-/// no Postgres/cluster mode required. Multi-node delivery/fan-out behavior itself is covered by
-/// `cluster_tests.sh`'s real multi-node suite, not here.
+/// the Multi-Object-Delete per-key routing share - is fully testable with no cluster mode
+/// required. Multi-node delivery/fan-out behavior is covered by `cluster_tests.sh` instead.
 @Suite("ClusterReplicationService tests (no cluster required)", .serialized)
 struct ClusterReplicationServiceTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -34,12 +33,9 @@ struct ClusterReplicationServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -111,19 +107,22 @@ struct ClusterReplicationServiceTests {
     )
     func dispatcherSkipsUndeliverablePutWithoutBurningAttempts() async throws {
         try await withApp { app in
-            // Every node runs this dispatcher independently against the same shared table, so any
-            // node's tick can pick up a .put task for an object it doesn't actually hold locally -
-            // this simulates exactly that: a task with no corresponding file on disk at all.
+            // This node owns the task (it enqueued it) but the object it references was never
+            // actually written locally - simulates a straggler task whose local copy has since
+            // vanished (e.g. reclaimed) by the time the dispatcher drains it.
             let task = ClusterReplicationTask(
                 bucketName: "no-local-copy-bucket", key: "missing.txt", versionId: nil,
-                operation: .put, targetNodeId: UUID(), reason: .write)
-            try await task.save(on: app.db)
-            let taskId = try task.requireID()
+                operation: .put, targetNodeId: UUID(), reason: .write,
+                ownerNodeId: OutboxMailbox.selfNodeId(app: app))
+            try OutboxMailbox.update(task, collection: OutboxCollections.clusterReplicationTasks)
 
             await ClusterReplicationDispatcher.shared.drain()
 
             let reloaded = try #require(
-                try await ClusterReplicationTask.find(taskId, on: app.db))
+                OutboxMailbox.allOwnedTasks(
+                    ClusterReplicationTask.self, app: app,
+                    collection: OutboxCollections.clusterReplicationTasks
+                ).first(where: { $0.id == task.id }))
             #expect(reloaded.state == ClusterReplicationTask.State.pending.rawValue)
             #expect(reloaded.attempts == 0)
             #expect(reloaded.lastError == nil)

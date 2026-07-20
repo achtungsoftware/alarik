@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
+import Foundation
 import Vapor
 
 /// Automatic rebalancing on cluster membership change - triggered by `CacheReloadDispatch`'s
@@ -82,7 +82,7 @@ enum ClusterRebalanceService {
         let active = await ClusterNodeCache.shared.activeNodes()
         guard !active.isEmpty else { return }
 
-        let buckets = try await Bucket.query(on: app.db).all()
+        let buckets = try await Bucket.all(app: app)
         var hasGatedReclaims = false
         for bucket in buckets {
             let bucketHasGatedReclaims = try await rebalanceBucket(
@@ -107,6 +107,14 @@ enum ClusterRebalanceService {
     private static func rebalanceBucket(
         app: Application, bucketName: String, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
     ) async throws -> Bool {
+        // This node always owns any `ClusterReplicationTask` it itself enqueues (see the type's
+        // own doc comment) - fetched once per bucket, not once per page, so every page below
+        // filters the same in-memory snapshot rather than re-walking the local mailbox directory
+        // repeatedly.
+        let ownedTasksForBucket = OutboxMailbox.allOwnedTasks(
+            ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
+        ).filter { $0.bucketName == bucketName }
+
         var keyMarker: String?
         var versionIdMarker: String?
         var hasGatedReclaims = false
@@ -144,18 +152,13 @@ enum ClusterRebalanceService {
             // same reasoning `rebalanceBucket`'s reclaim phase already applies below.
             var copyTasks: [ClusterReplicationTask] = []
             if !copyCandidates.isEmpty {
-                let existingCopyTasks = try await ClusterReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == bucketName)
-                    .filter(\.$key ~~ copyCandidates.map(\.key))
-                    .filter(\.$operation == ClusterReplicationTask.Operation.put.rawValue)
-                    .filter(
-                        \.$state
-                            ~~ [
-                                ClusterReplicationTask.State.pending.rawValue,
-                                ClusterReplicationTask.State.failed.rawValue,
-                            ]
-                    )
-                    .all()
+                let candidateKeys = Set(copyCandidates.map(\.key))
+                let existingCopyTasks = ownedTasksForBucket.filter {
+                    candidateKeys.contains($0.key)
+                        && $0.operation == ClusterReplicationTask.Operation.put.rawValue
+                        && ($0.state == ClusterReplicationTask.State.pending.rawValue
+                            || $0.state == ClusterReplicationTask.State.failed.rawValue)
+                }
 
                 func pairKey(_ key: String, _ targetNodeId: UUID) -> String {
                     "\(key)\u{0}\(targetNodeId)"
@@ -171,7 +174,7 @@ enum ClusterRebalanceService {
                     }
                 }
                 for task in failedTasksToRetry {
-                    try await task.delete(on: app.db)
+                    OutboxMailbox.remove(task, collection: OutboxCollections.clusterReplicationTasks)
                 }
 
                 for candidate in copyCandidates {
@@ -181,27 +184,24 @@ enum ClusterRebalanceService {
                         ClusterReplicationTask(
                             bucketName: bucketName, key: candidate.key,
                             versionId: candidate.versionId, operation: .put,
-                            targetNodeId: candidate.targetNodeId, reason: .rebalance))
+                            targetNodeId: candidate.targetNodeId, reason: .rebalance,
+                            ownerNodeId: selfNodeId))
                 }
             }
 
-            if !copyTasks.isEmpty {
-                try await copyTasks.create(on: app.db)
+            for task in copyTasks {
+                await OutboxMailbox.enqueue(
+                    app: app, collection: OutboxCollections.clusterReplicationTasks, row: task)
             }
 
             var reclaimTasks: [ClusterReplicationTask] = []
             if !reclaimCandidates.isEmpty {
-                let outstandingTasks = try await ClusterReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == bucketName)
-                    .filter(\.$key ~~ reclaimCandidates.map(\.key))
-                    .filter(
-                        \.$state
-                            ~~ [
-                                ClusterReplicationTask.State.pending.rawValue,
-                                ClusterReplicationTask.State.failed.rawValue,
-                            ]
-                    )
-                    .all()
+                let reclaimKeys = Set(reclaimCandidates.map(\.key))
+                let outstandingTasks = ownedTasksForBucket.filter {
+                    reclaimKeys.contains($0.key)
+                        && ($0.state == ClusterReplicationTask.State.pending.rawValue
+                            || $0.state == ClusterReplicationTask.State.failed.rawValue)
+                }
 
                 // A dead-lettered (`.failed`) copy task is retries-exhausted - the dispatcher
                 // only ever polls `.pending` rows, so nothing will ever touch it again on its
@@ -220,12 +220,16 @@ enum ClusterRebalanceService {
                     let retriedCopyTasks = deadLetteredCopies.map { task in
                         ClusterReplicationTask(
                             bucketName: bucketName, key: task.key, versionId: task.versionId,
-                            operation: .put, targetNodeId: task.targetNodeId, reason: .rebalance)
+                            operation: .put, targetNodeId: task.targetNodeId, reason: .rebalance,
+                            ownerNodeId: selfNodeId)
                     }
                     for task in deadLetteredCopies {
-                        try await task.delete(on: app.db)
+                        OutboxMailbox.remove(task, collection: OutboxCollections.clusterReplicationTasks)
                     }
-                    try await retriedCopyTasks.create(on: app.db)
+                    for task in retriedCopyTasks {
+                        await OutboxMailbox.enqueue(
+                            app: app, collection: OutboxCollections.clusterReplicationTasks, row: task)
+                    }
                     ClusterReplicationDispatcher.shared.wake()
                 }
 
@@ -237,10 +241,11 @@ enum ClusterRebalanceService {
                         ClusterReplicationTask(
                             bucketName: bucketName, key: candidate.key,
                             versionId: candidate.versionId, operation: .delete,
-                            targetNodeId: selfNodeId, reason: .reclaim)
+                            targetNodeId: selfNodeId, reason: .reclaim, ownerNodeId: selfNodeId)
                     }
-                if !reclaimTasks.isEmpty {
-                    try await reclaimTasks.create(on: app.db)
+                for task in reclaimTasks {
+                    await OutboxMailbox.enqueue(
+                        app: app, collection: OutboxCollections.clusterReplicationTasks, row: task)
                 }
                 if reclaimTasks.count < reclaimCandidates.count {
                     hasGatedReclaims = true

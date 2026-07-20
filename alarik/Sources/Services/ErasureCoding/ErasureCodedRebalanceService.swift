@@ -22,7 +22,6 @@ limitations under the License.
     import Musl
 #endif
 
-import Fluent
 import Foundation
 import Vapor
 
@@ -46,19 +45,12 @@ enum ErasureCodedRebalanceError: Error, CustomStringConvertible {
     }
 }
 
-/// Self-healing for erasure-coded shards: reconstruction-based delivery (used by
-/// `ErasureCodedDispatcher` for every outbox reason - a shard that failed to land during the
-/// original write is no different from one lost to a later node departure, both are just
-/// "currently missing, rebuildable from any `k` survivors") plus the membership-change-triggered
-/// walk that detects gaps and stale local copies in the first place.
-///
-/// Unlike `ClusterRebalanceService` (where the node holding a full copy can push it to every
-/// other responsible node directly), no single EC node ever holds more than one shard - "copying"
-/// a shard to a node that's missing it is only possible via reconstruction from survivors. To
-/// avoid every one of the `k+m` responsible nodes redundantly probing all `k+m` peers on every
-/// membership change, only the *current* rank-0 for a key runs its full gap-fill sweep - the same
-/// single-coordinator reasoning `ObjectRoutingService.erasureCodedRoutingDecision` already applies
-/// to writes.
+/// Self-healing for erasure-coded shards: reconstruction-based delivery for `ErasureCodedDispatcher`
+/// (a shard missing from the original write is no different from one lost later, both are just
+/// "rebuildable from any `k` survivors"), plus the membership-change walk that detects gaps and
+/// stale local copies. Unlike `ClusterRebalanceService`, no EC node ever holds more than one
+/// shard - "copying" only works via reconstruction, so only the current rank-0 for a key runs the
+/// full gap-fill sweep, avoiding every responsible node redundantly probing all peers.
 enum ErasureCodedRebalanceService {
     enum RebalanceReason: String {
         case membershipChange
@@ -66,14 +58,33 @@ enum ErasureCodedRebalanceService {
     }
 
     static let gatedReclaimFollowUpDelay: Duration = .seconds(30)
+    /// Caps how many local shards `rebalance`'s walk processes concurrently. Was 16; brought down
+    /// after evidence showed a freshly-rejoined node unable to promptly serve unrelated foreground
+    /// requests for several seconds - genuine CPU/thread contention from too many concurrent
+    /// Reed-Solomon operations, not just network queuing. 8 keeps most of the wall-clock gain over
+    /// a fully-sequential walk while leaving headroom for foreground requests.
+    static let maxConcurrentShardRebalances = 8
+
+    /// Resolves the shard counts a specific `bucketName`'s shards were *actually* encoded with -
+    /// the object-data config for a regular bucket, or the independently-configured (auto-capped)
+    /// metadata config for `.alarik.sys`. Every placement/reconstruction computation here must go
+    /// through this rather than trusting the object-data `ecConfig` directly, since metadata is
+    /// often encoded with a different k/m and using the wrong one corrupts rank/gap-fill decisions.
+    private static func shardCounts(
+        forBucket bucketName: String, app: Application, ecConfig: ClusterErasureCodingConfig,
+        activeNodeCount: Int
+    ) -> (dataShards: Int, parityShards: Int) {
+        guard MetadataNamespace.isReserved(bucketName) else {
+            return (ecConfig.dataShards, ecConfig.parityShards)
+        }
+        let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
+        return metadataConfig.effective(activeNodeCount: activeNodeCount)
+    }
 
     /// Reconstructs the shard at `shardIndex` of (bucketName, key, versionId) from up to
-    /// `dataShards + 1` currently-available survivors (one spare, so a single bad stripe
-    /// checksum among the gathered sources doesn't fail the whole reconstruction) and pushes the
-    /// result to `targetNodeId`. A no-op if the target already has it (checked first, so a
-    /// straggler that actually landed after the write coordinator stopped listening, or a repeat
-    /// dispatcher attempt, never does redundant work). This is the single delivery mechanism
-    /// `ErasureCodedDispatcher` uses for every `.put`-operation outbox row, regardless of reason.
+    /// `dataShards + 1` survivors (one spare, so a single bad checksum doesn't fail the whole
+    /// reconstruction) and pushes it to `targetNodeId`. A no-op if the target already has it.
+    /// The single delivery mechanism `ErasureCodedDispatcher` uses for every `.put` outbox row.
     static func reconstructAndPlaceShard(
         app: Application, bucketName: String, key: String, versionId: String?, shardIndex: Int,
         targetNodeId: UUID
@@ -81,14 +92,10 @@ enum ErasureCodedRebalanceService {
         guard let target = await ClusterNodeCache.shared.get(id: targetNodeId) else {
             throw ErasureCodedRebalanceError.unknownTarget(targetNodeId)
         }
-        // Idempotency short-circuit - but ONLY for versioned objects, where each version has its
-        // own shard directory, so "a shard already exists at this path" reliably means "the correct
-        // shard is already there". For a NON-versioned object every generation reuses the same path,
-        // so an existing shard may be a STALE copy a down replica missed while an overwrite landed
-        // elsewhere - exactly the async catch-up case. Skipping on mere existence there would leave
-        // the stale shard forever (and, once reads reject cross-generation mixes, make the object
-        // unreadable from that node). Non-versioned therefore always reconstructs and overwrites,
-        // matching how plain replication's catch-up unconditionally re-pushes the current object.
+        // Idempotency short-circuit, but ONLY for versioned objects (each version has its own
+        // shard directory, so existence reliably means correctness). A non-versioned object
+        // reuses the same path across generations, so an existing shard may be a stale copy a
+        // down replica missed - always reconstruct and overwrite there instead.
         if versionId != nil,
             await ClusterReplicationClient.shardExists(
                 app: app, node: target, bucketName: bucketName, key: key, versionId: versionId,
@@ -96,33 +103,61 @@ enum ErasureCodedRebalanceService {
         {
             return
         }
-        guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else {
-            throw ErasureCodedRebalanceError.notConfigured
-        }
-
         let active = await ClusterNodeCache.shared.activeNodes()
+        let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id
+
+        // For metadata, discover the TRUE as-written (dataShards, parityShards) rather than
+        // trusting the live recompute - see `rebalanceOne`'s identical reasoning. Unlike
+        // `rebalanceOne` (which already has this shard's own header in hand), the shard being
+        // reconstructed here doesn't exist locally yet, so the ground truth has to be probed from
+        // whoever still holds a copy - exactly `MetadataStore.discoverShardCounts`'s job, reused
+        // directly rather than duplicated.
+        let (dataShards, parityShards): (Int, Int)
+        if MetadataNamespace.isReserved(bucketName) {
+            if let discovered = await MetadataStore.discoverShardCounts(
+                app: app, key: key, candidates: active, selfNodeId: selfNodeId)
+            {
+                (dataShards, parityShards) = (discovered.dataShards, discovered.totalShards - discovered.dataShards)
+            } else {
+                guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else {
+                    throw ErasureCodedRebalanceError.notConfigured
+                }
+                (dataShards, parityShards) = shardCounts(
+                    forBucket: bucketName, app: app, ecConfig: ecConfig,
+                    activeNodeCount: active.count)
+            }
+        } else {
+            guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else {
+                throw ErasureCodedRebalanceError.notConfigured
+            }
+            (dataShards, parityShards) = shardCounts(
+                forBucket: bucketName, app: app, ecConfig: ecConfig, activeNodeCount: active.count)
+        }
         let responsible = PlacementService.responsibleNodes(
-            bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
-        // Deliberately not `responsible.count == ecConfig.totalShards`: the cluster commonly
-        // runs below full k+m strength (one node drained or down), and that's exactly when
-        // self-healing/redistribution matters most, not a condition to refuse to run under -
-        // requiring full strength here meant a single missing node permanently blocked every
-        // reindex of the *surviving* shards, since this error never clears until the missing
-        // node comes back. All that's actually needed: a rank for `shardIndex` must currently
-        // exist to place onto, and enough survivors (discovered by what each node actually holds,
-        // not by a rank==index assumption that's false after any membership change) to reconstruct.
+            bucketName: bucketName, key: key, activeNodes: active,
+            count: dataShards + parityShards)
+        // Deliberately not `responsible.count == dataShards + parityShards`: the cluster commonly
+        // runs below full k+m strength (a node drained or down), and that's exactly when
+        // self-healing matters most - requiring full strength would permanently block reindexing
+        // survivors until the missing node returns. Only a rank for `shardIndex` and enough
+        // discovered survivors to reconstruct are actually needed.
         guard shardIndex < responsible.count else {
             throw ErasureCodedRebalanceError.insufficientResponsibleNodes(
                 required: shardIndex + 1, found: responsible.count)
         }
 
-        let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id
+        // Gather candidates: `responsible` for regular object data (k/m never drifts from the
+        // live recompute); the full active set for metadata, since a metadata record's true
+        // holder(s) can fall outside the current `responsible` window entirely. `gather` queries
+        // each candidate for what it actually holds, so widening here is as safe as
+        // `MetadataStore.localGet`'s own widen-to-all-active fallback.
+        let gatherCandidates = MetadataNamespace.isReserved(bucketName) ? active : responsible
         let gathered: GatheredShards
         do {
             gathered = try await ErasureCodedShardGatherer.gather(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                responsible: responsible, selfNodeId: selfNodeId,
-                needed: ecConfig.dataShards, wantSpare: true, excludingIndex: shardIndex,
+                responsible: gatherCandidates, selfNodeId: selfNodeId,
+                needed: dataShards, wantSpare: true, excludingIndex: shardIndex,
                 requestId: UUID().uuidString)
         } catch ErasureCodedGatherError.notFound {
             // The object no longer exists anywhere (deleted out from under an in-flight rebalance
@@ -139,7 +174,7 @@ enum ErasureCodedRebalanceService {
         try await S3Service.offloadBlockingIO(app) {
             try reconstructShardFile(
                 availablePaths: availablePaths, missingIndex: shardIndex,
-                dataShards: ecConfig.dataShards, parityShards: ecConfig.parityShards,
+                dataShards: dataShards, parityShards: parityShards,
                 outputPath: scratchPath)
         }
 
@@ -280,12 +315,28 @@ enum ErasureCodedRebalanceService {
         }
         guard !localShards.isEmpty else { return }
 
+        // Bounded concurrency, not one shard at a time: each shard's gap-check/reclaim-safety
+        // work is independent, so a sequential loop only adds latency on a node holding many
+        // shards. A hard cap (not fully unbounded) keeps a single walk from flooding the
+        // connection pool when local state is large.
         var hasGatedReclaims = false
-        for (path, header) in localShards {
-            let bucketHasGatedReclaims = try await rebalanceOne(
-                app: app, path: path, header: header, activeNodes: active, selfNodeId: config.nodeId,
-                ecConfig: ecConfig)
-            hasGatedReclaims = hasGatedReclaims || bucketHasGatedReclaims
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            var iterator = localShards.makeIterator()
+            func submitNext() {
+                guard let (path, header) = iterator.next() else { return }
+                group.addTask {
+                    try await rebalanceOne(
+                        app: app, path: path, header: header, activeNodes: active,
+                        selfNodeId: config.nodeId, ecConfig: ecConfig)
+                }
+            }
+            for _ in 0..<min(maxConcurrentShardRebalances, localShards.count) {
+                submitNext()
+            }
+            while let gated = try await group.next() {
+                hasGatedReclaims = hasGatedReclaims || gated
+                submitNext()
+            }
         }
 
         if hasGatedReclaims {
@@ -306,8 +357,23 @@ enum ErasureCodedRebalanceService {
         let key = header.objectMeta.key
         let versionId = header.objectMeta.versionId == "null" ? nil : header.objectMeta.versionId
 
+        // For metadata (`.alarik.sys`), the live-recomputed `shardCounts` can legitimately differ
+        // from what THIS shard was actually encoded with, since auto-capping only shrinks as
+        // membership grows and nothing re-encodes an existing record. Trust this shard's own
+        // `header` (fixed at write time), not the live recompute, or a lone copy could be
+        // reclaimed before any replacement exists. Object-data buckets never auto-cap, so the two
+        // always agree there.
+        let (dataShards, parityShards): (Int, Int)
+        if MetadataNamespace.isReserved(bucketName) {
+            (dataShards, parityShards) = (header.dataShards, header.parityShards)
+        } else {
+            (dataShards, parityShards) = shardCounts(
+                forBucket: bucketName, app: app, ecConfig: ecConfig,
+                activeNodeCount: activeNodes.count)
+        }
         let responsible = PlacementService.responsibleNodes(
-            bucketName: bucketName, key: key, activeNodes: activeNodes, count: ecConfig.totalShards)
+            bucketName: bucketName, key: key, activeNodes: activeNodes,
+            count: dataShards + parityShards)
         let selfRank = responsible.firstIndex(where: { $0.id == selfNodeId })
 
         guard let selfRank else {
@@ -315,7 +381,8 @@ enum ErasureCodedRebalanceService {
             // shard's own index already holding a confirmed copy.
             return try await reclaimIfSafe(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                staleShardIndex: header.shardIndex, responsible: responsible, ecConfig: ecConfig)
+                staleShardIndex: header.shardIndex, responsible: responsible,
+                requiredDataShards: dataShards)
         }
 
         guard selfRank == 0 else {
@@ -325,7 +392,8 @@ enum ErasureCodedRebalanceService {
             if header.shardIndex != selfRank {
                 return try await reclaimIfSafe(
                     app: app, bucketName: bucketName, key: key, versionId: versionId,
-                    staleShardIndex: header.shardIndex, responsible: responsible, ecConfig: ecConfig)
+                    staleShardIndex: header.shardIndex, responsible: responsible,
+                    requiredDataShards: dataShards)
             }
             return false
         }
@@ -344,14 +412,26 @@ enum ErasureCodedRebalanceService {
         app: Application, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo]
     ) async throws {
-        var candidates: [(shardIndex: Int, targetNodeId: UUID)] = []
-        for (rank, node) in responsible.enumerated() {
-            let exists = await ClusterReplicationClient.shardExists(
-                app: app, node: node, bucketName: bucketName, key: key, versionId: versionId,
-                shardIndex: rank)
-            if !exists {
-                candidates.append((rank, node.id))
+        // Parallel, not sequential: each rank's `shardExists` check is independent, so awaiting
+        // one at a time only adds latency on a node holding many shards - this runs once per
+        // local rank-0 shard on every walk, and that cost compounds as local state grows.
+        let candidates = await withTaskGroup(
+            of: (shardIndex: Int, targetNodeId: UUID)?.self,
+            returning: [(shardIndex: Int, targetNodeId: UUID)].self
+        ) { group in
+            for (rank, node) in responsible.enumerated() {
+                group.addTask {
+                    let exists = await ClusterReplicationClient.shardExists(
+                        app: app, node: node, bucketName: bucketName, key: key,
+                        versionId: versionId, shardIndex: rank)
+                    return exists ? nil : (rank, node.id)
+                }
             }
+            var results: [(shardIndex: Int, targetNodeId: UUID)] = []
+            for await candidate in group {
+                if let candidate { results.append(candidate) }
+            }
+            return results
         }
         try await enqueueReconstructTasks(
             app: app, bucketName: bucketName, key: key, versionId: versionId,
@@ -359,14 +439,11 @@ enum ErasureCodedRebalanceService {
     }
 
     /// Rebuilds shards that are *genuinely missing* - held by no responsible node - onto their
-    /// current rank-holders, reconstructing from `k` survivors. Drives read-repair of missing
-    /// shards and the scrubber's post-delete rebuild. Deliberately does NOT act on "corrupt"
-    /// shards reported by a read's decode: a checksum failure seen while decoding a *fetched* copy
-    /// can be transit damage rather than on-disk rot, so deleting the source would risk destroying
-    /// a healthy shard. Corruption is instead confirmed and healed by the node that actually holds
-    /// the copy (`ErasureCodedScrubber.verifyAndHealObjectShards`, via the scrubber or a read-
-    /// triggered verify-heal request) - authoritative, with no transit ambiguity. Best-effort and
-    /// off the response path; enqueues via the same deduped outbox `sweepGaps` uses.
+    /// current rank-holders, reconstructing from `k` survivors. Drives read-repair and the
+    /// scrubber's post-delete rebuild. Deliberately does NOT act on shards a read's decode
+    /// reports "corrupt" - that can be transit damage rather than on-disk rot; corruption is
+    /// instead confirmed and healed by the node that actually holds the copy
+    /// (`ErasureCodedScrubber.verifyAndHealObjectShards`).
     static func healObject(
         app: Application, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo], missingIndices: Set<Int>
@@ -398,36 +475,44 @@ enum ErasureCodedRebalanceService {
     ) async throws {
         guard !candidates.isEmpty else { return }
 
-        let existingTasks = try await ErasureCodedReplicationTask.query(on: app.db)
-            .filter(\.$bucketName == bucketName)
-            .filter(\.$key == key)
-            .filter(\.$operation == ErasureCodedReplicationTask.Operation.put.rawValue)
-            .filter(
-                \.$state
-                    ~~ [
-                        ErasureCodedReplicationTask.State.pending.rawValue,
-                        ErasureCodedReplicationTask.State.failed.rawValue,
-                    ]
-            )
-            .all()
+        // A candidate's target is whichever node ranks that shard index - could be any node in
+        // the cluster, not just this one, so "already outstanding" needs the cluster-wide fan-out
+        // (`OutboxMailbox` mailboxes are per-owner-node; a target's own pending/failed row for
+        // this repair lives on *that* node's disk, not necessarily this one's).
+        let existingTasks = await OutboxMailbox.listAllAcrossCluster(
+            ErasureCodedReplicationTask.self, app: app,
+            collection: OutboxCollections.erasureCodedReplicationTasks
+        ).filter {
+            $0.bucketName == bucketName && $0.key == key
+                && $0.operation == ErasureCodedReplicationTask.Operation.put.rawValue
+        }
 
         // Dedup key includes versionId: without it, a pending task for one version of this key
         // would suppress enqueueing the same (shardIndex, target) pair for a *different* version,
-        // silently leaving that other version's gap unfilled. The `existingTasks` query above
-        // fetches every version's tasks for the key, so the version must be part of the identity.
+        // silently leaving that other version's gap unfilled. `existingTasks` fetches every
+        // version's tasks for the key, so the version must be part of the identity.
         func pairKey(_ versionId: String?, _ shardIndex: Int, _ targetNodeId: UUID) -> String {
             "\(versionId ?? "")\u{0}\(shardIndex)\u{0}\(targetNodeId)"
         }
-        var pendingPairs: Set<String> = []
-        for task in existingTasks where task.state == ErasureCodedReplicationTask.State.pending.rawValue {
-            pendingPairs.insert(pairKey(task.versionId, task.shardIndex, task.targetNodeId))
-        }
-        for task in existingTasks where task.state == ErasureCodedReplicationTask.State.failed.rawValue {
-            try await task.delete(on: app.db)
+        var coveredPairs: Set<String> = []
+        for task in existingTasks {
+            let pair = pairKey(task.versionId, task.shardIndex, task.targetNodeId)
+            if task.state == ErasureCodedReplicationTask.State.pending.rawValue {
+                coveredPairs.insert(pair)
+            } else if task.state == ErasureCodedReplicationTask.State.failed.rawValue {
+                // Dead-lettered - reset it in place on its owning node via the cross-node retry
+                // RPC (rather than deleting and recreating, which would require reaching directly
+                // into a peer's mailbox directory) so a stalled repair actually gets retried.
+                let retried = await OutboxMailbox.retryAcrossCluster(
+                    ErasureCodedReplicationTask.self, app: app,
+                    collection: OutboxCollections.erasureCodedReplicationTasks, taskId: task.id,
+                    failedStateValue: ErasureCodedReplicationTask.State.failed.rawValue)
+                if retried { coveredPairs.insert(pair) }
+            }
         }
 
         let newTasks = candidates
-            .filter { !pendingPairs.contains(pairKey(versionId, $0.shardIndex, $0.targetNodeId)) }
+            .filter { !coveredPairs.contains(pairKey(versionId, $0.shardIndex, $0.targetNodeId)) }
             .map { candidate in
                 ErasureCodedReplicationTask(
                     bucketName: bucketName, key: key, versionId: versionId,
@@ -435,59 +520,55 @@ enum ErasureCodedRebalanceService {
                     targetNodeId: candidate.targetNodeId, reason: reason)
             }
         guard !newTasks.isEmpty else { return }
-        try await newTasks.create(on: app.db)
+        for task in newTasks {
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.erasureCodedReplicationTasks, row: task)
+        }
         ErasureCodedDispatcher.shared.wake()
     }
 
-    /// Deletes this node's stale/orphaned local shard once the object is positively confirmed
-    /// reconstructable from the *current* responsible set without it - mirrors
-    /// `ClusterRebalanceService`'s "no outstanding task means delivered" reclaim gate, but adds
-    /// a second, positive check `ClusterRebalanceService` doesn't need: unlike whole-object
-    /// replication (where "no pending copy task" reliably means "already delivered", since the
-    /// source node created that task itself before this check ever runs), an EC shard's
-    /// redistribution task is created by a *different* node (whichever currently ranks 0 for
-    /// this key) via an independent, unsynchronized rebalance pass. "Zero outstanding tasks" is
-    /// also trivially true *before* that node's sweep has run at all - a real race that would
-    /// otherwise let this node delete its only copy of a shard before anyone has reconstructed
-    /// it elsewhere. Positively counting how many of `responsible`'s nodes already hold their
-    /// own correct-index shard closes that gap: only reclaim once there are independently enough
-    /// (>= `ecConfig.dataShards`) to reconstruct without this one.
+    /// Deletes this node's stale/orphaned local shard once positively confirmed reconstructable
+    /// without it. Unlike `ClusterRebalanceService`'s "no outstanding task means delivered" gate,
+    /// an EC shard's redistribution task is created by a *different* node (rank-0), so "zero
+    /// outstanding tasks" is also trivially true before that node's sweep has even run - a real
+    /// race that could delete this node's only copy before a replacement exists anywhere.
+    /// Positively counting how many of `responsible` already hold their own correct-index shard
+    /// closes that gap.
     private static func reclaimIfSafe(
         app: Application, bucketName: String, key: String, versionId: String?,
-        staleShardIndex: Int, responsible: [ClusterNodeInfo], ecConfig: ClusterErasureCodingConfig
+        staleShardIndex: Int, responsible: [ClusterNodeInfo], requiredDataShards: Int
     ) async throws -> Bool {
         // Scoped to this version: an in-flight repair of a *different* version of the same key
-        // mustn't hold this version's stale shard hostage. (Optional-field equality is handled
-        // in-memory to sidestep Fluent's `nil` vs `.null` filter ambiguity for the plain,
-        // versionless path.)
-        let keyTasks = try await ErasureCodedReplicationTask.query(on: app.db)
-            .filter(\.$bucketName == bucketName)
-            .filter(\.$key == key)
-            .filter(
-                \.$state
-                    ~~ [
-                        ErasureCodedReplicationTask.State.pending.rawValue,
-                        ErasureCodedReplicationTask.State.failed.rawValue,
-                    ]
-            )
-            .all()
+        // mustn't hold this version's stale shard hostage. Cluster-wide fan-out for the same
+        // reason `enqueueReconstructTasks` needs one - an outstanding repair's target (and thus
+        // its mailbox owner) could be any node, not just this one.
+        let keyTasks = await OutboxMailbox.listAllAcrossCluster(
+            ErasureCodedReplicationTask.self, app: app,
+            collection: OutboxCollections.erasureCodedReplicationTasks
+        ).filter {
+            $0.bucketName == bucketName && $0.key == key
+                && ($0.state == ErasureCodedReplicationTask.State.pending.rawValue
+                    || $0.state == ErasureCodedReplicationTask.State.failed.rawValue)
+        }
         let outstanding = keyTasks.filter { $0.versionId == versionId }.count
         guard outstanding == 0 else { return true }
 
         // Positive safety gate: only drop this stale shard once at least `dataShards` of the
-        // currently-responsible nodes independently hold their own correct-index shard, so the
-        // object stays reconstructable without this copy. Discovery-based, so it's correct even
-        // while indices are still drifting toward their new ranks.
-        var healthyCount = 0
-        for (rank, node) in responsible.enumerated() {
-            if await ClusterReplicationClient.shardExists(
-                app: app, node: node, bucketName: bucketName, key: key, versionId: versionId,
-                shardIndex: rank)
-            {
-                healthyCount += 1
+        // currently-responsible nodes independently hold their own correct-index shard.
+        // Parallel, not sequential - see `sweepGaps`'s identical reasoning.
+        let healthyCount = await withTaskGroup(of: Bool.self, returning: Int.self) { group in
+            for (rank, node) in responsible.enumerated() {
+                group.addTask {
+                    await ClusterReplicationClient.shardExists(
+                        app: app, node: node, bucketName: bucketName, key: key,
+                        versionId: versionId, shardIndex: rank)
+                }
             }
+            var count = 0
+            for await healthy in group where healthy { count += 1 }
+            return count
         }
-        guard healthyCount >= ecConfig.dataShards else { return true }
+        guard healthyCount >= requiredDataShards else { return true }
 
         // Surgical: remove only the one stale shard file, never the whole `.ecshards` directory -
         // mid-reindex this node can hold both its freshly delivered new-rank shard and this stale

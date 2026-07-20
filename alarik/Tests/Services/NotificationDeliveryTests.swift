@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -92,12 +91,9 @@ struct NotificationDeliveryTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -111,14 +107,14 @@ struct NotificationDeliveryTests {
         events: [String] = ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], secret: String? = nil,
         prefix: String? = nil, suffix: String? = nil
     ) async throws -> NotificationRule {
-        let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
-        let bucketModel = Bucket(name: bucket, userId: admin.id!)
+        let admin = try await User.findByUsername(app: app, username: "alarik")!
+        let bucketModel = Bucket(name: bucket, userId: admin.id)
         let rule = NotificationRule(
             id: UUID(), url: receiver.url, secret: secret, events: events,
             prefix: prefix, suffix: suffix, enabled: true)
         let config = NotificationConfiguration(rules: [rule])
         bucketModel.notificationConfig = config.toJSON()
-        try await bucketModel.save(on: app.db)
+        try await bucketModel.save(app: app)
         await NotificationConfigCache.shared.setConfig(for: bucket, config: config)
         return rule
     }
@@ -137,6 +133,13 @@ struct NotificationDeliveryTests {
         return await receiver.state.count() >= count
     }
 
+    /// This node's own queued webhook deliveries - in this single-process test harness, "this
+    /// node's own" is the whole story (there's nothing else running to own a delivery instead).
+    private func ownedDeliveries(_ app: Application) -> [NotificationDelivery] {
+        OutboxMailbox.allOwnedTasks(
+            NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
+    }
+
     // MARK: - Tests
 
     @Test("emit delivers an ObjectCreated payload with a valid HMAC signature")
@@ -150,7 +153,7 @@ struct NotificationDeliveryTests {
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "notif-bucket", key: "hello.txt",
                 size: 5, etag: "etag123", versionId: nil, requestId: "REQ", sourceIP: "1.1.1.1",
-                on: app.db)
+                app: app)
 
             #expect(try await waitForDeliveries(receiver, atLeast: 1))
 
@@ -175,7 +178,7 @@ struct NotificationDeliveryTests {
             _ = try await configureBucket(app, bucket: "nosecret", receiver: receiver, secret: nil)
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "nosecret", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
 
             #expect(try await waitForDeliveries(receiver, atLeast: 1))
             let delivery = try #require(await receiver.state.all().first)
@@ -188,10 +191,9 @@ struct NotificationDeliveryTests {
         try await withApp { app in
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "unconfigured", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
 
-            let count = try await NotificationDelivery.query(on: app.db).count()
-            #expect(count == 0)
+            #expect(ownedDeliveries(app).count == 0)
         }
     }
 
@@ -208,13 +210,13 @@ struct NotificationDeliveryTests {
             // Non-matching key -> no outbox row
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "filtered", key: "docs/readme.txt",
-                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
-            #expect(try await NotificationDelivery.query(on: app.db).count() == 0)
+                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
+            #expect(ownedDeliveries(app).count == 0)
 
             // Matching key -> delivered
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "filtered", key: "images/cat.jpg",
-                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
             #expect(try await waitForDeliveries(receiver, atLeast: 1))
         }
     }
@@ -231,22 +233,22 @@ struct NotificationDeliveryTests {
 
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "retry-bucket", key: "r.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
 
             // First drain fails -> row stays pending with a future nextAttemptAt. Force it due
             // and drain again to simulate the backoff elapsing, twice.
             for _ in 0..<3 {
                 await NotificationDispatcher.shared.drain()
-                if let row = try await NotificationDelivery.query(on: app.db).first() {
+                if let row = ownedDeliveries(app).first {
                     row.nextAttemptAt = Date().addingTimeInterval(-1)
-                    try await row.save(on: app.db)
+                    try OutboxMailbox.update(row, collection: OutboxCollections.notificationDeliveries)
                 }
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
             #expect(try await waitForDeliveries(receiver, atLeast: 1))
 
             // Once delivered, the outbox row is gone
-            #expect(try await NotificationDelivery.query(on: app.db).count() == 0)
+            #expect(ownedDeliveries(app).count == 0)
         }
     }
 
@@ -281,7 +283,7 @@ struct NotificationDeliveryTests {
         defer { Task { try? await receiver.shutdown() } }
 
         try await withApp { app in
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
             _ = try await configureBucket(app, bucket: "doomed", receiver: receiver)
             // BucketService.delete removes the bucket directory, so it must exist on disk
             try BucketHandler.create(name: "doomed")
@@ -289,15 +291,15 @@ struct NotificationDeliveryTests {
 
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "doomed", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
             await NotificationDispatcher.shared.drain()
-            #expect(try await NotificationDelivery.query(on: app.db).count() >= 1)
+            #expect(ownedDeliveries(app).count >= 1)
 
             let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
-                req: req, bucketName: "doomed", userId: admin.id!, force: true)
+                req: req, bucketName: "doomed", userId: admin.id, force: true)
 
-            #expect(try await NotificationDelivery.query(on: app.db).count() == 0)
+            #expect(ownedDeliveries(app).count == 0)
         }
     }
 
@@ -307,9 +309,9 @@ struct NotificationDeliveryTests {
     func setAndGetConfig() async throws {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
-            let bucketModel = Bucket(name: "api-bucket", userId: admin.id!)
-            try await bucketModel.save(on: app.db)
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
+            let bucketModel = Bucket(name: "api-bucket", userId: admin.id)
+            try await bucketModel.save(app: app)
 
             let body = #"{"rules":[{"id":"00000000-0000-0000-0000-000000000000","url":"https://example.com/h","events":["s3:ObjectCreated:*"],"enabled":true}]}"#
 
@@ -348,9 +350,9 @@ struct NotificationDeliveryTests {
     func webhookSecretIsMaskedAndPreservedAcrossEdits() async throws {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
-            let bucketModel = Bucket(name: "secret-mask-bucket", userId: admin.id!)
-            try await bucketModel.save(on: app.db)
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
+            let bucketModel = Bucket(name: "secret-mask-bucket", userId: admin.id)
+            try await bucketModel.save(app: app)
 
             let createBody = #"""
                 {"rules":[{"id":"00000000-0000-0000-0000-000000000000","url":"https://example.com/h","secret":"super-secret-value","events":["s3:ObjectCreated:*"],"enabled":true}]}
@@ -415,7 +417,7 @@ struct NotificationDeliveryTests {
             // The real secret must have survived server-side, unchanged, even though the client
             // never saw or resent it.
             let bucket = try #require(
-                try await Bucket.query(on: app.db).filter(\.$name == "secret-mask-bucket").first())
+                try await Bucket.find(app: app, name: "secret-mask-bucket"))
             let storedSecret = NotificationConfiguration.fromJSON(bucket.notificationConfig ?? "")
                 .rules.first?.secret
             #expect(storedSecret == "super-secret-value")
@@ -429,8 +431,8 @@ struct NotificationDeliveryTests {
 
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
-            try await Bucket(name: "purge-bucket", userId: admin.id!).save(on: app.db)
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
+            try await Bucket(name: "purge-bucket", userId: admin.id).save(app: app)
 
             // Two enabled rules; keep the receiver failing so rows stay queued
             await receiver.state.setFailFirst(99)
@@ -441,17 +443,17 @@ struct NotificationDeliveryTests {
                 id: UUID(), url: receiver.url, secret: nil, events: ["s3:ObjectCreated:*"],
                 prefix: nil, suffix: nil, enabled: true)
             let config = NotificationConfiguration(rules: [ruleA, ruleB])
-            let bucket = try await Bucket.query(on: app.db).filter(\.$name == "purge-bucket").first()!
+            let bucket = try await Bucket.find(app: app, name: "purge-bucket")!
             bucket.notificationConfig = config.toJSON()
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
             await NotificationConfigCache.shared.setConfig(for: "purge-bucket", config: config)
 
             // Queue one delivery per rule
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "purge-bucket", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
             await NotificationDispatcher.shared.drain()
-            #expect(try await NotificationDelivery.query(on: app.db).count() == 2)
+            #expect(ownedDeliveries(app).count == 2)
 
             // Re-save the config keeping only ruleA
             let body =
@@ -467,7 +469,7 @@ struct NotificationDeliveryTests {
                 afterResponse: { res async in #expect(res.status == .ok) })
 
             // ruleB's queued row is gone; ruleA's remains
-            let remaining = try await NotificationDelivery.query(on: app.db).all()
+            let remaining = ownedDeliveries(app)
             #expect(remaining.count == 1)
             #expect(remaining.first?.ruleId == ruleA.id)
         }
@@ -505,8 +507,8 @@ struct NotificationDeliveryTests {
     func validationRejectsBadInput() async throws {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
-            try await Bucket(name: "val-bucket", userId: admin.id!).save(on: app.db)
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
+            try await Bucket(name: "val-bucket", userId: admin.id).save(app: app)
 
             // Bad scheme
             try await app.test(
@@ -546,7 +548,7 @@ struct NotificationDeliveryTests {
 
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "health-bucket", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
 
             // Drive one failed attempt so attempts/lastError are populated
             await NotificationDispatcher.shared.drain()
@@ -584,31 +586,27 @@ struct NotificationDeliveryTests {
 
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "retry-health-bucket", key: "a.txt",
-                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                size: 1, etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
 
             // Force through every retry immediately (skip the real backoff) until dead-lettered
             var isFailed = false
             for _ in 0..<(NotificationDispatcher.maxAttempts + 2) {
                 await NotificationDispatcher.shared.drain()
-                if let row = try await NotificationDelivery.query(on: app.db)
-                    .filter(\.$bucketName == "retry-health-bucket")
-                    .first()
+                if let row = ownedDeliveries(app).first(where: { $0.bucketName == "retry-health-bucket" })
                 {
                     if row.state == NotificationDelivery.State.failed.rawValue {
                         isFailed = true
                         break
                     }
                     row.nextAttemptAt = Date().addingTimeInterval(-1)
-                    try await row.save(on: app.db)
+                    try OutboxMailbox.update(row, collection: OutboxCollections.notificationDeliveries)
                 }
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
             #expect(isFailed)
 
             let deadRow = try #require(
-                try await NotificationDelivery.query(on: app.db)
-                    .filter(\.$bucketName == "retry-health-bucket")
-                    .first())
+                ownedDeliveries(app).first(where: { $0.bucketName == "retry-health-bucket" }))
             #expect(deadRow.state == NotificationDelivery.State.failed.rawValue)
 
             // Now let the receiver succeed and retry via the API
@@ -616,7 +614,7 @@ struct NotificationDeliveryTests {
 
             try await app.test(
                 .POST,
-                "/api/v1/buckets/retry-health-bucket/notifications/deliveries/\(deadRow.id!.uuidString)/retry",
+                "/api/v1/buckets/retry-health-bucket/notifications/deliveries/\(deadRow.id.uuidString)/retry",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -629,9 +627,7 @@ struct NotificationDeliveryTests {
 
             #expect(try await waitForDeliveries(receiver, atLeast: 1))
             #expect(
-                try await NotificationDelivery.query(on: app.db)
-                    .filter(\.$bucketName == "retry-health-bucket")
-                    .count() == 0)
+                ownedDeliveries(app).filter { $0.bucketName == "retry-health-bucket" }.count == 0)
         }
     }
 
@@ -648,18 +644,16 @@ struct NotificationDeliveryTests {
 
             await NotificationService.emit(
                 event: .objectCreatedPut, bucketName: "scope-bucket-b", key: "a.txt", size: 1,
-                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, on: app.db)
+                etag: "e", versionId: nil, requestId: "R", sourceIP: nil, app: app)
             await NotificationDispatcher.shared.drain()
 
             let rowInB = try #require(
-                try await NotificationDelivery.query(on: app.db)
-                    .filter(\.$bucketName == "scope-bucket-b")
-                    .first())
+                ownedDeliveries(app).first(where: { $0.bucketName == "scope-bucket-b" }))
 
             // Attempting to retry bucket-b's delivery through bucket-a's path must 404
             try await app.test(
                 .POST,
-                "/api/v1/buckets/scope-bucket-a/notifications/deliveries/\(rowInB.id!.uuidString)/retry",
+                "/api/v1/buckets/scope-bucket-a/notifications/deliveries/\(rowInB.id.uuidString)/retry",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },

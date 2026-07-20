@@ -14,20 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
-import Vapor
-
-import struct Foundation.Date
-import struct Foundation.UUID
+import Foundation
 
 /// One pending (or dead-lettered) shard push/delete/reconstruction - the erasure-coding sibling
 /// of `ClusterReplicationTask`, targeting one `(bucketName, key, versionId, shardIndex)` shard
-/// instead of a whole object. Never holds shard bytes, only enough to re-derive them at delivery
-/// time: `.write`/`.rebalance`/`.reclaim` re-read this node's own local shard file; `.reconstruct`
-/// re-derives the shard from `k` healthy survivors via `ReedSolomonEngine`.
-final class ErasureCodedReplicationTask: Model, @unchecked Sendable {
-    static let schema = "erasure_coded_replication_tasks"
-
+/// instead of a whole object. Never holds shard bytes: `.write`/`.rebalance`/`.reclaim` re-read
+/// this node's own local shard file; `.reconstruct` re-derives it from `k` healthy survivors via
+/// `ReedSolomonEngine`. Backed by `OutboxMailbox`, not Fluent - `ownerNodeId` is a computed alias
+/// of `targetNodeId`, needing no backup mirroring since the rebalance/scrub walk self-heals gaps.
+final class ErasureCodedReplicationTask: @unchecked Sendable, Codable {
     enum State: String {
         case pending
         case failed
@@ -48,46 +43,19 @@ final class ErasureCodedReplicationTask: Model, @unchecked Sendable {
         case reconstruct
     }
 
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "bucket_name")
+    let id: UUID
     var bucketName: String
-
-    @Field(key: "key")
     var key: String
-
-    @Field(key: "version_id")
     var versionId: String?
-
-    @Field(key: "shard_index")
     var shardIndex: Int
-
-    @Field(key: "operation")
     var operation: String
-
-    @Field(key: "target_node_id")
     var targetNodeId: UUID
-
-    @Field(key: "reason")
     var reason: String
-
-    @Field(key: "attempts")
     var attempts: Int
-
-    @Field(key: "next_attempt_at")
     var nextAttemptAt: Date
-
-    @Field(key: "state")
     var state: String
-
-    @Field(key: "last_error")
     var lastError: String?
-
-    @Field(key: "created_at")
-    var createdAt: Date
-
-    init() {}
+    let createdAt: Date
 
     init(
         bucketName: String,
@@ -98,6 +66,7 @@ final class ErasureCodedReplicationTask: Model, @unchecked Sendable {
         targetNodeId: UUID,
         reason: Reason
     ) {
+        self.id = UUID()
         self.bucketName = bucketName
         self.key = key
         self.versionId = versionId
@@ -112,4 +81,9 @@ final class ErasureCodedReplicationTask: Model, @unchecked Sendable {
     }
 }
 
-extension ErasureCodedReplicationTask: OutboxRow {}
+extension ErasureCodedReplicationTask: OutboxMailboxRow {
+    var ownerNodeId: UUID {
+        get { targetNodeId }
+        set { targetNodeId = newValue }
+    }
+}

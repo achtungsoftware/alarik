@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 /// Evaluates and enforces bucket lifecycle rules - see `LifecycleConfiguration` for the
@@ -23,7 +22,7 @@ import Vapor
 /// waiting for the real once-an-hour interval.
 struct LifecycleService {
     static func runSweep(app: Application) async throws {
-        let buckets = try await Bucket.query(on: app.db).all()
+        let buckets = try await Bucket.all(app: app)
 
         for bucket in buckets {
             guard let rawRules = bucket.lifecycleRules else { continue }
@@ -37,13 +36,13 @@ struct LifecycleService {
                 if let expirationDays = rule.expirationDays {
                     try await expireCurrentObjects(
                         bucketName: bucket.name, prefix: rule.prefix, days: expirationDays,
-                        versioningStatus: versioningStatus, on: app.db, app: app)
+                        versioningStatus: versioningStatus, app: app)
                 }
 
                 if let noncurrentDays = rule.noncurrentVersionExpirationDays {
                     try await expireNoncurrentVersions(
                         bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays,
-                        on: app.db, app: app)
+                        app: app)
                 }
 
                 if let abortDays = rule.abortIncompleteMultipartUploadDays {
@@ -59,7 +58,7 @@ struct LifecycleService {
     /// identical to a normal DELETE request, matching S3's lifecycle Expiration behavior.
     private static func expireCurrentObjects(
         bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus,
-        on db: any Database, app: Application
+        app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(
@@ -71,13 +70,10 @@ struct LifecycleService {
         let clusterContext = await clusterContext(app: app)
 
         for object in objects where object.updatedAt <= cutoff {
-            // Every replica of this bucket runs its own sweep independently and would otherwise
-            // all race to expire the same object - gating on "am I the primary (rank-0)
-            // responsible node for this key" means exactly one node acts, the same way ownership
-            // already determines who coordinates a client-facing write. Being primary implies
-            // holding a local replica, so this node's own local listing above is already
-            // sufficient to find every key it's primary for - no cluster-wide fan-out listing
-            // needed here.
+            // Every replica runs its own sweep independently and would otherwise all race to
+            // expire the same object - gating on "am I the primary (rank-0) responsible node"
+            // means exactly one node acts. Being primary implies holding a local replica, so
+            // this node's own local listing above already covers every key it's primary for.
             let (isPrimary, peers) = primaryAuthority(
                 context: clusterContext, bucketName: bucketName, key: object.key)
             guard isPrimary else { continue }
@@ -90,10 +86,9 @@ struct LifecycleService {
                 event: outcome.isDeleteMarker
                     ? .lifecycleExpirationDeleteMarkerCreated : .lifecycleExpirationDelete,
                 bucketName: bucketName, key: object.key, size: nil, etag: nil,
-                versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, on: db)
+                versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, app: app)
             await ReplicationService.enqueueDelete(
-                app: app, bucketName: bucketName, key: object.key, versionId: outcome.versionId,
-                on: db)
+                app: app, bucketName: bucketName, key: object.key, versionId: outcome.versionId)
         }
     }
 
@@ -103,7 +98,7 @@ struct LifecycleService {
     /// the chain (the version that superseded them) - the closest equivalent derivable from the
     /// existing storage format.
     private static func expireNoncurrentVersions(
-        bucketName: String, prefix: String, days: Int, on db: any Database, app: Application
+        bucketName: String, prefix: String, days: Int, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
         let (versions, deleteMarkers, _, _, _, _) = try ObjectFileHandler.listAllVersions(
@@ -142,7 +137,7 @@ struct LifecycleService {
                 await NotificationService.emit(
                     event: .lifecycleExpirationDelete, bucketName: bucketName, key: key,
                     size: nil, etag: nil, versionId: outcome.versionId,
-                    requestId: UUID().uuidString, sourceIP: nil, on: db)
+                    requestId: UUID().uuidString, sourceIP: nil, app: app)
             }
         }
     }
@@ -181,12 +176,10 @@ struct LifecycleService {
 
     /// AbortIncompleteMultipartUpload - aborts in-progress multipart uploads initiated at least
     /// `days` ago. Deliberately local-only, unlike the two sweeps above: an upload's part state
-    /// only ever exists on the single primary node that coordinated its Create (see
-    /// `ObjectRoutingService.multipartRoutingDecision`), so this node's own local listing already
-    /// only surfaces uploads it genuinely owns - no other node could independently discover the
-    /// same upload to race on, and there is no peer state to replicate an abort to. The only gap
-    /// this leaves is that an upload whose owning node is permanently lost never gets swept, the
-    /// same durability tradeoff every other primary-pinned multipart operation already accepts.
+    /// only ever exists on the single primary node that coordinated its Create, so this node's
+    /// own local listing already surfaces only uploads it genuinely owns - no peer state to
+    /// replicate an abort to. An upload whose owning node is permanently lost never gets swept,
+    /// the same tradeoff every other primary-pinned multipart operation already accepts.
     private static func abortStaleMultipartUploads(
         bucketName: String, prefix: String, days: Int, app: Application
     ) async throws {

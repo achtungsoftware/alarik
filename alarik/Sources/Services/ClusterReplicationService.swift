@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
@@ -250,17 +249,13 @@ enum ClusterReplicationService {
         app: Application, nodes: [ClusterNodeInfo], bucketName: String, key: String,
         versionId: String?, operation: ClusterReplicationTask.Operation
     ) async {
+        guard let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId else { return }
         for node in nodes {
             let task = ClusterReplicationTask(
                 bucketName: bucketName, key: key, versionId: versionId, operation: operation,
-                targetNodeId: node.id, reason: .write)
-            do {
-                try await task.save(on: app.db)
-            } catch {
-                app.logger.error(
-                    "Failed to enqueue cluster replication task for '\(key)' -> \(node.id): \(error)"
-                )
-            }
+                targetNodeId: node.id, reason: .write, ownerNodeId: selfNodeId)
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.clusterReplicationTasks, row: task)
         }
         ClusterReplicationDispatcher.shared.wake()
     }

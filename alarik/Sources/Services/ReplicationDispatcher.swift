@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 
-/// Drains the `replication_tasks` outbox to external S3-compatible replication targets.
-/// Lower `maxConcurrentDeliveries` than the other dispatchers - each task here is a full
-/// object body transfer, not a small JSON POST.
+/// Drains this node's own `replication-tasks` mailbox to external S3-compatible replication
+/// targets. Lower `maxConcurrentDeliveries` than the other dispatchers - each task here is a
+/// full object body transfer, not a small JSON POST.
 enum ReplicationDispatcher {
     static let maxAttempts = 8
 
@@ -29,13 +28,12 @@ enum ReplicationDispatcher {
         maxConcurrentDeliveries: 4,
         logContext: "Replication",
         failedStateValue: ReplicationTask.State.failed.rawValue,
-        fetchDue: { db, limit in
-            try await ReplicationTask.query(on: db)
-                .filter(\.$state == ReplicationTask.State.pending.rawValue)
-                .filter(\.$nextAttemptAt <= Date())
-                .sort(\.$nextAttemptAt, .ascending)
-                .limit(limit)
-                .all()
+        fetchDue: { app, limit in
+            await OutboxMailbox.retryPendingEnqueues(
+                ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
+            return OutboxMailbox.dueTasks(
+                ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks,
+                limit: limit)
         },
         // Different targets for the same key are unrelated deliveries - dedup key includes
         // targetId so they're never held up by each other, only same-(key,target) is mutexed.
@@ -57,17 +55,18 @@ enum ReplicationDispatcher {
                 return .failure(error)
             }
         },
+        persist: { row, _ in try OutboxMailbox.update(row, collection: OutboxCollections.replicationTasks) },
+        remove: { row, _ in OutboxMailbox.remove(row, collection: OutboxCollections.replicationTasks) },
         describeFailure: { row in "\(row.key) to \(row.endpoint) (bucket: \(row.bucketName))" },
-        purgeExpired: { db in
-            try await ReplicationTask.query(on: db)
-                .filter(\.$state == ReplicationTask.State.failed.rawValue)
-                .filter(\.$createdAt < Date().addingTimeInterval(-7 * 24 * 3600))
-                .delete()
+        purgeExpired: { app in
+            OutboxMailbox.purgeExpiredFailures(
+                ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks,
+                failedStateValue: ReplicationTask.State.failed.rawValue)
         }
     )
 
-    static func purgeExpiredFailures(on db: any Database) async throws {
-        try await shared.purgeExpiredFailures(on: db)
+    static func purgeExpiredFailures(app: Application) async throws {
+        try await shared.purgeExpiredFailures(app: app)
     }
 }
 

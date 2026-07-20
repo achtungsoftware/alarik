@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -31,12 +30,9 @@ struct InternalBucketControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -2874,11 +2870,9 @@ struct InternalBucketControllerTests {
         try await withApp { app in
 
             // Create buckets for admin user via DB
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "access-key-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "access-key-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "access-key-bucket")
 
             // Add access key to bucket cache
@@ -2916,9 +2910,7 @@ struct InternalBucketControllerTests {
                 })
 
             // Verify bucket was created
-            let bucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "new-access-key-bucket")
-                .first()
+            let bucket = try await Bucket.find(app: app, name: "new-access-key-bucket")
             #expect(bucket != nil)
         }
     }
@@ -2928,11 +2920,9 @@ struct InternalBucketControllerTests {
         try await withApp { app in
 
             // Create bucket for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "delete-access-key-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "delete-access-key-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "delete-access-key-bucket")
             await AccessKeyBucketMapCache.shared.add(accessKey: testAccessKey, bucketName: "delete-access-key-bucket")
 
@@ -2946,9 +2936,7 @@ struct InternalBucketControllerTests {
                 })
 
             // Verify bucket was deleted
-            let deletedBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "delete-access-key-bucket")
-                .first()
+            let deletedBucket = try await Bucket.find(app: app, name: "delete-access-key-bucket")
             #expect(deletedBucket == nil)
         }
     }
@@ -2964,10 +2952,10 @@ struct InternalBucketControllerTests {
                 passwordHash: try Bcrypt.hash("TestPass123!"),
                 isAdmin: false
             )
-            try await otherUser.save(on: app.db)
+            try await otherUser.create(app: app)
 
-            let otherBucket = Bucket(name: "other-user-bucket", userId: otherUser.id!)
-            try await otherBucket.save(on: app.db)
+            let otherBucket = Bucket(name: "other-user-bucket", userId: otherUser.id)
+            try await otherBucket.save(app: app)
             try BucketHandler.create(name: "other-user-bucket")
 
             // Try to access other user's bucket with admin access key
@@ -2987,11 +2975,9 @@ struct InternalBucketControllerTests {
         try await withApp { app in
 
             // Create bucket for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "objects-access-key-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "objects-access-key-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "objects-access-key-bucket")
             await AccessKeyBucketMapCache.shared.add(accessKey: testAccessKey, bucketName: "objects-access-key-bucket")
 

@@ -14,18 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 
 /// Common retry-bookkeeping fields every outbox row (`ReplicationTask`,
 /// `ClusterReplicationTask`, `NotificationDelivery`, ...) already has.
 ///
-/// No state-value strings or `createdAt` here - fetch/purge queries need real Fluent
-/// `KeyPath`s (`\.$state == ...`), which stays per-dispatcher. This protocol only covers
-/// post-fetch bookkeeping on an already-loaded row.
-protocol OutboxRow: Model, Sendable {
+/// Deliberately not `Model`-constrained: `GenericOutboxDispatcher` is storage-agnostic (fetch/
+/// persist/remove are injected closures), so any row type can conform as long as it's a
+/// reference type - mutations inside `GenericOutboxDispatcher.deliver` must stay visible to the
+/// `persist` closure called right after, without threading a `var` binding through.
+protocol OutboxRow: AnyObject, Sendable {
     var state: String { get set }
     var nextAttemptAt: Date { get set }
     var attempts: Int { get set }
     var lastError: String? { get set }
+}
+
+/// A row backed by `OutboxMailbox` - every current outbox row type. `ownerNodeId` is the node
+/// whose local mailbox directory the task's file lives in (see `OutboxMailbox`'s doc comment for
+/// why ownership, not HRW key placement, is the right affinity for outbox records). For
+/// `ErasureCodedReplicationTask`/`ClusterReplicationTask` it's a computed alias of `targetNodeId`;
+/// for `NotificationDelivery`/`ReplicationTask` it's a real stored field set to whichever node
+/// received the triggering write.
+protocol OutboxMailboxRow: OutboxRow, Codable {
+    var id: UUID { get }
+    var ownerNodeId: UUID { get set }
+    var createdAt: Date { get }
 }
