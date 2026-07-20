@@ -94,9 +94,26 @@ enum MetadataListingService {
         return entries
     }
 
+    /// One retry after a short delay - without it, a peer that's transiently busy (most notably
+    /// right after its own restart, still running boot-time catch-up or a reactive rebalance
+    /// walk) silently contributes nothing to this collection for the entire call, which for
+    /// `LoadCacheLifecycle.reloadAll` on the *caller's* boot path means missing access keys or
+    /// buckets right when a freshly-restarted node starts serving real traffic.
+    private static let retryDelay: Duration = .milliseconds(750)
+
     private static func fetchRemote(
         app: Application, node: ClusterNodeInfo, collection: String
     ) async -> [Entry] {
+        if let entries = await fetchRemoteOnce(app: app, node: node, collection: collection) {
+            return entries
+        }
+        try? await Task.sleep(for: retryDelay)
+        return await fetchRemoteOnce(app: app, node: node, collection: collection) ?? []
+    }
+
+    private static func fetchRemoteOnce(
+        app: Application, node: ClusterNodeInfo, collection: String
+    ) async -> [Entry]? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return [] }
         var outbound = HTTPClientRequest(
             url: node.address + "/internal/cluster/metadata/list"
@@ -110,7 +127,7 @@ enum MetadataListingService {
             // cache-load path, where a long timeout lets one slow/unreachable peer stall boot.
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
-            guard response.status == .ok else { return [] }
+            guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 256 * 1024 * 1024)
             let decoded = try JSONDecoder().decode([WireEntry].self, from: Data(buffer: body))
             return decoded.compactMap { entry in
@@ -118,7 +135,7 @@ enum MetadataListingService {
                 return Entry(id: entry.id, value: data)
             }
         } catch {
-            return []
+            return nil
         }
     }
 
