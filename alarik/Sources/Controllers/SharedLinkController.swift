@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 /// Serves files shared via `POST /api/v1/objects/share` (InternalBucketController). Registered
@@ -38,7 +37,7 @@ struct SharedLinkController: RouteCollection {
         // A nil expiresAt means the link never expires - only an elapsed explicit expiry
         // rejects.
         guard
-            let link = try await SharedLink.find(token, on: req.db),
+            let link = try await SharedLink.find(app: req.application, id: token),
             link.expiresAt.map({ $0 > Date() }) ?? true
         else {
             throw Abort(.notFound)
@@ -105,19 +104,13 @@ struct SharedLinkController: RouteCollection {
             }
         }
 
-        // Not on this node - a shared link is public and lands on whichever node the load
-        // balancer picked, which needn't be one that holds the object. The token lookup above
-        // works from the shared DB on any node, but the bytes only live on the responsible
-        // nodes, so forward there (the object never being local, unlike an authed GET this can't
-        // fall through to a local read). A deleted object resolves nowhere and the responsible
-        // node returns 404 the same as a local miss would.
+        // Not on this node - a shared link is public and can land on any node, so forward to
+        // whichever node holds the object; a deleted object resolves nowhere and the responsible
+        // node returns 404 same as a local miss.
         //
-        // `candidates` is empty whenever `isLocal` was true (this node sits in the wider
-        // top-(k+m) set) - but once k+m > 3, being in that wider set doesn't mean this node is
-        // also one of the legacy top-3 a plain (non-EC) object actually replicated to, so both
-        // local branches above can find nothing even though the object is real. Forward to the
-        // legacy top-3 in that case too, unless this node genuinely is one of them (then nothing
-        // local really does mean 404, forwarding to itself again would just loop).
+        // `candidates` is empty whenever `isLocal` was true, but once k+m > 3 being in the wider
+        // EC set doesn't mean this node is also in the legacy top-3 a plain object replicated to -
+        // fall back to forwarding to the legacy top-3 unless this node genuinely is one of them.
         if let config = req.application.storage[ClusterConfigurationKey.self],
             candidates.isEmpty, !responsible.isEmpty,
             !ObjectRoutingService.isLegacyReplica(responsible: responsible, selfNodeId: config.nodeId)

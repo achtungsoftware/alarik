@@ -17,14 +17,11 @@ limitations under the License.
 import Foundation
 import Vapor
 
-/// This node's cluster identity/config, parsed once in
-/// `configure(app:)` from `CLUSTER_NODE_ADDRESS`/`CLUSTER_SECRET` and stashed in `app.storage`
-/// under `ClusterConfigurationKey` for every cluster subsystem to read - `ObjectRoutingService`,
-/// `ClusterForwardingClient`, `ClusterReplicationClient`, `ClusterReplicationService`,
-/// `ClusterMembershipLifecycle`, `InternalClusterController` - without each re-parsing env vars
-/// or re-touching the identity file. Absent entirely on a non-clustered node (single-node, or
-/// Postgres-mode-but-not-clustered) - every cluster subsystem treats a missing value here as
-/// "cluster mode is off."
+/// This node's cluster identity/config, parsed once in `configure(app:)` from
+/// `CLUSTER_NODE_ADDRESS`/`CLUSTER_SECRET` and stashed in `app.storage` under
+/// `ClusterConfigurationKey` for every cluster subsystem to read without each re-parsing env vars
+/// or re-touching the identity file. Absent entirely on a non-clustered (single-node) node -
+/// every cluster subsystem treats a missing value here as "cluster mode is off."
 struct ClusterConfiguration: Sendable {
     /// This node's identity, persisted across restarts in `Storage/cluster_node_id`. Must never
     /// change on restart - rendezvous hashing would otherwise treat every restart as a brand new
@@ -38,6 +35,18 @@ struct ClusterConfiguration: Sendable {
     /// `ClusterForwardAuthenticator` - separate from client-facing SigV4/JWT auth, since by the
     /// time a request reaches a peer it was already authenticated once at the entry node.
     let secret: String
+    /// Comma-separated peer base URLs from `CLUSTER_SEED_NODES`, used only once, at boot, to
+    /// bootstrap this node's initial view of cluster membership before it can place its own
+    /// `ClusterNode` metadata record - see `ClusterMembershipLifecycle`'s doc comment. Empty for
+    /// the first node of a brand-new cluster (nothing to seed from yet).
+    let seeds: [String]
+
+    init(nodeId: UUID, address: String, secret: String, seeds: [String] = []) {
+        self.nodeId = nodeId
+        self.address = address
+        self.secret = secret
+        self.seeds = seeds
+    }
 }
 
 struct ClusterConfigurationKey: StorageKey {

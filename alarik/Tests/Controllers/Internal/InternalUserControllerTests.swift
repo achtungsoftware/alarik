@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -35,12 +34,9 @@ struct UserControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -334,10 +330,9 @@ struct UserControllerTests {
                     token = tokenResponse.token
                 })
 
-            // Delete user manually from database
             if let id = userId {
-                let user = try await User.find(id, on: app.db)
-                try await user?.delete(on: app.db)
+                let user = try await User.find(app: app, id: id)
+                try await user?.delete(app: app)
             }
 
             // Try to use token after user deletion
@@ -673,14 +668,10 @@ struct UserControllerTests {
                 })
 
             // Verify user's access keys are deleted from database
-            let accessKeys = try await AccessKey.query(on: app.db)
-                .filter(\.$accessKey == "testkey1")
-                .all()
+            let accessKeys = try await AccessKey.find(app: app, accessKey: "testkey1").map { [$0] } ?? []
             #expect(accessKeys.isEmpty)
 
-            let accessKeys2 = try await AccessKey.query(on: app.db)
-                .filter(\.$accessKey == "testkey2")
-                .all()
+            let accessKeys2 = try await AccessKey.find(app: app, accessKey: "testkey2").map { [$0] } ?? []
             #expect(accessKeys2.isEmpty)
 
             // Verify all 3 caches are cleared too - not just the DB row. Missing the
@@ -702,25 +693,21 @@ struct UserControllerTests {
             // Create access key first
             try await createKey(app, token: token, accessKey: "testkey", secretKey: "testsecret")
 
-            // Get the user ID and access key to create bucket directly in database
-            let accessKey = try await AccessKey.query(on: app.db)
-                .filter(\.$accessKey == "testkey")
-                .first()
+            let accessKey = try await AccessKey.find(app: app, accessKey: "testkey")
 
-            guard let userId = accessKey?.$user.id else {
+            guard let userId = accessKey?.userId else {
                 Issue.record("Access key or user not found")
                 return
             }
 
-            // Create bucket directly in database
             let bucket = Bucket(name: "testbucket", userId: userId)
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             // Create bucket directory
             try BucketHandler.create(name: "testbucket")
 
             // Verify bucket exists
-            let bucketsBefore = try await Bucket.query(on: app.db).all()
+            let bucketsBefore = try await Bucket.all(app: app)
             #expect(bucketsBefore.count == 1)
 
             // Delete user
@@ -733,8 +720,7 @@ struct UserControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            // Verify buckets are deleted from database
-            let bucketsAfter = try await Bucket.query(on: app.db).all()
+            let bucketsAfter = try await Bucket.all(app: app)
             #expect(bucketsAfter.isEmpty)
         }
     }
@@ -747,16 +733,14 @@ struct UserControllerTests {
             let token = try await createUserAndLogin(app)
 
             try await createKey(app, token: token, accessKey: "outboxkey", secretKey: "testsecret")
-            let accessKey = try await AccessKey.query(on: app.db)
-                .filter(\.$accessKey == "outboxkey")
-                .first()
-            guard let userId = accessKey?.$user.id else {
+            let accessKey = try await AccessKey.find(app: app, accessKey: "outboxkey")
+            guard let userId = accessKey?.userId else {
                 Issue.record("Access key or user not found")
                 return
             }
 
             let bucket = Bucket(name: "self-outbox-bucket", userId: userId)
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "self-outbox-bucket")
 
             // Same regression as InternalAdminControllerTests's equivalent - the self-service
@@ -764,8 +748,9 @@ struct UserControllerTests {
             // BucketService.delete, leaving a straggler outbox row like this one behind forever.
             let staleTask = ClusterReplicationTask(
                 bucketName: "self-outbox-bucket", key: "straggler.txt", versionId: nil,
-                operation: .put, targetNodeId: UUID(), reason: .write)
-            try await staleTask.save(on: app.db)
+                operation: .put, targetNodeId: UUID(), reason: .write,
+                ownerNodeId: OutboxMailbox.selfNodeId(app: app))
+            try OutboxMailbox.update(staleTask, collection: OutboxCollections.clusterReplicationTasks)
 
             try await app.test(
                 .DELETE, "/api/v1/users",
@@ -776,9 +761,9 @@ struct UserControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let remainingTasks = try await ClusterReplicationTask.query(on: app.db)
-                .filter(\.$bucketName == "self-outbox-bucket")
-                .count()
+            let remainingTasks = OutboxMailbox.allOwnedTasks(
+                ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
+            ).filter { $0.bucketName == "self-outbox-bucket" }.count
             #expect(remainingTasks == 0)
         }
     }

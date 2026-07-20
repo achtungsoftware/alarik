@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -30,12 +29,9 @@ struct InternalClusterControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -49,24 +45,28 @@ struct InternalClusterControllerTests {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
 
+            let selfNodeId = OutboxMailbox.selfNodeId(app: app)
+
             // Two `.write`, one `.rebalance`, zero `.reclaim` - the zero case matters too, since
             // the aggregation must never report a reason with a zero count.
             for _ in 0..<2 {
-                try await ClusterReplicationTask(
-                    bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .put,
-                    targetNodeId: UUID(), reason: .write
-                ).save(on: app.db)
+                try OutboxMailbox.update(
+                    ClusterReplicationTask(
+                        bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .put,
+                        targetNodeId: UUID(), reason: .write, ownerNodeId: selfNodeId),
+                    collection: OutboxCollections.clusterReplicationTasks)
             }
-            try await ClusterReplicationTask(
-                bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .put,
-                targetNodeId: UUID(), reason: .rebalance
-            ).save(on: app.db)
+            try OutboxMailbox.update(
+                ClusterReplicationTask(
+                    bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .put,
+                    targetNodeId: UUID(), reason: .rebalance, ownerNodeId: selfNodeId),
+                collection: OutboxCollections.clusterReplicationTasks)
 
             let failedTask = ClusterReplicationTask(
                 bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .delete,
-                targetNodeId: UUID(), reason: .reclaim)
+                targetNodeId: UUID(), reason: .reclaim, ownerNodeId: selfNodeId)
             failedTask.state = ClusterReplicationTask.State.failed.rawValue
-            try await failedTask.save(on: app.db)
+            try OutboxMailbox.update(failedTask, collection: OutboxCollections.clusterReplicationTasks)
 
             try await app.test(
                 .GET, "/api/v1/admin/cluster/rebalance/status",

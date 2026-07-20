@@ -38,10 +38,8 @@ struct ClusterErasureCodingConfig: Sendable, Equatable {
     var scrubbingEnabled: Bool { scrubIntervalHours > 0 }
 
     /// Hard mathematical ceiling on `k + m`: the Reed-Solomon code runs over GF(256) with a
-    /// Cauchy matrix, which needs `k + m` distinct field elements out of the 255 usable ones - a
-    /// larger total silently produces a degenerate matrix and corrupts every encode. Real
-    /// deployments sit far below this (MinIO caps a set at 16 drives); the bound only exists so a
-    /// wildly wrong value fails boot loudly instead of destroying data.
+    /// Cauchy matrix, needing `k + m` distinct field elements out of the 255 usable ones - a
+    /// larger total silently produces a degenerate matrix and corrupts every encode.
     static let maxTotalShards = 255
 
     /// Reads `CLUSTER_EC_DATA_SHARDS`/`CLUSTER_EC_PARITY_SHARDS`/`CLUSTER_EC_SCRUB_INTERVAL_HOURS`,

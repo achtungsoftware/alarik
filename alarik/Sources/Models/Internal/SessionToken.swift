@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import JWT
 
@@ -31,7 +30,7 @@ struct SessionToken: Content, Authenticatable, JWTPayload {
     }
 
     init(with user: User) throws {
-        self.userId = try user.requireID()
+        self.userId = user.id
         self.expiration = ExpirationClaim(value: Date().addingTimeInterval(expirationTime))
     }
 

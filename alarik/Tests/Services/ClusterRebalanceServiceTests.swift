@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -40,12 +39,9 @@ struct ClusterRebalanceServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -93,8 +89,8 @@ struct ClusterRebalanceServiceTests {
         let user = User(
             name: "Rebalance Test User", username: UUID().uuidString,
             passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
-        try await user.save(on: app.db)
-        try await Bucket(name: bucketName, userId: user.id!).save(on: app.db)
+        try await user.create(app: app)
+        try await Bucket(name: bucketName, userId: user.id).save(app: app)
         try BucketHandler.create(name: bucketName)
 
         let selfId = UUID()
@@ -137,8 +133,8 @@ struct ClusterRebalanceServiceTests {
             // `rebalance()` entry point - see the suite-level doc comment.
             let pendingTask = ClusterReplicationTask(
                 bucketName: bucketName, key: key, versionId: nil, operation: .put,
-                targetNodeId: responsible[0].id, reason: .rebalance)
-            try await pendingTask.save(on: app.db)
+                targetNodeId: responsible[0].id, reason: .rebalance, ownerNodeId: selfId)
+            try OutboxMailbox.update(pendingTask, collection: OutboxCollections.clusterReplicationTasks)
 
             try await ClusterRebalanceService.rebalance(app: app, reason: .manualResync)
 
@@ -178,23 +174,24 @@ struct ClusterRebalanceServiceTests {
             for targetId in otherResponsibleIds {
                 let task = ClusterReplicationTask(
                     bucketName: bucketName, key: key, versionId: nil, operation: .put,
-                    targetNodeId: targetId, reason: .rebalance)
-                try await task.save(on: app.db)
-                preInsertedIds.insert(try task.requireID())
+                    targetNodeId: targetId, reason: .rebalance, ownerNodeId: selfId)
+                try OutboxMailbox.update(task, collection: OutboxCollections.clusterReplicationTasks)
+                preInsertedIds.insert(task.id)
             }
 
             try await ClusterRebalanceService.rebalance(app: app, reason: .manualResync)
 
-            let copyTasksForKey = try await ClusterReplicationTask.query(on: app.db)
-                .filter(\.$bucketName == bucketName)
-                .filter(\.$key == key)
-                .filter(\.$operation == ClusterReplicationTask.Operation.put.rawValue)
-                .all()
+            let copyTasksForKey = OutboxMailbox.allOwnedTasks(
+                ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
+            ).filter {
+                $0.bucketName == bucketName && $0.key == key
+                    && $0.operation == ClusterReplicationTask.Operation.put.rawValue
+            }
 
             // Exactly the pre-inserted rows survive, one per other-responsible target - no
             // duplicates were piled on top of the already-pending work.
             #expect(copyTasksForKey.count == otherResponsibleIds.count)
-            let survivingIds = Set(copyTasksForKey.compactMap(\.id))
+            let survivingIds = Set(copyTasksForKey.map(\.id))
             #expect(survivingIds == preInsertedIds)
         }
     }

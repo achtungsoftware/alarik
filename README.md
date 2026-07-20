@@ -101,7 +101,7 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 
 | Feature | Notes |
 | --- | --- |
-| Postgres-backed control plane | Opt-in multi-node HA for buckets, users, access keys, and policies behind a load balancer |
+| No external database | Buckets, users, access keys, policies, and cluster membership itself all live in Alarik's own erasure-coded object storage - `Storage/` is the only thing to back up |
 | Erasure-coded object data | Reed-Solomon `k` data + `m` parity shards across nodes (MinIO/Ceph-style), rebuildable from any `k` - the durability of replication at ~1.3-1.5x overhead instead of 3x |
 | Coordination-free placement | Rendezvous (HRW) hashing places each object's shards deterministically, no range-sharding hotspots or coordinator |
 | Any node serves any request | An entry node forwards to a responsible node transparently - no client-visible routing logic |

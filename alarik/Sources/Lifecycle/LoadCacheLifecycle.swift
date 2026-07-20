@@ -14,15 +14,51 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 final class LoadCacheLifecycle: LifecycleHandler {
+    /// Delays for the *background* boot-time catch-up retries, run after the server is already
+    /// serving traffic - a safety net for a peer that's still slow well past the blocking retries
+    /// in `didBootAsync` below. Every cache load is upsert-only (see `reloadAll`'s doc comment),
+    /// so repeating it costs nothing beyond the fan-out and can only fill gaps, never reintroduce one.
+    static let bootCatchUpDelays: [Duration] = [.seconds(4), .seconds(8), .seconds(15)]
+
+    /// A handful of quick, *blocking* retries before this node's server starts accepting real
+    /// traffic - not just the background catch-up above. A simultaneous multi-node cold start (or
+    /// several nodes restarting together) can leave every peer this node's first attempt asked
+    /// too busy to answer, and a node that starts serving S3 requests on that single incomplete
+    /// attempt fails real requests (missing access keys/buckets) for however long the background
+    /// catch-up takes to close the gap. These retries trade a bounded bit of extra boot latency
+    /// for meaningfully better odds of already being converged by the time traffic arrives.
+    static let blockingBootRetryDelays: [Duration] = [.milliseconds(500), .seconds(1)]
+
     func didBootAsync(_ app: Application) async throws {
         do {
             try await LoadCacheLifecycle.reloadAll(app: app)
         } catch {
             app.logger.error("Failed to load cache: \(error)")
+        }
+
+        if app.storage[ClusterConfigurationKey.self] != nil {
+            for delay in LoadCacheLifecycle.blockingBootRetryDelays {
+                try? await Task.sleep(for: delay)
+                do {
+                    try await LoadCacheLifecycle.reloadAll(app: app)
+                } catch {
+                    app.logger.warning("Blocking boot-time cache retry failed: \(error)")
+                }
+            }
+
+            Task {
+                for delay in LoadCacheLifecycle.bootCatchUpDelays {
+                    try? await Task.sleep(for: delay)
+                    do {
+                        try await LoadCacheLifecycle.reloadAll(app: app)
+                    } catch {
+                        app.logger.warning("Boot-time cache catch-up reload failed: \(error)")
+                    }
+                }
+            }
         }
 
         #if DEBUG  // Print all caches in debug
@@ -37,29 +73,47 @@ final class LoadCacheLifecycle: LifecycleHandler {
         #endif
     }
 
-    /// The full boot-time bulk load, factored out so it can also be run as the safety-net
-    /// reload after `CacheInvalidationListener` reconnects a dropped LISTEN connection -
-    /// Postgres does not redeliver missed NOTIFYs, so a full reload from the DB is the only
-    /// sound way to recover from a gap in the notification stream. Throws on failure (unlike
-    /// `didBootAsync`, which catches and only logs) so each caller can decide how to react.
+    /// The full boot-time bulk load, factored out so it can also be run as the periodic safety
+    /// net that recovers from any gap in the cache-invalidation broadcast stream. Throws on
+    /// failure (unlike `didBootAsync`, which catches and only logs) so each caller can decide
+    /// how to react.
+    ///
+    /// Every cache load below is upsert-only (merged in, nothing already cached is ever dropped)
+    /// - this function is called more than once in a node's lifetime: at boot, again whenever
+    /// `ClusterMembershipLifecycle` discovers a new peer (see its `reseedFromConfiguredSeeds` doc
+    /// comment), and on a 60s periodic timer - and `MetadataListingService`'s cluster-wide fan-out
+    /// every one of these loads relies on is a best-effort snapshot, not a guaranteed-complete one
+    /// (a peer that's merely slow to answer, or transiently unreachable during a node
+    /// kill/restart, just contributes nothing to *that* call). A destructive full replace on any
+    /// call whose fan-out happens to be less complete than a *previous* call's would silently wipe
+    /// out entries that were already correctly cached - including, worst case, a live access key
+    /// or bucket config still very much in use, on every node, until the next periodic tick
+    /// happens to see a more complete fan-out. This was the root cause of intermittent
+    /// `InvalidAccessKeyId` failures reappearing well after a cluster had already converged,
+    /// whenever the periodic reload's fan-out raced a `kill_node`/`restart_node` scenario.
+    ///
+    /// Genuine removal (a key revoked, a bucket deleted) is never this function's job to detect -
+    /// it already has its own authoritative, targeted signal via `CacheInvalidationService`'s
+    /// `.remove` broadcasts (see `AccessKeyService.delete`/`BucketService`'s delete path and
+    /// `CacheReloadDispatch`'s corresponding `.remove` cases), exactly mirroring
+    /// `ClusterNodeCache.reconcile`'s reasoning below - a merely-incomplete fan-out and a genuine
+    /// departure are indistinguishable from a listing snapshot alone, so this function must never
+    /// treat "absent from this one fan-out" as removal.
     static func reloadAll(app: Application) async throws {
-        // Load all access keys with their parent user
-        let keys = try await AccessKey.query(on: app.db)
-            .group(.or) {
-                $0.filter(\.$expirationDate == nil)
-                $0.filter(\.$expirationDate > Date.now)
-            }
-            .with(\.$user)
-            .all()
+        // Load all non-expired access keys
+        let keys = try await AccessKey.all(app: app).filter {
+            $0.expirationDate == nil || $0.expirationDate! > Date.now
+        }
 
-        // Load all buckets for the users referenced by access keys
-        let userIDs = keys.compactMap { $0.user.id }
-        let buckets = try await Bucket.query(on: app.db)
-            .filter(\.$user.$id ~~ userIDs)
-            .all()
+        // Every bucket, cluster-wide - loaded once and reused below for the versioning/policy/
+        // public-access-block/notification/replication caches too, rather than re-listing per
+        // cache.
+        let allBuckets = try await Bucket.all(app: app)
 
-        // Map userID -> buckets
-        let bucketsByUser = Dictionary(grouping: buckets, by: { $0.$user.id })
+        // Map userID -> buckets, scoped to the users referenced by access keys
+        let userIDs = Set(keys.map { $0.userId })
+        let bucketsByUser = Dictionary(
+            grouping: allBuckets.filter { userIDs.contains($0.userId) }, by: { $0.userId })
 
         // Build cache mappings
         var bucketData: [(accessKey: String, bucketName: String)] = []
@@ -69,7 +123,7 @@ final class LoadCacheLifecycle: LifecycleHandler {
         for key in keys {
             secretKeyData.append((accessKey: key.accessKey, secretKey: key.secretKey))
 
-            let userID = key.$user.id
+            let userID = key.userId
 
             // Add to user mapping cache
             userMappingData.append((accessKey: key.accessKey, userId: userID))
@@ -81,70 +135,63 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
         }
 
-        // Every cache below is a full replace, not a merge - `reloadAll` is also the safety-net
-        // reload after a missed-NOTIFY LISTEN gap, and re-`add`ing only what's currently in the
-        // DB would leave anything revoked/deleted during the gap cached forever.
-        await AccessKeySecretKeyMapCache.shared.load(initialData: secretKeyData)
-        await AccessKeyUserMapCache.shared.load(initialData: userMappingData)
-        await AccessKeyBucketMapCache.shared.load(initialData: bucketData)
-
-        // Load bucket versioning status cache
-        let allBuckets = try await Bucket.query(on: app.db).all()
-        let versioningData = allBuckets.map {
-            (bucketName: $0.name, versioningStatus: $0.versioningStatus)
+        for (accessKey, secretKey) in secretKeyData {
+            await AccessKeySecretKeyMapCache.shared.add(accessKey: accessKey, secretKey: secretKey)
         }
-        await BucketVersioningCache.shared.load(initialData: versioningData)
-
-        // Load bucket policy cache - skip (not crash) any policy that fails to
-        // re-validate, since it should always have been valid when it was saved
-        let policyData: [(bucketName: String, policy: BucketPolicy)] = allBuckets.compactMap {
-            bucket in
-            guard let policy = parsedPolicy(for: bucket, logger: app.logger) else { return nil }
-            return (bucketName: bucket.name, policy: policy)
+        for (accessKey, userId) in userMappingData {
+            await AccessKeyUserMapCache.shared.add(accessKey: accessKey, userId: userId)
         }
-        await BucketPolicyCache.shared.load(initialData: policyData)
+        for (accessKey, bucketName) in bucketData {
+            await AccessKeyBucketMapCache.shared.add(accessKey: accessKey, bucketName: bucketName)
+        }
 
-        // Load public access block cache - only buckets with at least one flag set are
-        // worth caching, an all-false bucket behaves identically to "not in the map".
-        let publicAccessBlockData:
-            [(bucketName: String, configuration: PublicAccessBlockConfiguration)] =
-                allBuckets.compactMap { bucket in
-                    guard let config = publicAccessBlockIfNonDefault(for: bucket) else {
-                        return nil
-                    }
-                    return (bucketName: bucket.name, configuration: config)
-                }
-        await BucketPolicyCache.shared.loadPublicAccessBlocks(
-            initialData: publicAccessBlockData)
+        // Bucket versioning status - upsert only, see the doc comment above.
+        for bucket in allBuckets {
+            let status = VersioningStatus(rawValue: bucket.versioningStatus) ?? .disabled
+            await BucketVersioningCache.shared.addBucket(bucket.name, versioningStatus: status)
+        }
 
-        // Load notification (webhook) configuration cache
-        let notificationData: [(bucketName: String, config: NotificationConfiguration)] =
-            allBuckets.compactMap { bucket in
-                guard let config = notificationConfig(for: bucket) else { return nil }
-                return (bucketName: bucket.name, config: config)
-            }
-        await NotificationConfigCache.shared.load(initialData: notificationData)
+        // Bucket policy - skip (not crash) any policy that fails to re-validate, since it should
+        // always have been valid when it was saved.
+        for bucket in allBuckets {
+            guard let policy = parsedPolicy(for: bucket, logger: app.logger) else { continue }
+            await BucketPolicyCache.shared.setPolicy(for: bucket.name, policy: policy)
+        }
 
-        // Load replication configuration cache
-        let replicationData: [(bucketName: String, config: ReplicationConfiguration)] =
-            allBuckets.compactMap { bucket in
-                guard let config = replicationConfig(for: bucket) else { return nil }
-                return (bucketName: bucket.name, config: config)
-            }
-        await ReplicationConfigCache.shared.load(initialData: replicationData)
+        // Public access block - only buckets with at least one flag set are worth caching, an
+        // all-false bucket behaves identically to "not in the map".
+        for bucket in allBuckets {
+            guard let config = publicAccessBlockIfNonDefault(for: bucket) else { continue }
+            await BucketPolicyCache.shared.setPublicAccessBlock(
+                for: bucket.name, configuration: config)
+        }
 
-        // Load cluster membership cache - harmless empty load when
-        // cluster mode is off, since no node ever registers itself into `cluster_nodes` then.
-        let clusterNodes = try await ClusterNode.query(on: app.db).all()
+        // Notification (webhook) configuration
+        for bucket in allBuckets {
+            guard let config = notificationConfig(for: bucket) else { continue }
+            await NotificationConfigCache.shared.setConfig(for: bucket.name, config: config)
+        }
+
+        // Replication configuration
+        for bucket in allBuckets {
+            guard let config = replicationConfig(for: bucket) else { continue }
+            await ReplicationConfigCache.shared.setConfig(for: bucket.name, config: config)
+        }
+
+        // Load cluster membership cache - harmless empty load when cluster mode is off, since no
+        // node ever registers itself into the `cluster-nodes` collection then. `reconcile`, not
+        // `load`: `ClusterNode.all` is a best-effort cluster-wide fan-out
+        // (`MetadataListingService`), so a peer merely slow to answer must not have its
+        // (still-fresher) cached entry clobbered by its absence here.
+        let clusterNodes = try await ClusterNode.all(app: app)
         let clusterNodeData = clusterNodes.compactMap { node -> ClusterNodeInfo? in
-            guard let id = node.id else { return nil }
+            guard let status = ClusterNode.Status(rawValue: node.status) else { return nil }
             return ClusterNodeInfo(
-                id: id, address: node.address,
-                status: ClusterNode.Status(rawValue: node.status) ?? .active,
+                id: node.id, address: node.address, status: status,
                 lastHeartbeatAt: node.lastHeartbeatAt,
                 totalBytes: node.totalBytes, availableBytes: node.availableBytes)
         }
-        await ClusterNodeCache.shared.load(initialData: clusterNodeData)
+        await ClusterNodeCache.shared.reconcile(snapshot: clusterNodeData)
     }
 
     // MARK: - Per-bucket mappers

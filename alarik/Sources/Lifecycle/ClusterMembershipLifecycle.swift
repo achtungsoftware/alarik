@@ -14,42 +14,45 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
+import AsyncHTTPClient
+import Foundation
+import NIOCore
 import Vapor
 
-import struct Foundation.Date
-import struct Foundation.UUID
-
-/// Self-registers this node into `cluster_nodes` at boot and keeps it alive with a heartbeat -
-/// a true no-op when `ClusterConfigurationKey` wasn't stashed in `app.storage` (cluster mode
-/// off). Registered as a `LifecycleHandler` after `LoadCacheLifecycle`/`CacheInvalidationListener`
-/// in `configure.swift`,  this must not announce the node until caches are loaded and the invalidation
-/// LISTEN loop is live to receive/relay it.
+/// Self-registers this node into the `cluster-nodes` metadata collection at boot and keeps it
+/// alive with a heartbeat - a true no-op when cluster mode is off. Registered as a
+/// `LifecycleHandler` *before* `LoadCacheLifecycle`, since that handler's cluster-wide listing
+/// fan-out needs `ClusterNodeCache.shared.activeNodes()` already populated or it queries nobody.
 ///
-/// Two independent periodic ticks, deliberately not one:
-/// - **Heartbeat** (every `heartbeatInterval`): updates only this node's own `last_heartbeat_at`
-///   directly in the DB, and mirrors it into the local cache immediately - no NOTIFY. Firing a
-///   cluster-wide NOTIFY on every 10-second heartbeat from every node would itself be the kind
-///   of stampede "automatic rebalancing" was designed to avoid (`CacheReloadDispatch`'s
-///   `clusterNode` case triggers a rebalance walk on every NOTIFY it receives) - heartbeats must
-///   never be able to trigger one.
-/// - **Membership refresh** (every `membershipRefreshInterval`): a full re-read of every row,
-///   reloaded into the local cache - the mechanism that actually propagates *peers'* updated
-///   heartbeat timestamps to this node (since heartbeats don't NOTIFY), and a safety net against
-///   a missed NOTIFY for status changes too.
+/// **Bootstrap circularity**: placing any metadata record, including this node's own, needs
+/// `activeNodes()` to know who else is in the cluster - but a joining node's cache starts empty.
+/// `didBootAsync` seeds the local cache from `CLUSTER_SEED_NODES` *before* ever calling
+/// `registerSelf`, so a brand-new cluster's founding node (no seeds reachable) just proceeds with
+/// an empty cache and takes the standalone (k=1,m=0) path.
+///
+/// Two independent periodic ticks: heartbeat (own record's liveness only, no broadcast - would
+/// otherwise stampede a rebalance walk on every tick) and a full membership refresh (propagates
+/// peers' heartbeats to this node and backstops a missed broadcast).
 final actor ClusterMembershipLifecycle: LifecycleHandler {
     static let shared = ClusterMembershipLifecycle()
 
     /// How often this node refreshes its own heartbeat.
     static let heartbeatInterval: Int64 = 10
-    /// How often this node pulls the full membership table to refresh peer liveness/status.
-    /// Deliberately longer than the heartbeat interval - this is a safety-net poll, not the
-    /// primary propagation path (that's `CacheReloadDispatch`'s NOTIFY handling for genuine
-    /// membership changes).
-    static let membershipRefreshInterval: Int64 = 15
+    /// How often this node pulls the full membership collection to refresh peer liveness/status.
+    /// Longer than the heartbeat interval - a safety-net poll, not the primary propagation path
+    /// (that's `CacheReloadDispatch`'s broadcast handling) - bounding how long a single dropped
+    /// `registerSelf` broadcast can leave a peer believing a restarted node is still absent.
+    static let membershipRefreshInterval: Int64 = 5
 
     private var heartbeatTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+
+    /// This node's own `joinedAt`/status, tracked locally so the heartbeat loop never *depends*
+    /// on successfully reading its own record back before it can write - see `heartbeatLoop`'s
+    /// doc comment for why that dependency is dangerous. Updated from `registerSelf` and from
+    /// every heartbeat tick that does manage a successful read.
+    private var lastKnownJoinedAt: Date?
+    private var lastKnownStatus: ClusterNode.Status = .active
 
     func didBootAsync(_ app: Application) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
@@ -57,13 +60,41 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         }
         guard heartbeatTask == nil, refreshTask == nil else { return }
 
-        try await registerSelf(app: app, config: config)
+        await bootstrapMembership(app: app, config: config)
+        // Never let a transient registration failure crash the whole node: `didBootAsync`
+        // throwing is fatal to the process. `registerSelf` can throw `coordinatorUnreachable` if
+        // this node isn't rank-0 for its own record and the peer that is happens to be slow right
+        // now - a missed first registration isn't fatal, the heartbeat loop below retries it.
+        do {
+            try await registerSelf(app: app, config: config)
+        } catch {
+            app.logger.warning(
+                "Initial cluster self-registration failed - will retry via the heartbeat loop: \(error)"
+            )
+        }
+
+        // `registerSelf`'s own broadcast is fire-and-forget with no retry - a single dropped
+        // delivery leaves that peer believing this node is still absent until the next
+        // `membershipRefreshInterval` tick. A cheap, short-delay repeat closes that gap in
+        // seconds; `registerSelf` is a plain idempotent upsert-and-broadcast, safe to call twice.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self else { return }
+            try? await self.registerSelf(app: app, config: config)
+        }
+
+        // A node coming back up never otherwise triggers its own rebalance walk - it only runs
+        // one reactively when it receives a peer's `clusterNode` broadcast, and that broadcast
+        // excludes the broadcaster itself. Left as-is, a restarted node passively waits to be
+        // noticed instead of reclaiming stale shards or picking up newly-owed ones itself.
+        await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+        await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
 
         heartbeatTask = Task { [weak self] in
             await self?.heartbeatLoop(app: app, config: config)
         }
         refreshTask = Task { [weak self] in
-            await self?.refreshLoop(app: app)
+            await self?.refreshLoop(app: app, config: config)
         }
     }
 
@@ -74,16 +105,128 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         refreshTask = nil
     }
 
-    /// Upserts this node's own row (creating it on first-ever boot, refreshing address/heartbeat
-    /// on every restart), updates the local cache immediately (not waiting on the NOTIFY
-    /// round-trip - same "update local state first, then notify" order, then notifies the cluster. A restart always re-activates a
-    /// previously-`draining` node - if an operator restarts the process, that's a clear signal
-    /// they want it back in service, not a state the node should second-guess.
+    /// How many times `bootstrapMembership` retries an incomplete seed picture before giving up
+    /// and falling through to the periodic `refreshLoop` reseed instead - tuned to stay well
+    /// under typical startup budgets while giving a cold multi-node start a few chances to
+    /// catch peers as they come up.
+    private static let bootstrapRetryAttempts = 8
+    private static let bootstrapRetryDelay: Duration = .milliseconds(300)
+    /// Deliberately much shorter than `ClusterReplicationClient.probeTimeout`: this call is
+    /// boot-blocking and retried, and a closed port refuses a connection in milliseconds at the
+    /// OS level - there's nothing legitimate for this query to wait 5 seconds for.
+    private static let seedQueryTimeout: TimeAmount = .milliseconds(800)
+
+    /// Seeds this node's local `ClusterNodeCache` from every configured seed before this node
+    /// ever places any metadata record
+    private func bootstrapMembership(app: Application, config: ClusterConfiguration) async {
+        guard !config.seeds.isEmpty else { return }
+        var anySucceeded = false
+        for attempt in 0..<Self.bootstrapRetryAttempts {
+            if await reseedFromConfiguredSeeds(
+                app: app, config: config, triggerCacheReloadOnGrowth: false)
+            {
+                anySucceeded = true
+                break
+            }
+            if attempt < Self.bootstrapRetryAttempts - 1 {
+                try? await Task.sleep(for: Self.bootstrapRetryDelay)
+            }
+        }
+        guard anySucceeded else {
+            app.logger.warning(
+                "Could not reach any CLUSTER_SEED_NODES peer at boot (\(config.seeds.count) configured) - proceeding with only the locally cached membership view."
+            )
+            return
+        }
+    }
+
+    /// Queries every statically-configured seed in parallel and merges their snapshots into the
+    /// local cache via `upsert` (additive, never drops) - reusable so `refreshLoop` can repeat it
+    /// periodically. This lets two independently-booted subsets of a cluster eventually merge,
+    /// since re-querying the fixed seed list sidesteps `ClusterNode.all()`'s fan-out only ever
+    /// discovering nodes whose records sit on an already-known peer. Returns whether at least
+    /// one seed answered. `triggerCacheReloadOnGrowth`: `false` from `bootstrapMembership` (a
+    /// full reload runs moments later anyway), `true` from `refreshLoop`.
+    @discardableResult
+    private func reseedFromConfiguredSeeds(
+        app: Application, config: ClusterConfiguration, triggerCacheReloadOnGrowth: Bool
+    ) async -> Bool {
+        let knownBefore = Set(await ClusterNodeCache.shared.all().map(\.id))
+        var anySucceeded = false
+        await withTaskGroup(of: [ClusterNodeInfo]?.self) { group in
+            for seedAddress in config.seeds {
+                group.addTask {
+                    await self.querySeed(app: app, address: seedAddress, config: config)
+                }
+            }
+            for await result in group {
+                guard let snapshot = result else { continue }
+                anySucceeded = true
+                for node in snapshot { await ClusterNodeCache.shared.upsert(node) }
+            }
+        }
+
+        // If this call discovered a genuinely new peer, any record that peer alone holds (most
+        // notably a just-seeded admin access key) was invisible to this node's caches until now,
+        // and would otherwise stay invisible until the 60s periodic reload catches up.
+        // Re-running the full reload immediately closes that gap. Best-effort: a failure here is
+        // no worse than the reload this node already ran at boot.
+        if triggerCacheReloadOnGrowth {
+            let knownAfter = Set(await ClusterNodeCache.shared.all().map(\.id))
+            if !knownAfter.isSubset(of: knownBefore) {
+                do {
+                    try await LoadCacheLifecycle.reloadAll(app: app)
+                } catch {
+                    app.logger.warning("Cache reload after discovering a new peer failed: \(error)")
+                }
+            }
+        }
+        return anySucceeded
+    }
+
+    private func querySeed(app: Application, address: String, config: ClusterConfiguration) async
+        -> [ClusterNodeInfo]?
+    {
+        var outbound = HTTPClientRequest(url: address + "/internal/cluster/members")
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            // `LightweightClusterControlClient.shared`, not `app.http.client.shared` - see its
+            // doc comment: this boot-blocking, retried probe must never queue behind unrelated
+            // shard-transfer/rebalance traffic on the general-purpose client's connection pool.
+            // `seedQueryTimeout`, not `ClusterReplicationClient.probeTimeout` - see its own doc
+            // comment for why this specific probe needs a much shorter ceiling than a normal
+            // peer-liveness check.
+            let response = try await LightweightClusterControlClient.shared.execute(
+                outbound, timeout: Self.seedQueryTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
+            let decoded = try JSONDecoder().decode(
+                [InternalClusterMetadataController.ClusterMemberWire].self, from: Data(buffer: body))
+            return decoded.compactMap { wire -> ClusterNodeInfo? in
+                guard let status = ClusterNode.Status(rawValue: wire.status) else { return nil }
+                return ClusterNodeInfo(
+                    id: wire.id, address: wire.address, status: status,
+                    lastHeartbeatAt: wire.lastHeartbeatAt, totalBytes: wire.totalBytes,
+                    availableBytes: wire.availableBytes)
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    /// Upserts this node's own record (creating it on first-ever boot, refreshing address/
+    /// heartbeat on every restart), updates the local cache immediately (not waiting on the
+    /// broadcast round-trip - same "update local state first, then notify" order), then notifies
+    /// the cluster. A restart always re-activates a previously-`draining` node - if an operator
+    /// restarts the process, that's a clear signal they want it back in service, not a state the
+    /// node should second-guess.
     private func registerSelf(app: Application, config: ClusterConfiguration) async throws {
         let now = Date()
         let (totalBytes, availableBytes) = DiskSpace.availableAndTotal(for: BucketHandler.rootURL)
         let node: ClusterNode
-        if let existing = try await ClusterNode.find(config.nodeId, on: app.db) {
+        if let existing = try? await ClusterNode.find(app: app, id: config.nodeId) {
             node = existing
             node.address = config.address
             node.status = ClusterNode.Status.active.rawValue
@@ -95,7 +238,19 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                 id: config.nodeId, address: config.address, status: .active, joinedAt: now,
                 lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes)
         }
-        try await node.save(on: app.db)
+        // Best-effort, not `try await`: `node.save` forwards to whichever node currently ranks
+        // rank-0 for this node's own record, not necessarily reachable right now. A node's
+        // belief about its own liveness must never depend on reaching some other peer first -
+        // the local cache upsert below still runs, and the durable write retries on the next tick.
+        do {
+            try await node.save(app: app)
+        } catch {
+            app.logger.warning(
+                "Cluster self-registration write failed - continuing with the in-memory update, the next heartbeat tick will retry the durable write: \(error)"
+            )
+        }
+        lastKnownJoinedAt = node.joinedAt
+        lastKnownStatus = .active
 
         await ClusterNodeCache.shared.upsert(
             ClusterNodeInfo(
@@ -103,9 +258,19 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                 totalBytes: totalBytes, availableBytes: availableBytes)
         )
         CacheInvalidationService.notify(
-            on: app.db, cache: "clusterNode", op: .upsert, key: config.nodeId.uuidString)
+            app: app, cache: "clusterNode", op: .upsert, key: config.nodeId.uuidString,
+            nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
+                id: config.nodeId, address: config.address, status: ClusterNode.Status.active.rawValue,
+                lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes))
     }
 
+    /// A heartbeat tick must never depend on first successfully *reading* this node's own record:
+    /// metadata routing is recomputed fresh on every call, so a read attempted before this node's
+    /// view has converged can legitimately fail even though the record is durable. Requiring a
+    /// successful read first would permanently wedge the heartbeat on a single boot-time hiccup.
+    /// Instead the read is best-effort (only used to preserve fields this loop doesn't own, like
+    /// an admin-initiated `draining` status); the write always goes through, self-correcting once
+    /// every node's view converges.
     private func heartbeatLoop(app: Application, config: ClusterConfiguration) async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(Self.heartbeatInterval))
@@ -113,47 +278,79 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
 
             let now = Date()
             let (totalBytes, availableBytes) = DiskSpace.availableAndTotal(for: BucketHandler.rootURL)
+
+            let node: ClusterNode
+            if let existing = try? await ClusterNode.find(app: app, id: config.nodeId) {
+                node = existing
+                lastKnownJoinedAt = existing.joinedAt
+                lastKnownStatus = ClusterNode.Status(rawValue: existing.status) ?? lastKnownStatus
+            } else if let cached = await ClusterNodeCache.shared.get(id: config.nodeId) {
+                // The direct read failed (a convergence hiccup), but this node's in-memory belief
+                // about ITSELF is usually still fresh: an admin-initiated drain reaches this node
+                // directly via `CacheInvalidationService.notify`'s broadcast, independent of
+                // whether this node's own read succeeds. Preferring the cache over
+                // `lastKnownStatus` here closes the "heartbeat silently reverts a drain" gap.
+                lastKnownStatus = cached.status
+                lastKnownJoinedAt = lastKnownJoinedAt ?? now
+                node = ClusterNode(
+                    id: config.nodeId, address: config.address, status: cached.status,
+                    joinedAt: lastKnownJoinedAt ?? now)
+            } else {
+                app.logger.warning(
+                    "Cluster heartbeat could not read this node's own record - re-registering from last-known state rather than skipping (see ClusterMembershipLifecycle.heartbeatLoop)."
+                )
+                node = ClusterNode(
+                    id: config.nodeId, address: config.address, status: lastKnownStatus,
+                    joinedAt: lastKnownJoinedAt ?? now)
+            }
+            node.lastHeartbeatAt = now
+            node.totalBytes = totalBytes
+            node.availableBytes = availableBytes
+
+            // Best-effort, not gating the cache update below: `node.save` forwards to whichever
+            // node currently ranks rank-0 for this node's own record, not necessarily reachable.
+            // Skipping the local cache upsert on a save failure would let a coordinator that's
+            // merely temporarily down leave this perfectly healthy node excluding ITSELF from its
+            // own `activeNodes()`. The durable write is simply retried on the next tick.
             do {
-                try await ClusterNode.query(on: app.db)
-                    .filter(\.$id == config.nodeId)
-                    .set(\.$lastHeartbeatAt, to: now)
-                    .set(\.$totalBytes, to: totalBytes)
-                    .set(\.$availableBytes, to: availableBytes)
-                    .update()
+                try await node.save(app: app)
             } catch {
-                app.logger.error("Cluster heartbeat update failed: \(error)")
-                continue
+                app.logger.warning(
+                    "Cluster heartbeat durable write failed - the local cache still updates below, and the next tick retries: \(error)"
+                )
             }
 
-            if var current = await ClusterNodeCache.shared.get(id: config.nodeId) {
-                current = ClusterNodeInfo(
-                    id: current.id, address: current.address, status: current.status,
+            // Always a valid rawValue here: `node` is either a fresh read-back (whose status was
+            // already parsed successfully above) or built from `lastKnownStatus`, itself always a
+            // real `ClusterNode.Status`.
+            let statusForCache = ClusterNode.Status(rawValue: node.status) ?? .active
+            await ClusterNodeCache.shared.upsert(
+                ClusterNodeInfo(
+                    id: config.nodeId, address: config.address, status: statusForCache,
                     lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes)
-                await ClusterNodeCache.shared.upsert(current)
-            }
+            )
         }
     }
 
-    private func refreshLoop(app: Application) async {
+    private func refreshLoop(app: Application, config: ClusterConfiguration) async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(Self.membershipRefreshInterval))
             guard !Task.isCancelled else { return }
 
             do {
-                let rows = try await ClusterNode.query(on: app.db).all()
+                let rows = try await ClusterNode.all(app: app)
                 let snapshot = rows.compactMap { row -> ClusterNodeInfo? in
-                    guard let id = row.id else { return nil }
                     // Fail closed on an unrecognized status rather than defaulting to the
-                    // most-trusting `.active` state - a row this node can't interpret must never
-                    // silently become eligible for placement/forwarding.
+                    // most-trusting `.active` state - a record this node can't interpret must
+                    // never silently become eligible for placement/forwarding.
                     guard let status = ClusterNode.Status(rawValue: row.status) else {
                         app.logger.error(
-                            "Cluster node \(id) has unrecognized status '\(row.status)' - excluding it from this refresh"
+                            "Cluster node \(row.id) has unrecognized status '\(row.status)' - excluding it from this refresh"
                         )
                         return nil
                     }
                     return ClusterNodeInfo(
-                        id: id, address: row.address, status: status,
+                        id: row.id, address: row.address, status: status,
                         lastHeartbeatAt: row.lastHeartbeatAt,
                         totalBytes: row.totalBytes, availableBytes: row.availableBytes)
                 }
@@ -161,6 +358,15 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             } catch {
                 app.logger.error("Cluster membership refresh failed: \(error)")
             }
+
+            // Re-query the static seed list too, not just the listing fan-out above - see
+            // `reseedFromConfiguredSeeds`'s doc comment for why the fan-out alone can leave two
+            // independently-booted subsets of a cluster permanently unaware of each other.
+            // Ordered after the listing-based reconcile (which can only ever shrink the cache) so
+            // any node it dropped that's still genuinely reachable via a seed is restored within
+            // the same tick, rather than staying dropped until the next cycle.
+            await reseedFromConfiguredSeeds(
+                app: app, config: config, triggerCacheReloadOnGrowth: true)
         }
     }
 }

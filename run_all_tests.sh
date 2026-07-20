@@ -7,7 +7,7 @@
 #   3. rclone S3 tests           (rclone_tests.sh)
 #   4. MinIO client (mc) tests   (mc_tests.sh)
 #   5. Bucket replication tests  (replication_tests.sh - 2 real server instances)
-#   6. Cluster tests             (cluster_tests.sh - 4 real instances + Postgres)
+#   6. Cluster tests             (cluster_tests.sh - 4 real instances, no external database)
 #
 # The S3 test suites run against a freshly built server that is started with a
 # clean, temporary state directory (empty database + storage) per suite, so
@@ -82,14 +82,8 @@ command -v aws >/dev/null || MISSING="$MISSING aws"
 command -v rclone >/dev/null || MISSING="$MISSING rclone"
 command -v mc >/dev/null || MISSING="$MISSING mc"
 command -v jq >/dev/null || MISSING="$MISSING jq"
-command -v docker >/dev/null || MISSING="$MISSING docker"
 if [ -n "$MISSING" ]; then
     echo "ERROR: missing required tools:$MISSING"
-    exit 1
-fi
-
-if ! docker info >/dev/null 2>&1; then
-    echo "ERROR: Docker daemon is not running - required for the cluster test suite's Postgres container."
     exit 1
 fi
 
@@ -209,9 +203,9 @@ record "Bucket replication tests" "$REPLICATION_RESULT" "$REPLICATION_PASSES pas
 echo ""
 
 # ── 7. Cluster tests ─────────────────────────────────────────────────────────────
-# Manages its own 4 server processes + a throwaway Postgres container - object-data
-# clustering requires the Postgres control plane, unlike every suite above.
-echo "--- Cluster tests (4 real instances + Postgres) ---"
+# Manages its own 4 server processes - no external database, unlike the suites above,
+# metadata is placed through the same erasure-coded engine as regular object data.
+echo "--- Cluster tests (4 real instances) ---"
 if (cd "$ROOT" && bash cluster_tests.sh) > "$LOG_DIR/cluster-tests.log" 2>&1; then
     CLUSTER_RESULT="PASS"
 else

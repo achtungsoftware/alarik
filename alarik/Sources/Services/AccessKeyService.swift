@@ -14,29 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import XMLCoder
 
 struct AccessKeyService {
     static func delete(
-        on database: any Database,
+        app: Application,
         accessKey: String
     )
         async throws
     {
-        try await AccessKey.query(on: database)
-            .filter(\.$accessKey == accessKey)
-            .delete()
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.accessKeys, id: accessKey)
 
         // Remove from all caches. Security-sensitive: a revoked key must stop authenticating
         // on every node, not just this one - notify immediately after each removal, not
         // batched, so the signal goes out as soon as this node itself has forgotten the key.
         await AccessKeySecretKeyMapCache.shared.remove(accessKey: accessKey)
-        CacheInvalidationService.notify(on: database, cache: "accessKeySecret", op: .remove, key: accessKey)
+        CacheInvalidationService.notify(app: app, cache: "accessKeySecret", op: .remove, key: accessKey)
         await AccessKeyUserMapCache.shared.remove(accessKey: accessKey)
-        CacheInvalidationService.notify(on: database, cache: "accessKeyUser", op: .remove, key: accessKey)
+        CacheInvalidationService.notify(app: app, cache: "accessKeyUser", op: .remove, key: accessKey)
         await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey)
-        CacheInvalidationService.notify(on: database, cache: "accessKeyBucket", op: .remove, key: accessKey)
+        CacheInvalidationService.notify(app: app, cache: "accessKeyBucket", op: .remove, key: accessKey)
     }
 }

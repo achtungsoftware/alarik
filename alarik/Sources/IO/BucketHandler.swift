@@ -89,7 +89,7 @@ struct BucketHandler {
         var buckets: [String] = []
         for url in items {
             if let values = try? url.resourceValues(forKeys: [.isDirectoryKey]),
-                values.isDirectory == true
+                values.isDirectory == true, !MetadataNamespace.isReserved(url.lastPathComponent)
             {
                 buckets.append(url.lastPathComponent)
             }

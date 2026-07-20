@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
-import FluentPostgresDriver
-import FluentSQLiteDriver
 import JWTKit
+import NIOCore
 import NIOSSL
-import PostgresKit
 import Vapor
 
 public func configure(_ app: Application) async throws {
@@ -27,6 +24,17 @@ public func configure(_ app: Application) async throws {
     // TODO: make this configurable ?
     app.routes.defaultMaxBodySize = "5tb"
     app.http.server.configuration.supportPipelining = true
+    // Vapor's default (10s) can be exceeded by a busy node with many in-flight cluster-internal
+    // requests (a rebalance walk's parallel probes/pushes, concurrent metadata fan-outs) at the
+    // exact moment it receives a shutdown signal - when that happens, Vapor logs "Server stop
+    // took too long" and proceeds with the rest of shutdown (clearing `app.storage`) regardless,
+    // while those still-running requests keep executing and crash the process the moment any of
+    // them next touches an `app`-scoped service ("Core not configured"). A longer budget gives
+    // genuinely-busy-but-still-progressing requests a real chance to drain normally instead of
+    // being abandoned mid-flight - this doesn't help a truly hung request, but that's not what's
+    // happening here (the requests preceding the crash complete in normal time, there's just a
+    // lot of them at once during heavy membership churn).
+    app.http.server.configuration.shutdownTimeout = .seconds(30)
 
     let consoleBaseUrl = ConsoleBaseURL.resolve()
 
@@ -43,44 +51,22 @@ public func configure(_ app: Application) async throws {
         )
     #endif
 
-    // A single node needs nothing beyond the zero-config SQLite default. `DATABASE_URL`
-    // opts into Postgres - required (not just supported) the moment more than one node shares
-    // this control-plane data, since SQLite has no safe multi-writer/multi-host story. The
-    // parsed config is reused for both the pooled Fluent connections and the dedicated
-    // LISTEN connection below - never re-parsed from the URL string a second time.
-    if let databaseURL = Environment.sanitizedGet("DATABASE_URL") {
-        let postgresConfig = try SQLPostgresConfiguration(url: databaseURL)
-        app.databases.use(.postgres(configuration: postgresConfig), as: .psql)
-        app.storage[PostgresListenConfigurationKey.self] = postgresConfig.coreConfiguration
-    } else {
-        #if DEBUG
-            // In debug, test & profiling - store the db relative to the work dir
-            app.databases.use(.sqlite(.file("db.sqlite")), as: .sqlite)
-        #else
-            app.databases.use(
-                DatabaseConfigurationFactory.sqlite(.file("Storage/db.sqlite")), as: .sqlite)
-        #endif
-    }
-
-    // Object-data clustering is opt-in on top of the Postgres control plane above - a node only
-    // joins the cluster when both `CLUSTER_NODE_ADDRESS` (its own internally-reachable base URL)
-    // and `CLUSTER_SECRET` (shared inter-node auth secret) are set. Neither alone is enough, and
-    // clustering requires `DATABASE_URL` (membership + cache invalidation need the shared
-    // Postgres control plane) - a single Postgres-mode node without these vars stays a plain
-    // single-node deployment with a shared control plane, never joining any cluster.
+    // Object-data clustering is opt-in - a node only joins the cluster when both
+    // `CLUSTER_NODE_ADDRESS` (its own internally-reachable base URL) and `CLUSTER_SECRET` (shared
+    // inter-node auth secret) are set; neither alone is enough. No database of any kind is
+    // required - control-plane metadata (including cluster membership itself) lives in Alarik's
+    // own erasure-coded object storage (`MetadataStore`), the same engine as regular object data.
+    // A brand-new node joining an existing cluster bootstraps its initial view of membership from
+    // `CLUSTER_SEED_NODES` (comma-separated peer addresses, optional - empty for the first node
+    // of a brand-new cluster) - see `ClusterMembershipLifecycle`.
     // Validated unconditionally (not just in cluster mode) so a typo in these vars fails boot
     // immediately, even before the operator flips on CLUSTER_NODE_ADDRESS/CLUSTER_SECRET.
     let erasureCodingConfig = try ClusterErasureCodingConfig.resolve()
+    let metadataErasureCodingConfig = try ClusterMetadataErasureCodingConfig.resolve()
 
     let clusterNodeAddress = Environment.sanitizedGet("CLUSTER_NODE_ADDRESS")
     let clusterSecret = Environment.sanitizedGet("CLUSTER_SECRET")
     if clusterNodeAddress != nil || clusterSecret != nil {
-        guard Environment.sanitizedGet("DATABASE_URL") != nil else {
-            throw ClusterConfigurationError(
-                description:
-                    "CLUSTER_NODE_ADDRESS/CLUSTER_SECRET require DATABASE_URL to be set - object-data clustering needs the shared Postgres control plane."
-            )
-        }
         guard let clusterNodeAddress, let clusterSecret else {
             throw ClusterConfigurationError(
                 description:
@@ -88,38 +74,20 @@ public func configure(_ app: Application) async throws {
             )
         }
         let nodeId = try ClusterNodeIdentity.loadOrCreate()
+        let seeds =
+            (Environment.sanitizedGet("CLUSTER_SEED_NODES") ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
         app.storage[ClusterConfigurationKey.self] = ClusterConfiguration(
-            nodeId: nodeId, address: clusterNodeAddress, secret: clusterSecret)
+            nodeId: nodeId, address: clusterNodeAddress, secret: clusterSecret, seeds: seeds)
         app.storage[ClusterErasureCodingConfigKey.self] = erasureCodingConfig
+        app.storage[ClusterMetadataErasureCodingConfigKey.self] = metadataErasureCodingConfig
     }
 
     // Spool files are per-request transients; anything still here is an orphan from an
     // unclean shutdown mid-upload.
     StreamingBodySpooler.cleanupOrphans()
-
-    app.migrations.add(CreateUser())
-    app.migrations.add(CreateAccessKey())
-    app.migrations.add(CreateBucket())
-    app.migrations.add(AddBucketPolicy())
-    app.migrations.add(CreateSharedLink())
-    app.migrations.add(AddBucketPublicAccessBlock())
-    app.migrations.add(AddBucketTags())
-    app.migrations.add(AddBucketLifecycleRules())
-    app.migrations.add(CreateOIDCProvider())
-    app.migrations.add(AddUserOIDCFields())
-    app.migrations.add(AddBucketNotificationConfig())
-    app.migrations.add(CreateNotificationDelivery())
-    app.migrations.add(AddNotificationDeliveryLastError())
-    app.migrations.add(AddBucketReplicationConfig())
-    app.migrations.add(CreateReplicationTask())
-    app.migrations.add(MakeSharedLinkExpiryOptional())
-    app.migrations.add(CreateOIDCState())
-    app.migrations.add(CreateClusterNode())
-    app.migrations.add(CreateClusterReplicationTask())
-    app.migrations.add(AddClusterNodeCapacity())
-    app.migrations.add(CreateErasureCodedReplicationTask())
-
-    app.migrations.add(CreateDefaultUser())
 
     let cors: CORSMiddleware = CORSMiddleware(
         configuration: .init(
@@ -152,24 +120,31 @@ public func configure(_ app: Application) async throws {
         await app.jwt.keys.add(hmac: "super-secret-key", digestAlgorithm: .sha256)
     }
 
-    app.lifecycle.use(LoadCacheLifecycle())
-    // Must be registered after LoadCacheLifecycle: Vapor runs didBootAsync handlers
-    // sequentially in registration order, and the LISTEN loop's reconnect-safety-net reload
-    // reuses the exact same bulk-load path - it must never race the initial one. No-op when
-    // running SQLite (no DATABASE_URL was set above).
-    app.lifecycle.use(CacheInvalidationListener.shared)
-    // Self-registers this node into `cluster_nodes` and starts its heartbeat - must run after
-    // the two handlers above for the same reason: it needs caches loaded and cluster-invalidation
-    // NOTIFYs flowing before it announces itself. No-op when `ClusterConfigurationKey` wasn't
-    // stashed above (cluster mode off).
+    // Self-registers this node into the `cluster-nodes` metadata collection and starts its
+    // heartbeat. Registered (and therefore its `didBootAsync` run) BEFORE `LoadCacheLifecycle`,
+    // deliberately: `LoadCacheLifecycle.reloadAll` lists access keys/buckets cluster-wide via
+    // `MetadataListingService`, which fans out to `ClusterNodeCache.shared.activeNodes()` - if
+    // that ran first, every node's `ClusterNodeCache` would still be completely empty (cluster
+    // bootstrap hasn't happened yet), so the fan-out would query nobody and the initial cache
+    // load would come back empty on every node that doesn't happen to hold every record
+    // locally itself - exactly the "InvalidAccessKeyId right after a fresh multi-node boot"
+    // failure this ordering exists to prevent.
     app.lifecycle.use(ClusterMembershipLifecycle.shared)
+    app.lifecycle.use(LoadCacheLifecycle())
 
     // Outbound HTTP timeouts (webhook deliveries, OIDC fetches): a hung remote endpoint
-    // must never wedge a background task or login flow indefinitely
+    // must never wedge a background task or long-running flow indefinitely
     app.http.client.configuration.timeout = .init(
         connect: .seconds(5), read: .seconds(10))
+    
+    app.http.client.configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 256
 
-    try await app.autoMigrate()
+    // Idempotent (see DefaultUserSeed.swift's doc comment) - safe to run on every boot, not
+    // just the first one, now that there's no migration-tracking table to gate it on. Gated to
+    // a single, statically-elected node in cluster mode - see `isDesignatedSeeder`'s doc comment.
+    if isDesignatedSeeder(app: app) {
+        try await CreateDefaultUser.run(app: app)
+    }
 
     // The webhook dispatcher needs the app for db/client access; configured in every
     // environment so tests can drive drains manually (only the periodic tick below is
@@ -178,6 +153,14 @@ public func configure(_ app: Application) async throws {
     await ReplicationDispatcher.shared.configure(app: app)
     await ClusterReplicationDispatcher.shared.configure(app: app)
     await ErasureCodedDispatcher.shared.configure(app: app)
+    // Stops every dispatcher's `wake()` from spawning new drain work before `app.storage` gets
+    // cleared - see `GenericOutboxDispatcher.prepareForShutdown`'s doc comment for the crash this
+    // closes.
+    app.lifecycle.use(OutboxDispatcherShutdown())
+    // Gracefully shuts down the dedicated HTTP client used for cluster control-plane traffic
+    // (cache-invalidation broadcasts, membership seed queries) - see its own doc comment for why
+    // that traffic gets a separate client from `app.http.client.shared`.
+    app.lifecycle.use(LightweightClusterControlClient.ShutdownHandler())
 
     try routes(app)
 
@@ -188,25 +171,27 @@ public func configure(_ app: Application) async throws {
         ) { task in
             Task {
                 do {
-                    let expiredAccessKeys = try await AccessKey.query(on: app.db)
-                        .filter(\.$expirationDate <= Date.now)
-                        .all()
+                    let expiredAccessKeys = try await AccessKey.all(app: app).filter {
+                        guard let expirationDate = $0.expirationDate else { return false }
+                        return expirationDate <= Date.now
+                    }
 
                     for accessKey in expiredAccessKeys {
                         try await AccessKeyService.delete(
-                            on: app.db, accessKey: accessKey.accessKey)
+                            app: app, accessKey: accessKey.accessKey)
                     }
                 } catch {
                     app.logger.error("Failed to invalidate expired access keys: \(error)")
                 }
 
                 do {
-                    let expiredSharedLinks = try await SharedLink.query(on: app.db)
-                        .filter(\.$expiresAt <= Date.now)
-                        .all()
+                    let expiredSharedLinks = try await SharedLink.all(app: app).filter {
+                        guard let expiresAt = $0.expiresAt else { return false }
+                        return expiresAt <= Date.now
+                    }
 
                     for link in expiredSharedLinks {
-                        try await link.delete(on: app.db)
+                        try await link.delete(app: app)
                     }
                 } catch {
                     app.logger.error("Failed to clean up expired shared links: \(error)")
@@ -215,7 +200,7 @@ public func configure(_ app: Application) async throws {
                 // In-flight OIDC login attempts (state/nonce/PKCE verifier) older than 10
                 // minutes - a login that never completes a round-trip should not linger.
                 do {
-                    try await OIDCStateCache.shared.removeExpired(on: app.db, olderThan: 600)
+                    try await OIDCStateCache.removeExpired(app: app, olderThan: 600)
                 } catch {
                     app.logger.error("Failed to clean up expired OIDC login states: \(error)")
                 }
@@ -231,6 +216,24 @@ public func configure(_ app: Application) async throws {
         ) { task in
             Task {
                 await MetricsCollector.shared.sample()
+            }
+        }
+
+        // Periodic full cache reload (upsert-only, see `LoadCacheLifecycle.reloadAll`'s doc
+        // comment) - bounds staleness from a dropped cache-invalidation broadcast
+        // (`CacheInvalidationService`, HTTP over the inter-node cluster protocol
+        if app.storage[ClusterConfigurationKey.self] != nil {
+            app.eventLoopGroup.next().scheduleRepeatedTask(
+                initialDelay: .seconds(60),
+                delay: .seconds(60)
+            ) { task in
+                Task {
+                    do {
+                        try await LoadCacheLifecycle.reloadAll(app: app)
+                    } catch {
+                        app.logger.error("Periodic full cache reload failed: \(error)")
+                    }
+                }
             }
         }
 
@@ -324,31 +327,68 @@ public func configure(_ app: Application) async throws {
                 }
 
                 do {
-                    try await NotificationDispatcher.purgeExpiredFailures(on: app.db)
+                    try await NotificationDispatcher.purgeExpiredFailures(app: app)
                 } catch {
                     app.logger.error("Failed to purge expired webhook failures: \(error)")
                 }
 
                 do {
-                    try await ReplicationDispatcher.purgeExpiredFailures(on: app.db)
+                    try await ReplicationDispatcher.purgeExpiredFailures(app: app)
                 } catch {
                     app.logger.error("Failed to purge expired replication failures: \(error)")
                 }
 
                 do {
-                    try await ClusterReplicationDispatcher.purgeExpiredFailures(on: app.db)
+                    try await ClusterReplicationDispatcher.purgeExpiredFailures(app: app)
                 } catch {
                     app.logger.error("Failed to purge expired cluster replication failures: \(error)")
                 }
 
                 do {
-                    try await ErasureCodedDispatcher.purgeExpiredFailures(on: app.db)
+                    try await ErasureCodedDispatcher.purgeExpiredFailures(app: app)
                 } catch {
                     app.logger.error("Failed to purge expired EC shard replication failures: \(error)")
                 }
             }
         }
     }
+}
+
+/// Calls `prepareForShutdown()` on all four outbox dispatchers before `app.storage` is cleared -
+/// see `GenericOutboxDispatcher.prepareForShutdown`'s doc comment.
+private struct OutboxDispatcherShutdown: LifecycleHandler {
+    func shutdownAsync(_ app: Application) async {
+        await NotificationDispatcher.shared.prepareForShutdown()
+        await ReplicationDispatcher.shared.prepareForShutdown()
+        await ClusterReplicationDispatcher.shared.prepareForShutdown()
+        await ErasureCodedDispatcher.shared.prepareForShutdown()
+    }
+}
+
+/// Whether THIS node is the one that should attempt `CreateDefaultUser.run` at boot.
+///
+/// In non-clustered mode there's only ever one node, so this is trivially `true`. In cluster
+/// mode, letting every node attempt the seed independently is unsafe: `ClusterMembershipLifecycle`
+/// (which discovers peers via `CLUSTER_SEED_NODES`) hasn't run yet at this point in boot -
+/// `configure(app:)` completes entirely before Vapor invokes any `LifecycleHandler`'s
+/// `didBootAsync` - so every node's `ClusterNodeCache` is still completely empty here, on every
+/// single cold boot, not just as a rare race. Each node's `MetadataStore.putIfAbsent` would then
+/// see itself as the sole/local coordinator (nothing else is known yet) and independently create
+/// its own distinct "default admin" record, producing N different admin accounts with N different
+/// passwords/UUIDs instead of one - exactly the split-brain this function prevents.
+///
+/// The fix doesn't wait for discovery (still unreliable under a simultaneous cold start - peers
+/// may not be listening yet regardless of when this runs) - it sidesteps discovery entirely by
+/// electing the seeder from information every node already has statically, before any network
+/// call: the full address set this node was configured with (itself plus every configured seed).
+/// Every node in a symmetrically-configured cluster (each node lists every other as a seed, as
+/// `CLUSTER_SEED_NODES` is documented and as `cluster_tests.sh` configures it) computes the exact
+/// same set and therefore the exact same minimum - so exactly one node ever attempts the seed,
+/// with no coordination round-trip needed.
+private func isDesignatedSeeder(app: Application) -> Bool {
+    guard let config = app.storage[ClusterConfigurationKey.self] else { return true }
+    let allAddresses = [config.address] + config.seeds
+    return config.address == allAddresses.min()
 }
 
 /// This makes sure, that we always allow the console localhost in the CORS middleware.

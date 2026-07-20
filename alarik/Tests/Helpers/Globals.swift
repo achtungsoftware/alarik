@@ -103,20 +103,20 @@ public func createNonAdminUserWithAccessKey(
         passwordHash: try Bcrypt.hash("TestPass123!"),
         isAdmin: false
     )
-    try await user.save(on: app.db)
+    try await user.create(app: app)
 
     let accessKeyModel = AccessKey(
-        userId: user.id!,
+        userId: user.id,
         accessKey: accessKey,
         secretKey: secretKey
     )
-    try await accessKeyModel.save(on: app.db)
+    _ = try await accessKeyModel.create(app: app)
 
     // Add to caches
     await AccessKeySecretKeyMapCache.shared.add(accessKey: accessKey, secretKey: secretKey)
-    await AccessKeyUserMapCache.shared.add(accessKey: accessKey, userId: user.id!)
+    await AccessKeyUserMapCache.shared.add(accessKey: accessKey, userId: user.id)
 
-    return user.id!
+    return user.id
 }
 
 /// Helper to set access key headers on a request

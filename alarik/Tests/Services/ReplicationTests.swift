@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import NIOCore
 import NIOHTTP1
@@ -46,7 +45,6 @@ struct ReplicationTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await LoadCacheLifecycle().didBootAsync(app)
 
             try await app.server.start(address: .hostname("127.0.0.1", port: 0))
@@ -63,10 +61,8 @@ struct ReplicationTests {
             }
             await app.server.shutdown()
 
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -227,6 +223,13 @@ struct ReplicationTests {
             bucketName: bucketName, key: key, versionId: nil, loadData: true))?.1
     }
 
+    /// This node's own queued replication tasks - see `NotificationDeliveryTests.ownedDeliveries`
+    /// for why "this node's own" is the whole story in this single-process test harness.
+    private func ownedTasks(_ app: Application) -> [ReplicationTask] {
+        OutboxMailbox.allOwnedTasks(
+            ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
+    }
+
     // MARK: - Tests
 
     @Test("a PUT is replicated and byte-identical on the target")
@@ -249,7 +252,7 @@ struct ReplicationTests {
                 readObject(bucketName: "repl-dst-put", key: "hello.txt") == content
             }
             #expect(replicated)
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
         }
     }
 
@@ -300,7 +303,7 @@ struct ReplicationTests {
             try await Task.sleep(nanoseconds: 300_000_000)
 
             // No delete task was ever enqueued, and the object still exists on the target
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
             #expect(readObject(bucketName: "repl-dst-del1", key: "a.txt") == content)
         }
     }
@@ -393,7 +396,7 @@ struct ReplicationTests {
             await ReplicationDispatcher.shared.drain()
             try await Task.sleep(nanoseconds: 300_000_000)
 
-            let failing = try #require(try await ReplicationTask.query(on: app.db).first())
+            let failing = try #require(ownedTasks(app).first)
             #expect(failing.attempts >= 1)
             #expect(failing.lastError != nil)
 
@@ -401,13 +404,13 @@ struct ReplicationTests {
             try await createBucket(app, bucketName: "repl-dst-retry")
             try await enableVersioning(app, bucketName: "repl-dst-retry")
             failing.nextAttemptAt = Date().addingTimeInterval(-1)
-            try await failing.save(on: app.db)
+            try OutboxMailbox.update(failing, collection: OutboxCollections.replicationTasks)
 
             let replicated = try await waitUntil {
                 readObject(bucketName: "repl-dst-retry", key: "c.txt") == content
             }
             #expect(replicated)
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
         }
     }
 
@@ -426,7 +429,7 @@ struct ReplicationTests {
 
             let content = Data("orphaned task".utf8)
             _ = try await putObject(app, bucketName: "repl-src-orphan", key: "d.txt", data: content)
-            #expect(try await ReplicationTask.query(on: app.db).count() == 1)
+            #expect(ownedTasks(app).count == 1)
 
             // Remove the target entirely - the rule referencing it is auto-disabled, but the
             // already-queued task must not be affected (it snapshotted its own credentials).
@@ -515,7 +518,7 @@ struct ReplicationTests {
     func bucketDeletePurgesReplicationTasks() async throws {
         try await withApp { app, baseURL in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try await User.query(on: app.db).filter(\.$username == "alarik").first()!
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
             try await createBucket(app, bucketName: "repl-doomed")
             try await enableVersioning(app, bucketName: "repl-doomed")
 
@@ -525,13 +528,13 @@ struct ReplicationTests {
                 destBucket: "never-created")
 
             _ = try await putObject(app, bucketName: "repl-doomed", key: "a.txt", data: Data("x".utf8))
-            #expect(try await ReplicationTask.query(on: app.db).count() == 1)
+            #expect(ownedTasks(app).count == 1)
 
             let req = Request(application: app, on: app.eventLoopGroup.next())
             try await BucketService.delete(
-                req: req, bucketName: "repl-doomed", userId: admin.id!, force: true)
+                req: req, bucketName: "repl-doomed", userId: admin.id, force: true)
 
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
         }
     }
 
@@ -669,7 +672,7 @@ struct ReplicationTests {
             // The real secret must have survived server-side, unchanged, even though the client
             // never saw or resent it.
             let bucket = try #require(
-                try await Bucket.query(on: app.db).filter(\.$name == "repl-src-secretmask").first())
+                try await Bucket.find(app: app, name: "repl-src-secretmask"))
             let storedSecret = ReplicationConfiguration.fromJSON(bucket.replicationConfig ?? "")
                 .targets.first?.secretAccessKey
             #expect(storedSecret == "super-secret-value")
@@ -875,25 +878,20 @@ struct ReplicationTests {
             var isFailed = false
             for _ in 0..<(ReplicationDispatcher.maxAttempts + 2) {
                 await ReplicationDispatcher.shared.drain()
-                if let row = try await ReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == "repl-src-deadletter")
-                    .first()
-                {
+                if let row = ownedTasks(app).first(where: { $0.bucketName == "repl-src-deadletter" }) {
                     if row.state == ReplicationTask.State.failed.rawValue {
                         isFailed = true
                         break
                     }
                     row.nextAttemptAt = Date().addingTimeInterval(-1)
-                    try await row.save(on: app.db)
+                    try OutboxMailbox.update(row, collection: OutboxCollections.replicationTasks)
                 }
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
             #expect(isFailed)
 
             let deadRow = try #require(
-                try await ReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == "repl-src-deadletter")
-                    .first())
+                ownedTasks(app).first(where: { $0.bucketName == "repl-src-deadletter" }))
 
             // Fix the destination, then retry via the API
             try await createBucket(app, bucketName: "repl-dst-deadletter")
@@ -901,7 +899,7 @@ struct ReplicationTests {
 
             try await app.test(
                 .POST,
-                "/api/v1/buckets/repl-src-deadletter/replication/tasks/\(deadRow.id!.uuidString)/retry",
+                "/api/v1/buckets/repl-src-deadletter/replication/tasks/\(deadRow.id.uuidString)/retry",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -916,10 +914,7 @@ struct ReplicationTests {
                 readObject(bucketName: "repl-dst-deadletter", key: "e.txt") == content
             }
             #expect(replicated)
-            #expect(
-                try await ReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == "repl-src-deadletter")
-                    .count() == 0)
+            #expect(ownedTasks(app).filter { $0.bucketName == "repl-src-deadletter" }.isEmpty)
         }
     }
 
@@ -941,14 +936,12 @@ struct ReplicationTests {
             await ReplicationDispatcher.shared.drain()
 
             let rowInB = try #require(
-                try await ReplicationTask.query(on: app.db)
-                    .filter(\.$bucketName == "repl-src-scope-b")
-                    .first())
+                ownedTasks(app).first(where: { $0.bucketName == "repl-src-scope-b" }))
 
             // Attempting to retry bucket-b's task through bucket-a's path must 404
             try await app.test(
                 .POST,
-                "/api/v1/buckets/repl-src-scope-a/replication/tasks/\(rowInB.id!.uuidString)/retry",
+                "/api/v1/buckets/repl-src-scope-a/replication/tasks/\(rowInB.id.uuidString)/retry",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -1074,7 +1067,7 @@ struct ReplicationTests {
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
             #expect(readObject(bucketName: "repl-dst-order", key: "race.txt") == finalContent)
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
         }
     }
 
@@ -1100,7 +1093,7 @@ struct ReplicationTests {
             // "synchronous" means), so the object must already be on the target by now.
             #expect(readObject(bucketName: "repl-dst-sync", key: "sync.txt") == content)
             // Delivered inline - nothing was ever enqueued to the outbox for it.
-            #expect(try await ReplicationTask.query(on: app.db).count() == 0)
+            #expect(ownedTasks(app).isEmpty)
         }
     }
 
@@ -1126,7 +1119,7 @@ struct ReplicationTests {
 
             // The failed inline attempt must have fallen back to the normal async outbox
             // rather than silently losing the replication.
-            let task = try #require(try await ReplicationTask.query(on: app.db).first())
+            let task = try #require(ownedTasks(app).first)
             #expect(task.key == "e.txt")
             #expect(task.state == ReplicationTask.State.pending.rawValue)
 
@@ -1134,7 +1127,7 @@ struct ReplicationTests {
             try await createBucket(app, bucketName: "repl-dst-syncfail-missing")
             try await enableVersioning(app, bucketName: "repl-dst-syncfail-missing")
             task.nextAttemptAt = Date().addingTimeInterval(-1)
-            try await task.save(on: app.db)
+            try OutboxMailbox.update(task, collection: OutboxCollections.replicationTasks)
 
             let replicated = try await waitUntil {
                 readObject(bucketName: "repl-dst-syncfail-missing", key: "e.txt") == content

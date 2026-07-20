@@ -29,12 +29,9 @@ struct LifecycleServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -50,11 +47,11 @@ struct LifecycleServiceTests {
         let user = User(
             name: "Lifecycle Test User", username: UUID().uuidString,
             passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
-        try await user.save(on: app.db)
+        try await user.create(app: app)
 
-        let bucket = Bucket(name: name, userId: user.id!, versioningStatus: versioningStatus)
+        let bucket = Bucket(name: name, userId: user.id, versioningStatus: versioningStatus)
         bucket.lifecycleRules = LifecycleConfiguration(rules: rules).toJSON()
-        try await bucket.save(on: app.db)
+        try await bucket.save(app: app)
 
         try BucketHandler.create(name: name)
         await BucketVersioningCache.shared.setStatus(for: name, status: versioningStatus)

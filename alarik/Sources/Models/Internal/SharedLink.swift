@@ -14,40 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
+import Vapor
 
 /// A public link to a single object, optionally time-limited. The row's own id is used
 /// directly as the opaque, unguessable public token - no credential of any kind is exposed,
 /// and revoking a link is just deleting (or letting expire) this row.
-final class SharedLink: Model, @unchecked Sendable {
-    static let schema = "shared_links"
-
-    @ID(key: .id)
-    var id: UUID?
-
-    @Parent(key: "user_id")
-    var user: User
-
-    @Field(key: "bucket_name")
+///
+/// Backed by `MetadataStore`, not Fluent - `id` doubles as the primary key directly (already a
+/// natural immutable identifier, unlike `User`'s mutable username).
+final class SharedLink: @unchecked Sendable, Codable {
+    let id: UUID
+    var userId: UUID
     var bucketName: String
-
-    @Field(key: "key")
     var key: String
 
     /// When the link stops working, or nil for a link that never expires. Non-expiring links
-    /// live until explicitly revoked - the hourly cleanup task's `expires_at <= now` filter
-    /// naturally never matches a NULL.
-    @OptionalField(key: "expires_at")
+    /// live until explicitly revoked - the hourly cleanup task's `expiresAt <= now` filter
+    /// naturally never matches a nil.
     var expiresAt: Date?
 
-    @Field(key: "created_at")
     var createdAt: Date
 
-    init() {}
-
     init(
-        id: UUID? = nil,
+        id: UUID = UUID(),
         userId: UUID,
         bucketName: String,
         key: String,
@@ -55,10 +45,35 @@ final class SharedLink: Model, @unchecked Sendable {
         createdAt: Date = Date()
     ) {
         self.id = id
-        self.$user.id = userId
+        self.userId = userId
         self.bucketName = bucketName
         self.key = key
         self.expiresAt = expiresAt
         self.createdAt = createdAt
+    }
+}
+
+// MARK: - MetadataStore access
+
+extension SharedLink {
+    static func find(app: Application, id: UUID) async throws -> SharedLink? {
+        try await MetadataStore.get(
+            SharedLink.self, app: app, collection: MetadataCollections.sharedLinks,
+            id: id.uuidString)
+    }
+
+    static func all(app: Application) async throws -> [SharedLink] {
+        await MetadataListingService.list(app: app, collection: MetadataCollections.sharedLinks)
+            .compactMap { try? JSONDecoder().decode(SharedLink.self, from: $0.value) }
+    }
+
+    func save(app: Application) async throws {
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.sharedLinks, id: id.uuidString, value: self)
+    }
+
+    func delete(app: Application) async throws {
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.sharedLinks, id: id.uuidString)
     }
 }

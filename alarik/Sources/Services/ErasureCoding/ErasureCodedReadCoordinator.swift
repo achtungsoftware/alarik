@@ -53,14 +53,29 @@ enum ErasureCodedReadCoordinator {
     /// Gathers the object's shards and resolves its metadata, without streaming. Split out from the
     /// body stream so a ranged GET can read `meta.size` (to validate/parse the `Range`) and reject
     /// a delete marker with a 404 *before* committing to decode.
+    /// `shardCounts` lets a caller supply its own `(dataShards, totalShards)` instead of reading
+    /// the object-data `ClusterErasureCodingConfigKey` from storage - needed by `MetadataStore`,
+    /// whose control-plane records are erasure-coded under their own, independently-configured
+    /// `ClusterMetadataErasureCodingConfig` (which can, and often does, differ from the bulk
+    /// object-data `k+m`). `nil` (every existing object-data call site) preserves today's
+    /// behavior exactly.
     static func prepare(
         app: Application, bucketName: String, key: String, versionId: String?,
-        responsible: [ClusterNodeInfo], selfNodeId: UUID, requestId: String
+        responsible: [ClusterNodeInfo], selfNodeId: UUID, requestId: String,
+        shardCounts: (dataShards: Int, totalShards: Int)? = nil
     ) async throws -> PreparedRead {
-        guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else {
-            throw ErasureCodedRebalanceError.notConfigured
+        let dataShards: Int
+        let totalShards: Int
+        if let shardCounts {
+            dataShards = shardCounts.dataShards
+            totalShards = shardCounts.totalShards
+        } else {
+            guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else {
+                throw ErasureCodedRebalanceError.notConfigured
+            }
+            dataShards = ecConfig.dataShards
+            totalShards = ecConfig.totalShards
         }
-        let totalShards = ecConfig.totalShards
 
         var gathered: GatheredShards?
         var attempt = 0
@@ -68,7 +83,7 @@ enum ErasureCodedReadCoordinator {
             do {
                 gathered = try await ErasureCodedShardGatherer.gather(
                     app: app, bucketName: bucketName, key: key, versionId: versionId,
-                    responsible: responsible, selfNodeId: selfNodeId, needed: ecConfig.dataShards,
+                    responsible: responsible, selfNodeId: selfNodeId, needed: dataShards,
                     wantSpare: true, excludingIndex: nil, requestId: requestId)
             } catch ErasureCodedGatherError.inconsistent where attempt < maxInconsistentRetries {
                 attempt += 1
@@ -161,11 +176,13 @@ enum ErasureCodedReadCoordinator {
     /// download, cross-cluster replication).
     static func read(
         app: Application, bucketName: String, key: String, versionId: String?,
-        responsible: [ClusterNodeInfo], selfNodeId: UUID, requestId: String
+        responsible: [ClusterNodeInfo], selfNodeId: UUID, requestId: String,
+        shardCounts: (dataShards: Int, totalShards: Int)? = nil
     ) async throws -> (meta: ObjectMeta, body: AsyncThrowingStream<ByteBuffer, any Error>) {
         let prepared = try await prepare(
             app: app, bucketName: bucketName, key: key, versionId: versionId,
-            responsible: responsible, selfNodeId: selfNodeId, requestId: requestId)
+            responsible: responsible, selfNodeId: selfNodeId, requestId: requestId,
+            shardCounts: shardCounts)
         return (prepared.meta, streamBody(app: app, prepared: prepared))
     }
 

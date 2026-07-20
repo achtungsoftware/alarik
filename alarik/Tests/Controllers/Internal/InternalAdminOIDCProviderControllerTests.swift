@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -30,12 +29,9 @@ struct InternalAdminOIDCProviderControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -49,7 +45,7 @@ struct InternalAdminOIDCProviderControllerTests {
         let provider = OIDCProvider(
             name: name, issuerURL: "https://example.com", clientId: "client-id",
             clientSecret: "original-secret", enabled: enabled)
-        try await provider.save(on: app.db)
+        try await provider.save(app: app)
         return provider
     }
 
@@ -113,7 +109,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(body.enabled == true)
                 })
 
-            let providers = try await OIDCProvider.query(on: app.db).all()
+            let providers = try await OIDCProvider.all(app: app)
             #expect(providers.count == 1)
             #expect(providers.first?.clientSecret == "shh")
         }
@@ -138,7 +134,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .unauthorized)
                 })
 
-            let providers = try await OIDCProvider.query(on: app.db).all()
+            let providers = try await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -162,7 +158,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .badRequest)
                 })
 
-            let providers = try await OIDCProvider.query(on: app.db).all()
+            let providers = try await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -174,7 +170,7 @@ struct InternalAdminOIDCProviderControllerTests {
             let provider = try await createProvider(app)
 
             let editDTO = OIDCProvider.Edit(
-                id: try provider.requireID(), name: "Renamed", issuerURL: "https://new.example.com",
+                id: provider.id, name: "Renamed", issuerURL: "https://new.example.com",
                 clientId: "new-client-id", clientSecret: nil, enabled: false)
 
             try await app.test(
@@ -192,7 +188,7 @@ struct InternalAdminOIDCProviderControllerTests {
                 })
 
             // Blank clientSecret means "keep the existing one" - must be untouched.
-            let reloaded = try #require(try await OIDCProvider.find(provider.id, on: app.db))
+            let reloaded = try #require(try await OIDCProvider.find(app: app, id: provider.id))
             #expect(reloaded.clientSecret == "original-secret")
         }
     }
@@ -204,7 +200,7 @@ struct InternalAdminOIDCProviderControllerTests {
             let provider = try await createProvider(app)
 
             let editDTO = OIDCProvider.Edit(
-                id: try provider.requireID(), name: provider.name, issuerURL: provider.issuerURL,
+                id: provider.id, name: provider.name, issuerURL: provider.issuerURL,
                 clientId: provider.clientId, clientSecret: "rotated-secret", enabled: true)
 
             try await app.test(
@@ -217,7 +213,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .ok)
                 })
 
-            let reloaded = try #require(try await OIDCProvider.find(provider.id, on: app.db))
+            let reloaded = try #require(try await OIDCProvider.find(app: app, id: provider.id))
             #expect(reloaded.clientSecret == "rotated-secret")
         }
     }
@@ -229,7 +225,7 @@ struct InternalAdminOIDCProviderControllerTests {
             let provider = try await createProvider(app)
 
             let editDTO = OIDCProvider.Edit(
-                id: try provider.requireID(), name: "Renamed", issuerURL: provider.issuerURL,
+                id: provider.id, name: "Renamed", issuerURL: provider.issuerURL,
                 clientId: provider.clientId, clientSecret: nil, enabled: true)
 
             try await app.test(
@@ -251,7 +247,7 @@ struct InternalAdminOIDCProviderControllerTests {
             let provider = try await createProvider(app)
 
             try await app.test(
-                .DELETE, "/api/v1/admin/oidcProviders/\(try provider.requireID())",
+                .DELETE, "/api/v1/admin/oidcProviders/\(provider.id)",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -259,7 +255,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let providers = try await OIDCProvider.query(on: app.db).all()
+            let providers = try await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -271,7 +267,7 @@ struct InternalAdminOIDCProviderControllerTests {
             let provider = try await createProvider(app)
 
             try await app.test(
-                .DELETE, "/api/v1/admin/oidcProviders/\(try provider.requireID())",
+                .DELETE, "/api/v1/admin/oidcProviders/\(provider.id)",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -279,7 +275,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .unauthorized)
                 })
 
-            let providers = try await OIDCProvider.query(on: app.db).all()
+            let providers = try await OIDCProvider.all(app: app)
             #expect(providers.count == 1)
         }
     }
@@ -289,14 +285,14 @@ struct InternalAdminOIDCProviderControllerTests {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
             let provider = try await createProvider(app)
-            let providerId = try provider.requireID()
+            let providerId = provider.id
 
             let user = User(
                 name: "Linked User", username: "linked@example.com",
                 passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
             user.oidcProviderId = providerId
             user.oidcSubject = "some-subject"
-            try await user.save(on: app.db)
+            try await user.create(app: app)
 
             try await app.test(
                 .DELETE, "/api/v1/admin/oidcProviders/\(providerId)",
@@ -307,7 +303,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let reloaded = try #require(try await User.find(user.id, on: app.db))
+            let reloaded = try #require(try await User.find(app: app, id: user.id))
             #expect(reloaded.oidcProviderId == nil)
             #expect(reloaded.oidcSubject == nil)
         }

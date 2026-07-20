@@ -14,30 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 import struct Foundation.UUID
 
 /// Makes bucket-wide scans (as opposed to single-key operations, which `ObjectRoutingService`
 /// already handles) cluster-aware. Placement is per-key rendezvous hashing, not range-sharded,
-/// so any node can hold any key - there is no way to know in advance which nodes hold which keys
-/// for a prefix, unlike a single-object GET/PUT. A correct bucket-wide scan therefore always
-/// fans out to every active node and merges results, never just consults placement for one key.
+/// so any node can hold any key - a correct bucket-wide scan therefore always fans out to every
+/// active node and merges results, never just consults placement for one key.
 ///
-/// Every entry point below follows the same shape: if this node isn't clustered (or has no
-/// peers), call the local `ObjectFileHandler`/`MultipartFileHandler` function directly - byte-
-/// for-byte the pre-cluster behavior, the same inert-when-not-clustered guarantee every other
-/// cluster feature holds. Otherwise, fetch this node's own local page first (no network hop),
-/// fan out to peers concurrently via `ClusterListingClient`, and merge.
-///
-/// Error handling is deliberately not uniform: plain listings and `calculateStats` are best-
-/// effort (an unreachable peer is logged and excluded - a brief under-listing during a node blip
-/// is a self-correcting, ordinary eventual-consistency artifact, matching
-/// `ClusterForwardingClient.forward`'s read-tolerance philosophy). `hasBucketObjects` fails
-/// closed instead - it gates `DeleteBucket`, an irreversible action, so an unreachable peer must
-/// refuse the delete rather than risk deleting a bucket's row while another node still
-/// physically holds its objects.
+/// If this node isn't clustered (or has no peers), each entry point calls the local
+/// `ObjectFileHandler`/`MultipartFileHandler` function directly. Otherwise it fetches this node's
+/// own local page first, fans out to peers via `ClusterListingClient`, and merges. Plain listings
+/// and `calculateStats` are best-effort (an unreachable peer is logged and excluded); only
+/// `hasBucketObjects` fails closed, since it gates the irreversible `DeleteBucket`.
 enum ClusterListingService {
     // MARK: - Objects (ListObjectsV2 / ListObjects)
 
@@ -267,13 +257,10 @@ enum ClusterListingService {
     }
 
     /// Per-node storage breakdown across the *whole cluster* (every bucket), for the admin
-    /// console's storage-distribution view - distinct from `calculateStats`, which is bucket-
-    /// scoped and sums every node's share into one cluster-wide total, discarding the per-node
-    /// split. Each active node's own contribution is already non-overlapping by construction
-    /// (the primary-owner convention `ownedStats`/`ownedStatsAllBuckets` use), so unlike listing
-    /// there's no merge/dedup step - just one fan-out and a collect. Best-effort: an unreachable
-    /// peer's entry is simply omitted (this is a display metric, not a safety gate, same
-    /// tolerance `calculateStats` already has).
+    /// console's storage-distribution view - distinct from `calculateStats`, which sums every
+    /// node's share into one cluster-wide total. Each node's contribution is non-overlapping by
+    /// construction (the primary-owner convention `ownedStats` uses), so there's no merge/dedup
+    /// step. Best-effort: an unreachable peer's entry is simply omitted.
     static func nodeStorageBreakdown(
         req: Request
     ) async throws -> [(nodeId: UUID, sizeBytes: Int64, objectCount: Int)] {
@@ -284,7 +271,7 @@ enum ClusterListingService {
         let peers = active.filter { $0.id != config.nodeId }
 
         let own = try await ownedStatsAllBuckets(
-            on: req.db, activeNodes: active, selfNodeId: config.nodeId)
+            app: req.application, activeNodes: active, selfNodeId: config.nodeId)
         var results: [(nodeId: UUID, sizeBytes: Int64, objectCount: Int)] = [
             (config.nodeId, own.sizeBytes, own.objectCount)
         ]
@@ -292,16 +279,25 @@ enum ClusterListingService {
         await withTaskGroup(of: (nodeId: UUID, sizeBytes: Int64, objectCount: Int)?.self) { group in
             for node in peers {
                 group.addTask {
-                    do {
-                        let r = try await ClusterListingClient.fetchOwnedStatsAll(
-                            app: req.application, from: node)
-                        return (node.id, r.sizeBytes, r.objectCount)
-                    } catch {
-                        req.logger.warning(
-                            "Cluster storage breakdown: peer \(node.id) unreachable, omitting from result: \(error)"
-                        )
-                        return nil
+                    // A short retry, not a single shot: this endpoint is polled for a
+                    // point-in-time cluster-wide total, and a transiently busy peer (e.g.
+                    // running its own reactive rebalance walk) would otherwise be silently
+                    // omitted, undercounting the true total for this one snapshot. Bounded (2
+                    // retries) so this still returns promptly for the admin dashboard.
+                    for delay: Duration? in [nil, .milliseconds(750), .seconds(2)] {
+                        if let delay { try? await Task.sleep(for: delay) }
+                        do {
+                            let r = try await ClusterListingClient.fetchOwnedStatsAll(
+                                app: req.application, from: node)
+                            return (node.id, r.sizeBytes, r.objectCount)
+                        } catch {
+                            continue
+                        }
                     }
+                    req.logger.warning(
+                        "Cluster storage breakdown: peer \(node.id) unreachable after retries, omitting from result"
+                    )
+                    return nil
                 }
             }
             for await result in group {
@@ -315,9 +311,9 @@ enum ClusterListingService {
     /// Cluster-wide (all-buckets) generalization of `ownedStats` - same primary-owner counting
     /// rule, just looped over every bucket instead of one.
     static func ownedStatsAllBuckets(
-        on db: any Database, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
+        app: Application, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
     ) async throws -> (sizeBytes: Int64, objectCount: Int) {
-        let buckets = try await Bucket.query(on: db).all()
+        let buckets = try await Bucket.all(app: app)
         var sizeBytes: Int64 = 0
         var objectCount = 0
         for bucket in buckets {
@@ -331,12 +327,10 @@ enum ClusterListingService {
     }
 
     /// Each historical version and delete marker is counted toward exactly one node's local
-    /// sum: the top-HRW-ranked ("primary") node among currently active nodes for that key -
-    /// since placement is per-key (every version shares identical placement), this avoids the
-    /// replication-factor triple-count without needing a full listing merge. Shared by this
-    /// node's own contribution to `calculateStats` and by
-    /// `InternalClusterListingController.handleOwnedStats` (a peer computing its own share) -
-    /// pure disk walk + placement check, no `Request`/HTTP involved.
+    /// sum: the top-HRW-ranked ("primary") node among currently active nodes for that key. Since
+    /// placement is per-key, this avoids the replication-factor triple-count without needing a
+    /// full listing merge. Shared by `calculateStats` and by a peer computing its own share via
+    /// `InternalClusterListingController.handleOwnedStats`.
     static func ownedStats(
         bucketName: String, prefix: String, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
     ) throws -> (sizeBytes: Int64, objectCount: Int) {
@@ -362,11 +356,9 @@ enum ClusterListingService {
             versionIdMarker = isTruncated ? nextVersionIdMarker : nil
         } while keyMarker != nil
 
-        // listAllVersions above already folds in this node's local EC shard-0 entries (its
-        // one-hit-per-version signal), and the top-3-is-a-prefix-of-top-(k+m) invariant means
-        // `responsible.first?.id == selfNodeId` correctly identifies the EC rank-0 owner too -
-        // no separate EC pass needed here (a prior version of this function double-counted by
-        // adding one).
+        // listAllVersions above already folds in this node's local EC shard-0 entries, and the
+        // top-3-is-a-prefix-of-top-(k+m) invariant means `responsible.first?.id == selfNodeId`
+        // correctly identifies the EC rank-0 owner too - no separate EC pass needed here.
 
         return (sizeBytes, objectCount)
     }

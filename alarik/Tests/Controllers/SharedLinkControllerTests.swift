@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -30,12 +29,9 @@ struct SharedLinkControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -52,8 +48,8 @@ struct SharedLinkControllerTests {
             passwordHash: try Bcrypt.hash("TestPass123!"),
             isAdmin: false
         )
-        try await user.save(on: app.db)
-        return user.id!
+        try await user.create(app: app)
+        return user.id
     }
 
     private func writeObject(bucketName: String, key: String, content: String) throws {
@@ -79,10 +75,10 @@ struct SharedLinkControllerTests {
             let link = SharedLink(
                 userId: userId, bucketName: "shared-bucket", key: "file.txt",
                 expiresAt: Date().addingTimeInterval(3600))
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .ok)
                     #expect(res.body.string == "hello world")
@@ -103,10 +99,10 @@ struct SharedLinkControllerTests {
             let link = SharedLink(
                 userId: userId, bucketName: "shared-bucket", key: "folder/sub/report.pdf",
                 expiresAt: Date().addingTimeInterval(3600))
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .ok)
                     #expect(
@@ -124,10 +120,10 @@ struct SharedLinkControllerTests {
 
             let link = SharedLink(
                 userId: userId, bucketName: "shared-bucket", key: "forever.txt", expiresAt: nil)
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .ok)
                     #expect(res.body.string == "no expiry")
@@ -136,11 +132,12 @@ struct SharedLinkControllerTests {
             // The hourly cleanup deletes rows where expires_at <= now - a NULL expiry must
             // never match that filter, or non-expiring links would silently vanish within an
             // hour of creation.
-            let expired = try await SharedLink.query(on: app.db)
-                .filter(\.$expiresAt <= Date.now)
-                .all()
+            let expired = try await SharedLink.all(app: app).filter {
+                guard let expiresAt = $0.expiresAt else { return false }
+                return expiresAt <= Date.now
+            }
             #expect(expired.isEmpty)
-            #expect(try await SharedLink.query(on: app.db).count() == 1)
+            #expect(try await SharedLink.all(app: app).count == 1)
         }
     }
 
@@ -153,10 +150,10 @@ struct SharedLinkControllerTests {
             let link = SharedLink(
                 userId: userId, bucketName: "shared-bucket", key: "file.txt",
                 expiresAt: Date().addingTimeInterval(-3600))
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .notFound)
                 })
@@ -194,14 +191,14 @@ struct SharedLinkControllerTests {
             let link = SharedLink(
                 userId: userId, bucketName: "shared-bucket", key: "file.txt",
                 expiresAt: Date().addingTimeInterval(3600))
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             // Remove the underlying file, simulating it being deleted after the link was made
             let path = ObjectFileHandler.storagePath(for: "shared-bucket", key: "file.txt")
             try FileManager.default.removeItem(atPath: path)
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .notFound)
                 })
@@ -224,7 +221,7 @@ struct SharedLinkControllerTests {
             let link = SharedLink(
                 userId: userId, bucketName: "shared-versioned-bucket", key: "file.txt",
                 expiresAt: Date().addingTimeInterval(3600))
-            try await link.save(on: app.db)
+            try await link.save(app: app)
 
             // Delete the object - in a versioned bucket this creates a delete marker as the
             // new latest version, rather than removing the file outright.
@@ -232,7 +229,7 @@ struct SharedLinkControllerTests {
                 bucketName: "shared-versioned-bucket", key: "file.txt")
 
             try await app.test(
-                .GET, "/api/v1/shared/\(link.id!.uuidString)",
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
                 afterResponse: { res async in
                     #expect(res.status == .notFound)
                 })

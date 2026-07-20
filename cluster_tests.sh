@@ -1,11 +1,14 @@
 #!/bin/bash
 
 # Tests object-data clustering end-to-end across 4 genuinely independent Alarik
-# *processes* sharing one real Postgres control plane (cluster mode requires Postgres - see
-# CLUSTER_NODE_ADDRESS/CLUSTER_SECRET handling in Sources/configure.swift). 4 nodes with the
-# default replication factor of 3 means exactly one node is never responsible for any given
-# object, which this script uses to concretely prove the proxy-forward path (not just "GET
-# happens to work because every node already had a copy").
+# *processes*. There's no external database of any kind - control-plane metadata (users,
+# buckets, access keys, policies, cluster membership itself) lives in Alarik's own erasure-coded
+# object storage, the same as regular object data (see Sources/Services/Metadata/MetadataStore
+# .swift). Each node bootstraps its initial view of cluster membership from CLUSTER_SEED_NODES -
+# see ClusterMembershipLifecycle.swift. 4 nodes with the default replication factor of 3 means
+# exactly one node is never responsible for any given object, which this script uses to
+# concretely prove the proxy-forward path (not just "GET happens to work because every node
+# already had a copy").
 #
 # Usage: ./cluster_tests.sh
 
@@ -17,9 +20,6 @@ BINARY="$PACKAGE_DIR/.build/debug/Alarik"
 
 NODE_COUNT=4
 BASE_PORT=8091
-PG_CONTAINER="alarik-cluster-test-postgres"
-PG_PORT=5434
-DATABASE_URL="postgres://alarik:alarik@localhost:$PG_PORT/alarik_cluster_test"
 CLUSTER_SECRET="test-cluster-secret"
 JWT_SECRET="test-secret"
 # k=2/m=2 uses all 4 nodes with zero slack - matches this harness's node count exactly (the
@@ -62,6 +62,26 @@ kill_node() {
     PIDS[$i]=""
 }
 
+# seed_nodes_for <index> -> comma-separated endpoints of every OTHER node, for that node's own
+# CLUSTER_SEED_NODES. Every node lists every other node (not just node 0) so that bootstrapping
+# - which happens on every boot, not just a node's first-ever start, since ClusterNodeCache is
+# purely in-memory and doesn't survive a restart - still finds a live peer to seed from even if
+# whichever node would otherwise be "the" seed happens to be down at that exact moment (the kind
+# of scenario this script's kill/restart tests deliberately create). Requires PORTS/ENDPOINTS to
+# already be fully populated (true for every caller below - both happen after the port-assignment
+# loop).
+seed_nodes_for() {
+    local self_index=$1
+    local seeds=""
+    for j in $(seq 0 $((NODE_COUNT - 1))); do
+        if [ "$j" -ne "$self_index" ]; then
+            if [ -n "$seeds" ]; then seeds="$seeds,"; fi
+            seeds="$seeds${ENDPOINTS[$j]}"
+        fi
+    done
+    echo "$seeds"
+}
+
 # Restarts node $1 on its original port/state_dir (so its persisted cluster_node_id and local
 # disk contents survive the restart, matching a real process restart) and waits for it to start
 # accepting connections. A restart re-activates a previously-draining node automatically (see
@@ -75,9 +95,9 @@ restart_node() {
     (
         cd "${STATE_DIRS[$i]}" \
             && JWT="$JWT_SECRET" \
-                DATABASE_URL="$DATABASE_URL" \
                 CLUSTER_NODE_ADDRESS="http://localhost:$port" \
                 CLUSTER_SECRET="$CLUSTER_SECRET" \
+                CLUSTER_SEED_NODES="$(seed_nodes_for "$i")" \
                 CLUSTER_EC_DATA_SHARDS="$CLUSTER_EC_DATA_SHARDS" \
                 CLUSTER_EC_PARITY_SHARDS="$CLUSTER_EC_PARITY_SHARDS" \
                 exec env $extra_env "$BINARY" serve --hostname 127.0.0.1 --port "$port"
@@ -94,7 +114,42 @@ restart_node() {
         fi
         sleep 1
     done
-    [ "$up" -eq 1 ]
+    [ "$up" -eq 1 ] || return 1
+
+    wait_for_cluster_convergence "$i"
+}
+
+# Polls a surviving (non-restarted) node's own membership view until it reports all
+# NODE_COUNT members, or gives up after a bounded wait. A node reporting "up" (accepting
+# connections) only means its own boot sequence finished - not that the *rest* of the cluster
+# has already re-discovered it as active again. That re-discovery happens via the direct
+# "I've rejoined" broadcast the restarting node's own registerSelf sends (best-effort, to
+# whichever peers its own bootstrap found), plus the periodic refresh loop as a fallback -
+# either way it's an asynchronous, non-instant process. Every test after a restart that relies
+# on all 4 nodes being counted active (most notably the zero-slack k=2/m=2 object-data
+# admission control this harness deliberately configures) would otherwise race this
+# convergence and intermittently fail with "only 3 active nodes" for a few seconds after every
+# single restart in the suite.
+wait_for_cluster_convergence() {
+    local restarted_index=$1
+    local observer_index=0
+    if [ "$restarted_index" -eq 0 ]; then
+        observer_index=1
+    fi
+    local observer_port="${PORTS[$observer_index]}"
+    for _ in $(seq 1 20); do
+        local count
+        count=$(curl -s "http://localhost:$observer_port/internal/cluster/members" \
+            -H "X-Alarik-Cluster-Secret: $CLUSTER_SECRET" 2>/dev/null \
+            | grep -o '"id"' | wc -l | tr -d ' ')
+        # handleMembers reports the observer's own ClusterNodeCache snapshot, which includes
+        # its own entry - a fully-converged cache holds all NODE_COUNT nodes, self included.
+        if [ "${count:-0}" -ge "$NODE_COUNT" ]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 0
 }
 
 cleanup() {
@@ -104,7 +159,6 @@ cleanup() {
             wait "$pid" 2>/dev/null
         fi
     done
-    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -195,7 +249,7 @@ obj_path() {
 }
 
 echo "==============================================="
-echo " Alarik cluster tests ($NODE_COUNT real instances + Postgres)"
+echo " Alarik cluster tests ($NODE_COUNT real instances)"
 echo " Logs: $LOG_DIR"
 echo "==============================================="
 echo ""
@@ -205,14 +259,8 @@ MISSING=""
 command -v aws >/dev/null || MISSING="$MISSING aws"
 command -v jq >/dev/null || MISSING="$MISSING jq"
 command -v curl >/dev/null || MISSING="$MISSING curl"
-command -v docker >/dev/null || MISSING="$MISSING docker"
 if [ -n "$MISSING" ]; then
     echo "ERROR: missing required tools:$MISSING"
-    exit 1
-fi
-
-if ! docker info >/dev/null 2>&1; then
-    echo "ERROR: Docker daemon is not running - cluster mode requires Postgres."
     exit 1
 fi
 
@@ -239,28 +287,12 @@ export AWS_ACCESS_KEY_ID="$ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$SECRET_KEY"
 export AWS_DEFAULT_REGION="us-east-1"
 
-# ── Start Postgres ───────────────────────────────────────────────────────────
-echo "--- Starting Postgres ($PG_CONTAINER on port $PG_PORT) ---"
-docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
-docker run -d --name "$PG_CONTAINER" \
-    -e POSTGRES_USER=alarik -e POSTGRES_PASSWORD=alarik -e POSTGRES_DB=alarik_cluster_test \
-    -p "$PG_PORT:5432" postgres:16 >/dev/null
-
-PG_READY=0
-for _ in $(seq 1 30); do
-    if docker exec "$PG_CONTAINER" pg_isready -U alarik >/dev/null 2>&1; then
-        PG_READY=1
-        break
-    fi
-    sleep 1
-done
-if [ "$PG_READY" -ne 1 ]; then
-    echo "ERROR: Postgres did not become ready in time."
-    exit 1
-fi
-echo ""
-
 # ── Start all node instances ────────────────────────────────────────────────
+# Sequential, each waited on before the next starts: since ClusterMembershipLifecycle's
+# didBootAsync (including bootstrapMembership's seed query) runs during Vapor's boot phase,
+# strictly before the server starts accepting connections, a node being "up" here already
+# guarantees its own membership bootstrap has completed - so by the time node i+1 queries node
+# i as a seed, node i is guaranteed ready to answer.
 for i in $(seq 0 $((NODE_COUNT - 1))); do
     port="${PORTS[$i]}"
     state_dir=$(mktemp -d)
@@ -269,9 +301,9 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     (
         cd "$state_dir" \
             && JWT="$JWT_SECRET" \
-                DATABASE_URL="$DATABASE_URL" \
                 CLUSTER_NODE_ADDRESS="http://localhost:$port" \
                 CLUSTER_SECRET="$CLUSTER_SECRET" \
+                CLUSTER_SEED_NODES="$(seed_nodes_for "$i")" \
                 CLUSTER_EC_DATA_SHARDS="$CLUSTER_EC_DATA_SHARDS" \
                 CLUSTER_EC_PARITY_SHARDS="$CLUSTER_EC_PARITY_SHARDS" \
                 exec "$BINARY" serve --hostname 127.0.0.1 --port "$port"

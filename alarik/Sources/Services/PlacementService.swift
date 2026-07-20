@@ -26,15 +26,10 @@ enum PlacementService {
 
     /// Rendezvous (HRW - "highest random weight") hashing: for each candidate node, compute a
     /// pseudo-random weight from `(nodeId, bucketName, key)` and take the top `N` by weight.
-    /// Deterministic (every node computes the identical answer from the same active-node list)
-    /// and, critically for *automatic* rebalancing not being a stampede, minimally disruptive on
-    /// membership change - adding or removing one node only reassigns the objects whose specific
-    /// top-N set changes, unlike naive `hash % nodeCount` which reshuffles almost everything.
-    ///
-    /// Returns fewer than `replicationFactor` nodes when the cluster itself has fewer active
-    /// nodes than that - never invents replicas that don't exist. Returns `[]` for an empty
-    /// cluster (never called in practice: `ObjectRoutingService` short-circuits to `.local` when
-    /// there are no peers at all).
+    /// Deterministic and, critically for rebalancing not being a stampede, minimally disruptive
+    /// on membership change - adding or removing one node only reassigns the objects whose
+    /// specific top-N set changes, unlike naive `hash % nodeCount` which reshuffles everything.
+    /// Returns fewer than `replicationFactor` nodes when the cluster has fewer active nodes than that.
     static func responsibleNodes(
         bucketName: String,
         key: String,

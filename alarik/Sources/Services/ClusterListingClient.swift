@@ -23,17 +23,18 @@ import Vapor
 /// The internal-only wire protocol for fanning a bucket-wide scan out to one peer's own local
 /// disk - `ClusterListingService` uses this to gather every node's local page before merging.
 /// Distinct from `ClusterReplicationClient` (object bytes push/fetch/delete) and
-/// `ClusterForwardingClient` (whole-request forwarding) - this one only ever asks "what do you
-/// have locally for this bucket/prefix," never moves object bytes or a client request. Every
-/// response here is small and bounded (`<= maxKeys` entries), so - unlike replication's
-/// streaming push/fetch - a plain buffered JSON body is used throughout, the same pattern
-/// `ClusterReplicationClient.deleteObject` already uses for its own bounded JSON response.
+/// `ClusterForwardingClient` (whole-request forwarding) - only ever asks "what do you have
+/// locally," never moves object bytes. Responses are small and bounded (`<= maxKeys` entries),
+/// so a plain buffered JSON body is used throughout, unlike replication's streaming push/fetch.
 enum ClusterListingClient {
-    /// Short relative to replication's 10-minute streaming deadline - listing responses are
-    /// small bounded JSON, and a hung peer here is stalling an interactive LIST or a
-    /// DeleteBucket safety check, not a large background transfer. Matches
-    /// `ClusterReplicationService.synchronousTimeout`'s same-private-network assumption.
-    static let requestTimeout: TimeAmount = .seconds(10)
+    /// Short: listing responses are small bounded JSON, and a hung peer here is stalling an
+    /// interactive LIST or a `DeleteBucket` safety check, not a large background transfer - a
+    /// genuinely healthy peer answers in milliseconds. Kept well under
+    /// `ClusterNodeCache.heartbeatStaleness` (60s) so a permanently-dead peer stays correctly
+    /// detected as unreachable across an S3 client's automatic retries of a fail-closed 503,
+    /// rather than the retry sequence's own elapsed time eventually letting the peer age out of
+    /// the active set and the delete slip through.
+    static let requestTimeout: TimeAmount = .seconds(3)
 
     struct ObjectsPageResponse: Codable {
         let objects: [ObjectMeta]
@@ -143,7 +144,7 @@ enum ClusterListingClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
 
-        let response = try await app.http.client.shared.execute(
+        let response = try await LightweightClusterControlClient.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
         guard (200..<300).contains(response.status.code) else {
             throw ClusterProxyError.pushFailed(status: Int(response.status.code))

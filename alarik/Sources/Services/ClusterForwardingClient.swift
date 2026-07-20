@@ -90,8 +90,35 @@ enum ClusterForwardingClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.forwardedHeaderName, value: "true")
 
+        // Never hand `req.body` to AsyncHTTPClient directly: if the peer responds (with an
+        // error, most often) before it needed the rest of the body, AsyncHTTPClient stops
+        // reading its outbound stream early - abandoning `req.body`'s iteration mid-stream.
+        // Vapor's own `Request.BodyStream` requires a terminal `.end`/`.error` write before it
+        // can be deallocated (it asserts on this in `deinit`), and nothing else in the request
+        // lifecycle supplies that once we've taken over reading the body ourselves. A bridging
+        // task decouples the two: it drains `req.body` to actual completion independently of
+        // whatever AsyncHTTPClient chooses to do with the stream it's given, so the terminal
+        // signal always lands. `.unbounded` buffering only matters in that same rare
+        // abandoned-early case - bounded by this one object's remaining bytes, and correctness
+        // (no crash) matters far more here than that edge case's transient memory cost.
         if streamBody {
-            outbound.body = .stream(req.body, length: .unknown)
+            let (bridged, continuation) = AsyncThrowingStream<ByteBuffer, any Error>.makeStream()
+            let requestBody = req.body
+            // Deliberately unstructured and never cancelled: it must keep draining
+            // `requestBody` to actual completion on its own, even after this function
+            // returns/throws, regardless of whether AsyncHTTPClient below ever finishes
+            // reading `bridged` - see the comment above for why.
+            Task {
+                do {
+                    for try await chunk in requestBody {
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            outbound.body = .stream(bridged, length: .unknown)
         }
 
         let client = req.application.http.client.shared

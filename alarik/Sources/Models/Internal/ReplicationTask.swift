@@ -14,25 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
-import Vapor
-
-import struct Foundation.Date
-import struct Foundation.UUID
+import Foundation
 
 /// One pending (or dead-lettered) replication task - the persistent outbox row that makes
 /// replication survive restarts and remote-endpoint outages. The target's connection details
 /// are snapshotted at enqueue time (not just referenced by `targetId`), so editing or deleting
-/// a target never changes what an in-flight task does - same reasoning as
-/// `NotificationDelivery` snapshotting `url`/`secret` rather than a rule reference.
-///
-/// Unlike a webhook delivery, this row never holds the object's bytes - `bucketName` + `key` +
-/// `versionId` is enough to re-read the exact payload from `ObjectFileHandler` at delivery
-/// time, since that version's bytes are immutable once written (replication requires
-/// versioning to be enabled - see `InternalBucketController`).
-final class ReplicationTask: Model, @unchecked Sendable {
-    static let schema = "replication_tasks"
-
+/// a target never changes what an in-flight task does. Never holds the object's bytes - re-reads
+/// the immutable versioned payload from `ObjectFileHandler` at delivery time. Backed by
+/// `OutboxMailbox`, not Fluent - `ownerNodeId` is a real stored field (see `NotificationDelivery`).
+final class ReplicationTask: @unchecked Sendable, Codable {
     enum State: String {
         case pending
         /// Retries exhausted - kept for a few days so failures are inspectable, then purged
@@ -45,64 +35,35 @@ final class ReplicationTask: Model, @unchecked Sendable {
         case delete
     }
 
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "bucket_name")
+    let id: UUID
     var bucketName: String
 
     /// Kept for display/traceability in the delivery-health UI only - never re-resolved. The
     /// fields actually used to perform the task (`endpoint`...`region` below) are snapshotted
     /// independently.
-    @Field(key: "rule_id")
     var ruleId: UUID
-
-    @Field(key: "target_id")
     var targetId: UUID
-
-    @Field(key: "endpoint")
     var endpoint: String
-
-    @Field(key: "target_bucket")
     var targetBucket: String
-
-    @Field(key: "access_key_id")
     var accessKeyId: String
-
-    @Field(key: "secret_access_key")
     var secretAccessKey: String
-
-    @Field(key: "region")
     var region: String
-
-    @Field(key: "key")
     var key: String
-
-    @Field(key: "version_id")
     var versionId: String?
-
-    @Field(key: "operation")
     var operation: String
-
-    @Field(key: "attempts")
     var attempts: Int
-
-    @Field(key: "next_attempt_at")
     var nextAttemptAt: Date
-
-    @Field(key: "state")
     var state: String
 
     /// The reason the most recent attempt failed - an HTTP status or a transport error
     /// description. Nil until the first failure; not cleared on success since a successful row
     /// is deleted outright, never left around with a stale error.
-    @Field(key: "last_error")
     var lastError: String?
 
-    @Field(key: "created_at")
-    var createdAt: Date
+    let createdAt: Date
 
-    init() {}
+    /// The node whose local mailbox directory this task's file lives in - see `OutboxMailboxRow`.
+    var ownerNodeId: UUID
 
     init(
         bucketName: String,
@@ -110,8 +71,10 @@ final class ReplicationTask: Model, @unchecked Sendable {
         target: ReplicationTarget,
         key: String,
         versionId: String?,
-        operation: Operation
+        operation: Operation,
+        ownerNodeId: UUID
     ) {
+        self.id = UUID()
         self.bucketName = bucketName
         self.ruleId = ruleId
         self.targetId = target.id
@@ -127,7 +90,8 @@ final class ReplicationTask: Model, @unchecked Sendable {
         self.nextAttemptAt = Date()
         self.state = State.pending.rawValue
         self.createdAt = Date()
+        self.ownerNodeId = ownerNodeId
     }
 }
 
-extension ReplicationTask: OutboxRow {}
+extension ReplicationTask: OutboxMailboxRow {}

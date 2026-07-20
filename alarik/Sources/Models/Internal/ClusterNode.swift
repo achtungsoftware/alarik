@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
+import Vapor
 
 import struct Foundation.Date
 import struct Foundation.UUID
 
-/// One member of the object-data cluster. Rows in this table are
-/// the durable source of truth for membership; `ClusterNodeCache` is every node's in-memory,
-/// invalidation-synced view of it - same relationship as every other `{Thing}Cache` to its
-/// backing table.
-final class ClusterNode: Model, @unchecked Sendable {
-    static let schema = "cluster_nodes"
-
+/// One member of the object-data cluster. Backed by `MetadataStore`, not Fluent - primary record
+/// at `cluster-nodes/<id>`, itself placed/erasure-coded the same as every other metadata record.
+/// `ClusterNodeCache` is every node's in-memory, invalidation-synced view of this collection.
+/// This is also the one collection with a genuine bootstrap circularity: placing *any* metadata
+/// record needs `ClusterNodeCache.shared.activeNodes()`, but membership itself lives here -
+/// `ClusterMembershipLifecycle` seeds the local cache from `CLUSTER_SEED_NODES` first to break it.
+final class ClusterNode: @unchecked Sendable, Codable {
     enum Status: String {
         /// Serving traffic normally - eligible to be a placement candidate.
         case active
@@ -33,42 +33,31 @@ final class ClusterNode: Model, @unchecked Sendable {
         /// is still being migrated off by the rebalance walk before it's safe to stop the process.
         case draining
         /// Fully decommissioned - the rebalance walk confirmed no object is responsible-on this
-        /// node anymore. Kept as a row (not deleted) for operational history/traceability.
+        /// node anymore. Kept as a record (not deleted) for operational history/traceability.
         case removed
     }
 
-    @ID(key: .id)
-    var id: UUID?
+    let id: UUID
 
     /// This node's internally-reachable base URL (`CLUSTER_NODE_ADDRESS`) - where peers send
     /// forwarded client requests and cluster-replication pushes.
-    @Field(key: "address")
     var address: String
 
-    @Field(key: "status")
     var status: String
-
-    @Field(key: "joined_at")
     var joinedAt: Date
 
     /// Updated on every heartbeat tick. A node is treated as unavailable by every other node once
     /// this exceeds the staleness window (`ClusterMembershipLifecycle.heartbeatStaleness`) - no
     /// separate failure-detector state, this field *is* the failure detector.
-    @Field(key: "last_heartbeat_at")
     var lastHeartbeatAt: Date
 
     /// Self-reported disk capacity, refreshed on every heartbeat tick. `nil` until this node's
     /// first post-upgrade heartbeat - always treated as "unknown" (fail open), never as "full".
-    @OptionalField(key: "total_bytes")
     var totalBytes: Int64?
-
-    @OptionalField(key: "available_bytes")
     var availableBytes: Int64?
 
-    init() {}
-
     init(
-        id: UUID? = nil,
+        id: UUID,
         address: String,
         status: Status = .active,
         joinedAt: Date = Date(),
@@ -83,5 +72,28 @@ final class ClusterNode: Model, @unchecked Sendable {
         self.lastHeartbeatAt = lastHeartbeatAt
         self.totalBytes = totalBytes
         self.availableBytes = availableBytes
+    }
+}
+
+// MARK: - MetadataStore access
+
+extension ClusterNode {
+    static func find(app: Application, id: UUID) async throws -> ClusterNode? {
+        try await MetadataStore.get(
+            ClusterNode.self, app: app, collection: MetadataCollections.clusterNodes,
+            id: id.uuidString)
+    }
+
+    /// Every cluster member - a full-collection fan-out. Membership is small and low-churn
+    /// (one record per node), and this is only ever called from admin-console/boot-time-reload
+    /// paths, never per-S3-request - the hot path is always `ClusterNodeCache`, in-memory.
+    static func all(app: Application) async throws -> [ClusterNode] {
+        await MetadataListingService.list(app: app, collection: MetadataCollections.clusterNodes)
+            .compactMap { try? JSONDecoder().decode(ClusterNode.self, from: $0.value) }
+    }
+
+    func save(app: Application) async throws {
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.clusterNodes, id: id.uuidString, value: self)
     }
 }

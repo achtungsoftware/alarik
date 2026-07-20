@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 import XMLCoder
@@ -58,7 +57,7 @@ struct InternalBucketController: RouteCollection {
         let createdAt: Date
 
         init(from delivery: NotificationDelivery) {
-            self.id = delivery.id!
+            self.id = delivery.id
             self.ruleId = delivery.ruleId
             self.url = delivery.url
             self.state = delivery.state
@@ -129,7 +128,7 @@ struct InternalBucketController: RouteCollection {
         let createdAt: Date
 
         init(from task: ReplicationTask) {
-            self.id = task.id!
+            self.id = task.id
             self.ruleId = task.ruleId
             self.targetId = task.targetId
             self.endpoint = task.endpoint
@@ -255,11 +254,8 @@ struct InternalBucketController: RouteCollection {
     private func requireOwnedBucket(req: Request, bucketName: String, userId: UUID) async throws
         -> Bucket
     {
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .filter(\.$user.$id == userId)
-                .first()
+        guard let bucket = try await Bucket.find(app: req.application, name: bucketName),
+            bucket.userId == userId
         else {
             throw Abort(.notFound, reason: "Bucket not found")
         }
@@ -282,12 +278,11 @@ struct InternalBucketController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
 
-        let query = Bucket.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .sort(\.$creationDate, .descending)
+        var buckets = try await Bucket.all(app: req.application).filter { $0.userId == auth.userId }
+        buckets.sort { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
 
         if let search, !search.isEmpty {
-            query.filter(\.$name ~~ search)
+            buckets = buckets.filter { $0.name.localizedCaseInsensitiveContains(search) }
         }
 
         // Never the raw model - a bucket the caller doesn't own but that happens to match
@@ -296,7 +291,7 @@ struct InternalBucketController: RouteCollection {
         // about not silently starting to leak the moment someone adds an eager-loaded relation
         // (like `.with(\.$user)`) to this query later, the same mistake the admin bucket list
         // endpoint made.
-        let page = try await query.paginate(for: req)
+        let page = try buckets.paginated(for: req)
         return page.map { $0.toResponseDTO() }
     }
 
@@ -308,20 +303,17 @@ struct InternalBucketController: RouteCollection {
 
         let create: Bucket.Create = try req.content.decode(Bucket.Create.self)
 
-        if (try await Bucket.query(on: req.db).filter(\.$name == create.name).first()) != nil {
+        if try await Bucket.find(app: req.application, name: create.name) != nil {
             throw Abort(.conflict, reason: "The requested bucket name is not available.")
         }
 
         try await BucketService.create(
-            on: req.db, bucketName: create.name, userId: auth.userId,
+            app: req.application, bucketName: create.name, userId: auth.userId,
             versioningEnabled: create.versioningEnabled)
 
         // Fetch the created bucket from the database to get the ID
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == create.name)
-                .filter(\.$user.$id == auth.userId)
-                .first()
+        guard let bucket = try await Bucket.find(app: req.application, name: create.name),
+            bucket.userId == auth.userId
         else {
             throw Abort(.internalServerError, reason: "Failed to retrieve created bucket")
         }
@@ -519,9 +511,9 @@ struct InternalBucketController: RouteCollection {
 
         let link = SharedLink(
             userId: auth.userId, bucketName: input.bucket, key: input.key, expiresAt: expiresAt)
-        try await link.save(on: req.db)
+        try await link.save(app: req.application)
 
-        let url = "\(apiBaseURL)/api/v1/shared/\(link.id!.uuidString)"
+        let url = "\(apiBaseURL)/api/v1/shared/\(link.id.uuidString)"
         return ShareResponseDTO(url: url, expiresAt: expiresAt)
     }
 
@@ -530,12 +522,11 @@ struct InternalBucketController: RouteCollection {
     func listSharedLinks(req: Request) async throws -> Page<SharedLink.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
-        let page: Page<SharedLink> = try await SharedLink.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .sort(\.$createdAt, .descending)
-            .paginate(for: req)
+        let links = try await SharedLink.all(app: req.application)
+            .filter { $0.userId == auth.userId }
+            .sorted { $0.createdAt > $1.createdAt }
 
-        return page.map { $0.toResponseDTO() }
+        return try links.paginated(for: req).map { $0.toResponseDTO() }
     }
 
     /// Revokes a shared link early, before it would otherwise expire.
@@ -548,15 +539,13 @@ struct InternalBucketController: RouteCollection {
         }
 
         guard
-            let link = try await SharedLink.query(on: req.db)
-                .filter(\.$id == sharedLinkId)
-                .filter(\.$user.$id == auth.userId)
-                .first()
+            let link = try await SharedLink.find(app: req.application, id: sharedLinkId),
+            link.userId == auth.userId
         else {
             throw Abort(.notFound, reason: "Shared link not found.")
         }
 
-        try await link.delete(on: req.db)
+        try await link.delete(app: req.application)
 
         return .noContent
     }
@@ -675,10 +664,10 @@ struct InternalBucketController: RouteCollection {
         await NotificationService.emit(
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: meta.size, etag: etag, versionId: meta.versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         await ReplicationService.enqueuePut(
             app: req.application, bucketName: bucketName, key: keyPath,
-            versionId: meta.versionId, on: req.db)
+            versionId: meta.versionId)
 
         return ObjectMeta.ResponseDTO(from: meta)
     }
@@ -756,10 +745,10 @@ struct InternalBucketController: RouteCollection {
                     await NotificationService.emit(
                         event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
                         size: nil, etag: nil, versionId: outcome.versionId,
-                        requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                        requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
                     await ReplicationService.enqueueDelete(
                         app: req.application, bucketName: bucketName, key: object.key,
-                        versionId: nil, on: req.db)
+                        versionId: nil)
                 }
                 marker = isTruncated ? nextMarker : nil
             } while marker != nil
@@ -780,10 +769,10 @@ struct InternalBucketController: RouteCollection {
                     ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
                 bucketName: bucketName, key: key, size: nil, etag: nil,
                 versionId: outcome.versionId,
-                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
             await ReplicationService.enqueueDelete(
                 app: req.application, bucketName: bucketName, key: key,
-                versionId: outcome.versionId, on: req.db)
+                versionId: outcome.versionId)
         }
 
         return .noContent
@@ -1139,10 +1128,10 @@ struct InternalBucketController: RouteCollection {
             req: req, bucketName: bucketName, userId: auth.userId)
 
         bucket.versioningStatus = newStatus.rawValue
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketVersioningCache.shared.setStatus(for: bucketName, status: newStatus)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketVersioning", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketVersioning", op: .upsert, key: bucketName)
 
         return VersioningStatusDTO(status: newStatus.rawValue)
     }
@@ -1231,20 +1220,20 @@ struct InternalBucketController: RouteCollection {
         }
 
         bucket.policy = rawJSON
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.setPolicy(for: bucketName, policy: policy)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketPolicy", op: .upsert, key: bucketName)
 
         return PolicyDTO(policy: rawJSON)
     }
 
     static func deletePolicy(req: Request, bucket: Bucket, bucketName: String) async throws {
         bucket.policy = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await BucketPolicyCache.shared.removePolicy(for: bucketName)
-        CacheInvalidationService.notify(on: req.db, cache: "bucketPolicy", op: .remove, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "bucketPolicy", op: .remove, key: bucketName)
     }
 
     @Sendable
@@ -1281,7 +1270,7 @@ struct InternalBucketController: RouteCollection {
 
         let tagging = Tagging(tags: input.tags)
         bucket.tags = tagging.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return TagsDTO(tags: tagging.tags)
     }
@@ -1298,7 +1287,7 @@ struct InternalBucketController: RouteCollection {
             req: req, bucketName: bucketName, userId: auth.userId)
 
         bucket.tags = nil
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         return .noContent
     }
@@ -1385,23 +1374,19 @@ struct InternalBucketController: RouteCollection {
 
         let config = NotificationConfiguration(rules: normalizedRules)
         bucket.notificationConfig = normalizedRules.isEmpty ? nil : config.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
-        CacheInvalidationService.notify(on: req.db, cache: "notificationConfig", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "notificationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued events for rules that were just removed - if a rule
         // is deleted because its endpoint is wrong or compromised, in-flight deliveries to the
         // old URL must not keep firing until they exhaust their retries.
-        let keptIds = normalizedRules.map(\.id)
-        let purge = NotificationDelivery.query(on: req.db)
-            .filter(\.$bucketName == bucketName)
-        // `!~ []` is driver-dependent, so when every rule was removed just purge the whole
-        // bucket's outbox rather than relying on a NOT IN () clause.
-        if !keptIds.isEmpty {
-            purge.filter(\.$ruleId !~ keptIds)
-        }
-        try await purge.delete()
+        let keptIds = Set(normalizedRules.map(\.id))
+        await OutboxMailbox.purgeBucketAcrossCluster(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries, bucketName: bucketName
+        ) { $0.bucketName == bucketName && !keptIds.contains($0.ruleId) }
 
         return NotificationConfigDTO(rules: Self.maskedNotificationRules(normalizedRules))
     }
@@ -1429,7 +1414,7 @@ struct InternalBucketController: RouteCollection {
         }
 
         try await NotificationService.emitTestEvent(
-            rule: rule, bucketName: bucketName, requestId: req.id, on: req.db)
+            rule: rule, bucketName: bucketName, requestId: req.id, app: req.application)
 
         return .accepted
     }
@@ -1447,11 +1432,13 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let deliveries = try await NotificationDelivery.query(on: req.db)
-            .filter(\.$bucketName == bucketName)
-            .sort(\.$createdAt, .descending)
-            .limit(100)
-            .all()
+        let deliveries = await OutboxMailbox.listAllAcrossCluster(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries
+        )
+        .filter { $0.bucketName == bucketName }
+        .sorted { $0.createdAt > $1.createdAt }
+        .prefix(100)
 
         return DeliveriesDTO(deliveries: deliveries.map(DeliveryDTO.init))
     }
@@ -1474,19 +1461,29 @@ struct InternalBucketController: RouteCollection {
 
         // Scope the lookup to this bucket too, not just the id - a delivery id alone doesn't
         // prove the caller owns the bucket it belongs to.
-        guard
-            let delivery = try await NotificationDelivery.query(on: req.db)
-                .filter(\.$id == deliveryId)
-                .filter(\.$bucketName == bucketName)
-                .first()
+        let deliveries = await OutboxMailbox.listAllAcrossCluster(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries)
+        guard let delivery = deliveries.first(where: { $0.id == deliveryId && $0.bucketName == bucketName })
         else {
             throw Abort(.notFound, reason: "Delivery not found")
         }
 
+        let retried = await OutboxMailbox.retryAcrossCluster(
+            NotificationDelivery.self, app: req.application,
+            collection: OutboxCollections.notificationDeliveries, taskId: deliveryId,
+            failedStateValue: NotificationDelivery.State.failed.rawValue)
+        guard retried else {
+            throw Abort(.notFound, reason: "Delivery not found")
+        }
+
+        // Mirrors exactly what `OutboxMailbox.retryOwned` just reset on whichever node actually
+        // owns this delivery - avoids a second cluster-wide fetch just to read back what's
+        // already known.
         delivery.state = NotificationDelivery.State.pending.rawValue
         delivery.attempts = 0
         delivery.nextAttemptAt = Date()
-        try await delivery.save(on: req.db)
+        delivery.lastError = nil
 
         NotificationDispatcher.shared.wake()
 
@@ -1589,10 +1586,10 @@ struct InternalBucketController: RouteCollection {
         let config = ReplicationConfiguration(targets: normalizedTargets, rules: adjustedRules)
         bucket.replicationConfig =
             (normalizedTargets.isEmpty && adjustedRules.isEmpty) ? nil : config.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
-        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "replicationConfig", op: .upsert, key: bucketName)
 
         return ReplicationTargetsDTO(targets: Self.maskedReplicationTargets(normalizedTargets))
     }
@@ -1664,20 +1661,18 @@ struct InternalBucketController: RouteCollection {
         let config = ReplicationConfiguration(targets: existingTargets, rules: normalizedRules)
         bucket.replicationConfig =
             (existingTargets.isEmpty && normalizedRules.isEmpty) ? nil : config.toJSON()
-        try await bucket.save(on: req.db)
+        try await bucket.save(app: req.application)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
-        CacheInvalidationService.notify(on: req.db, cache: "replicationConfig", op: .upsert, key: bucketName)
+        CacheInvalidationService.notify(app: req.application, cache: "replicationConfig", op: .upsert, key: bucketName)
 
         // Stop delivering already-queued tasks for rules that were just removed - same
         // reasoning as the equivalent webhook-delivery purge above.
-        let keptIds = normalizedRules.map(\.id)
-        let purge = ReplicationTask.query(on: req.db)
-            .filter(\.$bucketName == bucketName)
-        if !keptIds.isEmpty {
-            purge.filter(\.$ruleId !~ keptIds)
-        }
-        try await purge.delete()
+        let keptIds = Set(normalizedRules.map(\.id))
+        await OutboxMailbox.purgeBucketAcrossCluster(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
+            bucketName: bucketName
+        ) { $0.bucketName == bucketName && !keptIds.contains($0.ruleId) }
 
         return ReplicationRulesDTO(rules: normalizedRules)
     }
@@ -1730,12 +1725,12 @@ struct InternalBucketController: RouteCollection {
 
         // Scoped to the Application, not the Request - this must keep running after the
         // response below has been sent and `req` may have gone away.
-        let db = req.application.db
+        let app = req.application
         let logger = req.application.logger
         Task {
             do {
                 let enqueued = try await ReplicationService.resync(
-                    bucketName: bucketName, rule: rule, target: target, on: db)
+                    app: app, bucketName: bucketName, rule: rule, target: target)
                 logger.info(
                     "Replication resync for bucket '\(bucketName)' rule '\(rule.id)' enqueued \(enqueued) object(s)"
                 )
@@ -1761,11 +1756,12 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let tasks = try await ReplicationTask.query(on: req.db)
-            .filter(\.$bucketName == bucketName)
-            .sort(\.$createdAt, .descending)
-            .limit(100)
-            .all()
+        let tasks = await OutboxMailbox.listAllAcrossCluster(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks
+        )
+        .filter { $0.bucketName == bucketName }
+        .sorted { $0.createdAt > $1.createdAt }
+        .prefix(100)
 
         return ReplicationTasksDTO(tasks: tasks.map(ReplicationTaskDTO.init))
     }
@@ -1787,19 +1783,26 @@ struct InternalBucketController: RouteCollection {
 
         // Scope the lookup to this bucket too, not just the id - a task id alone doesn't prove
         // the caller owns the bucket it belongs to.
-        guard
-            let task = try await ReplicationTask.query(on: req.db)
-                .filter(\.$id == taskId)
-                .filter(\.$bucketName == bucketName)
-                .first()
-        else {
+        let allTasks = await OutboxMailbox.listAllAcrossCluster(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks)
+        guard let task = allTasks.first(where: { $0.id == taskId && $0.bucketName == bucketName }) else {
             throw Abort(.notFound, reason: "Replication task not found")
         }
 
+        let retried = await OutboxMailbox.retryAcrossCluster(
+            ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
+            taskId: taskId, failedStateValue: ReplicationTask.State.failed.rawValue)
+        guard retried else {
+            throw Abort(.notFound, reason: "Replication task not found")
+        }
+
+        // Mirrors exactly what `OutboxMailbox.retryOwned` just reset on whichever node actually
+        // owns this task - avoids a second cluster-wide fetch just to read back what's already
+        // known.
         task.state = ReplicationTask.State.pending.rawValue
         task.attempts = 0
         task.nextAttemptAt = Date()
-        try await task.save(on: req.db)
+        task.lastError = nil
 
         ReplicationDispatcher.shared.wake()
 
@@ -2101,7 +2104,7 @@ struct InternalBucketController: RouteCollection {
         await NotificationService.emit(
             event: .objectRemovedDelete, bucketName: bucketName, key: key,
             size: nil, etag: nil, versionId: outcome.versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, on: req.db)
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
 
         return .noContent
     }

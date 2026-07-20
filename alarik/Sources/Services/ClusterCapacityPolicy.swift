@@ -20,9 +20,8 @@ import Vapor
 /// consulted by `PlacementService.responsibleNodes`, `ClusterNodeCache.activeNodes`, or
 /// `ClusterRebalanceService.rebalanceBucket`'s reclaim logic: capacity data flows in parallel to
 /// "who is responsible for key K", never through it, so a near-full node never has its existing
-/// data reclaimed and read-routing never changes. This is purely about nudging *new-write*
-/// coordination away from a near-full node, among the exact same nodes HRW already picked as
-/// responsible for that key - never a node outside that set.
+/// data reclaimed. This only nudges *new-write* coordination away from a near-full node, among
+/// the exact same nodes HRW already picked as responsible for that key.
 enum ClusterCapacityPolicy {
     /// Percentage of a node's total disk that must remain free before new-write coordination
     /// stops preferring it away. Default 10% - overridable via `CLUSTER_MIN_FREE_PERCENT`. Read

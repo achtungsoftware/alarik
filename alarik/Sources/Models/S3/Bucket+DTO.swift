@@ -14,78 +14,51 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Vapor
 import XMLCoder
 
-final class Bucket: Content, Model, @unchecked Sendable {
-    static let schema = "buckets"
-
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "name")
+/// Backed by `MetadataStore`, not Fluent - primary record at `buckets/<name>`. The bucket name is
+/// already a natural, immutable, globally-unique identifier (S3 buckets can't be renamed), so it
+/// doubles as the primary key directly, the same pattern `AccessKey`/`SharedLink`/`OIDCProvider`
+/// already use for their own natural keys - no secondary index needed.
+final class Bucket: Content, @unchecked Sendable, Codable {
+    let id: UUID
     var name: String
-
-    @Parent(key: "user_id")
-    var user: User
-
-    @Field(key: "creation_date")
+    var userId: UUID
     var creationDate: Date?
-
-    @Field(key: "versioning_status")
     var versioningStatus: String
 
     /// Raw JSON bucket policy document, or nil if no policy has been set
-    @Field(key: "policy")
     var policy: String?
 
     /// Public Access Block settings - see `PublicAccessBlockConfiguration`. `blockPublicAcls`/
     /// `ignorePublicAcls` are accepted/stored for client compatibility (e.g. Terraform sets all
     /// 4 unconditionally) but are no-ops, since this system has no ACL concept at all.
-    @Field(key: "block_public_acls")
     var blockPublicAcls: Bool
-
-    @Field(key: "ignore_public_acls")
     var ignorePublicAcls: Bool
-
-    @Field(key: "block_public_policy")
     var blockPublicPolicy: Bool
-
-    @Field(key: "restrict_public_buckets")
     var restrictPublicBuckets: Bool
 
     /// JSON-encoded `[String: String]` tag-set, or nil if no tags have been set - see `Tagging`.
-    @Field(key: "tags")
     var tags: String?
 
     /// JSON-encoded `[LifecycleRule]`, or nil if no lifecycle configuration has been set - see
     /// `LifecycleConfiguration`.
-    @Field(key: "lifecycle_rules")
     var lifecycleRules: String?
 
     /// JSON-encoded `NotificationConfiguration` (webhook rules), or nil if none configured.
-    @Field(key: "notification_config")
     var notificationConfig: String?
 
     /// JSON-encoded `ReplicationConfiguration` (remote targets + rules), or nil if none
     /// configured.
-    @Field(key: "replication_config")
     var replicationConfig: String?
 
-    init() {
-        self.versioningStatus = VersioningStatus.disabled.rawValue
-        self.blockPublicAcls = false
-        self.ignorePublicAcls = false
-        self.blockPublicPolicy = false
-        self.restrictPublicBuckets = false
-    }
-
-    init(name: String, userId: UUID) {
+    init(id: UUID = UUID(), name: String, userId: UUID) {
+        self.id = id
         self.name = name
+        self.userId = userId
         self.creationDate = Date()
-        self.$user.id = userId
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false
         self.ignorePublicAcls = false
@@ -93,10 +66,11 @@ final class Bucket: Content, Model, @unchecked Sendable {
         self.restrictPublicBuckets = false
     }
 
-    init(name: String, userId: UUID, creationDate: Date) {
+    init(id: UUID = UUID(), name: String, userId: UUID, creationDate: Date) {
+        self.id = id
         self.name = name
+        self.userId = userId
         self.creationDate = creationDate
-        self.$user.id = userId
         self.versioningStatus = VersioningStatus.disabled.rawValue
         self.blockPublicAcls = false
         self.ignorePublicAcls = false
@@ -104,10 +78,11 @@ final class Bucket: Content, Model, @unchecked Sendable {
         self.restrictPublicBuckets = false
     }
 
-    init(name: String, userId: UUID, versioningStatus: VersioningStatus) {
+    init(id: UUID = UUID(), name: String, userId: UUID, versioningStatus: VersioningStatus) {
+        self.id = id
         self.name = name
+        self.userId = userId
         self.creationDate = Date()
-        self.$user.id = userId
         self.versioningStatus = versioningStatus.rawValue
         self.blockPublicAcls = false
         self.ignorePublicAcls = false
@@ -128,7 +103,7 @@ final class Bucket: Content, Model, @unchecked Sendable {
     func toResponseDTO() -> Bucket.ResponseDTO {
         .init(
             id: self.id,
-            name: self.$name.value,
+            name: self.name,
             creationDate: self.creationDate,
             versioningStatus: self.versioningStatus
         )
@@ -145,6 +120,40 @@ final class Bucket: Content, Model, @unchecked Sendable {
     }
 }
 
+// MARK: - MetadataStore access
+
+extension Bucket {
+    static func find(app: Application, name: String) async throws -> Bucket? {
+        try await MetadataStore.get(
+            Bucket.self, app: app, collection: MetadataCollections.buckets, id: name)
+    }
+
+    /// Every bucket cluster-wide - a full-collection fan-out (see `MetadataListingService`'s doc
+    /// comment). Only ever called from admin/console/background-sweep paths (bucket listing,
+    /// cache warm/reload, rebalance/lifecycle walks), never per-S3-request - the hot per-request
+    /// bucket lookup is always `find(app:name:)`, a single point read.
+    static func all(app: Application) async throws -> [Bucket] {
+        await MetadataListingService.list(app: app, collection: MetadataCollections.buckets)
+            .compactMap { try? JSONDecoder().decode(Bucket.self, from: $0.value) }
+    }
+
+    /// Creates the bucket, failing if the name is already taken.
+    func create(app: Application) async throws -> Bool {
+        try await MetadataStore.putIfAbsent(
+            app: app, collection: MetadataCollections.buckets, id: name, value: self)
+    }
+
+    func save(app: Application) async throws {
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.buckets, id: name, value: self)
+    }
+
+    func delete(app: Application) async throws {
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.buckets, id: name)
+    }
+}
+
 extension Bucket {
     struct Create: Content {
         var name: String
@@ -156,22 +165,6 @@ extension Bucket {
         var name: String?
         var creationDate: Date?
         var versioningStatus: String?
-
-        func toModel() -> Bucket {
-            let model = Bucket()
-
-            model.id = self.id
-            if let name = self.name {
-                model.name = name
-            }
-            if let creationDate = self.creationDate {
-                model.creationDate = creationDate
-            }
-            if let versioningStatus = self.versioningStatus {
-                model.versioningStatus = versioningStatus
-            }
-            return model
-        }
     }
 }
 

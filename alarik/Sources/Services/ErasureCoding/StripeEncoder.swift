@@ -156,8 +156,14 @@ enum StripeEncoder {
                     let start = d * stripeUnitSize
                     dataSlices.append(Data(stripeBuffer[start..<(start + stripeUnitSize)]))
                 }
-                let parityChunks = try ReedSolomonEngine.encode(
-                    dataShards: dataSlices, parityCount: parityShards)
+                // Zero parity shards is a well-defined degenerate case (just the k data shards,
+                // no redundancy - e.g. `MetadataStore`'s standalone k=1/m=0 path) - skip the RS
+                // engine entirely rather than calling it with nothing to compute, since
+                // `ReedSolomonEngine.encode` requires `parityCount >= 1`.
+                let parityChunks =
+                    parityShards > 0
+                    ? try ReedSolomonEngine.encode(dataShards: dataSlices, parityCount: parityShards)
+                    : []
 
                 for d in 0..<dataShards {
                     try writers[d].appendStripe(dataSlices[d])

@@ -20,10 +20,9 @@ import Vapor
 /// Background bit-rot scrubber - the at-rest-integrity defense that read-repair and rebalancing
 /// can't provide on their own, since a shard that's never read and never moved would otherwise rot
 /// undetected. Each node periodically re-verifies the per-stripe SHA-256 checksums of the shards
-/// it physically holds; any shard with a corrupt (or unreadable) stripe is deleted and rebuilt
-/// from healthy survivors, exactly like read-repair. Deliberately gentle: shards are verified one
-/// at a time with a small pause between them, so a full scrub of a large store trickles rather than
-/// saturating disk I/O.
+/// it physically holds; any corrupt or unreadable shard is deleted and rebuilt from healthy
+/// survivors. Deliberately gentle: shards are verified one at a time with a small pause between
+/// them, so a full scrub trickles rather than saturating disk I/O.
 enum ErasureCodedScrubber {
     /// Coalesces overlapping scrub requests (a periodic tick landing on top of an operator-
     /// triggered one) into a single in-flight pass, the same shape as the rebalance debouncer.
@@ -142,8 +141,21 @@ enum ErasureCodedScrubber {
 
         let active = await ClusterNodeCache.shared.activeNodes()
         guard let config = app.storage[ClusterConfigurationKey.self], !active.isEmpty else { return }
+        // `.alarik.sys` metadata shards are physically indistinguishable from regular object
+        // shards to this bucket-agnostic scrub walk, but are frequently encoded with a different
+        // k/m - see `ErasureCodedRebalanceService.shardCounts` for the full reasoning; using the
+        // object-data `ecConfig` unconditionally here would compute a bogus responsible-node set
+        // for every metadata shard this node holds.
+        let totalShards: Int
+        if MetadataNamespace.isReserved(bucketName) {
+            let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
+            let (dataShards, parityShards) = metadataConfig.effective(activeNodeCount: active.count)
+            totalShards = dataShards + parityShards
+        } else {
+            totalShards = ecConfig.totalShards
+        }
         let responsible = PlacementService.responsibleNodes(
-            bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
+            bucketName: bucketName, key: key, activeNodes: active, count: totalShards)
         guard let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId }) else {
             // No longer responsible for this key at all - the deleted corrupt shard was stale;
             // rebalance/reclaim will settle placement, nothing to rebuild here.

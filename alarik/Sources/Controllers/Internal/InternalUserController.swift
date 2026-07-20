@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import XMLCoder
 
@@ -22,7 +21,6 @@ struct InternalUserController: RouteCollection {
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("users").post(use: self.createUser)
         routes.grouped("users").grouped("login")
-            .grouped(User.credentialsAuthenticator())
             .post(use: login)
 
         routes.grouped("users").grouped("auth")
@@ -67,27 +65,17 @@ struct InternalUserController: RouteCollection {
             guard try auth.user.verify(password: currentPassword) else {
                 throw Abort(.unauthorized, reason: "Current password is incorrect")
             }
-
-            let newPasswordHash = try Bcrypt.hash(newPassword)
-            try await User.query(on: req.db)
-                .filter(\.$id == auth.userId)
-                .set(\.$passwordHash, to: newPasswordHash)
-                .update()
+            auth.user.passwordHash = try Bcrypt.hash(newPassword)
         }
 
+        let previousUsername = auth.user.username
+        auth.user.name = editUser.name
+        auth.user.username = editUser.username
+
         do {
-            try await User.query(on: req.db)
-                .filter(\.$id == auth.userId)
-                .set(\.$name, to: editUser.name)
-                .set(\.$username, to: editUser.username)
-                .update()
-        } catch {
-            if let dbError = error as? any DatabaseError,
-                dbError.isConstraintFailure
-            {
-                throw Abort(.conflict, reason: "Username already exists.")
-            }
-            throw error
+            try await auth.user.rename(app: req.application, from: previousUsername)
+        } catch is User.UserError {
+            throw Abort(.conflict, reason: "Username already exists.")
         }
 
         return editUser.toUserResponseDTO()
@@ -105,15 +93,8 @@ struct InternalUserController: RouteCollection {
             expirationDate: create.expirationDate
         )
 
-        do {
-            try await accessKey.save(on: req.db)
-        } catch {
-            if let dbError = error as? any DatabaseError,
-                dbError.isConstraintFailure
-            {
-                throw Abort(.conflict, reason: "Access key already exists.")
-            }
-            throw error
+        guard try await accessKey.create(app: req.application) else {
+            throw Abort(.conflict, reason: "Access key already exists.")
         }
 
         // Add to caches
@@ -122,18 +103,18 @@ struct InternalUserController: RouteCollection {
             secretKey: create.secretKey
         )
         CacheInvalidationService.notify(
-            on: req.db, cache: "accessKeySecret", op: .upsert, key: create.accessKey)
+            app: req.application, cache: "accessKeySecret", op: .upsert, key: create.accessKey)
         await AccessKeyUserMapCache.shared.add(
             accessKey: create.accessKey,
             userId: auth.userId
         )
         CacheInvalidationService.notify(
-            on: req.db, cache: "accessKeyUser", op: .upsert, key: create.accessKey)
+            app: req.application, cache: "accessKeyUser", op: .upsert, key: create.accessKey)
 
         // Map the new access key to all existing buckets for this user
-        let userBuckets = try await Bucket.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .all()
+        let userBuckets = try await Bucket.all(app: req.application).filter {
+            $0.userId == auth.userId
+        }
 
         for bucket in userBuckets {
             await AccessKeyBucketMapCache.shared.add(
@@ -144,7 +125,7 @@ struct InternalUserController: RouteCollection {
         // One notify for the whole key, not per bucket - accessKeyBucket/upsert reloads this
         // key's entire bucket set from the DB in one shot on the receiving end.
         CacheInvalidationService.notify(
-            on: req.db, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
+            app: req.application, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
 
         return accessKey.toResponseDTO()
     }
@@ -158,15 +139,13 @@ struct InternalUserController: RouteCollection {
         }
 
         guard
-            let accessKey = try await AccessKey.query(on: req.db)
-                .filter(\.$id == accessKeyId)
-                .filter(\.$user.$id == auth.userId)
-                .first()
+            let accessKey = try await AccessKey.findAll(app: req.application, userId: auth.userId)
+                .first(where: { $0.id == accessKeyId })
         else {
             throw Abort(.notFound, reason: "Access key not found.")
         }
 
-        try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
+        try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
 
         return .noContent
     }
@@ -175,12 +154,10 @@ struct InternalUserController: RouteCollection {
     func listAccessKeys(req: Request) async throws -> Page<AccessKey.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
-        let page: Page<AccessKey> = try await AccessKey.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .sort(\.$createdAt, .descending)
-            .paginate(for: req)
+        let keys = try await AccessKey.findAll(app: req.application, userId: auth.userId)
+            .sorted { $0.createdAt > $1.createdAt }
 
-        return page.map { $0.toResponseDTO() }
+        return try keys.paginated(for: req).map { $0.toResponseDTO() }
     }
 
     @Sendable
@@ -189,9 +166,23 @@ struct InternalUserController: RouteCollection {
         return auth.user.toResponseDTO()
     }
 
+    struct LoginCredentials: Content {
+        let username: String
+        let password: String
+    }
+
     @Sendable
     func login(req: Request) async throws -> ClientTokenResponse {
-        let user: User = try req.auth.require(User.self)
+        guard let credentials = try? req.content.decode(LoginCredentials.self) else {
+            throw Abort(.unauthorized)
+        }
+        guard
+            let user = try await User.findByUsername(
+                app: req.application, username: credentials.username),
+            try user.verify(password: credentials.password)
+        else {
+            throw Abort(.unauthorized)
+        }
         let payload: SessionToken = try SessionToken(with: user)
         return ClientTokenResponse(token: try await req.jwt.sign(payload))
     }
@@ -204,9 +195,9 @@ struct InternalUserController: RouteCollection {
         // removal - see InternalAdminController.deleteUser for why a raw `forceDelete` leaves
         // every other cluster node's physical copies orphaned, ready to silently resurface if a
         // bucket with the same name is ever created again.
-        let buckets = try await Bucket.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .all()
+        let buckets = try await Bucket.all(app: req.application).filter {
+            $0.userId == auth.userId
+        }
 
         for bucket in buckets {
             try await BucketService.delete(
@@ -215,16 +206,14 @@ struct InternalUserController: RouteCollection {
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -
         // skipping that one would leave a deleted user's S3 credentials valid until restart)
-        let accessKeys = try await AccessKey.query(on: req.db)
-            .filter(\.$user.$id == auth.userId)
-            .all()
+        let accessKeys = try await AccessKey.findAll(app: req.application, userId: auth.userId)
 
         for accessKey in accessKeys {
-            try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
+            try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
         }
 
         // Delete the user - buckets and access keys are already fully torn down above.
-        try await auth.user.delete(on: req.db)
+        try await auth.user.delete(app: req.application)
 
         return .noContent
     }
@@ -258,14 +247,9 @@ struct InternalUserController: RouteCollection {
         )
 
         do {
-            try await user.save(on: req.db)
-        } catch {
-            if let dbError = error as? any DatabaseError,
-                dbError.isConstraintFailure
-            {
-                throw Abort(.conflict, reason: "Username already exists.")
-            }
-            throw error
+            try await user.create(app: req.application)
+        } catch is User.UserError {
+            throw Abort(.conflict, reason: "Username already exists.")
         }
 
         return user.toResponseDTO()

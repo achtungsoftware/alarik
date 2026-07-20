@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import JWTKit
 import Testing
@@ -182,7 +181,6 @@ struct InternalAuthOIDCControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
 
             var providerId: UUID?
             if let fakeProvider {
@@ -193,15 +191,13 @@ struct InternalAuthOIDCControllerTests {
                     clientSecret: fakeProvider.clientSecret,
                     enabled: enabled
                 )
-                try await dbProvider.save(on: app.db)
-                providerId = try dbProvider.requireID()
+                try await dbProvider.save(app: app)
+                providerId = dbProvider.id
             }
 
             try await test(app, providerId)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -214,7 +210,7 @@ struct InternalAuthOIDCControllerTests {
         let user = User(
             name: "OIDC Test User", username: username,
             passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: isAdmin)
-        try await user.save(on: app.db)
+        try await user.create(app: app)
         return user
     }
 
@@ -280,7 +276,7 @@ struct InternalAuthOIDCControllerTests {
             let disabled = OIDCProvider(
                 name: "Disabled SSO", issuerURL: "https://example.com", clientId: "x",
                 clientSecret: "y", enabled: false)
-            try await disabled.save(on: app.db)
+            try await disabled.save(app: app)
 
             try await app.test(
                 .GET, "/api/v1/auth/oidc/providers",
@@ -594,9 +590,7 @@ struct InternalAuthOIDCControllerTests {
                 })
 
             // Confirm the account was genuinely not touched/linked.
-            let victim = try await User.query(on: app.db)
-                .filter(\.$username == "victim@example.com")
-                .first()
+            let victim = try await User.findByUsername(app: app, username: "victim@example.com")
             #expect(victim?.oidcSubject == nil)
         }
     }
@@ -611,7 +605,7 @@ struct InternalAuthOIDCControllerTests {
             let user = try await createUser(app, username: "already-linked@example.com")
             user.oidcProviderId = id
             user.oidcSubject = "already-linked-sub"
-            try await user.save(on: app.db)
+            try await user.save(app: app)
 
             let (state, nonce) = try await performLoginRedirect(app, providerId: id)
             // The (provider, sub) link is the trust anchor here, not the email - this must
@@ -680,9 +674,7 @@ struct InternalAuthOIDCControllerTests {
                         #expect(fragment(from: location)["error"] == "no_matching_account")
                     })
 
-                let users = try await User.query(on: app.db)
-                    .filter(\.$username == "nobody@example.com")
-                    .all()
+                let users = try await User.findByUsername(app: app, username: "nobody@example.com").map { [$0] } ?? []
                 #expect(users.isEmpty)
             }
         }
@@ -713,9 +705,7 @@ struct InternalAuthOIDCControllerTests {
                         #expect(frag["token"] == nil)
                     })
 
-                let users = try await User.query(on: app.db)
-                    .filter(\.$username == "disabled@example.com")
-                    .all()
+                let users = try await User.findByUsername(app: app, username: "disabled@example.com").map { [$0] } ?? []
                 #expect(users.isEmpty)
             }
         }
@@ -745,9 +735,7 @@ struct InternalAuthOIDCControllerTests {
                         let token = try #require(fragment(from: location)["token"])
 
                         let created = try #require(
-                            try await User.query(on: app.db)
-                                .filter(\.$username == "brand-new@example.com")
-                                .first())
+                            try await User.findByUsername(app: app, username: "brand-new@example.com"))
                         #expect(created.name == "Brand New Person")
                         #expect(created.isAdmin == false)
                         #expect(created.oidcProviderId == id)
@@ -782,9 +770,7 @@ struct InternalAuthOIDCControllerTests {
                     afterResponse: { res async throws in
                         #expect(res.status == .seeOther)
                         let created = try #require(
-                            try await User.query(on: app.db)
-                                .filter(\.$username == "nameless@example.com")
-                                .first())
+                            try await User.findByUsername(app: app, username: "nameless@example.com"))
                         #expect(created.name == "nameless@example.com")
                     })
             }
@@ -815,9 +801,7 @@ struct InternalAuthOIDCControllerTests {
                         #expect(fragment(from: location)["error"] == "email_not_verified")
                     })
 
-                let users = try await User.query(on: app.db)
-                    .filter(\.$username == "unverified@example.com")
-                    .all()
+                let users = try await User.findByUsername(app: app, username: "unverified@example.com").map { [$0] } ?? []
                 #expect(users.isEmpty)
             }
         }
@@ -853,9 +837,7 @@ struct InternalAuthOIDCControllerTests {
                     })
 
                 // Exactly one account with this username - linked, not duplicated.
-                let matches = try await User.query(on: app.db)
-                    .filter(\.$username == "pre-existing@example.com")
-                    .all()
+                let matches = try await User.findByUsername(app: app, username: "pre-existing@example.com").map { [$0] } ?? []
                 #expect(matches.count == 1)
                 #expect(matches.first?.oidcSubject == "sub-pre-existing")
             }
@@ -891,7 +873,7 @@ struct InternalAuthOIDCControllerTests {
                     #expect(sessionToken.userId == user.id)
                 })
 
-            let reloaded = try #require(try await User.find(user.id, on: app.db))
+            let reloaded = try #require(try await User.find(app: app, id: user.id))
             #expect(reloaded.oidcSubject == "sub-linked-user")
             #expect(reloaded.oidcProviderId == id)
         }
@@ -907,7 +889,7 @@ struct InternalAuthOIDCControllerTests {
             let user = try await createUser(app, username: "renamed-locally@example.com")
             user.oidcProviderId = id
             user.oidcSubject = "sub-already-linked"
-            try await user.save(on: app.db)
+            try await user.save(app: app)
 
             let (state, nonce) = try await performLoginRedirect(app, providerId: id)
             // Email claim no longer matches the (since-renamed) local username - matching by
@@ -946,7 +928,7 @@ struct InternalAuthOIDCControllerTests {
             let user = try await createUser(app, username: "collision@example.com")
             user.oidcProviderId = otherProviderId
             user.oidcSubject = "shared-subject-value"
-            try await user.save(on: app.db)
+            try await user.save(app: app)
 
             let (state, nonce) = try await performLoginRedirect(app, providerId: id)
             await provider.state.set(

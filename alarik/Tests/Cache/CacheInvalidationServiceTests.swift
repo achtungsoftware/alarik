@@ -14,17 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
 
 @testable import Alarik
 
-/// `CacheInvalidationMessage` -> `CacheReloadDispatch.apply` reload path directly against a real
-/// SQLite test `app.db`, since the reload queries themselves are backend-agnostic. This is the
-/// bulk of the invalidation logic's test coverage; only the actual NOTIFY delivery and the
-/// OIDCStateCache DB-table mode need a real Postgres (local-only for now).
+/// `CacheInvalidationMessage` -> `CacheReloadDispatch.apply` reload path against a real test
+/// app. This is the bulk of the invalidation logic's test coverage; only the actual HTTP
+/// broadcast delivery needs a real multi-node cluster, covered separately by `cluster_tests.sh`.
 @Suite("CacheInvalidationService / CacheReloadDispatch tests", .serialized)
 struct CacheInvalidationServiceTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -33,12 +31,9 @@ struct CacheInvalidationServiceTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -49,13 +44,13 @@ struct CacheInvalidationServiceTests {
         let user = User(
             name: "Cache Invalidation Test User", username: UUID().uuidString,
             passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
-        try await user.save(on: app.db)
-        return user.id!
+        try await user.create(app: app)
+        return user.id
     }
 
     private func createBucket(_ app: Application, userId: UUID, name: String) async throws -> Bucket {
         let bucket = Bucket(name: name, userId: userId)
-        try await bucket.save(on: app.db)
+        try await bucket.save(app: app)
         return bucket
     }
 
@@ -63,7 +58,7 @@ struct CacheInvalidationServiceTests {
         async throws
     {
         let key = AccessKey(userId: userId, accessKey: accessKey, secretKey: secretKey)
-        try await key.save(on: app.db)
+        _ = try await key.create(app: app)
     }
 
     private func payload(cache: String, op: CacheInvalidationMessage.Op, key: String) -> String {
@@ -71,16 +66,18 @@ struct CacheInvalidationServiceTests {
         return String(decoding: try! JSONEncoder().encode(message), as: UTF8.self)
     }
 
-    // MARK: - notify() is a true no-op on SQLite
+    // MARK: - notify() is a true no-op outside cluster mode
 
-    @Test("notify(on:) on a SQLite database returns without throwing or hanging")
-    func notifyIsNoOpOnSQLite() async throws {
+    @Test("notify(app:) on a non-clustered app returns without throwing or hanging")
+    func notifyIsNoOpWhenNotClustered() async throws {
         try await withApp { app in
-            // Nothing to assert beyond "this returns promptly and doesn't crash" - on SQLite
-            // the guard in `notify` fails before any Task is even spawned, so there is no
-            // async side effect to observe. Real NOTIFY delivery is a Postgres-only concern
+            // Nothing to assert beyond "this returns promptly and doesn't crash" - with no
+            // `ClusterConfigurationKey` stashed (the test process sets no CLUSTER_NODE_ADDRESS/
+            // CLUSTER_SECRET), the guard in `notify` returns before any Task is even spawned, so
+            // there is no async broadcast to observe. Real HTTP broadcast delivery needs a real
+            // multi-node cluster and is covered by `cluster_tests.sh`.
             CacheInvalidationService.notify(
-                on: app.db, cache: "bucketVersioning", op: .upsert, key: "does-not-matter")
+                app: app, cache: "bucketVersioning", op: .upsert, key: "does-not-matter")
         }
     }
 
@@ -106,7 +103,7 @@ struct CacheInvalidationServiceTests {
             let userId = try await createUser(app)
             let bucket = try await createBucket(app, userId: userId, name: "versioning-bucket")
             bucket.versioningStatus = VersioningStatus.enabled.rawValue
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
                 payload: payload(cache: "bucketVersioning", op: .upsert, key: "versioning-bucket"),
@@ -149,7 +146,7 @@ struct CacheInvalidationServiceTests {
                     }]
                 }
                 """
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
                 payload: payload(cache: "bucketPolicy", op: .upsert, key: "policy-bucket"),
@@ -187,7 +184,7 @@ struct CacheInvalidationServiceTests {
             let bucket = try await createBucket(app, userId: userId, name: "pab-bucket")
             bucket.blockPublicAcls = true
             bucket.restrictPublicBuckets = true
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
                 payload: payload(cache: "bucketPublicAccessBlock", op: .upsert, key: "pab-bucket"),
@@ -212,7 +209,7 @@ struct CacheInvalidationServiceTests {
                     events: ["s3:ObjectCreated:*"], prefix: nil, suffix: nil, enabled: true)
             ])
             bucket.notificationConfig = config.toJSON()
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
                 payload: payload(cache: "notificationConfig", op: .upsert, key: "webhook-bucket"),
@@ -241,7 +238,7 @@ struct CacheInvalidationServiceTests {
                         replicateExisting: false, enabled: true)
                 ])
             bucket.replicationConfig = config.toJSON()
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
                 payload: payload(
@@ -301,8 +298,8 @@ struct CacheInvalidationServiceTests {
         }
     }
 
-    @Test("apply accessKeyBucket upsert recomputes the key's entire bucket set from the DB")
-    func dispatchAccessKeyBucketUpsertRecomputesFullSet() async throws {
+    @Test("apply accessKeyBucket upsert additively merges the key's bucket set from the DB, never dropping entries")
+    func dispatchAccessKeyBucketUpsertIsAdditiveOnly() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
             _ = try await createBucket(app, userId: userId, name: "bucket-one")
@@ -310,17 +307,21 @@ struct CacheInvalidationServiceTests {
             try await createAccessKey(
                 app, userId: userId, accessKey: "multi-bucket-key", secretKey: "s")
 
-            // Seed a stale entry for a bucket that no longer applies - upsert must replace the
-            // whole set, not just add to it.
+            // Seed an entry for a bucket this key doesn't actually own in the DB. Upsert must be
+            // a pure additive merge (see `CacheReloadDispatch`'s doc comment on this case): it
+            // only ever ADDS what a successful read finds, never drops what it doesn't - a wipe-
+            // and-rebuild here is exactly the bug that caused real, currently-valid buckets to
+            // intermittently vanish from a key's cached access on any single incomplete fan-out.
+            // Genuine removal has its own dedicated `.removeBucket` signal, exercised below.
             await AccessKeyBucketMapCache.shared.add(
-                accessKey: "multi-bucket-key", bucketName: "stale-bucket")
+                accessKey: "multi-bucket-key", bucketName: "not-actually-owned-bucket")
 
             await CacheReloadDispatch.apply(
                 payload: payload(cache: "accessKeyBucket", op: .upsert, key: "multi-bucket-key"),
                 app: app)
 
             let buckets = await AccessKeyBucketMapCache.shared.buckets(for: "multi-bucket-key")
-            #expect(buckets == Set(["bucket-one", "bucket-two"]))
+            #expect(buckets == Set(["bucket-one", "bucket-two", "not-actually-owned-bucket"]))
         }
     }
 

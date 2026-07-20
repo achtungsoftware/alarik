@@ -16,13 +16,10 @@ limitations under the License.
 
 import Vapor
 
-/// Inter-node auth for cluster traffic - deliberately separate from
-/// `InternalAuthenticator` (client-facing SigV4/JWT). By the time a request reaches a peer node
-/// it was already authenticated once at the entry node, and re-running SigV4 against a forwarded
-/// request wouldn't even work (the entry node never has the client's secret key to re-sign
-/// with). A single shared bearer secret, checked in constant time, is deliberately simple -
-/// cluster traffic is assumed to run on a private network, the same assumption Postgres/Redis
-/// clustering commonly makes.
+/// Inter-node auth for cluster traffic - deliberately separate from `InternalAuthenticator`
+/// (client-facing SigV4/JWT), since a forwarded request can't be re-signed with a secret key the
+/// entry node never had. A single shared bearer secret, checked in constant time, is deliberately
+/// simple - cluster traffic is assumed to run on a private network.
 enum ClusterForwardAuthenticator {
     static let forwardedHeaderName = "X-Alarik-Cluster-Forwarded"
     static let secretHeaderName = "X-Alarik-Cluster-Secret"

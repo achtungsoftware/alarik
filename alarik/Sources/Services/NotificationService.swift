@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import Vapor
 
@@ -108,9 +107,7 @@ struct NotificationService {
     // MARK: - Emit
 
     /// Enqueues an event for every matching rule of the bucket's notification configuration.
-    /// Returns immediately when the bucket has none (the common case) - one actor lookup,
-    /// no database access. Never throws: a notification enqueue failure must not fail the
-    /// object operation that triggered it (the write/delete already happened).
+    /// Returns immediately when the bucket has none (the common case)
     static func emit(
         event: S3EventType,
         bucketName: String,
@@ -120,7 +117,7 @@ struct NotificationService {
         versionId: String?,
         requestId: String,
         sourceIP: String?,
-        on db: any Database
+        app: Application
     ) async {
         guard let config = await NotificationConfigCache.shared.config(for: bucketName) else {
             return
@@ -129,6 +126,7 @@ struct NotificationService {
         let matching = config.rules.filter { $0.matches(eventName: event.rawValue, key: key) }
         guard !matching.isEmpty else { return }
 
+        let ownerNodeId = OutboxMailbox.selfNodeId(app: app)
         for rule in matching {
             let payload = buildPayload(
                 event: event, bucketName: bucketName, key: key, size: size, etag: etag,
@@ -140,14 +138,11 @@ struct NotificationService {
                 ruleId: rule.id,
                 url: rule.url,
                 secret: rule.secret,
-                payload: payload
+                payload: payload,
+                ownerNodeId: ownerNodeId
             )
-            do {
-                try await delivery.save(on: db)
-            } catch {
-                db.logger.error(
-                    "Failed to enqueue webhook delivery for bucket '\(bucketName)': \(error)")
-            }
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.notificationDeliveries, row: delivery)
         }
 
         NotificationDispatcher.shared.wake()
@@ -158,7 +153,7 @@ struct NotificationService {
         rule: NotificationRule,
         bucketName: String,
         requestId: String,
-        on db: any Database
+        app: Application
     ) async throws {
         let payload = TestEventPayload(
             Time: Date().iso8601String,
@@ -173,9 +168,11 @@ struct NotificationService {
             ruleId: rule.id,
             url: rule.url,
             secret: rule.secret,
-            payload: body
+            payload: body,
+            ownerNodeId: OutboxMailbox.selfNodeId(app: app)
         )
-        try await delivery.save(on: db)
+        await OutboxMailbox.enqueue(
+            app: app, collection: OutboxCollections.notificationDeliveries, row: delivery)
         NotificationDispatcher.shared.wake()
     }
 

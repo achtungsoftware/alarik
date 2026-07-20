@@ -1,2 +1,7 @@
 .build/
 .swiftpm/
+# Runtime data, never build state - baking a local dev Storage/ into the image means every
+# fresh container/volume starts from identical pre-existing data (most dangerously
+# cluster_node_id: every node would then share the same cluster identity instead of each
+# generating its own on first boot).
+Storage/

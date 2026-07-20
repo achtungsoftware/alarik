@@ -22,7 +22,6 @@ limitations under the License.
     import Musl
 #endif
 
-import Fluent
 import Foundation
 import Vapor
 

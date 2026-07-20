@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 import struct Foundation.UUID
@@ -132,7 +131,7 @@ struct InternalClusterListingController: RouteCollection {
         }
         let active = await ClusterNodeCache.shared.activeNodes()
         let stats = try await ClusterListingService.ownedStatsAllBuckets(
-            on: req.db, activeNodes: active, selfNodeId: config.nodeId)
+            app: req.application, activeNodes: active, selfNodeId: config.nodeId)
 
         return try jsonResponse(
             ClusterListingClient.OwnedStatsResponse(

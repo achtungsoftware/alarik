@@ -207,13 +207,10 @@ enum ErasureCodedObjectHandler {
     }
 
     /// The shard indices this node physically holds for (bucketName, key[, versionId]) - read
-    /// straight from the `.ecshards` directory's filenames. Normally exactly one entry (a node
-    /// holds a single shard per version), but transiently more during reindexing, when a node has
-    /// received its new-rank shard but not yet reclaimed the old-rank one. Crucially: a shard's
-    /// index is fixed at encode time and stored in its filename, but which node holds a given
-    /// index drifts as HRW ranks shift on membership change - so this is the *only* correct way to
-    /// answer "what does this node actually hold", never "does the file matching my current rank
-    /// exist". Empty when the object isn't erasure-coded here (or doesn't exist).
+    /// straight from the `.ecshards` directory's filenames. Normally exactly one entry, but
+    /// transiently more during reindexing. A shard's index is fixed at encode time, but which
+    /// node holds a given index drifts as HRW ranks shift on membership change - so this is the
+    /// only correct way to answer "what does this node actually hold". Empty if not EC here.
     static func locallyHeldShardIndices(bucketName: String, key: String, versionId: String?) -> [Int] {
         let basePath =
             versionId != nil
@@ -256,14 +253,11 @@ enum ErasureCodedObjectHandler {
         }
     }
 
-    /// Commits an already fully-formed `.ecshard` file (header + every stripe already written -
-    /// scratch output from `StripeEncoder` or shard reconstruction) into its final on-disk shard
-    /// path, atomically, with the same isLatest demote-then-write-then-repoint-pointer sequence
-    /// every shard-arrival path needs (`InternalClusterErasureCodedController.handlePush` runs
-    /// the network-received equivalent of this after spooling). Used for a *local* commit - when
-    /// the node producing the shard bytes is itself the final destination, this skips the
-    /// otherwise-redundant HTTP round trip through `pushShard` entirely (spool to a temp file,
-    /// POST it to localhost, re-spool on receipt, copy into place) in favor of one direct copy.
+    /// Commits an already fully-formed `.ecshard` file (header + every stripe already written)
+    /// into its final on-disk shard path, atomically, with the same isLatest demote-then-write-
+    /// then-repoint sequence every shard-arrival path needs. Used for a *local* commit - when the
+    /// node producing the shard bytes is itself the final destination, this skips the otherwise-
+    /// redundant HTTP round trip through `pushShard` in favor of one direct copy.
     static func commitShardFile(
         sourcePath: String, finalPath: String, bucketName: String, key: String
     ) throws {
@@ -349,19 +343,32 @@ enum ErasureCodedObjectHandler {
         return results
     }
 
-    /// Every local shard-0 header for `bucketName` (optionally restricted to one `key`) - the
-    /// EC analog of walking `.obj` files, used by listing/lifecycle code that must see both
-    /// formats (`ObjectFileHandler.listObjects`/`listVersions`/`listAllVersions`). Shard index 0
-    /// lives on rank-0 by construction, so this yields exactly one hit per (key, version) this
-    /// node happens to be rank-0 for - never a fraction, never duplicated by the other `k+m-1`
-    /// shards, and the header's `ObjectMeta` is already complete (no separate re-read needed the
-    /// way a bare `.obj` path requires).
-    ///
-    /// Runs on every S3 listing/stats request, so cost matters: the walk is scoped to this one
-    /// bucket's directory (never the whole store the way the rebalance/scrub walk is), and only
-    /// files literally named `0.ecshard` are opened - the shard index is the filename, so the
-    /// other `k+m-1` shards are skipped without paying their header parse.
+    /// Every local shard-0 header for `bucketName` (optionally restricted to one `key`) - the EC
+    /// analog of walking `.obj` files, used by listing/lifecycle code that must see both formats.
+    /// Shard index 0 lives on rank-0 by construction, so this yields exactly one hit per (key,
+    /// version) this node is rank-0 for, and the header's `ObjectMeta` is already complete (no
+    /// separate re-read needed). Scoped to this one bucket's directory, and only files literally
+    /// named `0.ecshard` are opened, so cost stays bounded on every S3 listing/stats request.
     static func listLocalShardZeroEntries(bucketName: String, key: String? = nil) -> [ObjectMeta] {
+        localShardZeroEntries(bucketName: bucketName) { meta in
+            key == nil || meta.key == key
+        }
+    }
+
+    /// Prefix variant of `listLocalShardZeroEntries` - used by `MetadataListingService` to walk
+    /// one collection at a time (e.g. every key under `"users/"`) rather than a single exact key.
+    /// A distinct function, not a repurposed `key:` parameter: `listLocalShardZeroEntries`'s
+    /// existing exact-match callers (e.g. `ObjectFileHandler.listAllVersions`, listing every
+    /// version of one specific key) must never silently start prefix-matching.
+    static func listLocalShardZeroEntries(bucketName: String, keyPrefix: String) -> [ObjectMeta] {
+        localShardZeroEntries(bucketName: bucketName) { meta in
+            meta.key.hasPrefix(keyPrefix)
+        }
+    }
+
+    private static func localShardZeroEntries(
+        bucketName: String, matching: (ObjectMeta) -> Bool
+    ) -> [ObjectMeta] {
         let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
         guard
             let enumerator = FileManager.default.enumerator(
@@ -379,7 +386,7 @@ enum ErasureCodedObjectHandler {
             // Belt-and-braces: trust the header over the filename, and never leak another
             // bucket's meta if a file was somehow misplaced.
             guard header.shardIndex == 0, header.objectMeta.bucketName == bucketName else { continue }
-            if let key, header.objectMeta.key != key { continue }
+            guard matching(header.objectMeta) else { continue }
             results.append(header.objectMeta)
         }
         return results
@@ -481,9 +488,9 @@ final class ErasureCodedShardReader {
             }
             // Field sanity: valid JSON isn't proof of a healthy header - bit rot inside the JSON
             // itself can decode to values (negative, absurdly large) whose downstream allocations
-            // (`readStripe` allocates `stripeUnitSize` per call) would crash or OOM. Treat any
-            // out-of-band value exactly like an unreadable header: this copy can't be trusted.
-            guard header.dataShards >= 1, header.parityShards >= 1,
+            // would crash or OOM. `parityShards >= 0` (not `>= 1`): zero parity shards is a
+            // legitimate degenerate case for a standalone k=1/m=0 record.
+            guard header.dataShards >= 1, header.parityShards >= 0,
                 header.stripeUnitSize >= 1, header.stripeUnitSize <= Self.maxStripeUnitSize,
                 header.stripeCount >= 0,
                 header.shardIndex >= 0, header.shardIndex < header.dataShards + header.parityShards

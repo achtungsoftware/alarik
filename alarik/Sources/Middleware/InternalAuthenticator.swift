@@ -14,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import JWT
 import Vapor
 
 /// Authenticator that supports both JWT (SessionToken) and Access Key authentication.
 ///
-/// Authentication methods tried in order:
-/// 1. JWT Bearer token (`Authorization: Bearer <token>`)
-/// 2. Access Key headers (`X-Access-Key` and `X-Secret-Key`)
-///
-/// On successful authentication, an `AuthenticatedUser` is stored in `req.auth`.
+/// Tries JWT Bearer token (`Authorization: Bearer <token>`) first, then falls back to Access Key
+/// headers (`X-Access-Key`/`X-Secret-Key`). On success, an `AuthenticatedUser` is stored in
+/// `req.auth`.
 struct InternalAuthenticator: AsyncRequestAuthenticator {
 
     func authenticate(request: Request) async throws {
@@ -51,7 +48,8 @@ struct InternalAuthenticator: AsyncRequestAuthenticator {
         do {
             let sessionToken = try await request.jwt.verify(as: SessionToken.self)
 
-            guard let user = try await User.find(sessionToken.userId, on: request.db) else {
+            guard let user = try await User.find(app: request.application, id: sessionToken.userId)
+            else {
                 return nil
             }
 
@@ -72,14 +70,7 @@ struct InternalAuthenticator: AsyncRequestAuthenticator {
             return nil
         }
 
-        // Look up the access key with its associated user
-        guard
-            let accessKey =
-                try await AccessKey
-                .query(on: request.db)
-                .filter(\.$accessKey == accessKeyId)
-                .with(\.$user)
-                .first()
+        guard let accessKey = try await AccessKey.find(app: request.application, accessKey: accessKeyId)
         else {
             return nil
         }
@@ -94,6 +85,10 @@ struct InternalAuthenticator: AsyncRequestAuthenticator {
             return nil
         }
 
-        return AuthenticatedUser(user: accessKey.user, authMethod: .accessKey)
+        guard let user = try await User.find(app: request.application, id: accessKey.userId) else {
+            return nil
+        }
+
+        return AuthenticatedUser(user: user, authMethod: .accessKey)
     }
 }

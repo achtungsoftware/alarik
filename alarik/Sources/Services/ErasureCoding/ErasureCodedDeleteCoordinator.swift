@@ -107,7 +107,8 @@ enum ErasureCodedDeleteCoordinator {
         // special-casing (see its own design doc comment).
         try await ErasureCodedWriteCoordinator.write(
             app: app, bucketName: bucketName, key: key, objectMeta: versionedMeta,
-            payloadSources: [], peers: peers, ecConfig: ecConfig,
+            payloadSources: [], peers: peers,
+            ecConfig: (ecConfig.dataShards, ecConfig.parityShards),
             priorLatestVersionId: priorLatestVersionId)
 
         try await S3Service.offloadBlockingIO(app) {
@@ -158,7 +159,8 @@ enum ErasureCodedDeleteCoordinator {
             let task = ErasureCodedReplicationTask(
                 bucketName: bucketName, key: key, versionId: versionId, shardIndex: -1,
                 operation: .delete, targetNodeId: peer.id, reason: .write)
-            try? await task.save(on: app.db)
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.erasureCodedReplicationTasks, row: task)
         }
         ErasureCodedDispatcher.shared.wake()
     }

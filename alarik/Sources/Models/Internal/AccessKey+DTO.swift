@@ -14,36 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 import struct Foundation.UUID
 
-final class AccessKey: Model, @unchecked Sendable {
-    static let schema = "access_keys"
-
-    @ID(key: .id)
-    var id: UUID?
-
-    @Parent(key: "user_id")
-    var user: User
-
-    @Field(key: "access_key")
+/// Backed by `MetadataStore`, not Fluent - keyed by the access key VALUE itself (`accessKey`),
+/// not `id`. It's already a natural unique identifier, and the hot-path lookup (SigV4 auth) is
+/// always by that value, never by id - so unlike `User`, no secondary index is needed at all.
+/// `id` is kept only for API compatibility (the console addresses a key by id for deletion) - see
+/// `find(app:id:userId:)`, which lists this small per-user collection and filters in memory.
+final class AccessKey: @unchecked Sendable, Codable {
+    let id: UUID
+    var userId: UUID
     var accessKey: String
-
-    @Field(key: "secret_key")
     var secretKey: String
-
-    @Field(key: "created_at")
     var createdAt: Date
-
-    @Field(key: "expiration_date")
     var expirationDate: Date?
 
-    init() {}
-
     init(
-        id: UUID? = nil,
+        id: UUID = UUID(),
         userId: UUID,
         accessKey: String,
         secretKey: String,
@@ -51,11 +40,43 @@ final class AccessKey: Model, @unchecked Sendable {
         expirationDate: Date? = nil
     ) {
         self.id = id
-        self.$user.id = userId
+        self.userId = userId
         self.accessKey = accessKey
         self.secretKey = secretKey
         self.createdAt = createdAt
         self.expirationDate = expirationDate
+    }
+}
+
+// MARK: - MetadataStore access
+
+extension AccessKey {
+    static func find(app: Application, accessKey: String) async throws -> AccessKey? {
+        try await MetadataStore.get(
+            AccessKey.self, app: app, collection: MetadataCollections.accessKeys, id: accessKey)
+    }
+
+    /// Every access key belonging to `userId` - a full-collection listing filtered in memory.
+    /// Access keys are a shallow, low-churn collection (see `MetadataListingService`'s doc
+    /// comment), so this is only ever called from admin/console paths, never per-S3-request.
+    static func findAll(app: Application, userId: UUID) async throws -> [AccessKey] {
+        try await all(app: app).filter { $0.userId == userId }
+    }
+
+    static func all(app: Application) async throws -> [AccessKey] {
+        await MetadataListingService.list(app: app, collection: MetadataCollections.accessKeys)
+            .compactMap { try? JSONDecoder().decode(AccessKey.self, from: $0.value) }
+    }
+
+    /// Creates the key, failing if `accessKey`'s value is already taken by another key.
+    func create(app: Application) async throws -> Bool {
+        try await MetadataStore.putIfAbsent(
+            app: app, collection: MetadataCollections.accessKeys, id: accessKey, value: self)
+    }
+
+    func delete(app: Application) async throws {
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.accessKeys, id: accessKey)
     }
 }
 
@@ -76,9 +97,9 @@ extension AccessKey {
     func toResponseDTO() -> AccessKey.ResponseDTO {
         .init(
             id: self.id,
-            accessKey: self.$accessKey.value,
-            createdAt: self.$createdAt.value,
-            expirationDate: self.$expirationDate.value
+            accessKey: self.accessKey,
+            createdAt: self.createdAt,
+            expirationDate: self.expirationDate
         )
     }
 }

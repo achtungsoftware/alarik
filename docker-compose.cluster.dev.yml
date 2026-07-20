@@ -1,21 +1,4 @@
 services:
-  postgres:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=alarik
-      - POSTGRES_PASSWORD=alarik
-      - POSTGRES_DB=alarik
-    volumes:
-      - alarik-postgres-dev:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U alarik"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - alarik-network
-
   alarik-build:
     build:
       context: ./alarik
@@ -47,7 +30,6 @@ services:
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
       - JWT=dev-cluster-jwt-secret
-      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-1:8080
       - CLUSTER_SECRET=dev-cluster-secret
       # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
@@ -71,8 +53,6 @@ services:
     depends_on:
       alarik-build:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
     networks:
       - alarik-network
 
@@ -91,9 +71,9 @@ services:
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
       - JWT=dev-cluster-jwt-secret
-      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-2:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      - CLUSTER_SEED_NODES=http://alarik-1:8080
       # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
       # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
       # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
@@ -114,8 +94,6 @@ services:
     depends_on:
       alarik-build:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
       alarik-1:
         condition: service_healthy
     networks:
@@ -136,9 +114,9 @@ services:
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
       - JWT=dev-cluster-jwt-secret
-      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-3:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      - CLUSTER_SEED_NODES=http://alarik-1:8080
       # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
       # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
       # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
@@ -159,8 +137,6 @@ services:
     depends_on:
       alarik-build:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
       alarik-1:
         condition: service_healthy
     networks:
@@ -181,9 +157,9 @@ services:
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
       - JWT=dev-cluster-jwt-secret
-      - DATABASE_URL=postgres://alarik:alarik@postgres:5432/alarik
       - CLUSTER_NODE_ADDRESS=http://alarik-4:8080
       - CLUSTER_SECRET=dev-cluster-secret
+      - CLUSTER_SEED_NODES=http://alarik-1:8080
       # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
       # per node). The default is 4+2, which needs 6 nodes and would fail every write here - a
       # cluster must have at least k+m active nodes to accept writes. Tolerates losing any 2 nodes.
@@ -204,8 +180,6 @@ services:
     depends_on:
       alarik-build:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
       alarik-1:
         condition: service_healthy
     networks:
@@ -277,7 +251,6 @@ networks:
     driver: bridge
 
 volumes:
-  alarik-postgres-dev:
   alarik-build:
   alarik-1-storage:
   alarik-2-storage:

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 /// Admin-only CRUD for OIDC SSO providers - see `OIDCProvider+DTO.swift` for why this is
@@ -32,7 +31,7 @@ struct InternalAdminOIDCProviderController: RouteCollection {
     /// Fetches an OIDC provider by ID or throws the standard 404 - the same fetch-or-404 shape
     /// needed by both `editProvider` and `deleteProvider`.
     private func requireProvider(req: Request, id: UUID) async throws -> OIDCProvider {
-        guard let provider = try await OIDCProvider.find(id, on: req.db) else {
+        guard let provider = try await OIDCProvider.find(app: req.application, id: id) else {
             throw Abort(.notFound, reason: "OIDC provider not found")
         }
         return provider
@@ -43,11 +42,10 @@ struct InternalAdminOIDCProviderController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let page: Page<OIDCProvider> = try await OIDCProvider.query(on: req.db)
-            .sort(\.$createdAt, .descending)
-            .paginate(for: req)
+        let providers = try await OIDCProvider.all(app: req.application)
+            .sorted { $0.createdAt > $1.createdAt }
 
-        return page.map { $0.toResponseDTO() }
+        return try providers.paginated(for: req).map { $0.toResponseDTO() }
     }
 
     @Sendable
@@ -71,7 +69,7 @@ struct InternalAdminOIDCProviderController: RouteCollection {
             enabled: create.enabled
         )
 
-        try await provider.save(on: req.db)
+        try await provider.save(app: req.application)
 
         return provider.toResponseDTO()
     }
@@ -97,7 +95,7 @@ struct InternalAdminOIDCProviderController: RouteCollection {
             provider.clientSecret = newSecret
         }
 
-        try await provider.save(on: req.db)
+        try await provider.save(app: req.application)
 
         // The discovery/JWKS cache is keyed by issuer URL - if it changed, drop the old entry
         // immediately rather than leaving it to expire on its own TTL (up to an hour), which
@@ -125,14 +123,20 @@ struct InternalAdminOIDCProviderController: RouteCollection {
         // provider later) - matches this codebase's general "clean up, don't block" deletion
         // style elsewhere (e.g. deleting a bucket force-deletes its contents rather than
         // refusing).
-        try await User.query(on: req.db)
-            .filter(\.$oidcProviderId == providerId)
-            .set(\.$oidcProviderId, to: nil)
-            .set(\.$oidcSubject, to: nil)
-            .update()
+        let linkedUsers = await MetadataListingService.list(
+            app: req.application, collection: MetadataCollections.users
+        )
+        .compactMap { try? JSONDecoder().decode(User.self, from: $0.value) }
+        .filter { $0.oidcProviderId == providerId }
+
+        for user in linkedUsers {
+            user.oidcProviderId = nil
+            user.oidcSubject = nil
+            try await user.save(app: req.application)
+        }
 
         await OIDCDiscoveryCache.shared.invalidate(issuerURL: provider.issuerURL)
-        try await provider.delete(on: req.db)
+        try await provider.delete(app: req.application)
 
         return .noContent
     }

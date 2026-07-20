@@ -47,10 +47,15 @@ public enum Constants {
     /// finished spool into Storage/multipart is a same-filesystem move in the common case.
     public static let spoolDirectory = "Storage/spool/"
 
-    /// Per-shard bytes encoded together in one Reed-Solomon stripe. Mid-range of MinIO/RustFS
-    /// precedent (128-256 KiB) - large enough to amortize ISA-L call overhead, small enough to
-    /// keep per-stripe memory (`dataShards * stripeUnitSize`) bounded for wide k.
+    /// Per-shard bytes encoded together in one Reed-Solomon stripe - large enough to amortize
+    /// ISA-L call overhead, small enough to keep per-stripe memory (`dataShards * stripeUnitSize`)
+    /// bounded for wide k.
     public static let erasureCodingStripeUnitSize = 256 * 1024
+
+    /// Floor for `MetadataStripeSizing.chooseStripeUnitSize` - filesystem block-size alignment,
+    /// avoiding degenerate sub-block stripe units for tiny metadata records (a 200-byte outbox
+    /// row shouldn't encode into a handful of few-byte stripe units).
+    public static let metadataMinStripeUnitSize = 4096
 
     /// Scratch directory for shard files mid-encode, before fan-out to their destination nodes.
     /// Lives under Storage/ for the same same-filesystem-move reason as `spoolDirectory`.

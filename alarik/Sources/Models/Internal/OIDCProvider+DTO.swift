@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 import struct Foundation.UUID
@@ -25,34 +24,19 @@ import struct Foundation.UUID
 /// register multiple OAuth2/OIDC "Authentication Sources": this is deployment/admin-level
 /// configuration, not a per-user setting - the client credentials identify the whole Alarik
 /// instance to the provider, not an individual user.
-final class OIDCProvider: Model, @unchecked Sendable {
-    static let schema = "oidc_providers"
-
-    @ID(key: .id)
-    var id: UUID?
-
-    @Field(key: "name")
+///
+/// Backed by `MetadataStore`, not Fluent - primary record at `oidc-providers/<id>`.
+final class OIDCProvider: @unchecked Sendable, Codable {
+    let id: UUID
     var name: String
-
-    @Field(key: "issuer_url")
     var issuerURL: String
-
-    @Field(key: "client_id")
     var clientId: String
-
-    @Field(key: "client_secret")
     var clientSecret: String
-
-    @Field(key: "enabled")
     var enabled: Bool
-
-    @Field(key: "created_at")
     var createdAt: Date
 
-    init() {}
-
     init(
-        id: UUID? = nil,
+        id: UUID = UUID(),
         name: String,
         issuerURL: String,
         clientId: String,
@@ -77,6 +61,31 @@ final class OIDCProvider: Model, @unchecked Sendable {
             clientId: self.clientId,
             enabled: self.enabled
         )
+    }
+}
+
+// MARK: - MetadataStore access
+
+extension OIDCProvider {
+    static func find(app: Application, id: UUID) async throws -> OIDCProvider? {
+        try await MetadataStore.get(
+            OIDCProvider.self, app: app, collection: MetadataCollections.oidcProviders,
+            id: id.uuidString)
+    }
+
+    static func all(app: Application) async throws -> [OIDCProvider] {
+        await MetadataListingService.list(app: app, collection: MetadataCollections.oidcProviders)
+            .compactMap { try? JSONDecoder().decode(OIDCProvider.self, from: $0.value) }
+    }
+
+    func save(app: Application) async throws {
+        try await MetadataStore.put(
+            app: app, collection: MetadataCollections.oidcProviders, id: id.uuidString, value: self)
+    }
+
+    func delete(app: Application) async throws {
+        try await MetadataStore.delete(
+            app: app, collection: MetadataCollections.oidcProviders, id: id.uuidString)
     }
 }
 

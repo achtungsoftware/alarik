@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 
 extension SharedLink {
@@ -33,7 +32,7 @@ extension SharedLink {
             id: self.id,
             bucketName: self.bucketName,
             key: self.key,
-            url: "\(apiBaseURL)/api/v1/shared/\(self.id?.uuidString ?? "")",
+            url: "\(apiBaseURL)/api/v1/shared/\(self.id.uuidString)",
             expiresAt: self.expiresAt,
             createdAt: self.createdAt
         )

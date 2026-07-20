@@ -45,20 +45,12 @@ enum ErasureCodedCoordinatorError: Error, CustomStringConvertible {
 /// wait for `PlacementService.ecQuorumThreshold` acks before returning. Only the *coordinator*
 /// (rank-0, pinned by `ObjectRoutingService.erasureCodedRoutingDecision`) ever calls this.
 enum ErasureCodedWriteCoordinator {
-    /// Throws `.quorumNotReached` (never returns partial success) when fewer than
-    /// `ecQuorumThreshold` shards land synchronously - and rolls back every shard that DID land
-    /// (this node's own, plus any peer that already acked) before throwing, so a failed PUT never
-    /// leaves a partially-shard-covered, half-written object discoverable by a later GET. This is
-    /// the one place EC's quorum is a hard gate, not a soft preference: unlike plain replication
-    /// (which always acks the client after its own local write, letting peers catch up
-    /// asynchronously regardless of quorum), an EC object with too few shards placed isn't
-    /// reconstructable at all - there's nothing safe to leave half-visible.
-    /// `priorLatestVersionId` is the version `.latest` pointed at before this write began (nil for
-    /// a first-ever write, or a non-versioned write where the pointer isn't used). It's needed
-    /// only by the rollback path: if quorum fails, peers that already received the shard will have
-    /// repointed their `.latest` to this now-deleted version, so rollback restores them (and this
-    /// node) to the prior version - otherwise a failed PUT would leave `.latest` dangling at a
-    /// shardless version and make the previously-readable object 404.
+    /// Throws `.quorumNotReached` (never partial success) when fewer than `ecQuorumThreshold`
+    /// shards land synchronously, rolling back every shard that DID land first - an EC object
+    /// with too few shards isn't reconstructable at all, so quorum is a hard gate here, unlike
+    /// plain replication's soft catch-up. `priorLatestVersionId` lets rollback restore `.latest`
+    /// to the pre-write version. `ecConfig` is a plain shard-count pair (not the concrete config
+    /// type) so other callers can drive the same write path with their own shard counts.
     static func write(
         app: Application,
         bucketName: String,
@@ -66,10 +58,11 @@ enum ErasureCodedWriteCoordinator {
         objectMeta: ObjectMeta,
         payloadSources: [(path: String, offset: Int, size: Int)],
         peers: [ClusterNodeInfo],
-        ecConfig: ClusterErasureCodingConfig,
-        priorLatestVersionId: String? = nil
+        ecConfig: (dataShards: Int, parityShards: Int),
+        priorLatestVersionId: String? = nil,
+        stripeUnitSize: Int = Constants.erasureCodingStripeUnitSize
     ) async throws {
-        let totalShards = ecConfig.totalShards
+        let totalShards = ecConfig.dataShards + ecConfig.parityShards
         guard peers.count == totalShards - 1 else {
             throw ErasureCodedCoordinatorError.peerCountMismatch(
                 expected: totalShards - 1, actual: peers.count)
@@ -86,6 +79,7 @@ enum ErasureCodedWriteCoordinator {
             try StripeEncoder.encode(
                 objectMeta: objectMeta, payloadSources: payloadSources,
                 dataShards: ecConfig.dataShards, parityShards: ecConfig.parityShards,
+                stripeUnitSize: stripeUnitSize,
                 shardPath: { "\(scratchDir)\($0).ecshard" })
         }
 
@@ -137,18 +131,12 @@ enum ErasureCodedWriteCoordinator {
         }
     }
 
-    /// Best-effort: undoes every shard that landed before quorum failed, then repairs the `.latest`
-    /// pointer. Failures here are logged, not thrown - the client already gets `.quorumNotReached`
-    /// regardless, and a shard this couldn't clean up is exactly what
-    /// `ErasureCodedRebalanceService`'s health sweep would eventually reclaim as an orphan anyway.
-    ///
-    /// The latest-pointer repair is the load-bearing part: every peer that received the shard
-    /// demoted its prior version and repointed `.latest` to this (now-deleted) version on receipt.
-    /// Left unrepaired, a subsequent GET would resolve `.latest` to a version with no shards and
-    /// 404 an object that was perfectly readable a moment ago. Restore is broadcast to *all* peers
-    /// (idempotent - a peer that never received the shard just re-affirms its existing pointer),
-    /// and applied locally too, since this node's own prior version was demoted before the write.
-    /// Only versioned writes use the pointer, so a nil `versionId` skips the restore entirely.
+    /// Best-effort: undoes every shard that landed before quorum failed, then repairs the
+    /// `.latest` pointer. Failures here are logged, not thrown - an orphaned shard is reclaimed by
+    /// `ErasureCodedRebalanceService`'s health sweep anyway. The pointer repair is load-bearing:
+    /// peers that received the shard already repointed `.latest` to this now-deleted version, so
+    /// leaving it unrepaired would 404 a previously-readable object. Broadcast to all peers
+    /// (idempotent) and applied locally; a nil `versionId` skips it (non-versioned write).
     private static func rollback(
         app: Application, bucketName: String, key: String, versionId: String?,
         peers: [ClusterNodeInfo], delivered: Set<Int>, priorLatestVersionId: String?
@@ -242,13 +230,8 @@ enum ErasureCodedWriteCoordinator {
             let task = ErasureCodedReplicationTask(
                 bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex,
                 operation: .put, targetNodeId: peer.id, reason: .write)
-            do {
-                try await task.save(on: app.db)
-            } catch {
-                app.logger.error(
-                    "Failed to enqueue EC shard replication task for '\(key)' shard \(shardIndex) -> \(peer.id): \(error)"
-                )
-            }
+            await OutboxMailbox.enqueue(
+                app: app, collection: OutboxCollections.erasureCodedReplicationTasks, row: task)
         }
         ErasureCodedDispatcher.shared.wake()
     }

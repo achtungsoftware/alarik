@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Vapor
 import XMLCoder
 
@@ -46,8 +45,7 @@ struct InternalAdminController: RouteCollection {
         /// between "these metrics describe the whole deployment" (single-node mode) and "these
         /// describe only the one node that happened to answer this request" (cluster mode) -
         /// `metrics`, the local disk stats in `storageStats`, and `multipartUploadCount` are all
-        /// genuinely per-node in cluster mode (each node tracks its own process/disk/uploads),
-        /// unlike the plain-Postgres counts above, which are identical no matter which node answers.
+        /// genuinely per-node in cluster mode, unlike the cluster-wide counts above.
         let clusterNode: ClusterNodeIdentityDTO?
     }
 
@@ -125,18 +123,12 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket name")
         }
 
-        guard
-            let bucket =
-                try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .with(\.$user)
-                .first()
-        else {
+        guard let bucket = try await Bucket.find(app: req.application, name: bucketName) else {
             throw Abort(.notFound, reason: "Bucket not found")
         }
 
         try await BucketService.delete(
-            req: req, bucketName: bucketName, userId: bucket.user.id!, force: true)
+            req: req, bucketName: bucketName, userId: bucket.userId, force: true)
 
         return .noContent
     }
@@ -144,11 +136,7 @@ struct InternalAdminController: RouteCollection {
     /// Fetches any bucket by name (no ownership filter - the admin can manage any user's
     /// bucket) or throws the standard "Bucket not found" 404.
     private func fetchAnyBucket(req: Request, bucketName: String) async throws -> Bucket {
-        guard
-            let bucket = try await Bucket.query(on: req.db)
-                .filter(\.$name == bucketName)
-                .first()
-        else {
+        guard let bucket = try await Bucket.find(app: req.application, name: bucketName) else {
             throw Abort(.notFound, reason: "Bucket not found")
         }
         return bucket
@@ -225,16 +213,22 @@ struct InternalAdminController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let page = try await Bucket.query(on: req.db)
-            .sort(\.$creationDate, .descending)
-            .with(\.$user)
-            .paginate(for: req)
+        let allBuckets = try await Bucket.all(app: req.application)
+            .sorted { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
+        let page = try allBuckets.paginated(for: req)
 
-        return page.map {
-            AdminBucketDTO(
-                id: $0.id, name: $0.name, creationDate: $0.creationDate,
-                versioningStatus: $0.versioningStatus, user: $0.user.toResponseDTO())
+        // Point lookup per bucket ON this page only (never the whole collection) - small,
+        // bounded N, the same "shallow, per-page" cost `getBucketStats` already accepts.
+        var dto: [AdminBucketDTO] = []
+        dto.reserveCapacity(page.items.count)
+        for bucket in page.items {
+            let user = try await User.find(app: req.application, id: bucket.userId)
+            dto.append(
+                AdminBucketDTO(
+                    id: bucket.id, name: bucket.name, creationDate: bucket.creationDate,
+                    versioningStatus: bucket.versioningStatus, user: user?.toResponseDTO()))
         }
+        return Page(items: dto, metadata: page.metadata)
     }
 
     @Sendable
@@ -242,11 +236,13 @@ struct InternalAdminController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let user: Page<User> = try await User.query(on: req.db)
-            .sort(\.$name, .descending)
-            .paginate(for: req)
+        let users = await MetadataListingService.list(
+            app: req.application, collection: MetadataCollections.users
+        )
+        .compactMap { try? JSONDecoder().decode(User.self, from: $0.value) }
+        .sorted { $0.name > $1.name }
 
-        return user.map { $0.toResponseDTO() }
+        return try users.paginated(for: req).map { $0.toResponseDTO() }
     }
 
     @Sendable
@@ -265,14 +261,9 @@ struct InternalAdminController: RouteCollection {
         )
 
         do {
-            try await user.save(on: req.db)
-        } catch {
-            if let dbError = error as? any DatabaseError,
-                dbError.isConstraintFailure
-            {
-                throw Abort(.conflict, reason: "Username already exists.")
-            }
-            throw error
+            try await user.create(app: req.application)
+        } catch is User.UserError {
+            throw Abort(.conflict, reason: "Username already exists.")
         }
 
         return user.toResponseDTO()
@@ -287,10 +278,7 @@ struct InternalAdminController: RouteCollection {
 
         let editUser: User.EditAdmin = try req.content.decode(User.EditAdmin.self)
 
-        // The bulk `.filter(...).update()` below silently affects zero rows for an unknown id -
-        // without this check first, editing a nonexistent user would return a fabricated 200
-        // (`editUser.toUserResponseDTO()` just echoes the request back) instead of a 404.
-        guard let existingUser = try await User.find(editUser.id, on: req.db) else {
+        guard let existingUser = try await User.find(app: req.application, id: editUser.id) else {
             throw Abort(.notFound, reason: "User not found")
         }
 
@@ -298,30 +286,27 @@ struct InternalAdminController: RouteCollection {
         // stripping the last admin's status would permanently lock every admin-only action -
         // including re-promoting anyone - behind a login no account can pass anymore.
         if existingUser.isAdmin && !editUser.isAdmin {
-            let remainingAdmins = try await User.query(on: req.db)
-                .filter(\.$isAdmin == true)
-                .filter(\.$id != editUser.id)
-                .count()
+            let remainingAdmins = await MetadataListingService.list(
+                app: req.application, collection: MetadataCollections.users
+            )
+            .compactMap { try? JSONDecoder().decode(User.self, from: $0.value) }
+            .filter { $0.isAdmin && $0.id != editUser.id }
+            .count
             guard remainingAdmins > 0 else {
                 throw Abort(
                     .conflict, reason: "Cannot remove admin status from the last administrator.")
             }
         }
 
+        let previousUsername = existingUser.username
+        existingUser.name = editUser.name
+        existingUser.username = editUser.username
+        existingUser.isAdmin = editUser.isAdmin
+
         do {
-            try await User.query(on: req.db)
-                .filter(\.$id == editUser.id)
-                .set(\.$name, to: editUser.name)
-                .set(\.$username, to: editUser.username)
-                .set(\.$isAdmin, to: editUser.isAdmin)
-                .update()
-        } catch {
-            if let dbError = error as? any DatabaseError,
-                dbError.isConstraintFailure
-            {
-                throw Abort(.conflict, reason: "Username already exists.")
-            }
-            throw error
+            try await existingUser.rename(app: req.application, from: previousUsername)
+        } catch is User.UserError {
+            throw Abort(.conflict, reason: "Username already exists.")
         }
 
         return editUser.toUserResponseDTO()
@@ -338,7 +323,7 @@ struct InternalAdminController: RouteCollection {
             throw Abort(.badRequest, reason: "Invalid user ID")
         }
 
-        guard let userToDelete = try await User.find(userId, on: req.db) else {
+        guard let userToDelete = try await User.find(app: req.application, id: userId) else {
             throw Abort(.notFound, reason: "User not found")
         }
 
@@ -354,9 +339,7 @@ struct InternalAdminController: RouteCollection {
         // every other cluster node's physical copies orphaned - invisible until a bucket with
         // the same name is created again (bucket paths are name-derived, not id-derived), at
         // which point the "deleted" data silently resurfaces under the new bucket.
-        let buckets = try await Bucket.query(on: req.db)
-            .filter(\.$user.$id == userId)
-            .all()
+        let buckets = try await Bucket.all(app: req.application).filter { $0.userId == userId }
 
         for bucket in buckets {
             try await BucketService.delete(
@@ -365,16 +348,14 @@ struct InternalAdminController: RouteCollection {
 
         // Delete each access key (also clears all 3 caches, including the secret-key one -
         // skipping that one would leave a deleted user's S3 credentials valid until restart)
-        let accessKeys = try await AccessKey.query(on: req.db)
-            .filter(\.$user.$id == userId)
-            .all()
+        let accessKeys = try await AccessKey.findAll(app: req.application, userId: userId)
 
         for accessKey in accessKeys {
-            try await AccessKeyService.delete(on: req.db, accessKey: accessKey.accessKey)
+            try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
         }
 
         // Delete the user - buckets and access keys are already fully torn down above.
-        try await userToDelete.delete(on: req.db)
+        try await userToDelete.delete(app: req.application)
 
         return .noContent
     }
@@ -395,8 +376,10 @@ struct InternalAdminController: RouteCollection {
         let alarikUsedBytes = Self.calculateDirectorySize(at: storageURL)
 
         // Count buckets and objects
-        let bucketCount = try await Bucket.query(on: req.db).count()
-        let userCount = try await User.query(on: req.db).count()
+        let bucketCount = await MetadataListingService.count(
+            app: req.application, collection: MetadataCollections.buckets)
+        let userCount = await MetadataListingService.count(
+            app: req.application, collection: MetadataCollections.users)
 
         return StorageStats(
             totalBytes: totalBytes,
@@ -415,9 +398,12 @@ struct InternalAdminController: RouteCollection {
 
         let metrics = await MetricsCollector.shared.snapshot()
 
-        let accessKeyCount = try await AccessKey.query(on: req.db).count()
-        let sharedLinkCount = try await SharedLink.query(on: req.db).count()
-        let oidcProviderCount = try await OIDCProvider.query(on: req.db).count()
+        let accessKeyCount = await MetadataListingService.count(
+            app: req.application, collection: MetadataCollections.accessKeys)
+        let sharedLinkCount = await MetadataListingService.count(
+            app: req.application, collection: MetadataCollections.sharedLinks)
+        let oidcProviderCount = await MetadataListingService.count(
+            app: req.application, collection: MetadataCollections.oidcProviders)
 
         let clusterNode = req.application.storage[ClusterConfigurationKey.self].map {
             ClusterNodeIdentityDTO(nodeId: $0.nodeId, address: $0.address)

@@ -14,18 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
-
-struct AddBucketPolicy: AsyncMigration {
-    func prepare(on database: any Database) async throws {
-        try await database.schema("buckets")
-            .field("policy", .string)
-            .update()
-    }
-
-    func revert(on database: any Database) async throws {
-        try await database.schema("buckets")
-            .deleteField("policy")
-            .update()
-    }
+/// The 4 `OutboxMailbox` collection names - used consistently by the dispatchers, the internal
+/// cluster outbox RPCs, and every admin/console call site so a typo can't silently create a 5th,
+/// orphaned mailbox directory.
+enum OutboxCollections {
+    static let notificationDeliveries = "notification-deliveries"
+    static let replicationTasks = "replication-tasks"
+    static let clusterReplicationTasks = "cluster-replication-tasks"
+    static let erasureCodedReplicationTasks = "erasure-coded-replication-tasks"
 }

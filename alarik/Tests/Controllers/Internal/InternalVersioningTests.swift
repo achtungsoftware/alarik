@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 import Crypto
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -31,14 +30,11 @@ struct InternalVersioningTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             let loadCacheLifecycle = LoadCacheLifecycle()
             try await loadCacheLifecycle.didBootAsync(app)
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }

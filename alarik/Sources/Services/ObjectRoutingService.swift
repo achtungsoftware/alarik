@@ -240,13 +240,28 @@ enum ObjectRoutingService {
     static func erasureCodedRoutingDecision(
         req: Request, bucketName: String, key: String
     ) async throws -> ErasureCodedRoutingDecision {
-        guard let config = req.application.storage[ClusterConfigurationKey.self],
-            let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self]
+        try await erasureCodedRoutingDecision(
+            app: req.application,
+            isTrustedForward: ClusterForwardAuthenticator.isTrustedForward(req),
+            bucketName: bucketName, key: key, requestId: req.id)
+    }
+
+    /// Request-independent core of `erasureCodedRoutingDecision(req:bucketName:key:)`, for
+    /// callers with no live `Request` to route from - the metadata store (`MetadataStore`)
+    /// writes control-plane records through this same rank-0-pinned decision from boot-time
+    /// seeding and background dispatcher ticks, neither of which has a request to pull
+    /// `req.application`/the trusted-forward header/`req.id` from. Every existing object-data
+    /// call site keeps going through the `Request`-based wrapper above unchanged.
+    static func erasureCodedRoutingDecision(
+        app: Application, isTrustedForward: Bool, bucketName: String, key: String,
+        requestId: String? = nil
+    ) async throws -> ErasureCodedRoutingDecision {
+        guard let config = app.storage[ClusterConfigurationKey.self],
+            let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
         else {
             return .notClustered
         }
 
-        let isTrustedForward = ClusterForwardAuthenticator.isTrustedForward(req)
         let active = await ClusterNodeCache.shared.activeNodes()
 
         do {
@@ -256,7 +271,7 @@ enum ObjectRoutingService {
         } catch let error as PlacementServiceError {
             throw S3Error(
                 status: .serviceUnavailable, code: "ServiceUnavailable",
-                message: "\(error)", requestId: req.id)
+                message: "\(error)", requestId: requestId)
         }
 
         let responsible = PlacementService.responsibleNodes(
@@ -267,7 +282,7 @@ enum ObjectRoutingService {
             throw S3Error(
                 status: .serviceUnavailable, code: "ServiceUnavailable",
                 message: "No cluster node is currently available to coordinate this write.",
-                requestId: req.id)
+                requestId: requestId)
         }
 
         let peers = responsible.filter { $0.id != config.nodeId }

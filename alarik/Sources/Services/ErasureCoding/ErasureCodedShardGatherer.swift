@@ -70,8 +70,6 @@ struct GatheredShards {
 /// time (stored in its filename/header), but which node holds a given index drifts as HRW ranks
 /// shift on every membership change - so gathering must *discover* what each node actually holds
 /// (`/held`) and fetch shards by their true index, never assume "node at rank r holds shard r".
-/// The old rank==index assumption silently broke every read and every repair the moment a node
-/// was drained, joined, or lost.
 enum ErasureCodedShardGatherer {
     /// Discovers held indices across `responsible` (in parallel), plans a covering set of `needed`
     /// (plus one spare when a healthy extra exists) distinct indices - optionally excluding one

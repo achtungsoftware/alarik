@@ -47,30 +47,54 @@ struct SpooledBody {
     }
 }
 
-/// Streams a request body off the wire with bounded memory, replacing
-/// `S3Service.collectBodyData` for object-payload routes registered with `body: .stream`.
-///
-/// Everything the buffered path validated still gets validated here, just incrementally:
-/// - aws-chunked framing is decoded on the fly, with every chunk's SigV4 signature verified
-///   against the chain seeded by the (already header-verified) request signature
-/// - the declared `x-amz-content-sha256` is checked against the actual payload
-/// - `x-amz-decoded-content-length` must match the decoded byte count
+/// Streams a request body off the wire with bounded memory, for routes registered with
+/// `body: .stream`. Validates incrementally instead of after full buffering:
+/// - aws-chunked framing is decoded on the fly, each chunk's SigV4 signature verified
+/// - declared `x-amz-content-sha256` / `x-amz-decoded-content-length` checked against actuals
 /// - the configured max body size is enforced as bytes arrive, not after
 enum StreamingBodySpooler {
 
     private static let streamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
     private static let unsignedPayloadHash = "UNSIGNED-PAYLOAD"
 
+    /// Wraps a streaming-body route handler so that if `operation` throws before ever touching
+    /// `req.body` (an early auth/admission rejection), the body still gets drained instead of
+    /// abandoned. Vapor's `Request.BodyStream` asserts on deinit if it never receives a terminal
+    /// `.end`/`.error` write - which never lands if nothing is left reading `req.body` after an
+    /// early error response, crashing the process. Bounded by a 30s timeout in case `operation`
+    /// already fully drained the body itself, so this second attempt would otherwise hang forever.
+    static func withGuaranteedBodyDrain<T: Sendable>(
+        req: Request, _ operation: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation()
+        } catch {
+            let requestBody = req.body
+            Task {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        do {
+                            for try await _ in requestBody {}
+                        } catch {
+                            // Already erroring/closing - nothing more to drain.
+                        }
+                    }
+                    group.addTask {
+                        try? await Task.sleep(for: .seconds(30))
+                    }
+                    await group.next()
+                    group.cancelAll()
+                }
+            }
+            throw error
+        }
+    }
+
     /// Whether the whole-body SHA256 needs to be computed at all - it exists purely to be
-    /// checked against `declaredSha`, so this must be false in every case where that check
-    /// would be skipped anyway: aws-chunked bodies (verified per-chunk instead, by
-    /// `StreamingChunkDecoder`), query-auth requests (presigned URLs don't sign the payload),
-    /// and requests that didn't declare a real hash to check. Getting this wrong in either
-    /// direction is a real bug, not just style: too eager skips a security check, too
-    /// conservative burns CPU hashing bytes nobody will ever compare (this function exists
-    /// because a production CPU profile caught exactly that mistake - the chunked path was
-    /// unconditionally hashing the whole body a second time, on top of the per-chunk hashing
-    /// already required for signature verification).
+    /// checked against `declaredSha`, so this must be false wherever that check is skipped
+    /// anyway: aws-chunked bodies (verified per-chunk by `StreamingChunkDecoder`), query-auth
+    /// requests (presigned URLs don't sign the payload), and requests with no real hash to check.
+    /// Getting this wrong either skips a security check or wastes CPU hashing bytes never compared.
     static func needsWholeBodyHashVerification(
         isChunked: Bool, isQueryAuth: Bool, declaredSha: String?
     ) -> Bool {
@@ -112,14 +136,10 @@ enum StreamingBodySpooler {
         var sink = SpoolSink(requestId: req.id, threadPool: req.application.threadPool)
         defer { sink.discardOnError() }
 
-        // The whole-body SHA256 is only meaningful when something will actually check it
-        // against the client's declared hash. When the body is aws-chunked, that check is
-        // moot - StreamingChunkDecoder already verifies every chunk's own SHA256 against its
-        // SigV4 signature, so a second whole-body pass over the same bytes would just be
-        // hashing them twice for no reason (this is precisely what a CPU time profile of a
-        // PUT-heavy benchmark flagged: SHA256/MD5 compute dominated CPU time, and the
-        // whole-body SHA256 in the chunked path was pure waste - it's discarded a few lines
-        // below without ever being compared to anything).
+        // The whole-body SHA256 is only meaningful when something will check it against the
+        // client's declared hash. For aws-chunked bodies that check is moot - StreamingChunkDecoder
+        // already verifies each chunk's SHA256 against its SigV4 signature, so hashing the whole
+        // body again would be pure wasted CPU for a value nobody compares.
         let isQueryAuth =
             req.headers.first(name: "authorization") == nil
             && req.query[String.self, at: "X-Amz-Algorithm"] != nil
@@ -144,12 +164,29 @@ enum StreamingBodySpooler {
             try await sink.write(payload)
         }
 
-        for try await buffer in req.body {
-            if let decoder {
-                try await decoder.feed(buffer, emit: consume)
-            } else {
-                try await consume(buffer.readableBytesView)
+        // A thrown error here (oversized body, bad chunk signature, spool I/O failure) must not
+        // abandon `req.body` mid-stream: the caller responds with an error immediately after, and
+        // an abandoned stream never receives the terminal `.end`/`.error` write its `deinit`
+        // requires, crashing the process. Drain (discard) the rest in a best-effort task instead,
+        // then rethrow immediately so the client still gets a fast error response.
+        do {
+            for try await buffer in req.body {
+                if let decoder {
+                    try await decoder.feed(buffer, emit: consume)
+                } else {
+                    try await consume(buffer.readableBytesView)
+                }
             }
+        } catch {
+            let requestBody = req.body
+            Task {
+                do {
+                    for try await _ in requestBody {}
+                } catch {
+                    // Already erroring/closing - nothing more to drain.
+                }
+            }
+            throw error
         }
 
         if let decoder {
@@ -185,15 +222,10 @@ enum StreamingBodySpooler {
 }
 
 /// Where the spooled bytes actually go: memory until `Constants.streamingThreshold`, then a
-/// spool file (the buffered prefix is flushed to it on spill). Owns the file descriptor; one
-/// of `finish()` / `discardOnError()` must run - the spooler pairs a `defer`red discard with
-/// an explicit finish, so error paths never leak an fd or a file.
-///
-/// The memory path does a plain in-process append - no syscall, so no reason to leave the
-/// calling executor. The disk path is real blocking IO (open/write, and directory creation
-/// the first time), so every disk-touching operation here hops onto `threadPool` instead of
-/// running on whatever executor is driving the request's body stream (Swift's shared
-/// concurrent executor, which every other async task in the process also depends on).
+/// spool file. Owns the file descriptor; one of `finish()` / `discardOnError()` must run so
+/// error paths never leak an fd or a file. The memory path is a plain in-process append; the
+/// disk path is real blocking IO, so it hops onto `threadPool` instead of running on the shared
+/// concurrent executor every other async task in the process depends on.
 private struct SpoolSink {
     private let requestId: String
     private let threadPool: NIOThreadPool
@@ -300,13 +332,11 @@ private struct SpoolSink {
 
 /// Incremental aws-chunked decoder: feeds arriving `ByteBuffer`s through a small state
 /// machine, emitting only decoded payload bytes and verifying each chunk's SigV4 signature
-/// as soon as that chunk's payload has fully passed through. The buffered equivalent lives
-/// in `SigV4Validator.validateChunked` + `ChunkedDataDecoder`; this replaces both for
-/// streaming routes.
+/// as soon as that chunk's payload has fully passed through.
 ///
 /// Wire format per chunk: `<hex-size>;chunk-signature=<sig>\r\n<payload>\r\n`, terminated by
-/// a zero-size chunk (whose signature is also verified). Bytes after the final chunk
-/// (trailers) are ignored, matching the buffered decoder.
+/// a zero-size chunk (whose signature is also verified). Trailers after the final chunk are
+/// ignored.
 final class StreamingChunkDecoder {
     private enum State {
         case sizeLine

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Fluent
 import Foundation
 import Testing
 import Vapor
@@ -30,12 +29,9 @@ struct InternalAdminControllerTests {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
             try await configure(app)
-            try await app.autoMigrate()
             try await test(app)
-            try await app.autoRevert()
         } catch {
             try? StorageHelper.cleanStorage()
-            try? await app.autoRevert()
             try await app.asyncShutdown()
             throw error
         }
@@ -206,7 +202,7 @@ struct InternalAdminControllerTests {
                     #expect(res.status == .notFound)
                 })
 
-            #expect(try await User.query(on: app.db).filter(\.$username == "ghost@example.com").first() == nil)
+            #expect(try await User.findByUsername(app: app, username: "ghost@example.com") == nil)
         }
     }
 
@@ -298,14 +294,13 @@ struct InternalAdminControllerTests {
     func testEditUserCannotDemoteLastAdmin() async throws {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
-            let admin = try #require(
-                try await User.query(on: app.db).filter(\.$username == "alarik").first())
+            let admin = try #require(try await User.findByUsername(app: app, username: "alarik"))
 
             // The seeded default admin is the only admin in a fresh test app - demoting it must
             // be rejected, since every admin endpoint (including this one) requires an
             // authenticated admin and there'd be no account left that could ever undo this.
             let editDTO = User.EditAdmin(
-                id: try admin.requireID(), name: admin.name, username: admin.username,
+                id: admin.id, name: admin.name, username: admin.username,
                 isAdmin: false
             )
 
@@ -319,7 +314,7 @@ struct InternalAdminControllerTests {
                     #expect(res.status == .conflict)
                 })
 
-            let reloaded = try #require(try await User.find(admin.requireID(), on: app.db))
+            let reloaded = try #require(try await User.find(app: app, id: admin.id))
             #expect(reloaded.isAdmin == true)
         }
     }
@@ -329,7 +324,7 @@ struct InternalAdminControllerTests {
         try await withApp { app in
             let token = try await loginDefaultAdminUser(app)
             let defaultAdmin = try #require(
-                try await User.query(on: app.db).filter(\.$username == "alarik").first())
+                try await User.findByUsername(app: app, username: "alarik"))
 
             let createDTO = User.Create(
                 name: "Second Admin", username: "second-admin@example.com",
@@ -344,7 +339,7 @@ struct InternalAdminControllerTests {
 
             // Two admins now exist - demoting one is safe, the other remains.
             let editDTO = User.EditAdmin(
-                id: try defaultAdmin.requireID(), name: defaultAdmin.name,
+                id: defaultAdmin.id, name: defaultAdmin.name,
                 username: defaultAdmin.username, isAdmin: false
             )
 
@@ -398,7 +393,7 @@ struct InternalAdminControllerTests {
                 })
 
             // Verify user is deleted
-            let deletedUser = try await User.find(userId!, on: app.db)
+            let deletedUser = try await User.find(app: app, id: userId!)
             #expect(deletedUser == nil)
         }
     }
@@ -425,12 +420,10 @@ struct InternalAdminControllerTests {
             let token = try await loginDefaultAdminUser(app)
 
             // Get admin user ID
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
 
             try await app.test(
-                .DELETE, "/api/v1/admin/users/\(adminUser!.id!.uuidString)",
+                .DELETE, "/api/v1/admin/users/\(adminUser!.id.uuidString)",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
@@ -484,8 +477,8 @@ struct InternalAdminControllerTests {
             // Create buckets for this user directly in DB and on disk
             let bucket1 = Bucket(name: "user-bucket-1", userId: userId!)
             let bucket2 = Bucket(name: "user-bucket-2", userId: userId!)
-            try await bucket1.save(on: app.db)
-            try await bucket2.save(on: app.db)
+            try await bucket1.save(app: app)
+            try await bucket2.save(app: app)
             try BucketHandler.create(name: "user-bucket-1")
             try BucketHandler.create(name: "user-bucket-2")
 
@@ -522,9 +515,7 @@ struct InternalAdminControllerTests {
             #expect(!FileManager.default.fileExists(atPath: bucket2URL.path))
 
             // Verify buckets are deleted from DB (cascade)
-            let remainingBuckets = try await Bucket.query(on: app.db)
-                .filter(\.$user.$id == userId!)
-                .all()
+            let remainingBuckets = try await Bucket.all(app: app).filter { $0.userId == userId! }
             #expect(remainingBuckets.isEmpty)
         }
     }
@@ -556,7 +547,7 @@ struct InternalAdminControllerTests {
                 })
 
             let bucket = Bucket(name: "outbox-bucket", userId: userId!)
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "outbox-bucket")
 
             // Deleting a user used to only call BucketHandler.forceDelete (a raw local-disk
@@ -567,8 +558,9 @@ struct InternalAdminControllerTests {
             // BucketService.delete instead of reimplementing a partial version of it.
             let staleTask = ClusterReplicationTask(
                 bucketName: "outbox-bucket", key: "straggler.txt", versionId: nil,
-                operation: .put, targetNodeId: UUID(), reason: .write)
-            try await staleTask.save(on: app.db)
+                operation: .put, targetNodeId: UUID(), reason: .write,
+                ownerNodeId: OutboxMailbox.selfNodeId(app: app))
+            try OutboxMailbox.update(staleTask, collection: OutboxCollections.clusterReplicationTasks)
 
             try await app.test(
                 .DELETE, "/api/v1/admin/users/\(userId!.uuidString)",
@@ -579,9 +571,9 @@ struct InternalAdminControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let remainingTasks = try await ClusterReplicationTask.query(on: app.db)
-                .filter(\.$bucketName == "outbox-bucket")
-                .count()
+            let remainingTasks = OutboxMailbox.allOwnedTasks(
+                ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
+            ).filter { $0.bucketName == "outbox-bucket" }.count
             #expect(remainingTasks == 0)
         }
     }
@@ -614,8 +606,8 @@ struct InternalAdminControllerTests {
             // Create access keys for this user
             let accessKey1 = AccessKey(userId: userId!, accessKey: "TESTKEY1", secretKey: "secret1")
             let accessKey2 = AccessKey(userId: userId!, accessKey: "TESTKEY2", secretKey: "secret2")
-            try await accessKey1.save(on: app.db)
-            try await accessKey2.save(on: app.db)
+            _ = try await accessKey1.create(app: app)
+            _ = try await accessKey2.create(app: app)
 
             // Add to caches
             await AccessKeyUserMapCache.shared.add(accessKey: "TESTKEY1", userId: userId!)
@@ -649,9 +641,7 @@ struct InternalAdminControllerTests {
             #expect(await AccessKeySecretKeyMapCache.shared.secretKey(for: "TESTKEY2") == nil)
 
             // Verify keys are deleted from DB (cascade)
-            let remainingKeys = try await AccessKey.query(on: app.db)
-                .filter(\.$user.$id == userId!)
-                .all()
+            let remainingKeys = try await AccessKey.findAll(app: app, userId: userId!)
             #expect(remainingKeys.isEmpty)
         }
     }
@@ -788,13 +778,11 @@ struct InternalAdminControllerTests {
             try await createRandomUser(app)
 
             // Create buckets for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket1 = Bucket(name: "stats-test-bucket-1", userId: adminUser!.id!)
-            let bucket2 = Bucket(name: "stats-test-bucket-2", userId: adminUser!.id!)
-            try await bucket1.save(on: app.db)
-            try await bucket2.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket1 = Bucket(name: "stats-test-bucket-1", userId: adminUser!.id)
+            let bucket2 = Bucket(name: "stats-test-bucket-2", userId: adminUser!.id)
+            try await bucket1.save(app: app)
+            try await bucket2.save(app: app)
             try BucketHandler.create(name: "stats-test-bucket-1")
             try BucketHandler.create(name: "stats-test-bucket-2")
 
@@ -830,11 +818,9 @@ struct InternalAdminControllerTests {
                 })
 
             // Create a bucket and add a file
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "storage-usage-test-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "storage-usage-test-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "storage-usage-test-bucket")
 
             // Write a file with known size
@@ -866,11 +852,9 @@ struct InternalAdminControllerTests {
             let token = try await loginDefaultAdminUser(app)
 
             // Create a bucket for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "admin-delete-test-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "admin-delete-test-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "admin-delete-test-bucket")
 
             let bucketURL = BucketHandler.bucketURL(for: "admin-delete-test-bucket")
@@ -892,9 +876,7 @@ struct InternalAdminControllerTests {
             #expect(!FileManager.default.fileExists(atPath: bucketURL.path))
 
             // Verify bucket is deleted from DB
-            let deletedBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "admin-delete-test-bucket")
-                .first()
+            let deletedBucket = try await Bucket.find(app: app, name: "admin-delete-test-bucket")
             #expect(deletedBucket == nil)
         }
     }
@@ -905,11 +887,9 @@ struct InternalAdminControllerTests {
             let token = try await createUserAndLogin(app)
 
             // Create a bucket for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "non-admin-delete-test-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "non-admin-delete-test-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "non-admin-delete-test-bucket")
 
             try await app.test(
@@ -922,9 +902,7 @@ struct InternalAdminControllerTests {
                 })
 
             // Verify bucket still exists
-            let existingBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "non-admin-delete-test-bucket")
-                .first()
+            let existingBucket = try await Bucket.find(app: app, name: "non-admin-delete-test-bucket")
             #expect(existingBucket != nil)
         }
     }
@@ -983,7 +961,7 @@ struct InternalAdminControllerTests {
 
             // Create a bucket for the non-admin user
             let bucket = Bucket(name: "other-user-bucket", userId: userId!)
-            try await bucket.save(on: app.db)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "other-user-bucket")
 
             let bucketURL = BucketHandler.bucketURL(for: "other-user-bucket")
@@ -1005,9 +983,7 @@ struct InternalAdminControllerTests {
             #expect(!FileManager.default.fileExists(atPath: bucketURL.path))
 
             // Verify bucket is deleted from DB
-            let deletedBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "other-user-bucket")
-                .first()
+            let deletedBucket = try await Bucket.find(app: app, name: "other-user-bucket")
             #expect(deletedBucket == nil)
         }
     }
@@ -1018,11 +994,9 @@ struct InternalAdminControllerTests {
             let token = try await loginDefaultAdminUser(app)
 
             // Create a bucket
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "bucket-with-objects", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "bucket-with-objects", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "bucket-with-objects")
 
             // Add files to the bucket
@@ -1143,11 +1117,9 @@ struct InternalAdminControllerTests {
         try await withApp { app in
 
             // Create a bucket for admin user
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
-            let bucket = Bucket(name: "access-key-delete-test-bucket", userId: adminUser!.id!)
-            try await bucket.save(on: app.db)
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
+            let bucket = Bucket(name: "access-key-delete-test-bucket", userId: adminUser!.id)
+            try await bucket.save(app: app)
             try BucketHandler.create(name: "access-key-delete-test-bucket")
 
             // Delete the bucket using access key auth
@@ -1161,9 +1133,7 @@ struct InternalAdminControllerTests {
                 })
 
             // Verify bucket is deleted
-            let deletedBucket = try await Bucket.query(on: app.db)
-                .filter(\.$name == "access-key-delete-test-bucket")
-                .first()
+            let deletedBucket = try await Bucket.find(app: app, name: "access-key-delete-test-bucket")
             #expect(deletedBucket == nil)
         }
     }
@@ -1171,21 +1141,19 @@ struct InternalAdminControllerTests {
     @Test("Access key with expired date - should fail")
     func testExpiredAccessKey() async throws {
         try await withApp { app in
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
 
             // Create an expired access key
             let expiredAccessKey = AccessKey(
-                userId: adminUser!.id!,
+                userId: adminUser!.id,
                 accessKey: "EXPIREDKEY12345678",
                 secretKey: "expiredSecretKey123",
                 expirationDate: Date().addingTimeInterval(-3600)  // Expired 1 hour ago
             )
-            try await expiredAccessKey.save(on: app.db)
+            _ = try await expiredAccessKey.create(app: app)
 
             await AccessKeySecretKeyMapCache.shared.add(accessKey: "EXPIREDKEY12345678", secretKey: "expiredSecretKey123")
-            await AccessKeyUserMapCache.shared.add(accessKey: "EXPIREDKEY12345678", userId: adminUser!.id!)
+            await AccessKeyUserMapCache.shared.add(accessKey: "EXPIREDKEY12345678", userId: adminUser!.id)
 
             try await app.test(
                 .GET, "/api/v1/admin/users",
@@ -1202,7 +1170,7 @@ struct InternalAdminControllerTests {
         async throws
     {
         let bucket = Bucket(name: bucketName, userId: userId)
-        try await bucket.save(on: app.db)
+        try await bucket.save(app: app)
         try BucketHandler.create(name: bucketName)
     }
 
@@ -1353,11 +1321,9 @@ struct InternalAdminControllerTests {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
 
-            let adminUser = try await User.query(on: app.db)
-                .filter(\.$username == "alarik")
-                .first()
+            let adminUser = try await User.findByUsername(app: app, username: "alarik")
             try await createBucketForUser(
-                app, bucketName: "non-admin-get-policy-bucket", userId: adminUser!.id!)
+                app, bucketName: "non-admin-get-policy-bucket", userId: adminUser!.id)
 
             try await app.test(
                 .GET, "/api/v1/admin/buckets/non-admin-get-policy-bucket/policy",
@@ -1375,11 +1341,9 @@ struct InternalAdminControllerTests {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
 
-            let nonAdminUser = try await User.query(on: app.db)
-                .filter(\.$username == "test@example.com")
-                .first()
+            let nonAdminUser = try await User.findByUsername(app: app, username: "test@example.com")
             try await createBucketForUser(
-                app, bucketName: "non-admin-set-policy-bucket", userId: nonAdminUser!.id!)
+                app, bucketName: "non-admin-set-policy-bucket", userId: nonAdminUser!.id)
             let policyJSON = publicReadPolicy(bucketName: "non-admin-set-policy-bucket")
 
             // The site-wide admin endpoint must reject this even though the caller owns the
@@ -1560,9 +1524,7 @@ struct InternalAdminControllerTests {
             // used to serialize wholesale onto the wire - not just "decoding into a narrower
             // DTO type happens to ignore extra fields", which wouldn't catch a real leak.
             let owner = try #require(
-                try await User.query(on: app.db)
-                    .filter(\.$username == "bucket-owner@example.com")
-                    .first())
+                try await User.findByUsername(app: app, username: "bucket-owner@example.com"))
 
             let createDTO = Bucket.Create(name: "owner-bucket", versioningEnabled: false)
             try await app.test(

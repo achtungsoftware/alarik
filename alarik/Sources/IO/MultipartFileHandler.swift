@@ -36,15 +36,11 @@ struct MultipartFileHandler {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
-    /// `uploadId` always originates from `generateUploadId()`, but every public function below
-    /// also accepts one back from the client (UploadPart/CompleteMultipartUpload/
-    /// AbortMultipartUpload/UploadPartCopy/ListParts all echo it via a query param) - unlike
-    /// `key`, which gets its `..` components stripped before touching disk, `uploadId` had no
-    /// validation at all, so a crafted value like `../../otherbucket/<id>` could escape
-    /// `Storage/multipart/{bucket}/` entirely. Every path-building function below routes through
-    /// `uploadPath`, so validating here once, before any path is constructed, protects all of
-    /// them - rejecting exactly matches the "no such upload" case, since a real upload ID can
-    /// never fail this check.
+    /// Every public function below accepts an `uploadId` echoed back from the client - unlike
+    /// `key`, whose `..` components get stripped before touching disk. A crafted value like
+    /// `../../otherbucket/<id>` could otherwise escape `Storage/multipart/{bucket}/`, so every
+    /// path-building function routes through `uploadPath`, validating here once before any path
+    /// is constructed. Rejection matches the "no such upload" case; a real upload ID never fails.
     private static func validateUploadId(_ uploadId: String) throws {
         guard uploadId.count == 32, uploadId.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
             throw NSError(
@@ -289,13 +285,11 @@ struct MultipartFileHandler {
         try partMetaData.write(to: URL(fileURLWithPath: partMetaPath))
     }
 
-    /// Completes the multipart upload by concatenating parts and returns the final ETag
     /// Everything `completeUpload` does short of the actual write: validates/orders parts,
     /// verifies each part's ETag, computes the S3-style multipart ETag, and builds the final
     /// `ObjectMeta` plus the `payloadSources` list the write step streams from. Split out so an
-    /// erasure-coded completion (`ErasureCodedWriteCoordinator.write`, driven by
-    /// `S3Controller.handleCompleteMultipartUpload`) can reuse this identical
-    /// validation/assembly logic instead of duplicating it - only the final write step differs.
+    /// erasure-coded completion (`ErasureCodedWriteCoordinator.write`) can reuse this identical
+    /// validation/assembly logic - only the final write step differs.
     struct CompletionPlan {
         let key: String
         let objectMeta: ObjectMeta
@@ -339,8 +333,8 @@ struct MultipartFileHandler {
         }
 
         // Collect part file regions - the final object is assembled by streaming these
-        // straight into the .obj, never concatenated in memory (a 5 GiB upload used to need
-        // 5+ GiB of RAM right here)
+        // straight into the .obj, never concatenated in memory, so upload size never bounds
+        // process RAM.
         var payloadSources: [(path: String, offset: Int, size: Int)] = []
         var partEtags: [String] = []
         var totalSize = 0
