@@ -27,11 +27,14 @@ import Vapor
 /// locally," never moves object bytes. Responses are small and bounded (`<= maxKeys` entries),
 /// so a plain buffered JSON body is used throughout, unlike replication's streaming push/fetch.
 enum ClusterListingClient {
-    /// Short relative to replication's 10-minute streaming deadline - listing responses are
-    /// small bounded JSON, and a hung peer here is stalling an interactive LIST or a
-    /// DeleteBucket safety check, not a large background transfer. Matches
-    /// `ClusterReplicationService.synchronousTimeout`'s same-private-network assumption.
-    static let requestTimeout: TimeAmount = .seconds(10)
+    /// Short: listing responses are small bounded JSON, and a hung peer here is stalling an
+    /// interactive LIST or a `DeleteBucket` safety check, not a large background transfer - a
+    /// genuinely healthy peer answers in milliseconds. Kept well under
+    /// `ClusterNodeCache.heartbeatStaleness` (60s) so a permanently-dead peer stays correctly
+    /// detected as unreachable across an S3 client's automatic retries of a fail-closed 503,
+    /// rather than the retry sequence's own elapsed time eventually letting the peer age out of
+    /// the active set and the delete slip through.
+    static let requestTimeout: TimeAmount = .seconds(3)
 
     struct ObjectsPageResponse: Codable {
         let objects: [ObjectMeta]

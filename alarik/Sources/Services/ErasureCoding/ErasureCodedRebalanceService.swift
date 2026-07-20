@@ -376,6 +376,33 @@ enum ErasureCodedRebalanceService {
             count: dataShards + parityShards)
         let selfRank = responsible.firstIndex(where: { $0.id == selfNodeId })
 
+        // A metadata record seeded while the cluster had few nodes (most notably the founding
+        // node's boot-time admin-user seed, written before any peer exists to fan out to) is
+        // permanently stuck at whatever narrow k/m it was born with otherwise - nothing else
+        // ever widens it, which leaves it a single point of failure even once the cluster has
+        // long since grown enough to support real redundancy. The node currently authoritative
+        // for the OLD narrow encoding re-reads the record (self-healing via
+        // `MetadataStore.get`'s own discovery) and re-`put`s it, which naturally picks up the
+        // CURRENT wider placement - the stale narrow shard becomes an ordinary orphan the next
+        // walk reclaims once the wider copies are confirmed, exactly like any other stale shard.
+        if MetadataNamespace.isReserved(bucketName), selfRank == 0 {
+            let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
+            let currentWidth = metadataConfig.effective(activeNodeCount: activeNodes.count)
+            if currentWidth.dataShards + currentWidth.parityShards > dataShards + parityShards,
+                let (collection, id) = MetadataNamespace.splitKey(key)
+            {
+                do {
+                    if let value = try await MetadataStore.get(app: app, collection: collection, id: id) {
+                        try await MetadataStore.put(app: app, collection: collection, id: id, value: value)
+                    }
+                } catch {
+                    app.logger.warning(
+                        "Failed to widen under-replicated metadata record \(key): \(error)")
+                }
+                return false
+            }
+        }
+
         guard let selfRank else {
             // No longer responsible at all - reclaim, gated on the node now ranked at this
             // shard's own index already holding a confirmed copy.

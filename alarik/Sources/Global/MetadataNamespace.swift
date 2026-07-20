@@ -39,4 +39,12 @@ enum MetadataNamespace {
     static func key(collection: String, id: String) -> String {
         "\(collection)/\(id)"
     }
+
+    /// The inverse of `key(collection:id:)` - splits on the first `/` only, since an id (a UUID,
+    /// access key, or username) never legitimately contains one, but a collection name never
+    /// does either, so this is unambiguous either way.
+    static func splitKey(_ key: String) -> (collection: String, id: String)? {
+        guard let slash = key.firstIndex(of: "/") else { return nil }
+        return (String(key[key.startIndex..<slash]), String(key[key.index(after: slash)...]))
+    }
 }

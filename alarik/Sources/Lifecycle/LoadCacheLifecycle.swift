@@ -17,17 +17,20 @@ limitations under the License.
 import Vapor
 
 final class LoadCacheLifecycle: LifecycleHandler {
-    /// Delays for the boot-time catch-up retries below - short and front-loaded, since the gap
-    /// they're closing is a one-time race during a node's very first seconds alive, not a
-    /// steady-state condition worth polling for long. The server starts accepting real traffic
-    /// the instant `didBootAsync` returns - this catch-up runs in a detached background task, so
-    /// it does NOT block that - meaning a request can legitimately arrive before even the first
-    /// retry fires. Starting at 1s (not 3s) shrinks that specific window as much as is reasonable
-    /// without spamming a peer that's still mid-boot itself; the remaining delays stay spread out
-    /// since by then a genuinely slow peer needs real time, not tighter polling.
-    static let bootCatchUpDelays: [Duration] = [
-        .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15),
-    ]
+    /// Delays for the *background* boot-time catch-up retries, run after the server is already
+    /// serving traffic - a safety net for a peer that's still slow well past the blocking retries
+    /// in `didBootAsync` below. Every cache load is upsert-only (see `reloadAll`'s doc comment),
+    /// so repeating it costs nothing beyond the fan-out and can only fill gaps, never reintroduce one.
+    static let bootCatchUpDelays: [Duration] = [.seconds(4), .seconds(8), .seconds(15)]
+
+    /// A handful of quick, *blocking* retries before this node's server starts accepting real
+    /// traffic - not just the background catch-up above. A simultaneous multi-node cold start (or
+    /// several nodes restarting together) can leave every peer this node's first attempt asked
+    /// too busy to answer, and a node that starts serving S3 requests on that single incomplete
+    /// attempt fails real requests (missing access keys/buckets) for however long the background
+    /// catch-up takes to close the gap. These retries trade a bounded bit of extra boot latency
+    /// for meaningfully better odds of already being converged by the time traffic arrives.
+    static let blockingBootRetryDelays: [Duration] = [.milliseconds(500), .seconds(1)]
 
     func didBootAsync(_ app: Application) async throws {
         do {
@@ -36,17 +39,16 @@ final class LoadCacheLifecycle: LifecycleHandler {
             app.logger.error("Failed to load cache: \(error)")
         }
 
-        // The boot-time fan-out this reload just ran is a genuine one-shot race: a node started
-        // early in a simultaneous multi-node cold start (most notably the very first node, before
-        // any peer even exists yet to fan out to) can complete its own boot before a peer that
-        // holds records this node needs (the seeded admin key chief among them) has finished ITS
-        // boot and started answering `/internal/cluster/metadata/list`. Every cache load this
-        // function performs is upsert-only (see `reloadAll`'s doc comment), so re-running it a few
-        // more times over the following seconds costs nothing beyond the fan-out itself and can
-        // only ever fill gaps the first attempt missed - never re-introduce one it already closed.
-        // This is what keeps a fresh cluster's convergence bounded and fast without resorting to a
-        // live per-request lookup on the hot SigV4 auth path.
         if app.storage[ClusterConfigurationKey.self] != nil {
+            for delay in LoadCacheLifecycle.blockingBootRetryDelays {
+                try? await Task.sleep(for: delay)
+                do {
+                    try await LoadCacheLifecycle.reloadAll(app: app)
+                } catch {
+                    app.logger.warning("Blocking boot-time cache retry failed: \(error)")
+                }
+            }
+
             Task {
                 for delay in LoadCacheLifecycle.bootCatchUpDelays {
                     try? await Task.sleep(for: delay)
