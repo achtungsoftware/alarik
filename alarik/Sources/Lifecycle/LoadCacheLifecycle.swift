@@ -17,20 +17,19 @@ limitations under the License.
 import Vapor
 
 final class LoadCacheLifecycle: LifecycleHandler {
-    /// Delays for the *background* boot-time catch-up retries, run after the server is already
-    /// serving traffic - a safety net for a peer that's still slow well past the blocking retries
-    /// in `didBootAsync` below. Every cache load is upsert-only (see `reloadAll`'s doc comment),
-    /// so repeating it costs nothing beyond the fan-out and can only fill gaps, never reintroduce one.
-    static let bootCatchUpDelays: [Duration] = [.seconds(4), .seconds(8), .seconds(15)]
-
-    /// A handful of quick, *blocking* retries before this node's server starts accepting real
-    /// traffic - not just the background catch-up above. A simultaneous multi-node cold start (or
-    /// several nodes restarting together) can leave every peer this node's first attempt asked
-    /// too busy to answer, and a node that starts serving S3 requests on that single incomplete
-    /// attempt fails real requests (missing access keys/buckets) for however long the background
-    /// catch-up takes to close the gap. These retries trade a bounded bit of extra boot latency
-    /// for meaningfully better odds of already being converged by the time traffic arrives.
-    static let blockingBootRetryDelays: [Duration] = [.milliseconds(500), .seconds(1)]
+    /// Delays for the boot-time catch-up retries, which run in the background *after* the server
+    /// is already accepting traffic. Every cache load is upsert-only (see `reloadAll`'s doc
+    /// comment), so repeating it can only fill gaps the first attempt missed, never reintroduce one.
+    ///
+    /// These must stay off the boot path. `didBootAsync` runs before the server binds, and a
+    /// single `reloadAll` fans out to every peer across several collections - with an unreachable
+    /// peer costing the full probe timeout plus its retry, per collection. Making boot wait on
+    /// even a couple of extra rounds pushes startup past the point where a supervisor (or
+    /// `cluster_tests.sh`'s restart health check) gives up on the node entirely, turning a
+    /// convergence optimization into a node that never comes back.
+    static let bootCatchUpDelays: [Duration] = [
+        .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15),
+    ]
 
     func didBootAsync(_ app: Application) async throws {
         do {
@@ -40,15 +39,6 @@ final class LoadCacheLifecycle: LifecycleHandler {
         }
 
         if app.storage[ClusterConfigurationKey.self] != nil {
-            for delay in LoadCacheLifecycle.blockingBootRetryDelays {
-                try? await Task.sleep(for: delay)
-                do {
-                    try await LoadCacheLifecycle.reloadAll(app: app)
-                } catch {
-                    app.logger.warning("Blocking boot-time cache retry failed: \(error)")
-                }
-            }
-
             Task {
                 for delay in LoadCacheLifecycle.bootCatchUpDelays {
                     try? await Task.sleep(for: delay)

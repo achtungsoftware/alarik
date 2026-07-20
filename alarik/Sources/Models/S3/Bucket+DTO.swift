@@ -133,8 +133,8 @@ extension Bucket {
     /// cache warm/reload, rebalance/lifecycle walks), never per-S3-request - the hot per-request
     /// bucket lookup is always `find(app:name:)`, a single point read.
     static func all(app: Application) async throws -> [Bucket] {
-        await MetadataListingService.list(app: app, collection: MetadataCollections.buckets)
-            .compactMap { try? JSONDecoder().decode(Bucket.self, from: $0.value) }
+        await MetadataListingService.list(
+            Bucket.self, app: app, collection: MetadataCollections.buckets)
     }
 
     /// Creates the bucket, failing if the name is already taken.

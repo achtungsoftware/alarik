@@ -87,17 +87,22 @@ struct InternalClusterMetadataController: RouteCollection {
     }
 
     /// The receiving side of `MetadataListingService`'s cluster-wide fan-out - reports only this
-    /// node's own local contribution (`MetadataListingService.localEntries`), never recursing
-    /// into fanning out again itself, or every `list` call would storm the whole cluster.
+    /// node's own local contribution, never recursing into fanning out again itself, or every
+    /// `list` call would storm the whole cluster.
+    ///
+    /// Transmits whole envelopes: the caller merges replicas by `updatedAtMillis` and needs to
+    /// see tombstones, so stripping either here would let a stale copy beat a newer one and make
+    /// deletes invisible cluster-wide.
     @Sendable
     func handleList(req: Request) async throws -> Response {
         guard let collection = req.query[String.self, at: "collection"] else {
             throw Abort(.badRequest, reason: "Missing collection query parameter")
         }
-        let entries = await MetadataListingService.localEntries(
+        let entries = await MetadataListingService.localEnvelopeEntries(
             app: req.application, collection: collection)
-        let wire = entries.map {
-            MetadataListingService.WireEntry(id: $0.id, value: $0.value.base64EncodedString())
+        let wire = try entries.map {
+            MetadataListingService.WireEntry(
+                id: $0.id, value: try $0.envelope.encoded().base64EncodedString())
         }
         let response = Response(status: .ok)
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")

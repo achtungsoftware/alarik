@@ -64,8 +64,8 @@ extension AccessKey {
     }
 
     static func all(app: Application) async throws -> [AccessKey] {
-        await MetadataListingService.list(app: app, collection: MetadataCollections.accessKeys)
-            .compactMap { try? JSONDecoder().decode(AccessKey.self, from: $0.value) }
+        await MetadataListingService.list(
+            AccessKey.self, app: app, collection: MetadataCollections.accessKeys)
     }
 
     /// Creates the key, failing if `accessKey`'s value is already taken by another key.

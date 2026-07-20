@@ -1878,6 +1878,114 @@ else
 fi
 rm -f "$SCRUB_FILE"
 
+# ── Test: a revoked access key does not resurrect when a node missed the delete ──
+# The security property tombstones exist for. A node that is unreachable when a credential is
+# revoked keeps its own copy of that record on disk. Without a tombstone, the delete is only an
+# absence, so when the node returns it re-publishes the key from its stale local copy and the
+# revoked credential goes live again cluster-wide. With one, the delete is a positive, newer fact
+# that beats the stale copy.
+#
+# Deliberately no waiting on outbox retry windows: a tombstone is an ordinary record write, so the
+# returning node loses on the merge immediately rather than after some retry ceiling elapses.
+echo ""
+echo "=== Test: a revoked access key stays revoked after a node that missed the delete returns ==="
+RESURRECT_AK="AKIARESURRECTTEST999"
+RESURRECT_SK="resurrectSecret0123456789abcdefGHIJKLmno"
+
+RESURRECT_CREATE=$(curl -s -X POST "${ENDPOINTS[0]}/api/v1/users/accessKeys" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"accessKey\":\"$RESURRECT_AK\",\"secretKey\":\"$RESURRECT_SK\"}")
+RESURRECT_ID=$(echo "$RESURRECT_CREATE" | jq -r '.id // empty')
+
+if [ -z "$RESURRECT_ID" ]; then
+    fail "Could not create the access key for the resurrection test: $RESURRECT_CREATE"
+else
+    sleep 3
+
+    # The key must genuinely work first, or "it fails afterwards" proves nothing.
+    RESURRECT_WORKED_BEFORE=0
+    AWS_ACCESS_KEY_ID="$RESURRECT_AK" AWS_SECRET_ACCESS_KEY="$RESURRECT_SK" \
+        aws --endpoint-url "${ENDPOINTS[0]}" s3 ls >/dev/null 2>&1 && RESURRECT_WORKED_BEFORE=1
+
+    # Find a node physically holding a metadata shard for this key's record - killing a node that
+    # never had it would make the whole test vacuous.
+    RESURRECT_HOLDER=""
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        SHARD_DIR="${STATE_DIRS[$i]}/Storage/buckets/.alarik.sys/access-keys/${RESURRECT_AK}.ecshards"
+        if [ -n "$(find "$SHARD_DIR" -name '*.ecshard' 2>/dev/null | head -1)" ]; then
+            RESURRECT_HOLDER="$i"
+            break
+        fi
+    done
+
+    if [ "$RESURRECT_WORKED_BEFORE" -ne 1 ]; then
+        fail "The access key created for the resurrection test could not authenticate before deletion - the test cannot prove anything."
+    elif [ -z "$RESURRECT_HOLDER" ]; then
+        fail "No node holds an on-disk metadata shard for the resurrection test's access key."
+    else
+        # Take the holder offline, then revoke the key through a node that is still up, so the
+        # holder never learns about the deletion.
+        kill_node "$RESURRECT_HOLDER"
+        sleep 1
+        DELETER=0
+        [ "$RESURRECT_HOLDER" -eq 0 ] && DELETER=1
+        RESURRECT_DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            "${ENDPOINTS[$DELETER]}/api/v1/users/accessKeys/$RESURRECT_ID" \
+            -H "Authorization: Bearer $TOKEN")
+        sleep 3
+
+        # Checkpoint before any restart: the revocation itself has to have taken effect on the
+        # nodes that were up. Without this, a delete that silently failed (a 404 from the
+        # listing not finding the key while a holder is down, say) looks exactly like a
+        # resurrection, and the test would blame the wrong mechanism entirely.
+        RESURRECT_GONE_BEFORE_RESTART=1
+        for i in $(seq 0 $((NODE_COUNT - 1))); do
+            [ "$i" -eq "$RESURRECT_HOLDER" ] && continue
+            if AWS_ACCESS_KEY_ID="$RESURRECT_AK" AWS_SECRET_ACCESS_KEY="$RESURRECT_SK" \
+                aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls >/dev/null 2>&1; then
+                RESURRECT_GONE_BEFORE_RESTART=0
+                echo "  node $i still authenticates the key before any restart"
+            fi
+        done
+
+        if [ "$RESURRECT_DELETE_CODE" != "204" ] && [ "$RESURRECT_DELETE_CODE" != "200" ]; then
+            fail "Revoking the access key failed with HTTP $RESURRECT_DELETE_CODE - the resurrection scenario was never actually set up."
+        elif [ "$RESURRECT_GONE_BEFORE_RESTART" -ne 1 ]; then
+            fail "The access key still authenticates on nodes that were up during the revoke - the revoke itself did not take effect, independent of any resurrection."
+        # Bring it back still holding its stale copy of the record.
+        elif ! restart_node "$RESURRECT_HOLDER"; then
+            fail "The node that missed the access key deletion did not come back up."
+        else
+            wait_for_full_membership
+            # Let the returning node finish its boot cache load, which is exactly where a stale
+            # local copy would be re-published from.
+            sleep 8
+
+            RESURRECT_STILL_DEAD=1
+            for i in $(seq 0 $((NODE_COUNT - 1))); do
+                # The revoked credential must not authenticate anywhere.
+                if AWS_ACCESS_KEY_ID="$RESURRECT_AK" AWS_SECRET_ACCESS_KEY="$RESURRECT_SK" \
+                    aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls >/dev/null 2>&1; then
+                    RESURRECT_STILL_DEAD=0
+                    echo "  node $i still authenticates the revoked access key"
+                fi
+                # ...and it must not be listed as an existing key either.
+                if curl -s "${ENDPOINTS[$i]}/api/v1/users/accessKeys" \
+                    -H "Authorization: Bearer $TOKEN" | grep -q "$RESURRECT_AK"; then
+                    RESURRECT_STILL_DEAD=0
+                    echo "  node $i still lists the revoked access key"
+                fi
+            done
+
+            if [ "$RESURRECT_STILL_DEAD" -eq 1 ]; then
+                pass "A revoked access key stays revoked cluster-wide even after the node that missed the delete rejoins."
+            else
+                fail "A revoked access key came back after the node that missed the delete rejoined."
+            fi
+        fi
+    fi
+fi
+
 # ── Test 39: DeleteBucket fails closed when a peer is unreachable ──────────────
 # Must run last among the cluster tests - it permanently kills one node process. An otherwise-
 # empty bucket's DeleteBucket must be REFUSED (not silently allowed) when this node can't

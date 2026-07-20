@@ -63,8 +63,8 @@ extension SharedLink {
     }
 
     static func all(app: Application) async throws -> [SharedLink] {
-        await MetadataListingService.list(app: app, collection: MetadataCollections.sharedLinks)
-            .compactMap { try? JSONDecoder().decode(SharedLink.self, from: $0.value) }
+        await MetadataListingService.list(
+            SharedLink.self, app: app, collection: MetadataCollections.sharedLinks)
     }
 
     func save(app: Application) async throws {

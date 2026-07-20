@@ -36,4 +36,23 @@ enum MetadataCollections {
     /// Keyed by the OIDC `state` value itself - single-use by construction via
     /// `MetadataStore.consumeIfPresent`.
     static let oidcStates = "oidc-states"
+
+    /// Every collection, for maintenance passes that must cover the whole store
+    /// (`MetadataMaintenance`'s tombstone GC and migration sweep). A new collection added above
+    /// and forgotten here is simply never swept, so keep the two together.
+    static let all: [String] = [
+        users, usersByUsername, accessKeys, sharedLinks, buckets, clusterNodes, oidcProviders,
+        oidcStates,
+    ]
+
+    /// Collections whose deletes remove the record outright instead of leaving a tombstone.
+    ///
+    /// Tombstones exist so a replica that was offline during a delete can't resurrect the record
+    /// on return. Neither collection here has that exposure, and both would pay for it:
+    /// - `clusterNodes` is self-coordinated at k=1/m=0 and rewritten by every heartbeat, so a
+    ///   stale copy is corrected within one beat anyway - and it has no delete path at all.
+    /// - `oidcStates` entries are single-use (`consumeIfPresent`) and TTL-swept, so they churn
+    ///   constantly and a resurrected one is inert: it is still expired, and replay is already
+    ///   prevented by the consume. Tombstoning them would accumulate garbage for no gain.
+    static let tombstoneExempt: Set<String> = [clusterNodes, oidcStates]
 }

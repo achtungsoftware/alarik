@@ -88,8 +88,8 @@ extension ClusterNode {
     /// (one record per node), and this is only ever called from admin-console/boot-time-reload
     /// paths, never per-S3-request - the hot path is always `ClusterNodeCache`, in-memory.
     static func all(app: Application) async throws -> [ClusterNode] {
-        await MetadataListingService.list(app: app, collection: MetadataCollections.clusterNodes)
-            .compactMap { try? JSONDecoder().decode(ClusterNode.self, from: $0.value) }
+        await MetadataListingService.list(
+            ClusterNode.self, app: app, collection: MetadataCollections.clusterNodes)
     }
 
     func save(app: Application) async throws {

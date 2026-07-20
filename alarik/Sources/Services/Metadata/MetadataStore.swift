@@ -78,17 +78,59 @@ enum MetadataStore {
     }
 
     // MARK: - Byte-oriented core
+    //
+    // Records are stored wrapped in a `MetadataEnvelope` (tombstone flag, last-write timestamp,
+    // schema version). The wrapping lives here, at the boundary between the public API and
+    // routing, which is what keeps it invisible to everything else: the Codable overloads above
+    // keep their exact semantics, and the rank-0 forwarding path in
+    // `InternalClusterMetadataController` relays already-wrapped bytes opaquely, so it - and all
+    // of EC replication/rebalance/scrub - needs no envelope awareness at all. A tombstone is just
+    // another record write and propagates through that same machinery.
+    //
+    // The `executeLocal*` entry points below deliberately do NOT wrap: they receive bytes that
+    // were already wrapped by the originating node.
 
+    /// The record's own bytes, or `nil` when absent *or* tombstoned. Applies any outstanding
+    /// schema migration in memory (see `MetadataMigrations`).
     static func get(app: Application, collection: String, id: String) async throws -> Data? {
-        let key = MetadataNamespace.key(collection: collection, id: id)
-        let routing = await resolveRouting(app: app, key: key)
-        return try await localGet(app: app, key: key, routing: routing)
+        guard let envelope = try await getEnvelope(app: app, collection: collection, id: id),
+            !envelope.isTombstone, let payload = envelope.payload
+        else { return nil }
+        return MetadataMigrations.upgrade(
+            payload: payload, collection: collection, storedVersion: envelope.schemaVersion,
+            logger: app.logger)
     }
 
-
-    static func put(app: Application, collection: String, id: String, value: Data) async throws {
+    /// The stored envelope exactly as written - tombstones included, no migration applied.
+    /// Needed wherever a record must be moved or compared rather than consumed: the rebalance
+    /// widen path, listing merges, and the tombstone GC sweep.
+    static func getEnvelope(
+        app: Application, collection: String, id: String
+    ) async throws -> MetadataEnvelope? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
+        guard let stored = try await localGet(app: app, key: key, routing: routing) else {
+            return nil
+        }
+        return MetadataEnvelope.decode(stored)
+    }
+
+    static func put(app: Application, collection: String, id: String, value: Data) async throws {
+        let envelope = MetadataEnvelope.live(
+            payload: value, schemaVersion: MetadataMigrations.currentVersion(for: collection))
+        try await putEnvelope(app: app, collection: collection, id: id, envelope: envelope)
+    }
+
+    /// Stores `envelope` verbatim - no re-stamping of `updatedAtMillis`, no tombstone filtering.
+    /// The rebalance widen path depends on this: re-wrapping there would bump every record's
+    /// timestamp on a purely physical move, and would skip tombstones entirely (since `get`
+    /// reports them as absent), leaving them stuck at their original narrow placement.
+    static func putEnvelope(
+        app: Application, collection: String, id: String, envelope: MetadataEnvelope
+    ) async throws {
+        let key = MetadataNamespace.key(collection: collection, id: id)
+        let routing = await resolveRouting(app: app, key: key)
+        let value = try envelope.encoded()
         if routing.isLocalCoordinator {
             try await executeLocalPut(app: app, key: key, value: value, routing: routing)
         } else {
@@ -107,15 +149,39 @@ enum MetadataStore {
     ) async throws -> Bool {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
+        let envelope = MetadataEnvelope.live(
+            payload: value, schemaVersion: MetadataMigrations.currentVersion(for: collection))
+        let wrapped = try envelope.encoded()
         guard routing.isLocalCoordinator else {
             return try await forwardPutIfAbsent(
-                app: app, node: routing.primary, collection: collection, id: id, value: value)
+                app: app, node: routing.primary, collection: collection, id: id, value: wrapped)
         }
         return try await executeLocalPutIfAbsent(
-            app: app, collection: collection, id: id, value: value)
+            app: app, collection: collection, id: id, value: wrapped)
     }
 
+    /// Marks the record deleted. For most collections this *writes a tombstone* rather than
+    /// removing bytes: a replica that was unreachable during the delete would otherwise come back
+    /// still holding the record and resurrect it (a revoked access key going live again). The
+    /// tombstone is an ordinary record write, so it replicates, reconstructs, and self-heals
+    /// through the same paths as any other write, and beats the stale copy on `updatedAtMillis`.
+    ///
+    /// `MetadataCollections.tombstoneExempt` collections remove the bytes outright - see that
+    /// declaration for why neither of them needs the protection.
     static func delete(app: Application, collection: String, id: String) async throws {
+        guard !MetadataCollections.tombstoneExempt.contains(collection) else {
+            try await purge(app: app, collection: collection, id: id)
+            return
+        }
+        let tombstone = MetadataEnvelope.tombstone(
+            schemaVersion: MetadataMigrations.currentVersion(for: collection))
+        try await putEnvelope(app: app, collection: collection, id: id, envelope: tombstone)
+    }
+
+    /// Physically removes the record's bytes cluster-wide, leaving nothing behind. This is what
+    /// `delete` used to do for every collection; it now backs tombstone GC
+    /// (`MetadataTombstoneSweep`) and the tombstone-exempt collections.
+    static func purge(app: Application, collection: String, id: String) async throws {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
         if routing.isLocalCoordinator {
@@ -133,11 +199,20 @@ enum MetadataStore {
     ) async throws -> Data? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        guard routing.isLocalCoordinator else {
-            return try await forwardConsumeIfPresent(
+        let stored: Data?
+        if routing.isLocalCoordinator {
+            stored = try await executeLocalConsumeIfPresent(
+                app: app, collection: collection, id: id)
+        } else {
+            stored = try await forwardConsumeIfPresent(
                 app: app, node: routing.primary, collection: collection, id: id)
         }
-        return try await executeLocalConsumeIfPresent(app: app, collection: collection, id: id)
+        guard let stored else { return nil }
+        let envelope = MetadataEnvelope.decode(stored)
+        guard !envelope.isTombstone, let payload = envelope.payload else { return nil }
+        return MetadataMigrations.upgrade(
+            payload: payload, collection: collection, storedVersion: envelope.schemaVersion,
+            logger: app.logger)
     }
 
     // MARK: - Routing
@@ -253,7 +328,15 @@ enum MetadataStore {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
         return try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
-            guard !localShard0Exists(key: key) else { return false }
+            if localShard0Exists(key: key) {
+                // Bytes exist, but a tombstoned id is genuinely free to claim again (a username
+                // or bucket name released by a delete must be reusable). Anything else - present,
+                // or present-but-unreadable-right-now - is treated as taken, so a transient read
+                // failure can never clobber a live record.
+                let existing = try? await localGet(app: app, key: key, routing: routing)
+                let isTombstone = existing.map { MetadataEnvelope.decode($0).isTombstone } ?? false
+                guard isTombstone else { return false }
+            }
             try await localWrite(app: app, key: key, value: value, routing: routing)
             return true
         }
@@ -271,11 +354,21 @@ enum MetadataStore {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
         return try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
-            guard let value = try await localGet(app: app, key: key, routing: routing) else {
-                return nil
+            guard let stored = try await localGet(app: app, key: key, routing: routing),
+                !MetadataEnvelope.decode(stored).isTombstone
+            else { return nil }
+
+            // Returns the stored envelope verbatim; the caller (`consumeIfPresent`) unwraps once,
+            // so this stays correct whether it ran locally or was relayed from a peer.
+            if MetadataCollections.tombstoneExempt.contains(collection) {
+                try await executeLocalDelete(app: app, key: key, routing: routing)
+            } else {
+                let tombstone = MetadataEnvelope.tombstone(
+                    schemaVersion: MetadataMigrations.currentVersion(for: collection))
+                try await localWrite(
+                    app: app, key: key, value: try tombstone.encoded(), routing: routing)
             }
-            try await executeLocalDelete(app: app, key: key, routing: routing)
-            return value
+            return stored
         }
     }
 

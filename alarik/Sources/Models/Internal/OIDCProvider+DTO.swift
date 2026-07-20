@@ -74,8 +74,8 @@ extension OIDCProvider {
     }
 
     static func all(app: Application) async throws -> [OIDCProvider] {
-        await MetadataListingService.list(app: app, collection: MetadataCollections.oidcProviders)
-            .compactMap { try? JSONDecoder().decode(OIDCProvider.self, from: $0.value) }
+        await MetadataListingService.list(
+            OIDCProvider.self, app: app, collection: MetadataCollections.oidcProviders)
     }
 
     func save(app: Application) async throws {

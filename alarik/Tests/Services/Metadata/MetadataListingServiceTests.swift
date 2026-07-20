@@ -129,17 +129,20 @@ struct MetadataListingServiceTests {
         }
     }
 
-    @Test("localEntries matches list's result when there are no peers")
+    @Test("localEnvelopeEntries matches list's result when there are no peers")
     func localEntriesMatchesListWhenStandalone() async throws {
         try await withApp { app in
             let collection = "local-entries-test-\(UUID().uuidString)"
             try await MetadataStore.put(
                 app: app, collection: collection, id: "only", value: Data("v".utf8))
 
-            let local = await MetadataListingService.localEntries(app: app, collection: collection)
+            let local = await MetadataListingService.localEnvelopeEntries(
+                app: app, collection: collection)
             let full = await MetadataListingService.list(app: app, collection: collection)
             #expect(local.count == full.count)
             #expect(local.first?.id == full.first?.id)
+            // The local half carries envelopes so peers can merge them; `list` hands back payloads.
+            #expect(local.first?.envelope.payload == full.first?.value)
         }
     }
 }

@@ -378,13 +378,16 @@ enum ErasureCodedRebalanceService {
 
         // A metadata record seeded while the cluster had few nodes (most notably the founding
         // node's boot-time admin-user seed, written before any peer exists to fan out to) is
-        // permanently stuck at whatever narrow k/m it was born with otherwise - nothing else
-        // ever widens it, which leaves it a single point of failure even once the cluster has
-        // long since grown enough to support real redundancy. The node currently authoritative
-        // for the OLD narrow encoding re-reads the record (self-healing via
-        // `MetadataStore.get`'s own discovery) and re-`put`s it, which naturally picks up the
-        // CURRENT wider placement - the stale narrow shard becomes an ordinary orphan the next
-        // walk reclaims once the wider copies are confirmed, exactly like any other stale shard.
+        // otherwise stuck forever at whatever narrow k/m it was born with, leaving it a single
+        // point of failure long after the cluster grew. Re-reading and re-writing it picks up the
+        // CURRENT wider placement; the stale narrow shard becomes an ordinary orphan the next
+        // walk reclaims.
+        //
+        // Envelope-verbatim on purpose. The payload-level `get`/`put` would be wrong twice here:
+        // it would re-stamp `updatedAtMillis` on what is only a physical move (making a widened
+        // record spuriously win a later conflict), and it reports tombstones as absent - so
+        // tombstones would never widen and would stay pinned to one node, which is exactly the
+        // durability hole this whole path exists to close.
         if MetadataNamespace.isReserved(bucketName), selfRank == 0 {
             let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
             let currentWidth = metadataConfig.effective(activeNodeCount: activeNodes.count)
@@ -392,8 +395,11 @@ enum ErasureCodedRebalanceService {
                 let (collection, id) = MetadataNamespace.splitKey(key)
             {
                 do {
-                    if let value = try await MetadataStore.get(app: app, collection: collection, id: id) {
-                        try await MetadataStore.put(app: app, collection: collection, id: id, value: value)
+                    if let envelope = try await MetadataStore.getEnvelope(
+                        app: app, collection: collection, id: id)
+                    {
+                        try await MetadataStore.putEnvelope(
+                            app: app, collection: collection, id: id, envelope: envelope)
                     }
                 } catch {
                     app.logger.warning(

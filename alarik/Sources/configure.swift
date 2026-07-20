@@ -349,6 +349,12 @@ public func configure(_ app: Application) async throws {
                 } catch {
                     app.logger.error("Failed to purge expired EC shard replication failures: \(error)")
                 }
+
+                // Metadata upkeep. Both walk only this node's own local shard-0 records, so they
+                // cost the same whether the cluster has three nodes or a thousand - see
+                // `MetadataMaintenance`. Neither throws; both log their own failures.
+                await MetadataMaintenance.runTombstoneGC(app: app)
+                await MetadataMaintenance.runMigrationSweep(app: app)
             }
         }
     }

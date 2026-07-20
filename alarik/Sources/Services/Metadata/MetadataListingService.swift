@@ -27,69 +27,119 @@ import Vapor
 /// merging and deduping by id. Best-effort throughout: an unreachable node just contributes
 /// nothing to a given call, rather than failing the whole listing.
 enum MetadataListingService {
+    /// A record as callers consume it: `value` is the record's own bytes, already unwrapped from
+    /// its envelope and migrated to the current schema. Tombstoned ids never appear.
     struct Entry: Sendable {
         let id: String
         let value: Data
     }
 
+    /// A record as it is stored and transmitted between nodes - envelope intact, tombstones
+    /// included. The merge needs these; callers of `list` do not.
+    struct EnvelopeEntry: Sendable {
+        let id: String
+        let envelope: MetadataEnvelope
+    }
+
     static func list(app: Application, collection: String) async -> [Entry] {
-        var merged: [String: Data] = [:]
-        for entry in await localEntries(app: app, collection: collection) {
-            merged[entry.id] = entry.value
-        }
+        var merged: [String: MetadataEnvelope] = [:]
 
-        guard let config = app.storage[ClusterConfigurationKey.self] else {
-            return merged.map { Entry(id: $0.key, value: $0.value) }
-        }
-        // Every KNOWN peer, not `activeNodes()` - a `.draining` peer is excluded from
-        // `activeNodes()` for placement, but can still physically hold records that haven't
-        // finished migrating off it yet. Excluding it here would make those records vanish from
-        // every other node's listing until the drain finishes, even though the data isn't gone.
-        let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
-        guard !peers.isEmpty else {
-            return merged.map { Entry(id: $0.key, value: $0.value) }
-        }
-
-        await withTaskGroup(of: [Entry].self) { group in
-            for node in peers {
-                group.addTask {
-                    await fetchRemote(app: app, node: node, collection: collection)
-                }
-            }
-            for await entries in group {
-                for entry in entries where merged[entry.id] == nil {
-                    merged[entry.id] = entry.value
-                }
+        // Replicas can legitimately disagree (a write or delete that hasn't reached everyone
+        // yet), so the winner is decided by `supersedes` rather than by whoever answered first -
+        // otherwise the result would depend on gather order, and a stale copy could mask a newer
+        // one, including masking a delete.
+        func merge(_ entries: [EnvelopeEntry]) {
+            for entry in entries {
+                if let existing = merged[entry.id], !entry.envelope.supersedes(existing) { continue }
+                merged[entry.id] = entry.envelope
             }
         }
 
-        return merged.map { Entry(id: $0.key, value: $0.value) }
+        merge(await localEnvelopeEntries(app: app, collection: collection))
+
+        if let config = app.storage[ClusterConfigurationKey.self] {
+            // Every KNOWN peer, not `activeNodes()` - a `.draining` peer is excluded from
+            // `activeNodes()` for placement, but can still physically hold records that haven't
+            // finished migrating off it yet. Excluding it here would make those records vanish
+            // from every other node's listing until the drain finishes.
+            let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
+            if !peers.isEmpty {
+                await withTaskGroup(of: [EnvelopeEntry].self) { group in
+                    for node in peers {
+                        group.addTask {
+                            await fetchRemote(app: app, node: node, collection: collection)
+                        }
+                    }
+                    for await entries in group { merge(entries) }
+                }
+            }
+        }
+
+        return merged.compactMap { id, envelope in
+            guard !envelope.isTombstone, let payload = envelope.payload else { return nil }
+            return Entry(
+                id: id,
+                value: MetadataMigrations.upgrade(
+                    payload: payload, collection: collection,
+                    storedVersion: envelope.schemaVersion, logger: app.logger))
+        }
     }
 
     static func count(app: Application, collection: String) async -> Int {
         await list(app: app, collection: collection).count
     }
 
+    /// `list`, decoded into `T`, reporting anything that fails to decode instead of discarding it.
+    ///
+    /// The distinction matters more than it looks: a record that won't decode is indistinguishable
+    /// from a record that doesn't exist to every caller above this line, so silently skipping one
+    /// can drop a live access key out of authentication or a bucket out of a listing with no
+    /// symptom anywhere. That is exactly what a bad schema change would cause, so it is logged at
+    /// error with the collection and id needed to find it.
+    static func list<T: Decodable>(
+        _ type: T.Type, app: Application, collection: String
+    ) async -> [T] {
+        let entries = await list(app: app, collection: collection)
+        var decoded: [T] = []
+        decoded.reserveCapacity(entries.count)
+        for entry in entries {
+            do {
+                decoded.append(try JSONDecoder().decode(T.self, from: entry.value))
+            } catch {
+                app.logger.error(
+                    "Undecodable \(T.self) record '\(collection)/\(entry.id)' excluded from this listing - it is stored but unreadable by this binary: \(error)"
+                )
+            }
+        }
+        return decoded
+    }
+
     /// This node's own contribution only - no network fan-out. Used both by `list`'s local
     /// portion and directly by `InternalClusterMetadataController.handleList` when serving a
     /// peer's fan-out request (a peer must only ever report what it itself holds, never recurse
     /// into fanning out again, or every `list` call would storm the whole cluster).
-    static func localEntries(app: Application, collection: String) async -> [Entry] {
+    ///
+    /// Envelopes, not payloads: the receiving node needs `updatedAtMillis` to pick a winner and
+    /// the tombstone flag to know a record was deleted. Handing it bare payloads would strip
+    /// exactly the information the merge runs on, and would make deletes invisible to peers.
+    static func localEnvelopeEntries(app: Application, collection: String) async -> [EnvelopeEntry] {
         let prefix = "\(collection)/"
         let discovered = ErasureCodedObjectHandler.listLocalShardZeroEntries(
             bucketName: MetadataNamespace.bucketName, keyPrefix: prefix)
 
-        var entries: [Entry] = []
+        var entries: [EnvelopeEntry] = []
         entries.reserveCapacity(discovered.count)
         for meta in discovered {
             let id = String(meta.key.dropFirst(prefix.count))
-            // Must be a real gather (`get`), not a naive "read local shard 0 alone" shortcut:
+            // Must be a real gather, not a naive "read local shard 0 alone" shortcut:
             // Reed-Solomon reconstruction needs at least `dataShards` distinct shards, so a
             // record with dataShards > 1 can't be decoded from one shard alone - a single-shard
             // read would silently fail and drop the entry from the listing.
-            guard let value = try? await MetadataStore.get(app: app, collection: collection, id: id)
+            guard
+                let envelope = try? await MetadataStore.getEnvelope(
+                    app: app, collection: collection, id: id)
             else { continue }
-            entries.append(Entry(id: id, value: value))
+            entries.append(EnvelopeEntry(id: id, envelope: envelope))
         }
         return entries
     }
@@ -103,7 +153,7 @@ enum MetadataListingService {
 
     private static func fetchRemote(
         app: Application, node: ClusterNodeInfo, collection: String
-    ) async -> [Entry] {
+    ) async -> [EnvelopeEntry] {
         if let entries = await fetchRemoteOnce(app: app, node: node, collection: collection) {
             return entries
         }
@@ -113,7 +163,7 @@ enum MetadataListingService {
 
     private static func fetchRemoteOnce(
         app: Application, node: ClusterNodeInfo, collection: String
-    ) async -> [Entry]? {
+    ) async -> [EnvelopeEntry]? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return [] }
         var outbound = HTTPClientRequest(
             url: node.address + "/internal/cluster/metadata/list"
@@ -130,9 +180,9 @@ enum MetadataListingService {
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 256 * 1024 * 1024)
             let decoded = try JSONDecoder().decode([WireEntry].self, from: Data(buffer: body))
-            return decoded.compactMap { entry in
+            return decoded.compactMap { entry -> EnvelopeEntry? in
                 guard let data = Data(base64Encoded: entry.value) else { return nil }
-                return Entry(id: entry.id, value: data)
+                return EnvelopeEntry(id: entry.id, envelope: MetadataEnvelope.decode(data))
             }
         } catch {
             return nil
