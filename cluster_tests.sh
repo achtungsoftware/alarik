@@ -2134,8 +2134,16 @@ echo ""
 echo "=== Test: key ownership is unchanged while a node is unreachable ==="
 aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ownership-test >/dev/null 2>&1
 echo "ownership" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-ownership-test/own.txt >/dev/null 2>&1
-sleep 2
-OWNERS_BEFORE=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+# Poll for a stable ownership baseline rather than reading once: a preceding test just restarted
+# a node, and the placement endpoint's listing fan-out can time out on a still-booting peer and
+# return a partial (object-missing) result for a few seconds. This is establishing the baseline,
+# not the property under test.
+OWNERS_BEFORE=""
+for _ in $(seq 1 20); do
+    OWNERS_BEFORE=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+    [ -n "$OWNERS_BEFORE" ] && break
+    sleep 1
+done
 if [ -z "$OWNERS_BEFORE" ]; then
     fail "Could not read the ownership set for the placement-stability test."
 else
@@ -2239,6 +2247,106 @@ done
 [ "$POLICY_OK" -eq 1 ] \
     && pass "A public-read policy set through one node is enforced by every node for anonymous reads." \
     || fail "A bucket policy set on one node is not applied on every node."
+
+# ── Test: adding a brand-new node propagates metadata and migrates data to it ──
+# The rest of the suite runs at a fixed 4 nodes. This is the only test that grows the cluster:
+# it writes data, starts a real 5th node seeded to the existing four, and checks that the new
+# node (a) learns metadata created before it joined, (b) has object data migrated onto it
+# automatically by the existing nodes' rebalance walks, and (c) serves and accepts new writes.
+echo ""
+echo "=== Test: adding a new node propagates metadata and migrates data automatically ==="
+# Bring the cluster back to full strength first. kill THEN restart, so if node 3 is already
+# alive (an earlier test restarted it) we don't start a second process on its port - that would
+# just crash on the port bind. `kill_node` is a no-op if it's already down.
+kill_node 3 2>/dev/null || true
+sleep 1
+restart_node 3 >/dev/null 2>&1
+wait_for_full_membership
+
+ADDNODE_BUCKET="cluster-addnode-test"
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$ADDNODE_BUCKET" >/dev/null 2>&1
+# Enough keys that HRW places a decent share on any one node.
+ADDNODE_PREJOIN=12
+for n in $(seq 1 "$ADDNODE_PREJOIN"); do
+    echo "prejoin-content-$n" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://$ADDNODE_BUCKET/pre-$n.txt" >/dev/null 2>&1
+done
+
+# Start node 4 (index 4, port 8095), seeded to the original four.
+NEW_INDEX=4
+NEW_PORT=$((BASE_PORT + NEW_INDEX))
+NEW_STATE=$(mktemp -d)
+NEW_SEEDS=""
+for j in $(seq 0 $((NODE_COUNT - 1))); do
+    [ -n "$NEW_SEEDS" ] && NEW_SEEDS="$NEW_SEEDS,"
+    NEW_SEEDS="$NEW_SEEDS${ENDPOINTS[$j]}"
+done
+(
+    cd "$NEW_STATE" \
+        && JWT="$JWT_SECRET" \
+            CLUSTER_NODE_ADDRESS="http://localhost:$NEW_PORT" \
+            CLUSTER_SECRET="$CLUSTER_SECRET" \
+            CLUSTER_SEED_NODES="$NEW_SEEDS" \
+            CLUSTER_EC_DATA_SHARDS="$CLUSTER_EC_DATA_SHARDS" \
+            CLUSTER_EC_PARITY_SHARDS="$CLUSTER_EC_PARITY_SHARDS" \
+            exec "$BINARY" serve --hostname 127.0.0.1 --port "$NEW_PORT"
+) >"$LOG_DIR/node-4.log" 2>&1 &
+NEW_PID=$!
+PIDS+=("$NEW_PID")          # so the cleanup trap stops it
+STATE_DIRS+=("$NEW_STATE")
+NEW_ENDPOINT="http://localhost:$NEW_PORT"
+
+# Wait for it to accept connections, then to show up healthy in the cluster's own membership.
+ADDNODE_UP=0
+for _ in $(seq 1 30); do
+    [ "$(curl -s -o /dev/null -w "%{http_code}" "$NEW_ENDPOINT/" 2>/dev/null)" != "000" ] && { ADDNODE_UP=1; break; }
+    sleep 1
+done
+ADDNODE_JOINED=0
+if [ "$ADDNODE_UP" -eq 1 ]; then
+    for _ in $(seq 1 30); do
+        HEALTHY=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes" -H "Authorization: Bearer $TOKEN" \
+            | jq '[.[] | select(.isHealthy == true)] | length' 2>/dev/null)
+        [ "$HEALTHY" == "5" ] && { ADDNODE_JOINED=1; break; }
+        sleep 1
+    done
+fi
+
+if [ "$ADDNODE_JOINED" -ne 1 ]; then
+    fail "The new 5th node did not come up and join the cluster (up=$ADDNODE_UP)."
+else
+    # (a) Metadata propagation: the new node must serve a pre-join object with correct content
+    # (proves it learned the bucket record and can forward/read cluster data).
+    PREJOIN_BODY=$(aws --endpoint-url "$NEW_ENDPOINT" s3 cp "s3://$ADDNODE_BUCKET/pre-1.txt" - 2>/dev/null)
+    ADDNODE_META_OK=0
+    [ "$PREJOIN_BODY" == "prejoin-content-1" ] && ADDNODE_META_OK=1
+
+    # (c) New writes through the new node land and are readable from an original node.
+    echo "postjoin-via-new" | aws --endpoint-url "$NEW_ENDPOINT" s3 cp - "s3://$ADDNODE_BUCKET/post-1.txt" >/dev/null 2>&1
+    sleep 2
+    POSTJOIN_BODY=$(aws --endpoint-url "${ENDPOINTS[0]}" s3 cp "s3://$ADDNODE_BUCKET/post-1.txt" - 2>/dev/null)
+    ADDNODE_WRITE_OK=0
+    [ "$POSTJOIN_BODY" == "postjoin-via-new" ] && ADDNODE_WRITE_OK=1
+
+    # (b) Automatic data migration: the existing nodes' rebalance walks must place some of the
+    # pre-join objects' shards onto the new node. Poll its state dir, since migration is
+    # outbox-driven and asynchronous.
+    ADDNODE_MIGRATED=0
+    for _ in $(seq 1 40); do
+        SHARDS=$(find "$NEW_STATE/Storage/buckets/$ADDNODE_BUCKET" -name "*.ecshard" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$SHARDS" -gt 0 ]; then ADDNODE_MIGRATED=1; break; fi
+        sleep 1
+    done
+
+    if [ "$ADDNODE_META_OK" -eq 1 ] && [ "$ADDNODE_WRITE_OK" -eq 1 ] && [ "$ADDNODE_MIGRATED" -eq 1 ]; then
+        pass "A newly added node learns existing metadata, has object data migrated onto it automatically, and serves new writes."
+    else
+        fail "Adding a node did not fully propagate (metadata_read=$ADDNODE_META_OK new_write=$ADDNODE_WRITE_OK data_migrated=$ADDNODE_MIGRATED)."
+    fi
+fi
+
+# Stop the 5th node so it doesn't interfere with anything after this (and the trap still has it).
+kill "$NEW_PID" 2>/dev/null
+wait "$NEW_PID" 2>/dev/null
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""

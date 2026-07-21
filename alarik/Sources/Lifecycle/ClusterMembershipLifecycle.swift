@@ -201,11 +201,19 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             }
         }
 
-        // If this call discovered a genuinely new peer, any record that peer alone holds (most
-        // notably a just-seeded admin access key) was invisible to this node's caches until now,
-        // and would otherwise stay invisible until the 60s periodic reload catches up.
-        // Re-running the full reload immediately closes that gap. Best-effort: a failure here is
-        // no worse than the reload this node already ran at boot.
+        // Discovering a genuinely new peer here (rather than via its join broadcast) means that
+        // broadcast was dropped - so this node never ran the join's reactive work. Do it now:
+        //
+        //  - Reload caches, so a record the new peer alone holds (a just-seeded admin access key,
+        //    say) becomes visible immediately instead of waiting for the 60s periodic reload.
+        //  - Schedule a rebalance, so this node migrates the keys the new peer is now responsible
+        //    for onto it. Without this the join broadcast is the ONLY thing that triggers that
+        //    migration, and a single dropped packet would leave a node permanently un-rebalanced
+        //    (an availability-safe convergence lag - reads still widen to all known nodes - but it
+        //    must self-heal without a manual resync).
+        //
+        // Only from `refreshLoop` (`triggerCacheReloadOnGrowth`): `bootstrapMembership` already
+        // schedules its own rebalance and full reload in `didBootAsync`.
         if triggerCacheReloadOnGrowth {
             let knownAfter = Set(await ClusterNodeCache.shared.all().map(\.id))
             if !knownAfter.isSubset(of: knownBefore) {
@@ -214,6 +222,9 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                 } catch {
                     app.logger.warning("Cache reload after discovering a new peer failed: \(error)")
                 }
+                await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+                await ErasureCodedRebalanceService.scheduleRebalance(
+                    app: app, reason: .membershipChange)
             }
         }
         return anySucceeded
