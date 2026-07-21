@@ -61,14 +61,19 @@ struct ClusterNodeInfo: Sendable, Equatable {
 final actor ClusterNodeCache {
     public static let shared = ClusterNodeCache()
 
-    /// How long a node's `lastHeartbeatAt` can go without an update before every other node
-    /// treats it as unavailable. Set well above `ClusterMembershipLifecycle`'s heartbeat
-    /// interval (10s) - six missed ticks - so a node that's briefly too busy to heartbeat (a GC
-    /// pause, a slow query, an IO-heavy burst) isn't falsely marked down and flapped out of the
-    /// active set. Membership stability matters more than fast failure detection here: a genuine
-    /// crash is recovered by an operator draining the node (which excludes it immediately, no
-    /// staleness wait), so a generous window costs nothing but avoids spurious placement churn.
+    /// How long `lastHeartbeatAt` may lag before a node counts as unreachable. Six missed ticks,
+    /// so a briefly-busy node isn't flapped out. Affects liveness only, never ownership.
     static let heartbeatStaleness: TimeInterval = 60
+
+    /// Ownership is deliberately decoupled from liveness.
+    ///
+    /// A key's replicas are ranked over every *registered* node, so a node going down does not
+    /// hand its keys to someone else and hand them back on recovery. Reads tolerate it (any one
+    /// replica answers), writes to it queue in the outbox and replay, and the record stays where
+    /// it was written. Ownership changes only when an operator drains or removes a node.
+    ///
+    /// Deriving ownership from the live set instead makes every blip reshuffle part of the
+    /// keyspace, so records stop being where the current placement says they are.
 
     private var nodes: [UUID: ClusterNodeInfo] = [:]
 
@@ -128,10 +133,14 @@ final actor ClusterNodeCache {
         Array(nodes.values)
     }
 
-    /// `active`-status nodes whose heartbeat hasn't gone stale - the exact candidate set
-    /// placement/routing/replication treat as "up". A node's own liveness (whether it's stale)
-    /// is derived here at read time rather than tracked via a separate detector, since
-    /// `lastHeartbeatAt` already carries everything needed to decide.
+    /// Who *owns* a key: every registered, non-draining node, regardless of whether it is
+    /// answering right now. Deliberately ignores heartbeat staleness - see the doc comment above.
+    func placementNodes() -> [ClusterNodeInfo] {
+        nodes.values.filter { $0.status == .active }
+    }
+
+    /// Who is *reachable* right now - for admission checks, broadcast targets and liveness
+    /// reporting. Never for deciding where a key lives; use `placementNodes()` for that.
     func activeNodes(now: Date = Date(), staleness: TimeInterval = ClusterNodeCache.heartbeatStaleness)
         -> [ClusterNodeInfo]
     {

@@ -79,7 +79,9 @@ enum ClusterRebalanceService {
     /// actually clears, then stopping on its own once nothing is gated anymore.
     static func rebalance(app: Application, reason: RebalanceReason) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // See `ErasureCodedRebalanceService.rebalance` - reclaim decisions need stable
+        // ownership, not liveness.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return }
 
         let buckets = try await Bucket.all(app: app)

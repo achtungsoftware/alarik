@@ -209,7 +209,8 @@ enum ObjectRoutingService {
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
             return ([], nil)
         }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Ownership follows registration, not liveness - a down replica keeps its keys.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else {
             return ([], config)
         }
@@ -262,20 +263,19 @@ enum ObjectRoutingService {
             return .notClustered
         }
 
-        var active = await ClusterNodeCache.shared.activeNodes()
+        // Registered nodes, so a peer being briefly down doesn't shrink the cluster and refuse
+        // writes; a shard that can't be delivered now is retried from the outbox instead.
+        var active = await ClusterNodeCache.shared.placementNodes()
 
         // Too few nodes is far more often "this node hasn't finished learning who its peers are"
         // than "the cluster is genuinely too small" - a node that booted while its seeds were
-        // briefly down starts out knowing only itself. Re-seed membership and re-check before
-        // rejecting, so a converging node delays a write instead of failing it with a confident
-        // and wrong claim about cluster size. Debounced inside `refreshNow`; only reached on a
-        // path that would otherwise already be returning an error.
+        // briefly down starts out knowing only itself. Re-seed and re-check before rejecting.
         if (try? PlacementService.ensureErasureCodingAdmission(
             activeNodeCount: active.count, dataShards: ecConfig.dataShards,
             parityShards: ecConfig.parityShards)) == nil
         {
             await ClusterMembershipLifecycle.shared.refreshNow(app: app)
-            active = await ClusterNodeCache.shared.activeNodes()
+            active = await ClusterNodeCache.shared.placementNodes()
         }
 
         do {
@@ -329,7 +329,8 @@ enum ObjectRoutingService {
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
             return (true, [], [])
         }
-        var active = await ClusterNodeCache.shared.activeNodes()
+        // Read placement must match write placement exactly, so it uses the same registered set.
+        var active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return (true, [], []) }
 
         let count: Int
@@ -342,7 +343,7 @@ enum ObjectRoutingService {
             // when the view is already too small to be right.
             if active.count < ecConfig.totalShards {
                 await ClusterMembershipLifecycle.shared.refreshNow(app: req.application)
-                active = await ClusterNodeCache.shared.activeNodes()
+                active = await ClusterNodeCache.shared.placementNodes()
             }
         } else {
             count = PlacementService.replicationFactor

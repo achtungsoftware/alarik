@@ -412,7 +412,8 @@ struct InternalClusterController: RouteCollection {
         let (objects, _, _, _) = try await ClusterListingService.listObjects(
             req: req, bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 1000,
             marker: nil)
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Reports where objects actually live, so it must use the same set placement does.
+        let active = await ClusterNodeCache.shared.placementNodes()
 
         func entry(for object: ObjectMeta) -> PlacementEntryDTO {
             let responsible = PlacementService.responsibleNodes(

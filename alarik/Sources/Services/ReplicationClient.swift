@@ -132,21 +132,21 @@ enum ReplicationClient {
         guard let clusterConfig = app.storage[ClusterConfigurationKey.self],
             let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
         else { return nil }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Same ownership set the write used, so ranks here match the shards on disk.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return nil }
 
         let responsible = PlacementService.responsibleNodes(
             bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
-        guard let selfRank = responsible.firstIndex(where: { $0.id == clusterConfig.nodeId })
-        else { return nil }
+        guard responsible.contains(where: { $0.id == clusterConfig.nodeId }) else { return nil }
 
-        let shardPath =
-            versionId != nil
-            ? ErasureCodedObjectHandler.versionedShardPath(
-                bucketName: bucketName, key: key, versionId: versionId!, shardIndex: selfRank)
-            : ErasureCodedObjectHandler.shardPath(
-                bucketName: bucketName, key: key, shardIndex: selfRank)
-        guard FileManager.default.fileExists(atPath: shardPath) else { return nil }
+        // Index-agnostic: this node may hold a shard whose index differs from its rank, and
+        // reading rank-as-index here would make it decline to replicate an object it does hold -
+        // silently leaving that object unreplicated to the remote target.
+        guard
+            ErasureCodedObjectHandler.holdsAnyLocalShard(
+                bucketName: bucketName, key: key, versionId: versionId)
+        else { return nil }
 
         return (responsible, clusterConfig.nodeId)
     }

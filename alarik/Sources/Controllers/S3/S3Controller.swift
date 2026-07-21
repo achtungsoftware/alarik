@@ -1115,9 +1115,9 @@ struct S3Controller: RouteCollection {
     ) async throws -> ObjectMeta {
         if let placement = await ErasureCodedDeleteCoordinator.ecPlacement(
             app: req.application, bucketName: bucketName, key: key),
-            let selfRank = placement.responsible.firstIndex(where: { $0.id == placement.selfNodeId }),
-            ErasureCodedDeleteCoordinator.localShardExists(
-                bucketName: bucketName, key: key, versionId: versionId, selfRank: selfRank)
+            placement.responsible.contains(where: { $0.id == placement.selfNodeId }),
+            ErasureCodedObjectHandler.holdsAnyLocalShard(
+                bucketName: bucketName, key: key, versionId: versionId)
         {
             return try await ErasureCodedWriteCoordinator.rewriteMetadata(
                 app: req.application, bucketName: bucketName, key: key, versionId: versionId,

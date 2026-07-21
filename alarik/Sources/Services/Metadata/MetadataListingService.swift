@@ -85,11 +85,14 @@ enum MetadataListingService {
             // finished migrating off it yet. Excluding it here would make those records vanish
             // from every other node's listing until the drain finishes.
             let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
+            let liveIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
             if !peers.isEmpty {
                 await withTaskGroup(of: (entries: [EnvelopeEntry], ok: Bool).self) { group in
                     for node in peers {
+                        let retryable = liveIds.contains(node.id)
                         group.addTask {
-                            await fetchRemote(app: app, node: node, collection: collection)
+                            await fetchRemote(
+                                app: app, node: node, collection: collection, retryable: retryable)
                         }
                     }
                     for await outcome in group {
@@ -243,14 +246,19 @@ enum MetadataListingService {
     static let listingCompleteHeader = "x-alarik-listing-complete"
 
     private static func fetchRemote(
-        app: Application, node: ClusterNodeInfo, collection: String
+        app: Application, node: ClusterNodeInfo, collection: String, retryable: Bool
     ) async -> (entries: [EnvelopeEntry], ok: Bool) {
         if let outcome = await fetchRemoteOnce(app: app, node: node, collection: collection) {
             return outcome
         }
-        try? await Task.sleep(for: retryDelay)
-        if let outcome = await fetchRemoteOnce(app: app, node: node, collection: collection) {
-            return outcome
+        // The retry is for a peer that's transiently busy - usually one still finishing its own
+        // boot. A peer already known to be missing heartbeats gets one attempt only: retrying it
+        // costs another full timeout on every listing, and listings sit on common paths.
+        if retryable {
+            try? await Task.sleep(for: retryDelay)
+            if let outcome = await fetchRemoteOnce(app: app, node: node, collection: collection) {
+                return outcome
+            }
         }
         // Never silent: everything this peer holds exclusively is now missing from the merged
         // result, and callers can't tell a partial listing from a complete one.

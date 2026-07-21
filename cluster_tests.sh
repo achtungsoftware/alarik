@@ -2009,6 +2009,194 @@ else
     pass "DeleteBucket refuses to proceed when it cannot verify every active peer is empty."
 fi
 
+# ══ Control plane (metadata) ═════════════════════════════════════════════════
+# Everything above exercises object data. These exercise Alarik's own metadata - users, access
+# keys, buckets, policies - which is stored differently (whole copies, not stripes) and is what
+# every request depends on before it can touch an object at all.
+
+# The DeleteBucket fail-closed test above deliberately leaves node 3 down, so bring the cluster
+# back to full strength before starting - these tests control node availability themselves.
+restart_node 3 >/dev/null 2>&1
+wait_for_full_membership
+
+# ── Test: a new access key works on every node immediately ────────────────────
+echo ""
+echo "=== Test: an access key created on one node authenticates on every node ==="
+PROP_AK="AKIAPROPAGATION00001"
+PROP_SK="propagationSecret0123456789abcdefGHIJ"
+PROP_CREATE=$(curl -s -X POST "${ENDPOINTS[1]}/api/v1/users/accessKeys" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"accessKey\":\"$PROP_AK\",\"secretKey\":\"$PROP_SK\"}")
+if [ -z "$(echo "$PROP_CREATE" | jq -r '.id // empty')" ]; then
+    fail "Could not create an access key through node 1: $PROP_CREATE"
+else
+    sleep 3
+    PROP_OK=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if ! AWS_ACCESS_KEY_ID="$PROP_AK" AWS_SECRET_ACCESS_KEY="$PROP_SK" \
+            aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls >/dev/null 2>&1; then
+            PROP_OK=0
+            echo "  node $i does not accept the new access key"
+        fi
+    done
+    [ "$PROP_OK" -eq 1 ] \
+        && pass "An access key created through one node authenticates on every node." \
+        || fail "An access key created on one node is not usable on every node."
+fi
+
+# ── Test: a user created on one node can log in on every node ─────────────────
+# Covers the users collection AND its username->id pointer, which is a separate record that has
+# to land and be readable cluster-wide for a login to resolve at all.
+echo ""
+echo "=== Test: a user created on one node can log in on every node ==="
+NEWUSER="clusteruser$RANDOM"
+USER_BODY=$(mktemp)
+USER_CREATE=$(curl -s -o "$USER_BODY" -w "%{http_code}" -X POST "${ENDPOINTS[2]}/api/v1/admin/users" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"name\":\"Cluster User\",\"username\":\"$NEWUSER\",\"password\":\"ClusterPass123!\",\"isAdmin\":false}")
+if [ "$USER_CREATE" != "200" ] && [ "$USER_CREATE" != "201" ]; then
+    fail "Could not create a user through node 2 (HTTP $USER_CREATE): $(head -c 300 "$USER_BODY")"
+else
+    sleep 3
+    LOGIN_OK=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        TOK=$(curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/login" -H "Content-Type: application/json" \
+            -d "{\"username\":\"$NEWUSER\",\"password\":\"ClusterPass123!\"}" | jq -r '.token // empty')
+        if [ -z "$TOK" ]; then
+            LOGIN_OK=0
+            echo "  node $i could not log the new user in"
+        fi
+    done
+    [ "$LOGIN_OK" -eq 1 ] \
+        && pass "A user created through one node can log in through every node." \
+        || fail "A user created on one node cannot log in on every node."
+fi
+
+# ── Test: creating a bucket while a peer is down really creates it ────────────
+# A create that reports success while writing nothing is worse than a failed create: the client
+# believes the bucket exists. This is exactly what a "could not verify absence" claim-check
+# regression produces, and it only shows up while a peer is unreachable.
+echo ""
+echo "=== Test: a bucket created while a peer is down is really created ==="
+DOWN_CREATE_BUCKET="cluster-create-peer-down"
+kill_node 3
+sleep 2
+CREATE_CODE=$(aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$DOWN_CREATE_BUCKET" >/dev/null 2>&1; echo $?)
+if [ "$CREATE_CODE" != "0" ]; then
+    fail "CreateBucket failed while one peer was down (exit $CREATE_CODE) - it should still succeed."
+else
+    CREATE_VISIBLE=1
+    for i in 0 1 2; do
+        aws --endpoint-url "${ENDPOINTS[$i]}" s3api head-bucket --bucket "$DOWN_CREATE_BUCKET" >/dev/null 2>&1 \
+            || { CREATE_VISIBLE=0; echo "  node $i does not see the bucket"; }
+    done
+    # The real trap: CreateBucket reporting success without persisting anything. The admin
+    # placement endpoint reads the bucket record straight from the store, so it can't be fooled
+    # by a cache entry the create left behind.
+    PLACEMENT_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        "${ENDPOINTS[0]}/api/v1/admin/cluster/placement?bucket=$DOWN_CREATE_BUCKET" \
+        -H "Authorization: Bearer $TOKEN")
+    [ "$PLACEMENT_CODE" == "200" ] || { CREATE_VISIBLE=0; echo "  bucket record not durably stored (placement HTTP $PLACEMENT_CODE)"; }
+    [ "$CREATE_VISIBLE" -eq 1 ] \
+        && pass "A bucket created while a peer was down is durably stored and visible cluster-wide." \
+        || fail "CreateBucket reported success while a peer was down but the bucket is not really there."
+fi
+restart_node 3 >/dev/null
+wait_for_full_membership
+
+# ── Test: the control plane keeps working with a responsible node down ────────
+# Metadata is stored as whole copies, so any single surviving holder can answer. With one node
+# down every control-plane read must still work from every remaining node.
+echo ""
+echo "=== Test: control plane stays readable with a node down ==="
+kill_node 2
+sleep 3
+CP_OK=1
+for i in 0 1 3; do
+    curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/login" -H "Content-Type: application/json" \
+        -d '{"username":"alarik","password":"alarik"}' | jq -e '.token' >/dev/null 2>&1 \
+        || { CP_OK=0; echo "  node $i cannot log in with a peer down"; }
+    aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls >/dev/null 2>&1 \
+        || { CP_OK=0; echo "  node $i cannot authenticate S3 with a peer down"; }
+done
+[ "$CP_OK" -eq 1 ] \
+    && pass "Login and S3 authentication keep working on every remaining node with a peer down." \
+    || fail "The control plane became unreadable on some node while a peer was down."
+restart_node 2 >/dev/null
+wait_for_full_membership
+
+# ── Test: ownership does not move when a node goes unreachable ────────────────
+# The core placement invariant: a key's nodes are fixed by hashing over registered nodes, so an
+# unreachable node keeps its keys instead of handing them to someone else (and taking them back
+# on recovery). Deliberately waits past the heartbeat-staleness window, since that is precisely
+# when liveness-derived placement would silently reassign.
+echo ""
+echo "=== Test: key ownership is unchanged while a node is unreachable ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-ownership-test >/dev/null 2>&1
+echo "ownership" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - s3://cluster-ownership-test/own.txt >/dev/null 2>&1
+sleep 2
+OWNERS_BEFORE=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+if [ -z "$OWNERS_BEFORE" ]; then
+    fail "Could not read the ownership set for the placement-stability test."
+else
+    kill_node 3
+    # Past ClusterNodeCache.heartbeatStaleness (60s) - the point where a liveness-derived
+    # placement would drop the dead node and reassign its keys.
+    echo "  waiting out the heartbeat-staleness window (~65s)..."
+    sleep 65
+    OWNERS_AFTER=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+    if [ "$OWNERS_BEFORE" == "$OWNERS_AFTER" ]; then
+        pass "A key's ownership set is identical before and after a node became unreachable."
+    else
+        fail "Ownership moved when a node went unreachable (before: $OWNERS_BEFORE / after: $OWNERS_AFTER)."
+    fi
+    restart_node 3 >/dev/null
+    wait_for_full_membership
+fi
+
+# ── Test: concurrent creation of the same bucket name yields one bucket ───────
+echo ""
+echo "=== Test: the same bucket name created from two nodes at once stays unique ==="
+RACE_BUCKET="cluster-race-bucket"
+# Waited on by PID, never a bare `wait`: the node servers are themselves background jobs of
+# this script, so a bare `wait` blocks until the whole cluster exits.
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$RACE_BUCKET" >/dev/null 2>&1 &
+RACE_PID_A=$!
+aws --endpoint-url "${ENDPOINTS[1]}" s3api create-bucket --bucket "$RACE_BUCKET" >/dev/null 2>&1 &
+RACE_PID_B=$!
+wait "$RACE_PID_A" 2>/dev/null
+wait "$RACE_PID_B" 2>/dev/null
+sleep 3
+RACE_UNIQUE=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    COUNT=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-buckets \
+        | jq -r --arg b "$RACE_BUCKET" '[.Buckets[] | select(.Name == $b)] | length')
+    [ "$COUNT" == "1" ] || { RACE_UNIQUE=0; echo "  node $i lists the bucket $COUNT times"; }
+done
+[ "$RACE_UNIQUE" -eq 1 ] \
+    && pass "Two nodes creating the same bucket name concurrently leave exactly one bucket." \
+    || fail "Concurrent creation of the same bucket name did not leave exactly one bucket."
+
+# ── Test: a bucket policy set on one node applies on every node ───────────────
+# Anonymous public-read has to work through whichever node the client happens to reach, which
+# means the policy record itself must be readable cluster-wide - not just cached where it was set.
+echo ""
+echo "=== Test: a bucket policy set on one node is enforced by every node ==="
+POLICY_BUCKET="cluster-policy-propagation"
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$POLICY_BUCKET" >/dev/null 2>&1
+echo "public payload" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://$POLICY_BUCKET/public.txt" >/dev/null 2>&1
+POLICY_JSON=$(printf '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' "$POLICY_BUCKET")
+aws --endpoint-url "${ENDPOINTS[2]}" s3api put-bucket-policy --bucket "$POLICY_BUCKET" --policy "$POLICY_JSON" >/dev/null 2>&1
+sleep 3
+POLICY_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    BODY=$(curl -s "${ENDPOINTS[$i]}/$POLICY_BUCKET/public.txt")
+    [ "$BODY" == "public payload" ] || { POLICY_OK=0; echo "  node $i did not serve the object anonymously"; }
+done
+[ "$POLICY_OK" -eq 1 ] \
+    && pass "A public-read policy set through one node is enforced by every node for anonymous reads." \
+    || fail "A bucket policy set on one node is not applied on every node."
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: $PASS_COUNT passed, $FAIL_COUNT failed ==="

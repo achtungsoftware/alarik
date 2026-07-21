@@ -142,8 +142,16 @@ enum MetadataStore {
             try await executeLocalPut(app: app, key: key, value: value, routing: routing)
         } else {
             do {
-                try await forwardPut(
-                    app: app, node: routing.primary, collection: collection, id: id, value: value)
+                try await withCoordinator(
+                    app: app, routing: routing, collection: collection, id: id,
+                    local: {
+                        try await executeLocalPut(
+                            app: app, key: key, value: value, routing: routing)
+                    },
+                    forward: { node in
+                        try await forwardPut(
+                            app: app, node: node, collection: collection, id: id, value: value)
+                    })
             } catch {
                 // Rank-0 pinning exists to serialize writes, but a plain put/tombstone is safe
                 // under last-writer-wins even with two coordinators (`MetadataEnvelope.supersedes`
@@ -176,12 +184,16 @@ enum MetadataStore {
         let envelope = MetadataEnvelope.live(
             payload: value, schemaVersion: MetadataMigrations.currentVersion(for: collection))
         let wrapped = try envelope.encoded()
-        guard routing.isLocalCoordinator else {
-            return try await forwardPutIfAbsent(
-                app: app, node: routing.primary, collection: collection, id: id, value: wrapped)
-        }
-        return try await executeLocalPutIfAbsent(
-            app: app, collection: collection, id: id, value: wrapped)
+        return try await withCoordinator(
+            app: app, routing: routing, collection: collection, id: id,
+            local: {
+                try await executeLocalPutIfAbsent(
+                    app: app, collection: collection, id: id, value: wrapped)
+            },
+            forward: { node in
+                try await forwardPutIfAbsent(
+                    app: app, node: node, collection: collection, id: id, value: wrapped)
+            })
     }
 
     /// Marks the record deleted. For most collections this *writes a tombstone* rather than
@@ -217,7 +229,7 @@ enum MetadataStore {
             try await executeLocalDelete(app: app, key: key, routing: routing)
         } else {
             try await forwardDelete(
-                app: app, node: routing.primary, collection: collection, id: id)
+                app: app, node: routing.coordinator, collection: collection, id: id)
         }
     }
 
@@ -235,14 +247,13 @@ enum MetadataStore {
     ) async throws -> Data? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        let stored: Data?
-        if routing.isLocalCoordinator {
-            stored = try await executeLocalConsumeIfPresent(
-                app: app, collection: collection, id: id)
-        } else {
-            stored = try await forwardConsumeIfPresent(
-                app: app, node: routing.primary, collection: collection, id: id)
-        }
+        let stored: Data? = try await withCoordinator(
+            app: app, routing: routing, collection: collection, id: id,
+            local: { try await executeLocalConsumeIfPresent(app: app, collection: collection, id: id) },
+            forward: { node in
+                try await forwardConsumeIfPresent(
+                    app: app, node: node, collection: collection, id: id)
+            })
         guard let stored else { return nil }
         let envelope = MetadataEnvelope.decode(stored)
         guard !envelope.isTombstone, let payload = envelope.payload else { return nil }
@@ -267,13 +278,33 @@ enum MetadataStore {
             return responsible.filter { $0.id != selfNodeId }
         }
 
+        /// Where the record lives - fixed by placement, unaffected by who is up.
         var primary: ClusterNodeInfo? { responsible.first }
 
-        /// True when this node should coordinate the write itself - either it IS rank-0, or
-        /// there's no meaningful "rank-0" to speak of (nothing responsible, nowhere else to go).
+        /// Reachable owners, in placement order. Empty when liveness is unknown.
+        var reachableResponsible: [ClusterNodeInfo] = []
+
+        /// Who serializes writes for this key: the first *reachable* owner.
+        ///
+        /// Placement is deliberately stable, so a dead node keeps owning its keys - but it must
+        /// not keep *coordinating* them, or every create hashing to it fails until an operator
+        /// intervenes. Every node ranks owners identically and picks the first reachable one, so
+        /// they agree on the coordinator without talking to each other.
+        var coordinator: ClusterNodeInfo? { reachableResponsible.first ?? primary }
+
+        /// True when this node should coordinate the write itself.
         var isLocalCoordinator: Bool {
-            guard let selfNodeId, let primary else { return true }
-            return primary.id == selfNodeId
+            guard let selfNodeId, let coordinator else { return true }
+            return coordinator.id == selfNodeId
+        }
+
+        /// Coordinators to try, in placement order: apparently-reachable owners first, the rest
+        /// as a last resort. Liveness is only a hint - `activeNodes` tolerates a stale heartbeat
+        /// for a minute, so a just-killed node still looks fine here. Callers therefore walk this
+        /// list and advance only when a forward actually fails, rather than trusting the guess.
+        var coordinatorCandidates: [ClusterNodeInfo] {
+            let reachableIds = Set(reachableResponsible.map(\.id))
+            return reachableResponsible + responsible.filter { !reachableIds.contains($0.id) }
         }
 
         /// Routing for the rank-0-unreachable failover: this node takes over shard 0 (written
@@ -356,7 +387,9 @@ enum MetadataStore {
             }
         }
 
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Registered nodes, not live ones: a record must stay where it was written even
+        // while a replica is down. See `ClusterNodeCache.placementNodes`.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else {
             let (dataShards, parityShards) =
                 isClusterNode ? (1, 0) : metadataConfig.effective(activeNodeCount: 1)
@@ -369,9 +402,46 @@ enum MetadataStore {
         let responsible = PlacementService.responsibleNodes(
             bucketName: MetadataNamespace.bucketName, key: key, activeNodes: active,
             count: dataShards + parityShards)
+        let liveIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
         return Routing(
             responsible: responsible, selfNodeId: config.nodeId, dataShards: dataShards,
-            parityShards: parityShards)
+            parityShards: parityShards,
+            reachableResponsible: responsible.filter {
+                liveIds.contains($0.id) || $0.id == config.nodeId
+            })
+    }
+
+    /// Runs an operation on the key's coordinator, falling forward through the remaining owners
+    /// when one can't be reached.
+    ///
+    /// Placement is stable, so a dead node keeps owning its keys - it must not also keep
+    /// coordinating them, or every create hashing to it fails until an operator intervenes. Every
+    /// node walks the same order and only advances on an observed failure, so they keep agreeing
+    /// on one coordinator per key.
+    private static func withCoordinator<T>(
+        app: Application, routing: Routing, collection: String, id: String,
+        local: () async throws -> T,
+        forward: (ClusterNodeInfo) async throws -> T
+    ) async throws -> T {
+        var lastError: (any Error)?
+        for candidate in routing.coordinatorCandidates {
+            if candidate.id == routing.selfNodeId { return try await local() }
+            do {
+                return try await forward(candidate)
+            } catch {
+                lastError = error
+                app.logger.warning(
+                    "Coordinator \(candidate.id) unreachable for '\(collection)/\(id)' - trying the next owner: \(error)"
+                )
+            }
+        }
+        // No owner could be reached. Coordinating here beats failing outright: the alternative is
+        // that one unreachable node blocks writes to its keys indefinitely.
+        guard routing.selfNodeId != nil else {
+            throw lastError
+                ?? MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
+        }
+        return try await local()
     }
 
     // MARK: - Local execution (assumes THIS node is already the confirmed coordinator)
@@ -647,7 +717,11 @@ enum MetadataStore {
         return try await S3Service.offloadBlockingIO(app) {
             var collected = Data()
             do {
-                try StripeDecoder.decode(shardPaths: [0: path], range: nil) { chunk in
+                // Keyed by the shard's TRUE index. This node may hold a parity copy rather than
+                // index 0, and with k=1 a parity shard is a transform of the data, not a byte
+                // copy of it - handing it over as index 0 decodes to garbage.
+                try StripeDecoder.decode(shardPaths: [header.shardIndex: path], range: nil) {
+                    chunk in
                     collected.append(chunk)
                 }
             } catch {

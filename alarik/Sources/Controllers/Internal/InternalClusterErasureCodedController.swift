@@ -423,8 +423,14 @@ struct InternalClusterErasureCodedController: RouteCollection {
     /// in-place metadata push (tagging, admin metadata edit).
     @Sendable
     func handleMetadataPatch(req: Request) async throws -> HTTPStatus {
-        let (path, _, _) = try shardPath(req: req)
-        guard FileManager.default.fileExists(atPath: path) else {
+        let (bucketName, key, versionId) = try bucketKey(req: req)
+
+        // Every shard this node holds gets patched, and the caller's `shardIndex` is ignored:
+        // the caller cannot know which index this node actually holds, and guessing it from rank
+        // is wrong whenever placement has drifted.
+        let indices = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: versionId)
+        guard !indices.isEmpty else {
             throw Abort(.notFound, reason: "Shard not found")
         }
 
@@ -434,8 +440,12 @@ struct InternalClusterErasureCodedController: RouteCollection {
             throw Abort(.badRequest, reason: "Invalid ObjectMeta body")
         }
 
-        _ = try await req.application.threadPool.runIfActive {
-            try ErasureCodedObjectHandler.rewriteShardMetadata(at: path) { $0 = newMeta }
+        try await req.application.threadPool.runIfActive {
+            for index in indices {
+                let path = ErasureCodedObjectHandler.shardPath(
+                    bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
+                _ = try ErasureCodedObjectHandler.rewriteShardMetadata(at: path) { $0 = newMeta }
+            }
         }
         return .ok
     }

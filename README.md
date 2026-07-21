@@ -107,7 +107,7 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Any node serves any request | An entry node forwards to a responsible node transparently - no client-visible routing logic |
 | Quorum writes | A write acks once a quorum of shards land durably, with async catch-up for stragglers |
 | Read-repair & bit-rot scrubbing | Missing or silently-corrupted shards are rebuilt from survivors automatically - on read, and on a periodic background scrub |
-| Automatic rebalancing & reconstruction | Node join/drain/loss redistributes shards and reconstructs any that were lost, including historical versions and delete markers |
+| Stable ownership & automatic rebalancing | A key's nodes are fixed by hashing, so a node going down never reshuffles data - it keeps its keys, and queued writes replay when it returns. Joining or draining a node redistributes shards and reconstructs any that were lost, including historical versions and delete markers |
 | Ranged reads | `Range` requests on erasure-coded objects reconstruct only the stripes they cover (`206 Partial Content`) |
 | Cluster-aware listing | `ListObjects`, `ListObjectVersions`, `ListMultipartUploads`, and `DeleteBucket` safety checks work correctly across every node |
 | Admin console | Live node health, `k`/`m` and shard-repair status, storage distribution, and an object placement browser under Admin → Cluster |

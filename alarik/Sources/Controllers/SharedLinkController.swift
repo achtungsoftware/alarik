@@ -52,9 +52,9 @@ struct SharedLinkController: RouteCollection {
             // `.obj` path unchanged when the target isn't erasure-coded.
             if let config = req.application.storage[ClusterConfigurationKey.self],
                 req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
-                let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId }),
-                ErasureCodedDeleteCoordinator.localShardExists(
-                    bucketName: link.bucketName, key: link.key, versionId: nil, selfRank: selfRank)
+                responsible.contains(where: { $0.id == config.nodeId }),
+                ErasureCodedObjectHandler.holdsAnyLocalShard(
+                    bucketName: link.bucketName, key: link.key, versionId: nil)
             {
                 let (meta, body) = try await ErasureCodedReadCoordinator.read(
                     app: req.application, bucketName: link.bucketName, key: link.key,

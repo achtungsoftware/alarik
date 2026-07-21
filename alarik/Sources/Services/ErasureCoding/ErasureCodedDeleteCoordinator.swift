@@ -31,7 +31,8 @@ enum ErasureCodedDeleteCoordinator {
         guard let config = app.storage[ClusterConfigurationKey.self],
             let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
         else { return nil }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Same ownership set the write used, so a delete reaches every replica.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return nil }
         let responsible = PlacementService.responsibleNodes(
             bucketName: bucketName, key: key, activeNodes: active, count: ecConfig.totalShards)
@@ -39,13 +40,12 @@ enum ErasureCodedDeleteCoordinator {
         return (config.nodeId, responsible, ecConfig)
     }
 
-    static func localShardExists(
-        bucketName: String, key: String, versionId: String?, selfRank: Int
-    ) -> Bool {
-        FileManager.default.fileExists(
-            atPath: ErasureCodedObjectHandler.shardPath(
-                bucketName: bucketName, key: key, versionId: versionId, shardIndex: selfRank))
-    }
+    // Deliberately absent: a "does my rank's shard file exist" check.
+    //
+    // A node's rank in the current responsible list is not the shard index it holds - placement
+    // drift and coordinator failover both break that assumption - so such a check reports a real
+    // holder as a non-holder and the request 404s. Use
+    // `ErasureCodedObjectHandler.holdsAnyLocalShard`.
 
     /// Whether (bucketName, key, versionId) is erasure-coded anywhere in `responsible` - this node
     /// holds a shard (index-agnostic, so a drifted-index shard still counts), or a peer does.

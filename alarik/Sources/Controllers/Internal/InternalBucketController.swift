@@ -463,10 +463,10 @@ struct InternalBucketController: RouteCollection {
         let (isLocal, _, responsible) = await ObjectRoutingService.erasureCodedReadPlacement(
             req: req, bucketName: input.bucket, key: input.key)
         if !existsLocally, isLocal, let config = req.application.storage[ClusterConfigurationKey.self],
-            let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId })
+            responsible.contains(where: { $0.id == config.nodeId })
         {
-            existsLocally = ErasureCodedDeleteCoordinator.localShardExists(
-                bucketName: input.bucket, key: input.key, versionId: nil, selfRank: selfRank)
+            existsLocally = ErasureCodedObjectHandler.holdsAnyLocalShard(
+                bucketName: input.bucket, key: input.key, versionId: nil)
         }
         if !existsLocally {
             var existsRemotely = false
@@ -821,9 +821,9 @@ struct InternalBucketController: RouteCollection {
             // `.obj` path unchanged when the target isn't erasure-coded.
             if let config = req.application.storage[ClusterConfigurationKey.self],
                 req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
-                let selfRank = responsible.firstIndex(where: { $0.id == config.nodeId }),
-                ErasureCodedDeleteCoordinator.localShardExists(
-                    bucketName: bucketName, key: key, versionId: versionId, selfRank: selfRank)
+                responsible.contains(where: { $0.id == config.nodeId }),
+                ErasureCodedObjectHandler.holdsAnyLocalShard(
+                    bucketName: bucketName, key: key, versionId: versionId)
             {
                 let (meta, body) = try await ErasureCodedReadCoordinator.read(
                     app: req.application, bucketName: bucketName, key: key,

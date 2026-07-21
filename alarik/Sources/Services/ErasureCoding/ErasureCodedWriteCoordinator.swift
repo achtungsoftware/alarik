@@ -247,25 +247,35 @@ enum ErasureCodedWriteCoordinator {
         responsible: [ClusterNodeInfo], selfNodeId: UUID,
         transform: @escaping @Sendable (inout ObjectMeta) -> Void
     ) async throws -> ObjectMeta {
-        guard let selfRank = responsible.firstIndex(where: { $0.id == selfNodeId }) else {
+        // Whatever indices this node actually holds - not the one its rank implies, which is a
+        // different thing entirely once placement has drifted.
+        let localIndices = ErasureCodedObjectHandler.locallyHeldShardIndices(
+            bucketName: bucketName, key: key, versionId: versionId)
+        guard let firstIndex = localIndices.first else {
             throw ErasureCodedRebalanceError.insufficientResponsibleNodes(
                 required: 1, found: 0)
         }
-        let localPath = ErasureCodedObjectHandler.shardPath(
-            bucketName: bucketName, key: key, versionId: versionId, shardIndex: selfRank)
 
         let updatedHeader = try await S3Service.offloadBlockingIO(app) {
-            try ErasureCodedObjectHandler.rewriteShardMetadata(at: localPath, transform: transform)
+            var header: ErasureCodedShardHeader?
+            for index in localIndices {
+                let path = ErasureCodedObjectHandler.shardPath(
+                    bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
+                let rewritten = try ErasureCodedObjectHandler.rewriteShardMetadata(
+                    at: path, transform: transform)
+                if index == firstIndex { header = rewritten }
+            }
+            return header!
         }
         let updatedMeta = updatedHeader.objectMeta
 
-        let peers = responsible.enumerated().filter { $0.offset != selfRank }
+        // The index sent is a hint only; each peer patches whatever it holds.
         await withTaskGroup(of: Void.self) { group in
-            for (rank, peer) in peers {
+            for peer in responsible where peer.id != selfNodeId {
                 group.addTask {
                     try? await ClusterReplicationClient.patchShardMetadata(
                         app: app, to: peer, bucketName: bucketName, key: key, versionId: versionId,
-                        shardIndex: rank, meta: updatedMeta)
+                        shardIndex: 0, meta: updatedMeta)
                 }
             }
         }

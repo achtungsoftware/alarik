@@ -63,6 +63,39 @@ struct ClusterNodeCacheTests {
         #expect(all.first?.id == freshId)
     }
 
+    @Test("placementNodes keeps a node with a stale heartbeat - ownership must not follow liveness")
+    func placementNodesIgnoresStaleHeartbeat() async {
+        let cache = ClusterNodeCache()
+        let live = UUID()
+        let stale = UUID()
+        await cache.upsert(
+            ClusterNodeInfo(
+                id: live, address: "http://live:8080", status: .active, lastHeartbeatAt: Date()))
+        await cache.upsert(
+            ClusterNodeInfo(
+                id: stale, address: "http://stale:8080", status: .active,
+                lastHeartbeatAt: Date().addingTimeInterval(-3600)))
+
+        // A node being briefly unreachable must not hand its keys to someone else, or records
+        // stop being where the current placement says they are.
+        let placement = await cache.placementNodes().map(\.id)
+        #expect(placement.count == 2)
+        #expect(placement.contains(stale))
+
+        // Liveness still reports it as down.
+        #expect(await cache.activeNodes().map(\.id) == [live])
+    }
+
+    @Test("placementNodes excludes a drained node - the one way ownership does change")
+    func placementNodesExcludesDrained() async {
+        let cache = ClusterNodeCache()
+        let drained = UUID()
+        await cache.upsert(
+            ClusterNodeInfo(
+                id: drained, address: "http://d:8080", status: .draining, lastHeartbeatAt: Date()))
+        #expect(await cache.placementNodes().isEmpty)
+    }
+
     @Test("activeNodes excludes draining/removed status")
     func activeNodesExcludesNonActiveStatus() async {
         let cache = ClusterNodeCache()

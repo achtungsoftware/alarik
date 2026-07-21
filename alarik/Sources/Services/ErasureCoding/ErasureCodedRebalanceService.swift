@@ -103,7 +103,9 @@ enum ErasureCodedRebalanceService {
         {
             return
         }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Placement set, not the live one: reconstructing must target the same nodes the
+        // write did, or a shard lands somewhere no reader will look for it.
+        let active = await ClusterNodeCache.shared.placementNodes()
         let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id
 
         // A metadata shard this node already holds is pushed verbatim. The reconstruction
@@ -324,7 +326,10 @@ enum ErasureCodedRebalanceService {
         guard let config = app.storage[ClusterConfigurationKey.self],
             let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
         else { return }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        // Responsibility (and therefore reclaim) must be judged against registered nodes.
+        // Against the live set, a peer being briefly down would reassign its keys here and this
+        // walk would start moving - and reclaiming - shards that were never misplaced.
+        let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return }
 
         let localShards = try await S3Service.offloadBlockingIO(app) {

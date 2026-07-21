@@ -128,10 +128,23 @@ enum ErasureCodedShardGatherer {
         let allHeldIndices = reportedIndices
         if let excludingIndex { reportedIndices.remove(excludingIndex) }
 
-        // Nothing anywhere and everyone answered -> the object genuinely doesn't exist here.
+        // Nobody reported holding anything. Whether that proves absence depends on how many
+        // owners answered: a write only returns success once `quorum` of them have it, so a
+        // reader that heard "nothing here" from more than `total - quorum` owners has necessarily
+        // asked at least one node any successful write would have touched. Below that threshold
+        // absence is unproven and this is a degraded read, not a 404.
+        //
+        // Requiring *every* owner to answer instead would mean no record could ever be proven
+        // absent while any owner is down - and since absence is what `putIfAbsent` checks, that
+        // makes creating a user, bucket or access key fail for as long as one node is offline.
         if reportedIndices.isEmpty {
-            if anyUnreachable { throw ErasureCodedGatherError.degraded(found: 0, needed: needed) }
-            throw ErasureCodedGatherError.notFound
+            let reachableOwners = discovered.filter { $0.shards != nil }.count
+            let quorum = PlacementService.ecQuorumThreshold(
+                dataShards: needed, parityShards: Swift.max(0, responsible.count - needed))
+            if reachableOwners >= responsible.count - quorum + 1 {
+                throw ErasureCodedGatherError.notFound
+            }
+            throw ErasureCodedGatherError.degraded(found: 0, needed: needed)
         }
 
         // Newest generation wins. Copies of the same key can legitimately disagree: a

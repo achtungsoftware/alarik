@@ -456,7 +456,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
-            let response = try await app.http.client.shared.execute(
+            let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 256 * 1024)
@@ -485,7 +485,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
-            let response = try await app.http.client.shared.execute(
+            let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 64 * 1024)
@@ -517,7 +517,7 @@ enum ClusterReplicationClient {
         outbound.method = .POST
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
-        _ = try? await app.http.client.shared.execute(
+        _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: probeTimeout, logger: app.logger)
     }
 
@@ -536,7 +536,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
-            let response = try await app.http.client.shared.execute(
+            let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 64 * 1024)
@@ -563,7 +563,7 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
-            let response = try await app.http.client.shared.execute(
+            let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
@@ -588,7 +588,7 @@ enum ClusterReplicationClient {
         outbound.method = .POST
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
-        _ = try? await app.http.client.shared.execute(
+        _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: probeTimeout, logger: app.logger)
     }
 
