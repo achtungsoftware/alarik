@@ -70,7 +70,7 @@ final actor OIDCDiscoveryCache {
             return (entry.discovery, entry.keys)
         }
 
-        let trimmedIssuer = issuerURL.hasSuffix("/") ? String(issuerURL.dropLast()) : issuerURL
+        let trimmedIssuer = Self.canonicalIssuer(issuerURL)
         try Self.rejectMetadataHost(of: trimmedIssuer)
 
         let discoveryResponse = try await client.get(
@@ -84,10 +84,23 @@ final actor OIDCDiscoveryCache {
         // Per the OIDC Discovery spec, the issuer value the discovery document reports MUST
         // match the issuer URL it was fetched from - otherwise a token's `iss` claim is only
         // ever compared against a value the doc itself supplied, which proves nothing.
-        guard discoveryDoc.issuer == trimmedIssuer else {
+        //
+        // Compared in canonical form on BOTH sides. Providers differ on whether their issuer
+        // carries a trailing slash (Authentik's does, Google's doesn't), and an admin pastes it
+        // either way - but the slash is not what makes the check meaningful. What matters is
+        // that the document came from the host and path the admin configured, and a trailing
+        // slash changes neither. Comparing the raw document value against a one-slash-trimmed
+        // config value made a correctly-configured Authentik issuer impossible to match, since
+        // trimming was applied to only one side (issue #14).
+        guard Self.canonicalIssuer(discoveryDoc.issuer) == trimmedIssuer else {
             throw Abort(
                 .badGateway,
-                reason: "OIDC discovery document's issuer does not match the configured issuer URL."
+                reason: """
+                    OIDC discovery document's issuer does not match the configured issuer URL. \
+                    Configured: '\(issuerURL)', but \(trimmedIssuer)/.well-known/openid-configuration \
+                    reports issuer '\(discoveryDoc.issuer)'. Set the provider's issuer URL to \
+                    exactly the value the document reports.
+                    """
             )
         }
 
@@ -131,6 +144,21 @@ final actor OIDCDiscoveryCache {
     /// minor memory-hygiene cleanup.
     func invalidate(issuerURL: String) {
         entries.removeValue(forKey: issuerURL)
+    }
+
+    /// An issuer URL with every trailing slash removed - the form used both to build the
+    /// `.well-known` URL and to compare the configured issuer against the one the discovery
+    /// document reports.
+    ///
+    /// Strips *all* trailing slashes, not one: admins hitting issue #14 were told to work around
+    /// it by configuring a doubled slash (`.../alarik//`), and that config must keep working
+    /// after this fix rather than breaking a second time. It also stops the doubled slash from
+    /// producing a `.../alarik//.well-known/openid-configuration` request, which some providers
+    /// reject outright.
+    static func canonicalIssuer(_ issuerURL: String) -> String {
+        var canonical = issuerURL
+        while canonical.hasSuffix("/") { canonical.removeLast() }
+        return canonical
     }
 
     /// Best-effort SSRF defense-in-depth: blocks the cloud metadata service address
