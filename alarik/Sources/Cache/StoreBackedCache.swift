@@ -49,6 +49,21 @@ struct CacheMissLedger<Key: Hashable & Sendable>: Sendable {
     }
 }
 
+/// The three genuinely different outcomes of an authoritative lookup.
+///
+/// Collapsing `absent` and `unavailable` into `nil` is correct for authorization (both must
+/// deny), but wrong wherever the answer is reported to a client as a fact about the world:
+/// telling an S3 client a bucket does not exist, when the truth is "this node couldn't check",
+/// is indistinguishable to that client - or to a replication/sync tool - from the bucket having
+/// been deleted.
+enum StoreBackedResolution<Value: Sendable>: Sendable {
+    case found(Value)
+    /// Authoritatively determined not to exist.
+    case absent
+    /// Could not be determined right now (the store was unreadable).
+    case unavailable
+}
+
 /// A cache that is a *projection* of `MetadataStore`, never a source of truth.
 ///
 /// Conforming makes the correct behaviour the default: consult the cache, and only when it has no
@@ -79,9 +94,21 @@ protocol StoreBackedCache: Actor {
 extension StoreBackedCache {
     /// Cache first, then the authoritative store. The only lookup that may be used to tell a
     /// client something does not exist.
+    ///
+    /// Answers `nil` for both "does not exist" and "could not check" - the safe collapse for
+    /// authorization decisions, which must deny either way. Callers that report the outcome to a
+    /// client as a fact (existence checks especially) want `resolveDistinguishing` instead.
     func resolve(app: Application, key: Key) async -> Value? {
-        if let cached = cachedValue(for: key) { return cached }
-        if missLedger.confirmedMissing(key) { return nil }
+        switch await resolveDistinguishing(app: app, key: key) {
+        case .found(let value): return value
+        case .absent, .unavailable: return nil
+        }
+    }
+
+    /// `resolve`, keeping "authoritatively absent" and "couldn't determine" apart.
+    func resolveDistinguishing(app: Application, key: Key) async -> StoreBackedResolution<Value> {
+        if let cached = cachedValue(for: key) { return .found(cached) }
+        if missLedger.confirmedMissing(key) { return .absent }
 
         let loaded: Value?
         do {
@@ -90,15 +117,15 @@ extension StoreBackedCache {
             app.logger.warning(
                 "\(Self.self) could not consult the metadata store; answering 'unknown' rather than 'absent': \(error)"
             )
-            return nil
+            return .unavailable
         }
 
         guard let loaded else {
             missLedger.note(key)
-            return nil
+            return .absent
         }
         absorb(loaded, for: key)
         missLedger.clear(key)
-        return loaded
+        return .found(loaded)
     }
 }

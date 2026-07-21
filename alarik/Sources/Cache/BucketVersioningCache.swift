@@ -56,6 +56,21 @@ final actor BucketVersioningCache: StoreBackedCache {
         await resolve(app: app, key: bucket) ?? .disabled
     }
 
+    /// Whether `bucket` exists at all, keeping "no such bucket" apart from "couldn't check".
+    ///
+    /// Bucket existence is answered here because this cache is this node's projection of the
+    /// ENTIRE `buckets` collection: every bucket is present in it regardless of who owns the
+    /// bucket or whether any access key maps to it, and a miss falls through to the store.
+    ///
+    /// It must never be answered from `AccessKeyBucketMapCache`, which only knows buckets
+    /// reachable by some access key. A bucket whose owner has no access key - the normal state
+    /// for one created and managed entirely through the web console - is absent from that map
+    /// entirely, so existence checks reported `NoSuchBucket` and anonymous public-read was
+    /// impossible until the owner happened to create a key (issue #16).
+    func existence(app: Application, bucket: String) async -> StoreBackedResolution<VersioningStatus> {
+        await resolveDistinguishing(app: app, key: bucket)
+    }
+
     func loadFromStore(app: Application, key: String) async throws -> VersioningStatus? {
         guard let stored = try await Bucket.find(app: app, name: key) else { return nil }
         return VersioningStatus(rawValue: stored.versioningStatus) ?? .disabled

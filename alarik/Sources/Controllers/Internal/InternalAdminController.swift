@@ -75,6 +75,10 @@ struct InternalAdminController: RouteCollection {
         let creationDate: Date?
         let versioningStatus: String
         let user: User.ResponseDTO?
+        /// Raw bucket-policy JSON, or nil when unset - see `Bucket.ResponseDTO.policy`. The admin
+        /// bucket list badges each bucket public/private from this; without it every bucket reads
+        /// as private regardless of what its policy actually says.
+        let policy: String?
     }
 
     func boot(routes: any RoutesBuilder) throws {
@@ -226,7 +230,8 @@ struct InternalAdminController: RouteCollection {
             dto.append(
                 AdminBucketDTO(
                     id: bucket.id, name: bucket.name, creationDate: bucket.creationDate,
-                    versioningStatus: bucket.versioningStatus, user: user?.toResponseDTO()))
+                    versioningStatus: bucket.versioningStatus, user: user?.toResponseDTO(),
+                    policy: bucket.policy))
         }
         return Page(items: dto, metadata: page.metadata)
     }

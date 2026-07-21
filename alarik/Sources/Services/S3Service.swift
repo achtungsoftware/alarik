@@ -76,11 +76,26 @@ struct S3Service {
         return key.removingPercentEncoding ?? key
     }
 
-    static func verifyBucketExists(_ bucketName: String, requestId: String) async throws {
-        guard await AccessKeyBucketMapCache.shared.bucket(for: bucketName) != nil else {
+    /// Existence comes from the `buckets` projection (cache, then store), NOT from the
+    /// access-key→bucket map: that map only contains buckets some access key can reach, so a
+    /// bucket whose owner has never created an access key would read as nonexistent (issue #16).
+    /// A store that cannot be read answers 503, never 404 - a 404 tells an S3 client the bucket
+    /// was deleted, which is a different and far more destructive statement than "try again".
+    static func verifyBucketExists(_ bucketName: String, app: Application, requestId: String)
+        async throws
+    {
+        switch await BucketVersioningCache.shared.existence(app: app, bucket: bucketName) {
+        case .found:
+            return
+        case .absent:
             throw S3Error(
                 status: .notFound, code: "NoSuchBucket",
                 message: "The specified bucket does not exist.", requestId: requestId)
+        case .unavailable:
+            throw S3Error(
+                status: .serviceUnavailable, code: "ServiceUnavailable",
+                message: "The bucket's metadata could not be read right now - please retry.",
+                requestId: requestId)
         }
     }
 
@@ -811,16 +826,25 @@ struct S3Service {
     ) async throws -> S3AuthInfo {
         let authInfo: S3AuthInfo = try await SigV4Validator.authenticateRequest(for: req)
 
-        guard
-            await AccessKeyBucketMapCache.shared.canAccess(
-                app: req.application, accessKey: authInfo.accessKey, bucket: bucketName)
-        else {
-            // Reached only after ownership has also been checked against the store, so this is a
-            // real authorization failure rather than an artifact of a cold cache.
+        switch await AccessKeyBucketMapCache.shared.accessDecision(
+            app: req.application, accessKey: authInfo.accessKey, bucket: bucketName)
+        {
+        case .found(true):
+            return authInfo
+        case .found(false), .absent:
+            // Ownership was checked against the store and genuinely does not hold - a real
+            // authorization failure, not an artifact of a cold cache.
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
+        case .unavailable:
+            // The grant could not be determined at all (this node's metadata store was briefly
+            // unreadable - most often moments after a restart). Answering `AccessDenied` here
+            // tells the client its credentials are wrong, which is both false and final: S3
+            // clients do not retry a 403. A 503 says what is actually true and is retried.
+            throw S3Error(
+                status: .serviceUnavailable, code: "ServiceUnavailable",
+                message: "Could not verify access to this bucket right now - please retry.",
+                requestId: req.id)
         }
-
-        return authInfo
     }
 
     /// Authenticates the request if any credentials are present (header or query), exactly like
@@ -842,17 +866,25 @@ struct S3Service {
             return try await authenticateWithCache(req: req, bucketName: bucketName)
         }
 
+        // Both lookups go through the store-backed accessors, never the raw cache maps. A bucket
+        // this node hasn't cached yet is the normal state right after a restart, and answering
+        // from a cold cache gets BOTH directions wrong: a legitimately public bucket is refused
+        // (its policy simply isn't cached yet), while a bucket an admin explicitly restricted is
+        // served anonymously (its public-access-block isn't cached either). The second of those
+        // is a data exposure, so neither may be answered from cache alone.
+        //
         // RestrictPublicBuckets blocks anonymous access outright, regardless of what the bucket
         // policy says - it only ever affects this no-credentials branch, never authenticated
         // (owner/SigV4) requests.
-        if await BucketPolicyCache.shared.publicAccessBlock(for: bucketName)?.restrictPublicBuckets
-            == true
+        if await BucketPolicyCache.shared.resolvedPublicAccessBlock(app: req.application, bucket: bucketName)?
+            .restrictPublicBuckets == true
         {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 
         guard
-            let policy = await BucketPolicyCache.shared.policy(for: bucketName),
+            let policy = await BucketPolicyCache.shared.resolvedPolicy(
+                app: req.application, bucket: bucketName),
             policy.allowsAnonymous(action: action, bucketName: bucketName, key: key)
         else {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")

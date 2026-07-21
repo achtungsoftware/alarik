@@ -138,97 +138,145 @@ enum ErasureCodedShardGatherer {
         // non-versioned overwrite, or a tombstone, that hasn't reached every holder - placement
         // drift and rank-0 coordinator failover both produce exactly this. Assembling "whichever
         // holder answered first" would nondeterministically serve the OLD generation, and for a
-        // revoked credential's tombstone that is a resurrection. So the winner is decided by
-        // (updatedAtMillis, etag) across every reported copy - the same newest-wins rule MinIO
-        // applies across disagreeing drives and Cassandra applies across replica timestamps.
+        // revoked credential's tombstone that is a resurrection. So generations are ordered by
+        // (updatedAtMillis, etag)
         //
         // Generation is tracked per (node, index), never per node: one node can hold shards from
         // two different generations at once (its own old copy plus a newly delivered one), so
         // judging a whole node by one sampled shard would both exclude good shards and admit
         // stale ones.
-        var winner: Generation?
+        var holdersByGeneration: [Generation: [Int: [ClusterNodeInfo]]] = [:]
+        var unknownGenerationHolders: [Int: [ClusterNodeInfo]] = [:]
         for entry in discovered {
             for shard in entry.shards ?? [] where shard.index != excludingIndex {
-                guard let generation = Generation(shard) else { continue }
-                if winner == nil || generation.isNewer(than: winner!) { winner = generation }
+                if let generation = Generation(shard) {
+                    holdersByGeneration[generation, default: [:]][shard.index, default: []]
+                        .append(entry.node)
+                } else {
+                    unknownGenerationHolders[shard.index, default: []].append(entry.node)
+                }
             }
         }
+        let orderedGenerations = holdersByGeneration.keys.sorted { $0.isNewer(than: $1) }
 
-        // Stale means POSITIVELY known to be older than the winner. A shard whose generation is
-        // unknown (an older peer that answered with bare indices) is not stale - it stays usable
-        // as a fallback, with the identity verification below still guarding the final assembly.
-        func isStale(_ shard: ClusterReplicationClient.HeldShard) -> Bool {
-            guard let winner, let generation = Generation(shard) else { return false }
-            return generation != winner
-        }
-
-        // Phase 2: pick one holder per distinct index (two nodes can hold the same index, either
-        // transiently mid-reindex or as divergent generations). Winner-generation copies are
-        // preferred; unknown-generation copies are a fallback; stale copies are never planned in.
-        var candidates: [(index: Int, node: ClusterNodeInfo, generationKnown: Bool)] = []
-        for entry in discovered {
-            for shard in entry.shards ?? [] where shard.index != excludingIndex {
-                guard !isStale(shard) else { continue }
-                candidates.append((shard.index, entry.node, Generation(shard) != nil))
+        // Try generations newest-first, and only give up once none of them can be assembled.
+        //
+        // Falling back matters: a write in flight (or one whose coordinator died mid-push) leaves
+        // a NEWER generation that does not yet have `needed` shards anywhere. Refusing the read
+        // then - while a complete older generation sits right there - turns every overwrite into
+        // a window of spurious 503s. Falling back is also safe for deletes: a tombstone only
+        // becomes the newest generation after its write reached quorum, so if it is assemblable
+        // it wins here, and if it is not then the delete itself failed and the client was told so.
+        for (position, generation) in orderedGenerations.enumerated() {
+            var holders = holdersByGeneration[generation] ?? [:]
+            // Copies whose generation this peer couldn't report are usable filler for indices
+            // this generation doesn't otherwise cover - the final identity check still guards
+            // against actually mixing generations.
+            for (index, nodes) in unknownGenerationHolders where holders[index] == nil {
+                holders[index] = nodes
             }
-        }
-        candidates.sort { $0.generationKnown && !$1.generationKnown }
+            guard
+                let assembled = await assemble(
+                    app: app, bucketName: bucketName, key: key, versionId: versionId,
+                    holdersByIndex: holders, selfNodeId: selfNodeId, needed: needed,
+                    wantSpare: wantSpare, excludingIndex: excludingIndex, requestId: requestId,
+                    allHeldIndices: allHeldIndices, reachableRanks: reachableRanks)
+            else { continue }
 
+            // Read repair, but ONLY when serving the newest generation. Repairing while serving a
+            // fallback would push an older generation over a newer one - convergence running
+            // backwards.
+            if position == 0 {
+                await repairStaleCopies(
+                    app: app, bucketName: bucketName, key: key, versionId: versionId,
+                    discovered: discovered, winner: generation, gathered: assembled.shards,
+                    selfNodeId: selfNodeId)
+            }
+            return assembled
+        }
+
+        // No known generation could be assembled. If nothing reported a generation at all (every
+        // peer is an older binary), fall back to a generation-blind assembly.
+        if orderedGenerations.isEmpty,
+            let assembled = await assemble(
+                app: app, bucketName: bucketName, key: key, versionId: versionId,
+                holdersByIndex: unknownGenerationHolders, selfNodeId: selfNodeId, needed: needed,
+                wantSpare: wantSpare, excludingIndex: excludingIndex, requestId: requestId,
+                allHeldIndices: allHeldIndices, reachableRanks: reachableRanks)
+        {
+            return assembled
+        }
+
+        // Shards were reported to exist but none of them could be pulled together - degraded,
+        // never "not found", and never silently backfilled from a generation that isn't whole.
+        throw ErasureCodedGatherError.degraded(found: 0, needed: needed)
+    }
+
+    /// Fetches and verifies one candidate assembly. `nil` means "this generation could not be
+    /// assembled right now" - the caller decides whether to try an older one.
+    private static func assemble(
+        app: Application, bucketName: String, key: String, versionId: String?,
+        holdersByIndex: [Int: [ClusterNodeInfo]], selfNodeId: UUID, needed: Int, wantSpare: Bool,
+        excludingIndex: Int?, requestId: String, allHeldIndices: Set<Int>, reachableRanks: Set<Int>
+    ) async -> GatheredShards? {
         let target = needed + (wantSpare ? 1 : 0)
-        var plan: [(index: Int, node: ClusterNodeInfo)] = []
-        var claimed: Set<Int> = []
-        if let excludingIndex { claimed.insert(excludingIndex) }
-        for candidate in candidates where !claimed.contains(candidate.index) {
-            claimed.insert(candidate.index)
-            plan.append((candidate.index, candidate.node))
-            if plan.count >= target { break }
-        }
+        // Sorted for determinism: two nodes gathering the same object should make the same plan,
+        // so behaviour doesn't change run to run.
+        let indices = holdersByIndex.keys.sorted().filter { $0 != excludingIndex }
+        guard !indices.isEmpty else { return nil }
 
-        // Phase 3: fetch the planned (index, node) pairs in parallel - local ranks read from disk,
-        // remote ranks fetch to a temp file.
-        var gathered: [Int: (path: String, isTemp: Bool)] = [:]
-        let requestIdCopy = requestId
+        // Every holder of an index is a fallback for that index, tried in order. Without this a
+        // single slow or briefly-unreachable node loses a shard outright even though another node
+        // holds the very same one - which is exactly how an object that is fully intact reads as
+        // degraded, intermittently, depending on which node happened to be busy.
         let fetched: [(index: Int, result: (path: String, isTemp: Bool)?)] = await withTaskGroup(
             of: (index: Int, result: (path: String, isTemp: Bool)?).self
         ) { group in
-            for item in plan {
+            for index in indices.prefix(target) {
+                let holders = holdersByIndex[index] ?? []
                 group.addTask {
-                    if item.node.id == selfNodeId {
-                        let localPath = ErasureCodedObjectHandler.shardPath(
-                            bucketName: bucketName, key: key, versionId: versionId,
-                            shardIndex: item.index)
-                        guard FileManager.default.fileExists(atPath: localPath) else {
-                            return (item.index, nil)
+                    for node in holders {
+                        if node.id == selfNodeId {
+                            let localPath = ErasureCodedObjectHandler.shardPath(
+                                bucketName: bucketName, key: key, versionId: versionId,
+                                shardIndex: index)
+                            if FileManager.default.fileExists(atPath: localPath) {
+                                return (index, (localPath, false))
+                            }
+                            continue
                         }
-                        return (item.index, (localPath, false))
+                        if let tempPath = try? await ClusterReplicationClient.fetchShard(
+                            app: app, candidates: [node], bucketName: bucketName, key: key,
+                            versionId: versionId, shardIndex: index, requestId: requestId)
+                        {
+                            return (index, (tempPath, true))
+                        }
                     }
-                    guard
-                        let tempPath = try? await ClusterReplicationClient.fetchShard(
-                            app: app, candidates: [item.node], bucketName: bucketName, key: key,
-                            versionId: versionId, shardIndex: item.index, requestId: requestIdCopy)
-                    else { return (item.index, nil) }
-                    return (item.index, (tempPath, true))
+                    return (index, nil)
                 }
             }
             var results: [(index: Int, result: (path: String, isTemp: Bool)?)] = []
             for await outcome in group { results.append(outcome) }
             return results
         }
+
+        var gathered: [Int: (path: String, isTemp: Bool)] = [:]
         for entry in fetched {
             if let result = entry.result { gathered[entry.index] = result }
         }
 
-        guard gathered.count >= needed else {
+        func discard() {
             for entry in gathered.values where entry.isTemp { _ = POSIXFile.unlink(entry.path) }
-            // Shards were reported to exist (reportedIndices non-empty) but too few of the WINNING
-            // generation could be pulled together - degraded, never "not found", and never
-            // silently backfilled with the older generation's shards.
-            throw ErasureCodedGatherError.degraded(found: gathered.count, needed: needed)
         }
 
-        // Phase 4: verify identity agreement. The generation filter above should already guarantee
-        // this, but unknown-generation copies (older peers) can still slip a cross-generation mix
-        // in, which would decode to garbage - so the assembled set is checked, not assumed.
+        guard gathered.count >= needed else {
+            discard()
+            return nil
+        }
+
+        // Verify identity agreement. The generation grouping above should already guarantee it,
+        // but unknown-generation copies can still slip a cross-generation mix in, which would
+        // decode to garbage - so the assembled set is checked, never assumed.
         let paths = gathered.values.map(\.path)
         let headers = try? await S3Service.offloadBlockingIO(app) {
             try paths.map { path -> ErasureCodedShardHeader in
@@ -237,63 +285,63 @@ enum ErasureCodedShardGatherer {
                 return reader.header
             }
         }
-        guard let headers, let reference = headers.first?.objectMeta else {
-            for entry in gathered.values where entry.isTemp { _ = POSIXFile.unlink(entry.path) }
-            throw ErasureCodedGatherError.degraded(found: 0, needed: needed)
-        }
-        let consistent = headers.allSatisfy {
-            $0.objectMeta.etag == reference.etag && $0.objectMeta.size == reference.size
-        }
-        guard consistent else {
-            for entry in gathered.values where entry.isTemp { _ = POSIXFile.unlink(entry.path) }
-            throw ErasureCodedGatherError.inconsistent
-        }
-        // The assembly must BE the winning generation, not merely internally consistent - an
-        // all-stale set agrees with itself perfectly and would silently serve the old record.
-        if let winner, reference.etag != winner.etag {
-            for entry in gathered.values where entry.isTemp { _ = POSIXFile.unlink(entry.path) }
-            throw ErasureCodedGatherError.inconsistent
-        }
-
-        // Phase 5: read repair. Overwrite each positively-stale copy with the winning generation's
-        // shard of the same index, so divergence heals on the read path instead of lingering until
-        // some later walk notices - the repair Cassandra performs on a digest mismatch. Only runs
-        // when divergence was actually detected, and only pushes indices already assembled here.
-        let staleTargets: [(node: ClusterNodeInfo, index: Int)] = discovered.flatMap {
-            entry -> [(ClusterNodeInfo, Int)] in
-            guard entry.node.id != selfNodeId else { return [] }
-            return (entry.shards ?? []).compactMap { shard in
-                isStale(shard) && gathered[shard.index] != nil
-                    ? (entry.node, shard.index) : nil
-            }
-        }
-        if !staleTargets.isEmpty {
-            await withTaskGroup(of: Void.self) { group in
-                for target in staleTargets {
-                    guard let source = gathered[target.index] else { continue }
-                    group.addTask {
-                        do {
-                            try await ClusterReplicationClient.pushShard(
-                                app: app, to: target.node, sourcePath: source.path,
-                                bucketName: bucketName, key: key, versionId: versionId,
-                                shardIndex: target.index)
-                            app.logger.info(
-                                "Read repair: replaced stale copy of shard \(target.index) for '\(key)' on node \(target.node.id)."
-                            )
-                        } catch {
-                            app.logger.debug(
-                                "Read repair push of shard \(target.index) for '\(key)' to \(target.node.id) failed (retried on a later read): \(error)"
-                            )
-                        }
-                    }
-                }
-            }
+        guard let headers, let reference = headers.first?.objectMeta,
+            headers.allSatisfy({
+                $0.objectMeta.etag == reference.etag && $0.objectMeta.size == reference.size
+            })
+        else {
+            discard()
+            return nil
         }
 
         return GatheredShards(
             shards: gathered, meta: reference, heldIndices: allHeldIndices,
             reachableRanks: reachableRanks)
     }
+
+    /// Overwrites copies positively known to be older than the generation just served, so
+    /// divergence heals on the read path instead of lingering until some later walk notices - the
+    /// repair Cassandra performs on a digest mismatch. Best-effort and only for indices already
+    /// assembled here.
+    private static func repairStaleCopies(
+        app: Application, bucketName: String, key: String, versionId: String?,
+        discovered: [(node: ClusterNodeInfo, shards: [ClusterReplicationClient.HeldShard]?)],
+        winner: Generation, gathered: [Int: (path: String, isTemp: Bool)], selfNodeId: UUID
+    ) async {
+        let staleTargets: [(node: ClusterNodeInfo, index: Int)] = discovered.flatMap {
+            entry -> [(ClusterNodeInfo, Int)] in
+            guard entry.node.id != selfNodeId else { return [] }
+            return (entry.shards ?? []).compactMap { shard in
+                guard let generation = Generation(shard), generation != winner,
+                    gathered[shard.index] != nil
+                else { return nil }
+                return (entry.node, shard.index)
+            }
+        }
+        guard !staleTargets.isEmpty else { return }
+
+        await withTaskGroup(of: Void.self) { group in
+            for target in staleTargets {
+                guard let source = gathered[target.index] else { continue }
+                group.addTask {
+                    do {
+                        try await ClusterReplicationClient.pushShard(
+                            app: app, to: target.node, sourcePath: source.path,
+                            bucketName: bucketName, key: key, versionId: versionId,
+                            shardIndex: target.index)
+                        app.logger.info(
+                            "Read repair: replaced stale copy of shard \(target.index) for '\(key)' on node \(target.node.id)."
+                        )
+                    } catch {
+                        app.logger.debug(
+                            "Read repair push of shard \(target.index) for '\(key)' to \(target.node.id) failed (retried on a later read): \(error)"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
 
     /// This node's own held shards with their generations - the local counterpart of the peer
     /// `/held?detail=1` probe, reading each shard's header straight off disk.
@@ -303,11 +351,18 @@ enum ErasureCodedShardGatherer {
         let indices = ErasureCodedObjectHandler.locallyHeldShardIndices(
             bucketName: bucketName, key: key, versionId: versionId)
         guard !indices.isEmpty else { return [] }
+        // `map`, never `compactMap`: the generation is an enrichment, so a shard whose header
+        // can't be read at this instant (it is being written right now, say) is still reported as
+        // held, with its generation unknown. Dropping it would understate what this node has, and
+        // enough missing indices turns an object that exists into a NoSuchKey.
         let read = try? await S3Service.offloadBlockingIO(app) {
-            indices.compactMap { index -> ClusterReplicationClient.HeldShard? in
+            indices.map { index -> ClusterReplicationClient.HeldShard in
                 let path = ErasureCodedObjectHandler.shardPath(
                     bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
-                guard let reader = try? ErasureCodedShardReader(path: path) else { return nil }
+                guard let reader = try? ErasureCodedShardReader(path: path) else {
+                    return ClusterReplicationClient.HeldShard(
+                        index: index, etag: "", updatedAtMillis: 0)
+                }
                 defer { reader.close() }
                 let meta = reader.header.objectMeta
                 return ClusterReplicationClient.HeldShard(
@@ -325,7 +380,7 @@ enum ErasureCodedShardGatherer {
 
     /// Which write a shard belongs to. `nil` when the reporting peer didn't supply one (an older
     /// binary answering with bare indices).
-    private struct Generation: Equatable {
+    private struct Generation: Hashable {
         let etag: String
         let updatedAtMillis: Int64
 

@@ -58,7 +58,8 @@ struct S3Controller: RouteCollection {
     func handleBucketGet(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
 
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
 
         let query = req.url.query ?? ""
         let queryNames = S3Service.queryParameterNames(from: query)
@@ -166,7 +167,8 @@ struct S3Controller: RouteCollection {
     @Sendable
     func handleBucketHead(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
         let response = S3Service.buildStandardResponse(status: .ok, requestId: req.id)
         // S3 always reports the bucket's region via this header on HeadBucket, regardless
@@ -325,7 +327,8 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
         let keyPath = S3Service.extractObjectKey(from: req)
 
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
 
         // Check for versionId query parameter
         let versionId = req.query[String.self, at: "versionId"]
@@ -1396,7 +1399,8 @@ struct S3Controller: RouteCollection {
         peers: [ClusterNodeInfo] = [],
         ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)? = nil
     ) async throws -> Response {
-        try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            copySource.bucketName, app: req.application, requestId: req.id)
 
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
@@ -1573,7 +1577,8 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
         let keyPath = S3Service.extractObjectKey(from: req)
 
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
 
         // ListParts (GET with uploadId) always requires strict auth - it isn't in the
         // public-access whitelist, so it's checked before any anonymous-access decision.
@@ -1898,7 +1903,8 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
         let query = req.url.query ?? ""
 
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         if S3Service.queryParameterNames(from: query).contains("delete") {
@@ -2046,7 +2052,8 @@ struct S3Controller: RouteCollection {
         let keyPath = S3Service.extractObjectKey(from: req)
         let query = req.url.query ?? ""
 
-        try await S3Service.verifyBucketExists(bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // Cluster routing: this whole handler is multipart create/complete, so every request
@@ -2342,7 +2349,8 @@ struct S3Controller: RouteCollection {
                 message: "Part number must be between 1 and 10000.", requestId: req.id)
         }
 
-        try await S3Service.verifyBucketExists(copySource.bucketName, requestId: req.id)
+        try await S3Service.verifyBucketExists(
+            copySource.bucketName, app: req.application, requestId: req.id)
 
         // Authenticate access to the source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)

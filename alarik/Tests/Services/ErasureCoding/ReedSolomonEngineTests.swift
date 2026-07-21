@@ -28,6 +28,37 @@ struct ReedSolomonEngineTests {
         }
     }
 
+
+    // MARK: - Replicated metadata (k=1) prerequisite
+
+    /// With `k=1` every parity shard is a function of the single data shard, so ANY one surviving
+    /// shard - parity included - must reconstruct the whole payload alone. This is the property
+    /// the replicated metadata layout depends on: a node holding only shard 2 must still serve a
+    /// read without contacting anybody.
+    @Test(
+        "k=1: any single surviving shard reconstructs the data, parity-only included",
+        arguments: [1, 2, 3]
+    )
+    func kOneReconstructsFromAnySingleShard(m: Int) throws {
+        let payload = randomShards(count: 1, length: 512, seed: 9)
+        let parity = try ReedSolomonEngine.encode(dataShards: payload, parityCount: m)
+        #expect(parity.count == m)
+
+        let all: [Int: Data] = {
+            var map: [Int: Data] = [0: payload[0]]
+            for (offset, shard) in parity.enumerated() { map[1 + offset] = shard }
+            return map
+        }()
+
+        for survivor in all.keys {
+            let recovered = try ReedSolomonEngine.reconstruct(
+                availableShards: [survivor: all[survivor]!], missingIndices: survivor == 0 ? [] : [0],
+                dataCount: 1, parityCount: m)
+            let data = survivor == 0 ? all[0]! : recovered[0]
+            #expect(data == payload[0], "shard \(survivor) alone did not reconstruct the payload")
+        }
+    }
+
     // MARK: - Round trips
 
     @Test(

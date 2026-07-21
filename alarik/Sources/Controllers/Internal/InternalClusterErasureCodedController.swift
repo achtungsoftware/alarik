@@ -106,11 +106,19 @@ struct InternalClusterErasureCodedController: RouteCollection {
             return response
         }
 
+        // Every held index is reported, ALWAYS - the generation is an enrichment, never a filter.
+        // A shard whose header can't be read at this instant (it is being written right now, say)
+        // must still be reported as held, with its generation left unknown; dropping it would
+        // tell the caller "I don't have that shard", which is a different and much more damaging
+        // claim - enough missing indices and an object that exists reads as NoSuchKey.
         let detailed = try await req.application.threadPool.runIfActive {
-            indices.compactMap { index -> ClusterReplicationClient.HeldShard? in
+            indices.map { index -> ClusterReplicationClient.HeldShard in
                 let path = ErasureCodedObjectHandler.shardPath(
                     bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
-                guard let reader = try? ErasureCodedShardReader(path: path) else { return nil }
+                guard let reader = try? ErasureCodedShardReader(path: path) else {
+                    return ClusterReplicationClient.HeldShard(
+                        index: index, etag: "", updatedAtMillis: 0)
+                }
                 defer { reader.close() }
                 let meta = reader.header.objectMeta
                 return ClusterReplicationClient.HeldShard(

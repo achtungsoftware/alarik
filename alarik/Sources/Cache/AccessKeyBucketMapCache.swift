@@ -46,17 +46,6 @@ final actor AccessKeyBucketMapCache: StoreBackedCache {
         }
     }
 
-    // Check if a bucket exists for this access key
-    func bucket(for bucketName: String) -> String? {
-        // Check if ANY access key has this bucket
-        for (_, buckets) in map {
-            if buckets.contains(bucketName) {
-                return bucketName
-            }
-        }
-        return nil
-    }
-
     // Check if this access key can access this bucket
     func canAccess(accessKey: String, bucket: String) -> Bool {
         map[accessKey]?.contains(bucket) ?? false
@@ -106,6 +95,16 @@ final actor AccessKeyBucketMapCache: StoreBackedCache {
     /// cached grant - the accessor every caller should use.
     func canAccess(app: Application, accessKey: String, bucket: String) async -> Bool {
         await resolve(app: app, key: Grant(accessKey: accessKey, bucket: bucket)) ?? false
+    }
+
+    /// `canAccess`, keeping "not authorized" apart from "could not determine". A store this node
+    /// cannot read must not be reported to an S3 client as a permission failure: `AccessDenied`
+    /// is final and stops clients retrying, whereas the honest answer during a restart or a
+    /// degraded store is "try again".
+    func accessDecision(app: Application, accessKey: String, bucket: String) async
+        -> StoreBackedResolution<Bool>
+    {
+        await resolveDistinguishing(app: app, key: Grant(accessKey: accessKey, bucket: bucket))
     }
 
     func cachedValue(for key: Grant) -> Bool? {

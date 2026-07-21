@@ -23,6 +23,11 @@ import Vapor
 enum MetadataStoreError: Error, CustomStringConvertible {
     case corruptRecord(collection: String, id: String)
     case coordinatorUnreachable(collection: String, id: String)
+    /// This node holds a shard of the record but the record spans more shards than it has, and it
+    /// currently knows of no peers to gather the rest from (its membership view is momentarily
+    /// empty - most often the first moments after a restart). Deliberately distinct from
+    /// `corruptRecord`: the data is fine, this node just cannot assemble it *yet*.
+    case insufficientLocalShards(id: String, dataShards: Int)
 
     var description: String {
         switch self {
@@ -30,6 +35,8 @@ enum MetadataStoreError: Error, CustomStringConvertible {
             "Metadata record \(collection)/\(id) failed decode/checksum verification"
         case .coordinatorUnreachable(let collection, let id):
             "Could not reach the coordinating node for metadata record \(collection)/\(id)"
+        case .insufficientLocalShards(let id, let dataShards):
+            "Metadata record \(id) is encoded across \(dataShards) shards and this node knows of no peers to gather them from yet"
         }
     }
 }
@@ -399,15 +406,14 @@ enum MetadataStore {
             // username/bucket name must be reusable). Anything else - present, or
             // present-but-unreadable-right-now - is treated as taken, so a transient read
             // failure can never clobber a live record.
-            let existing: Data?
-            do {
-                existing = try await localGet(app: app, key: key, routing: routing)
-            } catch {
-                app.logger.warning(
-                    "putIfAbsent for '\(collection)/\(id)' could not verify absence (treating the id as taken): \(error)"
-                )
-                return false
-            }
+            // A read failure must PROPAGATE, never become `false`. `false` has exactly one
+            // meaning to every caller - "this id is already taken" - which they surface as
+            // `BucketAlreadyExists`/`usernameTaken`. Answering that because a peer was briefly
+            // unreachable silently turns a legitimate creation into a no-op that still looks
+            // like success to the client, leaving nothing on disk (observed: a CreateBucket
+            // during a peer restart reported success while never creating the bucket).
+            // Throwing lets the caller fail loudly and retry, and still never clobbers anything.
+            let existing = try await localGet(app: app, key: key, routing: routing)
             if let existing, !MetadataEnvelope.decode(existing).isTombstone {
                 return false
             }
@@ -476,6 +482,18 @@ enum MetadataStore {
     private static func localGet(app: Application, key: String, routing: Routing) async throws
         -> Data?
     {
+        var routing = routing
+        if routing.responsible.isEmpty, app.storage[ClusterConfigurationKey.self] != nil {
+            // An empty membership view in cluster mode is a transient startup state, not a fact
+            // about the cluster: this node has restarted and hasn't re-seeded yet. Falling
+            // straight through to the single-shard local read here is what made a restarting node
+            // declare every multi-shard record unreadable. Re-query the statically configured
+            // seeds first (debounced inside `refreshNow`) and re-resolve - the same repair
+            // `ObjectRoutingService` performs before refusing a write for "too few nodes".
+            await ClusterMembershipLifecycle.shared.refreshNow(app: app)
+            routing = await resolveRouting(app: app, key: key)
+        }
+
         guard !routing.responsible.isEmpty, let selfNodeId = routing.selfNodeId else {
             return try await directLocalRead(app: app, key: key)
         }
@@ -574,6 +592,28 @@ enum MetadataStore {
         }
     }
 
+    /// This node's own copy of a record, decoded without contacting anybody.
+    ///
+    /// Possible whenever the record is REPLICATED (`dataShards == 1`, the default metadata
+    /// layout): the local copy is the whole record, so there is nothing to gather. `nil` when
+    /// this node holds nothing for the key, or holds part of an older striped (`k > 1`) record -
+    /// the caller must fall back to a cluster gather for those.
+    ///
+    /// This is what makes a cluster-wide listing cheap: without it, reporting the N records a
+    /// node already holds costs N gathers (each probing every responsible node), which routinely
+    /// overran the caller's 5s budget and made the node contribute *nothing* to the listing.
+    /// Reporting exactly what this node holds is also what the merge in
+    /// `MetadataListingService.list` expects - it resolves disagreement between nodes itself,
+    /// newest-wins.
+    static func localEnvelopeIfWholeCopy(app: Application, collection: String, id: String) async
+        -> MetadataEnvelope?
+    {
+        let key = MetadataNamespace.key(collection: collection, id: id)
+        guard let header = localShardHeader(key: key), header.dataShards == 1 else { return nil }
+        guard let stored = try? await directLocalRead(app: app, key: key) else { return nil }
+        return MetadataEnvelope.decode(stored)
+    }
+
     private static func localShardHeader(key: String) -> ErasureCodedShardHeader? {
         let held = ErasureCodedObjectHandler.locallyHeldShardIndices(
             bucketName: MetadataNamespace.bucketName, key: key, versionId: nil)
@@ -585,10 +625,25 @@ enum MetadataStore {
         return reader.header
     }
 
+    /// Last-resort read with no cluster to gather from: decode this node's own shard alone.
+    ///
+    /// Only ever valid for a k=1 record, where that single shard IS the whole payload. A wider
+    /// record cannot be reconstructed from one shard by definition, and treating that as a decode
+    /// failure was actively harmful: a node whose membership view was momentarily empty (the first
+    /// moments after a restart) reported its ENTIRE control plane as corrupt, which cascaded into
+    /// `AccessDenied` on valid credentials, because an unreadable access key is indistinguishable
+    /// from a missing one to every caller above this line.
     private static func directLocalRead(app: Application, key: String) async throws -> Data? {
+        // The header of whatever index this node actually holds - not a hardcoded shard 0, which
+        // a node holding only shard 1 of a wider record would read as "no such record".
+        guard let header = localShardHeader(key: key) else { return nil }
+        guard header.dataShards == 1 else {
+            throw MetadataStoreError.insufficientLocalShards(
+                id: key, dataShards: header.dataShards)
+        }
         let path = ErasureCodedObjectHandler.shardPath(
-            bucketName: MetadataNamespace.bucketName, key: key, versionId: nil, shardIndex: 0)
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
+            bucketName: MetadataNamespace.bucketName, key: key, versionId: nil,
+            shardIndex: header.shardIndex)
         return try await S3Service.offloadBlockingIO(app) {
             var collected = Data()
             do {
@@ -596,6 +651,7 @@ enum MetadataStore {
                     collected.append(chunk)
                 }
             } catch {
+                // A k=1 record that won't decode from its only shard genuinely is damaged.
                 throw MetadataStoreError.corruptRecord(collection: "", id: key)
             }
             return collected

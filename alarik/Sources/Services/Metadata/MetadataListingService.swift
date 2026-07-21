@@ -182,9 +182,20 @@ enum MetadataListingService {
             for meta in discovered {
                 let id = String(meta.key.dropFirst(prefix.count))
                 group.addTask {
-                    // Must be a real gather, not a naive "read local shard 0 alone" shortcut:
-                    // Reed-Solomon reconstruction needs at least `dataShards` distinct shards,
-                    // so a record with dataShards > 1 can't be decoded from one shard alone.
+                    // Replicated metadata (the default `k=1`) means this node's own copy IS the
+                    // whole record, so its contribution is a local decode - no per-record cluster
+                    // gather at all. That is the difference between a listing costing N local
+                    // reads and N gathers each probing every responsible node; the latter
+                    // routinely overran the caller's 5s budget, at which point this node
+                    // contributed nothing and the listing came back partial.
+                    if let envelope = await MetadataStore.localEnvelopeIfWholeCopy(
+                        app: app, collection: collection, id: id)
+                    {
+                        return (entry: EnvelopeEntry(id: id, envelope: envelope), failed: false)
+                    }
+
+                    // Older striped (`k > 1`) records genuinely need a gather - Reed-Solomon
+                    // needs `dataShards` distinct shards, so one shard alone can't decode them.
                     do {
                         guard
                             let envelope = try await MetadataStore.getEnvelope(

@@ -105,7 +105,8 @@ final class Bucket: Content, @unchecked Sendable, Codable {
             id: self.id,
             name: self.name,
             creationDate: self.creationDate,
-            versioningStatus: self.versioningStatus
+            versioningStatus: self.versioningStatus,
+            policy: self.policy
         )
     }
 
@@ -174,6 +175,11 @@ extension Bucket {
         var name: String?
         var creationDate: Date?
         var versioningStatus: String?
+        /// The raw bucket-policy JSON, or nil when the bucket has none. Returned so the console's
+        /// policy editor opens with the saved policy rather than blank, and so a "public" badge
+        /// can reflect reality - without it the UI cannot tell an unset policy from one it simply
+        /// wasn't told about, and silently offers to overwrite the real one.
+        var policy: String?
     }
 }
 

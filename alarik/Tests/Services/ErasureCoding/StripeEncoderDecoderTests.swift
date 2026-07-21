@@ -68,6 +68,76 @@ struct StripeEncoderDecoderTests {
         return out
     }
 
+    // MARK: - Metadata layout migration (striped -> replicated)
+
+    /// The control-plane metadata layout changed from striped (`k=2/m=1`) to replicated
+    /// (`k=1/m=2`). Records written under the old layout must stay readable forever, which holds
+    /// only because the on-disk format is self-describing: every shard header carries the
+    /// `(dataShards, parityShards)` it was actually written with, and every metadata read path
+    /// derives the width from that header rather than from whatever the node is configured with
+    /// today. These tests pin that property in both directions.
+    @Test("a shard header reports the width the record was actually written with")
+    func headerCarriesAsWrittenWidth() throws {
+        for (k, m) in [(2, 1), (1, 2), (1, 0)] {
+            let scratch = tempDir("width-\(k)-\(m)")
+            try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(atPath: scratch) }
+
+            let payload = randomData(3000, seed: UInt8(k))
+            let paths = try encodeAndCollectPaths(
+                data: payload, dataShards: k, parityShards: m, stripeUnitSize: 512,
+                scratchDir: scratch)
+
+            for (_, path) in paths {
+                let reader = try ErasureCodedShardReader(path: path)
+                defer { reader.close() }
+                #expect(reader.header.dataShards == k)
+                #expect(reader.header.parityShards == m)
+            }
+        }
+    }
+
+    @Test("an old striped k=2/m=1 metadata record still decodes after the default became k=1/m=2")
+    func oldStripedRecordStillDecodes() throws {
+        let scratch = tempDir("legacy-striped")
+        try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: scratch) }
+
+        let payload = randomData(4096, seed: 3)
+        let paths = try encodeAndCollectPaths(
+            data: payload, dataShards: 2, parityShards: 1, stripeUnitSize: 512,
+            scratchDir: scratch)
+
+        // Exactly what a reader does today: learn the width from the header, then decode with it.
+        let header = try ErasureCodedShardReader(path: paths[0]!).header
+        #expect(header.dataShards == 2, "record must still describe itself as striped")
+
+        // Any 2 of the 3 shards, including a parity-only combination.
+        #expect(try decodeAll([0: paths[0]!, 1: paths[1]!]) == payload)
+        #expect(try decodeAll([1: paths[1]!, 2: paths[2]!]) == payload)
+    }
+
+    @Test("a replicated k=1/m=2 metadata record decodes from ANY single shard on its own")
+    func replicatedRecordDecodesFromAnySingleShard() throws {
+        let scratch = tempDir("replicated")
+        try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: scratch) }
+
+        let payload = randomData(4096, seed: 7)
+        let paths = try encodeAndCollectPaths(
+            data: payload, dataShards: 1, parityShards: 2, stripeUnitSize: 512,
+            scratchDir: scratch)
+
+        // This is the property the whole replicated-metadata design rests on: whichever single
+        // copy a node happens to hold, it can answer a control-plane read alone - no peer, no
+        // quorum, no gather.
+        for index in 0...2 {
+            #expect(
+                try decodeAll([index: paths[index]!]) == payload,
+                "shard \(index) alone did not reconstruct the record")
+        }
+    }
+
     // MARK: - Round trips across sizes
 
     @Test(

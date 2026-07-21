@@ -39,14 +39,32 @@ struct ClusterMetadataErasureCodingConfigTests {
         try body()
     }
 
-    @Test("resolves to the default k=2/m=1 when both env vars are unset")
+    /// Metadata is REPLICATED, not striped. `dataShards == 1` is the property the whole control
+    /// plane depends on: it means each responsible node holds a complete copy, so any single
+    /// reachable node can answer "does this bucket exist" / "who owns this access key" on its own.
+    /// A default above 1 would split every control-plane record across nodes and make routine
+    /// reads fail intermittently whenever a peer restarts - this assertion is here to stop that
+    /// regressing silently.
+    @Test("defaults to replicated metadata (k=1/m=2), never striped")
     func resolvesToDefaultWhenUnset() throws {
         try withEnv(["CLUSTER_METADATA_EC_DATA_SHARDS": nil, "CLUSTER_METADATA_EC_PARITY_SHARDS": nil]) {
             let config = try ClusterMetadataErasureCodingConfig.resolve()
             #expect(config == ClusterMetadataErasureCodingConfig.default)
-            #expect(config.dataShards == 2)
-            #expect(config.parityShards == 1)
-            #expect(config.totalShards == 3)
+            #expect(config.dataShards == 1, "metadata must be replicated, not striped")
+            #expect(config.parityShards == 2)
+            #expect(config.totalShards == 3, "still three copies, matching the replication factor")
+        }
+    }
+
+    @Test("auto-capping keeps metadata replicated at every cluster size")
+    func autoCapKeepsSingleDataShard() {
+        let config = ClusterMetadataErasureCodingConfig.default
+        for nodeCount in 1...5 {
+            let effective = config.effective(activeNodeCount: nodeCount)
+            #expect(
+                effective.dataShards == 1,
+                "a \(nodeCount)-node cluster must still hold whole copies, not stripes")
+            #expect(effective.parityShards == min(2, nodeCount - 1))
         }
     }
 

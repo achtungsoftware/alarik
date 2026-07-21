@@ -28,10 +28,21 @@ final actor BucketPolicyCache: StoreBackedCache {
     private var map: [String: BucketPolicy] = [:]
     private var publicAccessBlockMap: [String: PublicAccessBlockConfiguration] = [:]
 
+    /// Buckets an authoritative read proved have NEITHER a policy nor a public-access-block.
+    ///
+    /// Without this, "exists but has neither" is uncacheable: both maps stay empty for such a
+    /// bucket, so `cachedValue` reports a miss forever and every single anonymous request pays a
+    /// metadata-store read. That is the common case (most buckets have no policy), and it sits on
+    /// the anonymous hot path, so the negative answer has to be cacheable exactly like a positive
+    /// one. Kept in sync by every mutator below - a policy or PAB appearing must evict the entry,
+    /// or a bucket that just became public would keep reading as "nothing set".
+    private var knownWithoutAuthorization: Set<String> = []
+
     /// Full replace, not merge - see `AccessKeySecretKeyMapCache.load` for why this matters on a
     /// LISTEN-outage reload, not just at boot.
     func load(initialData: [(bucketName: String, policy: BucketPolicy)]) {
         map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.bucketName, $0.policy) })
+        knownWithoutAuthorization.subtract(map.keys)
     }
 
     /// Get the parsed policy for a bucket, or nil if none has been set
@@ -42,11 +53,15 @@ final actor BucketPolicyCache: StoreBackedCache {
     /// Set/replace the policy for a bucket
     func setPolicy(for bucketName: String, policy: BucketPolicy) {
         map[bucketName] = policy
+        knownWithoutAuthorization.remove(bucketName)
     }
 
     /// Remove a bucket's policy (DeleteBucketPolicy, or bucket deletion)
     func removePolicy(for bucketName: String) {
         map.removeValue(forKey: bucketName)
+        // Not inserted into `knownWithoutAuthorization` here: this only proves the POLICY is
+        // gone, and says nothing about the public-access-block. Let the next read establish it.
+        knownWithoutAuthorization.remove(bucketName)
     }
 
     func getMap() -> [String: BucketPolicy] {
@@ -60,6 +75,7 @@ final actor BucketPolicyCache: StoreBackedCache {
     ) {
         publicAccessBlockMap = Dictionary(
             uniqueKeysWithValues: initialData.map { ($0.bucketName, $0.configuration) })
+        knownWithoutAuthorization.subtract(publicAccessBlockMap.keys)
     }
 
     /// Get the public access block configuration for a bucket, or nil if never configured
@@ -73,16 +89,29 @@ final actor BucketPolicyCache: StoreBackedCache {
         for bucketName: String, configuration: PublicAccessBlockConfiguration
     ) {
         publicAccessBlockMap[bucketName] = configuration
+        knownWithoutAuthorization.remove(bucketName)
     }
 
     /// Remove a bucket's public access block configuration (DeletePublicAccessBlock, or bucket
     /// deletion)
     func removePublicAccessBlock(for bucketName: String) {
         publicAccessBlockMap.removeValue(forKey: bucketName)
+        // See `removePolicy`: proves nothing about the policy half.
+        knownWithoutAuthorization.remove(bucketName)
     }
 
     func getPublicAccessBlockMap() -> [String: PublicAccessBlockConfiguration] {
         publicAccessBlockMap
+    }
+
+    /// Records that `bucketName` has neither a policy nor a public-access-block, from a source
+    /// that already knows authoritatively (the bulk reload, which reads every bucket anyway).
+    /// Without this the anonymous path pays one store read per policy-less bucket after every
+    /// restart to learn the same thing. Ignores buckets that do have either, so it can never
+    /// mask a policy that another pass already installed.
+    func markWithoutAuthorization(_ bucketName: String) {
+        guard map[bucketName] == nil, publicAccessBlockMap[bucketName] == nil else { return }
+        knownWithoutAuthorization.insert(bucketName)
     }
 
     // MARK: - StoreBackedCache
@@ -97,13 +126,24 @@ final actor BucketPolicyCache: StoreBackedCache {
     var missLedger = CacheMissLedger<String>()
 
     func cachedValue(for key: String) -> Authorization? {
-        guard map[key] != nil || publicAccessBlockMap[key] != nil else { return nil }
-        return Authorization(policy: map[key], publicAccessBlock: publicAccessBlockMap[key])
+        if map[key] != nil || publicAccessBlockMap[key] != nil {
+            return Authorization(policy: map[key], publicAccessBlock: publicAccessBlockMap[key])
+        }
+        // A bucket proven to have neither is a real cached answer, not a miss.
+        if knownWithoutAuthorization.contains(key) {
+            return Authorization(policy: nil, publicAccessBlock: nil)
+        }
+        return nil
     }
 
     func absorb(_ value: Authorization, for key: String) {
         if let policy = value.policy { map[key] = policy }
         if let pab = value.publicAccessBlock { publicAccessBlockMap[key] = pab }
+        if value.policy == nil && value.publicAccessBlock == nil {
+            knownWithoutAuthorization.insert(key)
+        } else {
+            knownWithoutAuthorization.remove(key)
+        }
     }
 
     func loadFromStore(app: Application, key: String) async throws -> Authorization? {

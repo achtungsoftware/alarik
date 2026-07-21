@@ -143,19 +143,25 @@ final class LoadCacheLifecycle: LifecycleHandler {
             await BucketVersioningCache.shared.addBucket(bucket.name, versioningStatus: status)
         }
 
-        // Bucket policy - skip (not crash) any policy that fails to re-validate, since it should
-        // always have been valid when it was saved.
+        // Bucket policy and public access block, in one pass over the buckets (each is parsed
+        // once, and buckets with neither are recorded as such so the anonymous request path can
+        // answer "nothing set" from cache rather than paying a store read per bucket to
+        // rediscover it after every restart). A policy that fails to re-validate is skipped, not
+        // crashed on, since it should always have been valid when it was saved.
         for bucket in allBuckets {
-            guard let policy = parsedPolicy(for: bucket, logger: app.logger) else { continue }
-            await BucketPolicyCache.shared.setPolicy(for: bucket.name, policy: policy)
-        }
+            let policy = parsedPolicy(for: bucket, logger: app.logger)
+            let publicAccessBlock = publicAccessBlockIfNonDefault(for: bucket)
 
-        // Public access block - only buckets with at least one flag set are worth caching, an
-        // all-false bucket behaves identically to "not in the map".
-        for bucket in allBuckets {
-            guard let config = publicAccessBlockIfNonDefault(for: bucket) else { continue }
-            await BucketPolicyCache.shared.setPublicAccessBlock(
-                for: bucket.name, configuration: config)
+            if let policy {
+                await BucketPolicyCache.shared.setPolicy(for: bucket.name, policy: policy)
+            }
+            if let publicAccessBlock {
+                await BucketPolicyCache.shared.setPublicAccessBlock(
+                    for: bucket.name, configuration: publicAccessBlock)
+            }
+            if policy == nil, publicAccessBlock == nil {
+                await BucketPolicyCache.shared.markWithoutAuthorization(bucket.name)
+            }
         }
 
         // Notification (webhook) configuration
