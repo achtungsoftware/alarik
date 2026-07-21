@@ -28,6 +28,11 @@ enum MetadataStoreError: Error, CustomStringConvertible {
     /// empty - most often the first moments after a restart). Deliberately distinct from
     /// `corruptRecord`: the data is fine, this node just cannot assemble it *yet*.
     case insufficientLocalShards(id: String, dataShards: Int)
+    /// The uniqueness claim for a create could not be acquired on a majority of the record's
+    /// owners - contended, or too many owners unreachable. Retryable, and crucially NOT the
+    /// same as "the name is taken": returning `false` here would surface as a false
+    /// `BucketAlreadyExists`/`usernameTaken` for a name that may not exist at all.
+    case claimNotAcquired(collection: String, id: String)
 
     var description: String {
         switch self {
@@ -37,6 +42,8 @@ enum MetadataStoreError: Error, CustomStringConvertible {
             "Could not reach the coordinating node for metadata record \(collection)/\(id)"
         case .insufficientLocalShards(let id, let dataShards):
             "Metadata record \(id) is encoded across \(dataShards) shards and this node knows of no peers to gather them from yet"
+        case .claimNotAcquired(let collection, let id):
+            "Could not acquire the uniqueness claim for \(collection)/\(id) on a majority of its owners - please retry"
         }
     }
 }
@@ -424,7 +431,15 @@ enum MetadataStore {
         forward: (ClusterNodeInfo) async throws -> T
     ) async throws -> T {
         var lastError: (any Error)?
-        for candidate in routing.coordinatorCandidates {
+        // Self first when it's an owner (no network at all), then the other owners in placement
+        // order. Every node computes the same order, so they agree on the coordinator.
+        var candidates = routing.coordinatorCandidates
+        if let selfNodeId = routing.selfNodeId,
+            let selfIndex = candidates.firstIndex(where: { $0.id == selfNodeId })
+        {
+            candidates.swapAt(0, selfIndex)
+        }
+        for candidate in candidates {
             if candidate.id == routing.selfNodeId { return try await local() }
             do {
                 return try await forward(candidate)
@@ -445,6 +460,114 @@ enum MetadataStore {
             )
         }
         return try await local()
+    }
+
+    // MARK: - Distributed claim (unique-name safety across coordinators)
+
+    /// Runs `body` holding a majority reservation on `(collection, id)` across the record's
+    /// owners, or returns `nil` if a majority couldn't be reached.
+    ///
+    /// Coordination is per-node and liveness-dependent, so two nodes can briefly disagree about
+    /// who coordinates a key and both run a check-then-write. A single node grants at most one
+    /// live reservation per name, so only one of them can hold a majority - the other backs off
+    /// instead of writing a duplicate. Standalone (no peers) is trivially a majority of one.
+    private static func withClaimQuorum<T>(
+        app: Application, routing: Routing, collection: String, id: String,
+        body: () async throws -> T
+    ) async throws -> T? {
+        let owners = routing.responsible
+        let token = UUID()
+        // Owners other than this node; the local grant is taken directly.
+        let peers = owners.filter { $0.id != routing.selfNodeId }
+        let required = owners.isEmpty ? 1 : owners.count / 2 + 1
+
+        await MetadataClaimRegistry.shared.purgeExpired()
+        var granted = await MetadataClaimRegistry.shared.reserve(
+            collection: collection, id: id, token: token) ? 1 : 0
+        var grantedPeers: [ClusterNodeInfo] = []
+
+        if granted > 0, !peers.isEmpty {
+            let outcomes = await withTaskGroup(of: (ClusterNodeInfo, Bool).self) { group in
+                for peer in peers {
+                    group.addTask {
+                        (
+                            peer,
+                            await requestClaim(
+                                app: app, node: peer, collection: collection, id: id, token: token)
+                        )
+                    }
+                }
+                var results: [(ClusterNodeInfo, Bool)] = []
+                for await outcome in group { results.append(outcome) }
+                return results
+            }
+            for (peer, ok) in outcomes where ok {
+                granted += 1
+                grantedPeers.append(peer)
+            }
+        }
+
+        func releaseAll() async {
+            await MetadataClaimRegistry.shared.release(
+                collection: collection, id: id, token: token)
+            await withTaskGroup(of: Void.self) { group in
+                for peer in grantedPeers {
+                    group.addTask {
+                        await releaseClaim(
+                            app: app, node: peer, collection: collection, id: id, token: token)
+                    }
+                }
+            }
+        }
+
+        guard granted >= required else {
+            await releaseAll()
+            return nil
+        }
+        do {
+            let result = try await body()
+            await releaseAll()
+            return result
+        } catch {
+            await releaseAll()
+            throw error
+        }
+    }
+
+    private static func requestClaim(
+        app: Application, node: ClusterNodeInfo, collection: String, id: String, token: UUID
+    ) async -> Bool {
+        await claimCall(
+            app: app, node: node, path: "claim", collection: collection, id: id, token: token)
+    }
+
+    private static func releaseClaim(
+        app: Application, node: ClusterNodeInfo, collection: String, id: String, token: UUID
+    ) async {
+        _ = await claimCall(
+            app: app, node: node, path: "claim-release", collection: collection, id: id,
+            token: token)
+    }
+
+    private static func claimCall(
+        app: Application, node: ClusterNodeInfo, path: String, collection: String, id: String,
+        token: UUID
+    ) async -> Bool {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return false }
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/metadata/\(path)"
+                + querySuffix(collection: collection, id: id) + "&token=\(token.uuidString)")
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await LightweightClusterControlClient.shared.execute(
+                outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
+            return response.status == .ok
+        } catch {
+            // Unreachable owner: not a grant. A majority of the rest can still be reached.
+            return false
+        }
     }
 
     // MARK: - Local execution (assumes THIS node is already the confirmed coordinator)
@@ -468,31 +591,31 @@ enum MetadataStore {
     ) async throws -> Bool {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        return try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
-            // A full gather (with its widen-to-all-known fallback), never a local shard-0 file
-            // check: this node being rank-0 TODAY says nothing about where the record's shards
-            // were placed when it was written - a local-only check under placement drift reads
-            // "absent" for a live record and double-claims a unique id (an access key value, a
-            // username, a bucket name), silently orphaning one of the two claims via LWW later.
-            //
-            // Error policy: a tombstoned id is genuinely free to claim again (a released
-            // username/bucket name must be reusable). Anything else - present, or
-            // present-but-unreadable-right-now - is treated as taken, so a transient read
-            // failure can never clobber a live record.
-            // A read failure must PROPAGATE, never become `false`. `false` has exactly one
-            // meaning to every caller - "this id is already taken" - which they surface as
-            // `BucketAlreadyExists`/`usernameTaken`. Answering that because a peer was briefly
-            // unreachable silently turns a legitimate creation into a no-op that still looks
-            // like success to the client, leaving nothing on disk (observed: a CreateBucket
-            // during a peer restart reported success while never creating the bucket).
-            // Throwing lets the caller fail loudly and retry, and still never clobbers anything.
-            let existing = try await localGet(app: app, key: key, routing: routing)
-            if let existing, !MetadataEnvelope.decode(existing).isTombstone {
-                return false
+        // Losing the claim means another coordinator is claiming this same name right now, so the
+        // name is taken from this caller's point of view - same answer as finding it present.
+        let claimed = try await withClaimQuorum(
+            app: app, routing: routing, collection: collection, id: id
+        ) {
+            try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+                // A full gather, never a local shard-0 file check: being rank-0 today says nothing
+                // about where this record's shards were placed when it was written.
+                //
+                // A tombstoned id is free to claim again (a released username or bucket name must
+                // be reusable). A read failure PROPAGATES rather than becoming `false`, which
+                // callers read as "already taken" and would turn a legitimate create into a
+                // silent no-op that still looks like success.
+                let existing = try await localGet(app: app, key: key, routing: routing)
+                if let existing, !MetadataEnvelope.decode(existing).isTombstone {
+                    return false
+                }
+                try await localWrite(app: app, key: key, value: value, routing: routing)
+                return true
             }
-            try await localWrite(app: app, key: key, value: value, routing: routing)
-            return true
         }
+        guard let claimed else {
+            throw MetadataStoreError.claimNotAcquired(collection: collection, id: id)
+        }
+        return claimed
     }
 
     static func executeLocalDelete(app: Application, collection: String, id: String) async throws {
@@ -506,23 +629,33 @@ enum MetadataStore {
     ) async throws -> Data? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        return try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
-            guard let stored = try await localGet(app: app, key: key, routing: routing),
-                !MetadataEnvelope.decode(stored).isTombstone
-            else { return nil }
+        // Same majority claim as `putIfAbsent`: single-use means two coordinators must not both
+        // be able to consume the record. Losing the claim reads as "already consumed".
+        let consumed = try await withClaimQuorum(
+            app: app, routing: routing, collection: collection, id: id
+        ) {
+            try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+                guard let stored = try await localGet(app: app, key: key, routing: routing),
+                    !MetadataEnvelope.decode(stored).isTombstone
+                else { return Data?.none }
 
-            // Returns the stored envelope verbatim; the caller (`consumeIfPresent`) unwraps once,
-            // so this stays correct whether it ran locally or was relayed from a peer.
-            if MetadataCollections.tombstoneExempt.contains(collection) {
-                try await executeLocalDelete(app: app, key: key, routing: routing)
-            } else {
-                let tombstone = MetadataEnvelope.tombstone(
-                    schemaVersion: MetadataMigrations.currentVersion(for: collection))
-                try await localWrite(
-                    app: app, key: key, value: try tombstone.encoded(), routing: routing)
+                // Returns the stored envelope verbatim; the caller unwraps once, so this stays
+                // correct whether it ran locally or was relayed from a peer.
+                if MetadataCollections.tombstoneExempt.contains(collection) {
+                    try await executeLocalDelete(app: app, key: key, routing: routing)
+                } else {
+                    let tombstone = MetadataEnvelope.tombstone(
+                        schemaVersion: MetadataMigrations.currentVersion(for: collection))
+                    try await localWrite(
+                        app: app, key: key, value: try tombstone.encoded(), routing: routing)
+                }
+                return stored
             }
-            return stored
         }
+        guard let consumed else {
+            throw MetadataStoreError.claimNotAcquired(collection: collection, id: id)
+        }
+        return consumed
     }
 
     private static func executeLocalPut(

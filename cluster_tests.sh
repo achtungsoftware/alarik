@@ -2154,28 +2154,71 @@ else
     wait_for_full_membership
 fi
 
-# ── Test: concurrent creation of the same bucket name yields one bucket ───────
+# ── Test: concurrent same-name bucket creation across every node stays unique ──
+# A duplicate is probabilistic - the two claimants have to interleave inside the check-then-write
+# window - so this fires many rounds from all nodes at once rather than a single race, which a
+# non-quorum implementation passes by luck. Exactly one create must win each round, and every
+# node must then agree the bucket exists once.
 echo ""
-echo "=== Test: the same bucket name created from two nodes at once stays unique ==="
-RACE_BUCKET="cluster-race-bucket"
-# Waited on by PID, never a bare `wait`: the node servers are themselves background jobs of
-# this script, so a bare `wait` blocks until the whole cluster exits.
-aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$RACE_BUCKET" >/dev/null 2>&1 &
-RACE_PID_A=$!
-aws --endpoint-url "${ENDPOINTS[1]}" s3api create-bucket --bucket "$RACE_BUCKET" >/dev/null 2>&1 &
-RACE_PID_B=$!
-wait "$RACE_PID_A" 2>/dev/null
-wait "$RACE_PID_B" 2>/dev/null
-sleep 3
-RACE_UNIQUE=1
-for i in $(seq 0 $((NODE_COUNT - 1))); do
-    COUNT=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-buckets \
-        | jq -r --arg b "$RACE_BUCKET" '[.Buckets[] | select(.Name == $b)] | length')
-    [ "$COUNT" == "1" ] || { RACE_UNIQUE=0; echo "  node $i lists the bucket $COUNT times"; }
+echo "=== Test: concurrent same-name bucket creation stays unique (stress) ==="
+RACE_ROUNDS=15
+RACE_DUPLICATES=0
+RACE_MISSING=0
+for r in $(seq 1 "$RACE_ROUNDS"); do
+    RB="cluster-race-$r"
+    RACE_PIDS=()
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        aws --endpoint-url "${ENDPOINTS[$i]}" s3api create-bucket --bucket "$RB" >/dev/null 2>&1 &
+        RACE_PIDS+=("$!")
+    done
+    for pid in "${RACE_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+    sleep 1
+    # Count from a node's list AND from the durable bucket record (placement endpoint), so a
+    # duplicate can't hide behind a coalesced listing.
+    COUNT=$(aws --endpoint-url "${ENDPOINTS[0]}" s3api list-buckets \
+        | jq -r --arg b "$RB" '[.Buckets[] | select(.Name == $b)] | length')
+    if [ "$COUNT" -gt 1 ]; then
+        RACE_DUPLICATES=$((RACE_DUPLICATES + 1)); echo "  round $r: bucket listed $COUNT times"
+    elif [ "$COUNT" -lt 1 ]; then
+        RACE_MISSING=$((RACE_MISSING + 1)); echo "  round $r: bucket missing after a create won"
+    fi
 done
-[ "$RACE_UNIQUE" -eq 1 ] \
-    && pass "Two nodes creating the same bucket name concurrently leave exactly one bucket." \
-    || fail "Concurrent creation of the same bucket name did not leave exactly one bucket."
+if [ "$RACE_DUPLICATES" -eq 0 ] && [ "$RACE_MISSING" -eq 0 ]; then
+    pass "Across $RACE_ROUNDS rounds, concurrent same-name creation from every node left exactly one bucket each."
+else
+    fail "Concurrent same-name creation produced $RACE_DUPLICATES duplicate(s) and $RACE_MISSING lost create(s) over $RACE_ROUNDS rounds."
+fi
+
+# ── Test: two different users can't both claim the same username at once ──────
+# The same uniqueness guarantee for a DIFFERENT unique key (username), created through the admin
+# API rather than S3 - covers that the claim is per (collection, id), not bucket-specific.
+echo ""
+echo "=== Test: concurrent creation of the same username stays unique ==="
+RACE_USERNAME="raceuser$RANDOM"
+UNAME_PIDS=()
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    curl -s -o /dev/null -X POST "${ENDPOINTS[$i]}/api/v1/admin/users" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"name\":\"Race\",\"username\":\"$RACE_USERNAME\",\"password\":\"ClusterPass123!\",\"isAdmin\":false}" &
+    UNAME_PIDS+=("$!")
+done
+for pid in "${UNAME_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+sleep 3
+# Log in through every node and ask each one which user id that session belongs to (via
+# /users/auth, which returns the authenticated user). Two users sharing a username would resolve
+# to different ids depending on which record a node read - exactly the corruption a per-name
+# claim prevents. A single distinct id (or none, if every create lost the race) is correct.
+UNAME_IDS=$(for i in $(seq 0 $((NODE_COUNT - 1))); do
+    UTOK=$(curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/login" -H "Content-Type: application/json" \
+        -d "{\"username\":\"$RACE_USERNAME\",\"password\":\"ClusterPass123!\"}" | jq -r '.token // empty')
+    [ -n "$UTOK" ] || continue
+    curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/auth" -H "Authorization: Bearer $UTOK" | jq -r '.id // empty'
+done | sort -u | grep -c .)
+if [ "$UNAME_IDS" -le 1 ]; then
+    pass "Concurrent creation of the same username resolves to a single user cluster-wide."
+else
+    fail "The same username resolves to $UNAME_IDS distinct users - a concurrent claim produced duplicates."
+fi
 
 # ── Test: a bucket policy set on one node applies on every node ───────────────
 # Anonymous public-read has to work through whichever node the client happens to reach, which

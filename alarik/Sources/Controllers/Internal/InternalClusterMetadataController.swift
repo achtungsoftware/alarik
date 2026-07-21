@@ -33,6 +33,10 @@ struct InternalClusterMetadataController: RouteCollection {
         cluster.on(.POST, "consume-if-present", use: handleConsumeIfPresent)
         cluster.get("list", use: handleList)
 
+        // Distributed claim used to keep unique names unique across coordinators.
+        cluster.on(.POST, "claim", use: handleClaim)
+        cluster.on(.POST, "claim-release", use: handleClaimRelease)
+
         // Cache-invalidation broadcast - kept top-level (not under .../metadata) since it isn't
         // itself a metadata-record operation.
         routes.grouped("internal", "cluster", "cache-invalidate").grouped(ClusterSecretMiddleware())
@@ -70,6 +74,30 @@ struct InternalClusterMetadataController: RouteCollection {
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")
         response.body = try Response.Body(data: JSONEncoder().encode(wire))
         return response
+    }
+
+    /// Grants this node's reservation for `(collection, id)` - 200 when granted, 409 when another
+    /// claimant already holds it. See `MetadataClaimRegistry`.
+    @Sendable
+    func handleClaim(req: Request) async throws -> HTTPStatus {
+        let (collection, id) = try collectionAndId(req: req)
+        guard let token = req.query[UUID.self, at: "token"] else {
+            throw Abort(.badRequest, reason: "Missing claim token")
+        }
+        await MetadataClaimRegistry.shared.purgeExpired()
+        let granted = await MetadataClaimRegistry.shared.reserve(
+            collection: collection, id: id, token: token)
+        return granted ? .ok : .conflict
+    }
+
+    @Sendable
+    func handleClaimRelease(req: Request) async throws -> HTTPStatus {
+        let (collection, id) = try collectionAndId(req: req)
+        guard let token = req.query[UUID.self, at: "token"] else {
+            throw Abort(.badRequest, reason: "Missing claim token")
+        }
+        await MetadataClaimRegistry.shared.release(collection: collection, id: id, token: token)
+        return .ok
     }
 
     /// The receiving side of `CacheInvalidationService.notify`'s broadcast - decodes the message
