@@ -435,11 +435,14 @@ enum MetadataStore {
                 )
             }
         }
-        // No owner could be reached. Coordinating here beats failing outright: the alternative is
-        // that one unreachable node blocks writes to its keys indefinitely.
-        guard routing.selfNodeId != nil else {
-            throw lastError
-                ?? MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
+        // Nothing reachable - or nobody else exists at all, which is the normal standalone
+        // (non-clustered) case where `responsible` is empty and this node is the whole cluster.
+        // Coordinating here beats failing outright: the alternative is that one unreachable node
+        // blocks writes to its keys indefinitely.
+        if let lastError {
+            app.logger.warning(
+                "No reachable coordinator for '\(collection)/\(id)' - coordinating locally: \(lastError)"
+            )
         }
         return try await local()
     }
