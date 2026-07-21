@@ -41,8 +41,28 @@ enum MetadataListingService {
         let envelope: MetadataEnvelope
     }
 
+    /// A merged listing plus the honesty flag callers need before treating it as authoritative:
+    /// `complete` is true only when this node's own local walk read every record it holds AND
+    /// every known peer's contribution arrived (including that peer's own self-reported
+    /// completeness). A partial listing is still useful for additive work (cache warm-up), but
+    /// only a complete one may ever justify a REMOVAL - "absent from a partial snapshot" and
+    /// "deleted" are indistinguishable otherwise.
+    struct VerifiedListing {
+        let entries: [Entry]
+        /// Ids of every live (non-tombstoned) record in the merged view - including records whose
+        /// payload a typed decode later drops, so reconcile-style callers never mistake
+        /// "stored but undecodable" for "gone".
+        let presentIds: Set<String>
+        let complete: Bool
+    }
+
     static func list(app: Application, collection: String) async -> [Entry] {
+        await listVerified(app: app, collection: collection).entries
+    }
+
+    static func listVerified(app: Application, collection: String) async -> VerifiedListing {
         var merged: [String: MetadataEnvelope] = [:]
+        var complete = true
 
         // Replicas can legitimately disagree (a write or delete that hasn't reached everyone
         // yet), so the winner is decided by `supersedes` rather than by whoever answered first -
@@ -55,7 +75,9 @@ enum MetadataListingService {
             }
         }
 
-        merge(await localEnvelopeEntries(app: app, collection: collection))
+        let local = await localEnvelopeEntriesVerified(app: app, collection: collection)
+        merge(local.entries)
+        complete = complete && local.allReadable
 
         if let config = app.storage[ClusterConfigurationKey.self] {
             // Every KNOWN peer, not `activeNodes()` - a `.draining` peer is excluded from
@@ -64,18 +86,21 @@ enum MetadataListingService {
             // from every other node's listing until the drain finishes.
             let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
             if !peers.isEmpty {
-                await withTaskGroup(of: [EnvelopeEntry].self) { group in
+                await withTaskGroup(of: (entries: [EnvelopeEntry], ok: Bool).self) { group in
                     for node in peers {
                         group.addTask {
                             await fetchRemote(app: app, node: node, collection: collection)
                         }
                     }
-                    for await entries in group { merge(entries) }
+                    for await outcome in group {
+                        merge(outcome.entries)
+                        complete = complete && outcome.ok
+                    }
                 }
             }
         }
 
-        return merged.compactMap { id, envelope in
+        let entries = merged.compactMap { id, envelope -> Entry? in
             guard !envelope.isTombstone, let payload = envelope.payload else { return nil }
             return Entry(
                 id: id,
@@ -83,6 +108,8 @@ enum MetadataListingService {
                     payload: payload, collection: collection,
                     storedVersion: envelope.schemaVersion, logger: app.logger))
         }
+        return VerifiedListing(
+            entries: entries, presentIds: Set(entries.map(\.id)), complete: complete)
     }
 
     static func count(app: Application, collection: String) async -> Int {
@@ -99,10 +126,18 @@ enum MetadataListingService {
     static func list<T: Decodable>(
         _ type: T.Type, app: Application, collection: String
     ) async -> [T] {
-        let entries = await list(app: app, collection: collection)
+        await listVerified(type, app: app, collection: collection).records
+    }
+
+    /// Typed variant of `listVerified`: `presentIds` still covers undecodable records (they exist,
+    /// they just can't be read by this binary), so reconciliation callers won't purge them.
+    static func listVerified<T: Decodable>(
+        _ type: T.Type, app: Application, collection: String
+    ) async -> (records: [T], presentIds: Set<String>, complete: Bool) {
+        let listing = await listVerified(app: app, collection: collection)
         var decoded: [T] = []
-        decoded.reserveCapacity(entries.count)
-        for entry in entries {
+        decoded.reserveCapacity(listing.entries.count)
+        for entry in listing.entries {
             do {
                 decoded.append(try JSONDecoder().decode(T.self, from: entry.value))
             } catch {
@@ -111,7 +146,7 @@ enum MetadataListingService {
                 )
             }
         }
-        return decoded
+        return (decoded, listing.presentIds, listing.complete)
     }
 
     /// This node's own contribution only - no network fan-out. Used both by `list`'s local
@@ -123,25 +158,64 @@ enum MetadataListingService {
     /// the tombstone flag to know a record was deleted. Handing it bare payloads would strip
     /// exactly the information the merge runs on, and would make deletes invisible to peers.
     static func localEnvelopeEntries(app: Application, collection: String) async -> [EnvelopeEntry] {
+        await localEnvelopeEntriesVerified(app: app, collection: collection).entries
+    }
+
+    /// `localEnvelopeEntries` plus `allReadable`: false when at least one record discovered on
+    /// local disk could not be read right now - the caller's view is then partial, and must not
+    /// be treated as authoritative for absence.
+    static func localEnvelopeEntriesVerified(
+        app: Application, collection: String
+    ) async -> (entries: [EnvelopeEntry], allReadable: Bool) {
         let prefix = "\(collection)/"
-        let discovered = ErasureCodedObjectHandler.listLocalShardZeroEntries(
+        // Any shard index, not just shard 0: a record must not vanish from cluster-wide listings
+        // merely because the one node holding its shard 0 is down, when the remaining shards can
+        // still reconstruct it. See `listLocalShardEntries`.
+        let discovered = ErasureCodedObjectHandler.listLocalShardEntries(
             bucketName: MetadataNamespace.bucketName, keyPrefix: prefix)
 
-        var entries: [EnvelopeEntry] = []
-        entries.reserveCapacity(discovered.count)
-        for meta in discovered {
-            let id = String(meta.key.dropFirst(prefix.count))
-            // Must be a real gather, not a naive "read local shard 0 alone" shortcut:
-            // Reed-Solomon reconstruction needs at least `dataShards` distinct shards, so a
-            // record with dataShards > 1 can't be decoded from one shard alone - a single-shard
-            // read would silently fail and drop the entry from the listing.
-            guard
-                let envelope = try? await MetadataStore.getEnvelope(
-                    app: app, collection: collection, id: id)
-            else { continue }
-            entries.append(EnvelopeEntry(id: id, envelope: envelope))
+        // Parallel, not sequential: each entry's gather is an independent network round trip,
+        // and this whole method must finish inside a peer's `probeTimeout` (5s) when serving
+        // a fan-out request - a sequential walk of N records during membership churn can blow
+        // that budget and make this node contribute NOTHING to the caller's listing.
+        return await withTaskGroup(of: (entry: EnvelopeEntry?, failed: Bool).self) { group in
+            for meta in discovered {
+                let id = String(meta.key.dropFirst(prefix.count))
+                group.addTask {
+                    // Must be a real gather, not a naive "read local shard 0 alone" shortcut:
+                    // Reed-Solomon reconstruction needs at least `dataShards` distinct shards,
+                    // so a record with dataShards > 1 can't be decoded from one shard alone.
+                    do {
+                        guard
+                            let envelope = try await MetadataStore.getEnvelope(
+                                app: app, collection: collection, id: id)
+                        else {
+                            // `nil` from getEnvelope is genuine absence (deleted out from under
+                            // the walk) - not a read failure, so it doesn't taint completeness.
+                            return (entry: nil, failed: false)
+                        }
+                        return (entry: EnvelopeEntry(id: id, envelope: envelope), failed: false)
+                    } catch {
+                        // Never silent: a record that is physically held here but unreadable
+                        // right now vanishes from the caller's merged listing, which upstream
+                        // turns into "does not exist" - for an access key that means a revoke
+                        // 404s or a live key drops out of auth with no symptom anywhere.
+                        app.logger.warning(
+                            "Local listing skipped '\(collection)/\(id)' - held on disk but not readable right now: \(error)"
+                        )
+                        return (entry: nil, failed: true)
+                    }
+                }
+            }
+            var entries: [EnvelopeEntry] = []
+            var allReadable = true
+            entries.reserveCapacity(discovered.count)
+            for await outcome in group {
+                if let entry = outcome.entry { entries.append(entry) }
+                allReadable = allReadable && !outcome.failed
+            }
+            return (entries, allReadable)
         }
-        return entries
     }
 
     /// One retry after a short delay - without it, a peer that's transiently busy (most notably
@@ -151,20 +225,34 @@ enum MetadataListingService {
     /// buckets right when a freshly-restarted node starts serving real traffic.
     private static let retryDelay: Duration = .milliseconds(750)
 
+    /// Header the peer's `handleList` uses to self-report whether ITS local walk read every
+    /// record it holds - without this, a peer that answered but silently skipped an unreadable
+    /// record would look complete to the caller. Absent header (older binary) reads as complete,
+    /// matching the old behavior during a rolling upgrade.
+    static let listingCompleteHeader = "x-alarik-listing-complete"
+
     private static func fetchRemote(
         app: Application, node: ClusterNodeInfo, collection: String
-    ) async -> [EnvelopeEntry] {
-        if let entries = await fetchRemoteOnce(app: app, node: node, collection: collection) {
-            return entries
+    ) async -> (entries: [EnvelopeEntry], ok: Bool) {
+        if let outcome = await fetchRemoteOnce(app: app, node: node, collection: collection) {
+            return outcome
         }
         try? await Task.sleep(for: retryDelay)
-        return await fetchRemoteOnce(app: app, node: node, collection: collection) ?? []
+        if let outcome = await fetchRemoteOnce(app: app, node: node, collection: collection) {
+            return outcome
+        }
+        // Never silent: everything this peer holds exclusively is now missing from the merged
+        // result, and callers can't tell a partial listing from a complete one.
+        app.logger.warning(
+            "Peer \(node.address) contributed nothing to the '\(collection)' listing (unreachable or timed out twice) - records only it holds are missing from this result."
+        )
+        return ([], false)
     }
 
     private static func fetchRemoteOnce(
         app: Application, node: ClusterNodeInfo, collection: String
-    ) async -> [EnvelopeEntry]? {
-        guard let config = app.storage[ClusterConfigurationKey.self] else { return [] }
+    ) async -> (entries: [EnvelopeEntry], ok: Bool)? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return ([], true) }
         var outbound = HTTPClientRequest(
             url: node.address + "/internal/cluster/metadata/list"
                 + querySuffix(collection: collection))
@@ -178,12 +266,14 @@ enum MetadataListingService {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
+            let peerComplete = response.headers.first(name: listingCompleteHeader) != "false"
             let body = try await response.body.collect(upTo: 256 * 1024 * 1024)
             let decoded = try JSONDecoder().decode([WireEntry].self, from: Data(buffer: body))
-            return decoded.compactMap { entry -> EnvelopeEntry? in
+            let entries = decoded.compactMap { entry -> EnvelopeEntry? in
                 guard let data = Data(base64Encoded: entry.value) else { return nil }
                 return EnvelopeEntry(id: entry.id, envelope: MetadataEnvelope.decode(data))
             }
+            return (entries, peerComplete)
         } catch {
             return nil
         }

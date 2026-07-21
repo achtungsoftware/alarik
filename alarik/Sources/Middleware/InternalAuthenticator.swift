@@ -45,19 +45,34 @@ struct InternalAuthenticator: AsyncRequestAuthenticator {
             return nil
         }
 
+        let sessionToken: SessionToken
         do {
-            let sessionToken = try await request.jwt.verify(as: SessionToken.self)
-
-            guard let user = try await User.find(app: request.application, id: sessionToken.userId)
-            else {
-                return nil
-            }
-
-            return AuthenticatedUser(user: user, authMethod: .jwt)
+            sessionToken = try await request.jwt.verify(as: SessionToken.self)
         } catch {
-            // JWT verification failed, return nil to try next method
+            // Genuinely not a usable JWT - fall through to the next auth method.
             return nil
         }
+
+        // Deliberately outside the catch above. Looking the user up reads the metadata store,
+        // and folding that into "JWT verification failed" turns a transient store error - a peer
+        // mid-restart, a read that couldn't gather - into `401 Unauthorized` for a token that is
+        // perfectly valid. Telling a caller their credentials are wrong because this node
+        // couldn't reach its own data is both misleading and unfixable from their side; a failed
+        // read has to surface as a failed read.
+        let user: User?
+        do {
+            user = try await User.find(app: request.application, id: sessionToken.userId)
+        } catch {
+            request.logger.warning(
+                "Could not load the user for an otherwise-valid session token: \(error)")
+            throw Abort(
+                .serviceUnavailable,
+                reason: "Could not verify this session right now - please retry.")
+        }
+
+        // The token verified but names a user that genuinely no longer exists (deleted account).
+        guard let user else { return nil }
+        return AuthenticatedUser(user: user, authMethod: .jwt)
     }
 
     /// Attempts Access Key authentication via custom headers

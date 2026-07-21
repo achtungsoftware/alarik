@@ -326,11 +326,24 @@ enum ErasureCodedObjectHandler {
     /// by `ErasureCodedRebalanceService`'s self-scoped membership-change walk. A node only ever
     /// physically holds the shard(s) it's currently or previously responsible for, so this is
     /// inherently local, same as every other cluster-rebalance walk in this codebase.
+    /// Deliberately does **not** pass `.skipsHiddenFiles`, unlike the bucket-scoped walks. This
+    /// one starts at `rootURL` and descends *into* each bucket directory - and the control-plane
+    /// namespace is `.alarik.sys`, which is dot-prefixed and therefore hidden. With that option
+    /// set this walk returned zero metadata shards, so the rebalance walk and the bit-rot
+    /// scrubber covered object data only: control-plane records got no redistribution,
+    /// re-replication, or corruption healing, and it failed silently because an empty walk looks
+    /// exactly like one with nothing to do.
+    ///
+    /// Exposing metadata here is only safe alongside the two guards in
+    /// `ErasureCodedRebalanceService.rebalanceOne`: metadata shards are never reclaimed, and are
+    /// only re-encoded to a wider layout once every target node is confirmed reachable.
+    ///
+    /// Only `.ecshard` files are opened below, so traversing hidden entries costs nothing beyond
+    /// the directory scan.
     static func listAllLocalShards() -> [(path: String, header: ErasureCodedShardHeader)] {
         guard
             let enumerator = FileManager.default.enumerator(
-                at: BucketHandler.rootURL, includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles])
+                at: BucketHandler.rootURL, includingPropertiesForKeys: [.isDirectoryKey])
         else { return [] }
 
         var results: [(path: String, header: ErasureCodedShardHeader)] = []
@@ -364,6 +377,38 @@ enum ErasureCodedObjectHandler {
         localShardZeroEntries(bucketName: bucketName) { meta in
             meta.key.hasPrefix(keyPrefix)
         }
+    }
+
+    /// Every locally-held record under `keyPrefix`, discovered from **any** shard index rather
+    /// than only shard 0 - at most one entry per key, whichever index this node happens to hold.
+    ///
+    /// Shard-0-only discovery makes a record's visibility depend entirely on one node staying up:
+    /// lose the shard-0 holder and the record disappears from cluster-wide listings even though
+    /// it is still perfectly reconstructable from the surviving shards. For control-plane
+    /// metadata that means a live access key silently stops being listed - and therefore stops
+    /// being findable, editable, or revocable - the moment one particular node goes down.
+    ///
+    /// Every holder reporting the same key is fine: `MetadataListingService.list` already merges
+    /// by id, so duplicates collapse.
+    static func listLocalShardEntries(bucketName: String, keyPrefix: String) -> [ObjectMeta] {
+        let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: bucketPath),
+                includingPropertiesForKeys: [.isDirectoryKey])
+        else { return [] }
+
+        var byKey: [String: ObjectMeta] = [:]
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension == "ecshard" else { continue }
+            guard let reader = try? ErasureCodedShardReader(path: fileURL.path) else { continue }
+            let header = reader.header
+            reader.close()
+            guard header.objectMeta.bucketName == bucketName else { continue }
+            guard header.objectMeta.key.hasPrefix(keyPrefix) else { continue }
+            byKey[header.objectMeta.key] = header.objectMeta
+        }
+        return Array(byKey.values)
     }
 
     private static func localShardZeroEntries(

@@ -134,8 +134,25 @@ enum MetadataStore {
         if routing.isLocalCoordinator {
             try await executeLocalPut(app: app, key: key, value: value, routing: routing)
         } else {
-            try await forwardPut(
-                app: app, node: routing.primary, collection: collection, id: id, value: value)
+            do {
+                try await forwardPut(
+                    app: app, node: routing.primary, collection: collection, id: id, value: value)
+            } catch {
+                // Rank-0 pinning exists to serialize writes, but a plain put/tombstone is safe
+                // under last-writer-wins even with two coordinators (`MetadataEnvelope.supersedes`
+                // picks the same winner everywhere) - so when rank-0 is unreachable, coordinate
+                // locally rather than fail. The alternative is far worse: `activeNodes` tolerates
+                // a stale heartbeat for up to a minute, so a crashed rank-0 makes every write to
+                // its keys - including *revoking a credential* - error out for that whole window.
+                // CAS operations (`putIfAbsent`/`consumeIfPresent`) deliberately keep the strict
+                // single-coordinator requirement; uniqueness cannot be LWW-merged.
+                app.logger.warning(
+                    "Rank-0 coordinator unreachable for '\(collection)/\(id)' - coordinating this write locally so it isn't blocked by a down peer: \(error)"
+                )
+                try await executeLocalPut(
+                    app: app, key: key, value: value,
+                    routing: routing.assumingLocalCoordination(app: app))
+            }
         }
     }
 
@@ -181,6 +198,11 @@ enum MetadataStore {
     /// Physically removes the record's bytes cluster-wide, leaving nothing behind. This is what
     /// `delete` used to do for every collection; it now backs tombstone GC
     /// (`MetadataTombstoneSweep`) and the tombstone-exempt collections.
+    ///
+    /// Deliberately NO rank-0-unreachable failover here, unlike `putEnvelope`: a purge is
+    /// physical removal, which is not LWW-mergeable - two uncoordinated purges racing a
+    /// concurrent recreate could remove the new record. A purge blocked by a down rank-0 simply
+    /// happens on a later GC/TTL sweep; nothing is ever wrong in the meantime, just unreclaimed.
     static func purge(app: Application, collection: String, id: String) async throws {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
@@ -194,6 +216,13 @@ enum MetadataStore {
 
     /// Atomic read-then-delete, single-use by construction: the record is gone the instant this
     /// returns non-nil, cluster-wide, and can never be consumed twice.
+    ///
+    /// Honest scope of that guarantee: it holds as long as every consumer resolves the SAME
+    /// rank-0 for the key. Under membership drift two nodes can transiently disagree on rank-0
+    /// and each consume "the" record once. The only current caller is `oidc-states`, where the
+    /// worst case of that window is a replayed-but-still-TTL-checked login state - accepted
+    /// deliberately rather than paying for consensus here. Do NOT build anything on this method
+    /// where double-consumption would be a security or billing event.
     static func consumeIfPresent(
         app: Application, collection: String, id: String
     ) async throws -> Data? {
@@ -238,6 +267,32 @@ enum MetadataStore {
         var isLocalCoordinator: Bool {
             guard let selfNodeId, let primary else { return true }
             return primary.id == selfNodeId
+        }
+
+        /// Routing for the rank-0-unreachable failover: this node takes over shard 0 (written
+        /// locally, off-placement but discoverable - metadata reads probe any-index holders and
+        /// widen to all known nodes), while the dead rank-0 is dropped from the target list.
+        /// Without this, `ErasureCodedWriteCoordinator`'s peers-must-be-`k+m-1` contract breaks
+        /// whenever the failover coordinator isn't in the responsible set at all.
+        func assumingLocalCoordination(app: Application) -> Routing {
+            guard let selfNodeId, let config = app.storage[ClusterConfigurationKey.self],
+                let primary, primary.id != selfNodeId
+            else { return self }
+            var reordered = responsible
+            if let selfIndex = reordered.firstIndex(where: { $0.id == selfNodeId }) {
+                // Self already owns a slot: swap it into rank-0. The unreachable ex-rank-0
+                // stays as a target (its shard push just fails; quorum is met without it).
+                reordered.swapAt(0, selfIndex)
+            } else {
+                // Self takes the unreachable rank-0's slot outright - list length must stay
+                // exactly k+m or the write coordinator rejects the placement.
+                reordered[0] = ClusterNodeInfo(
+                    id: selfNodeId, address: config.address, status: .active,
+                    lastHeartbeatAt: Date())
+            }
+            return Routing(
+                responsible: reordered, selfNodeId: selfNodeId,
+                dataShards: dataShards, parityShards: parityShards)
         }
     }
 
@@ -285,6 +340,12 @@ enum MetadataStore {
                 // Target genuinely unknown to this node (a peer this node hasn't discovered at
                 // all yet) - nothing to route to directly; fall through to the best-effort
                 // HRW-based computation below, the same fallback every other collection uses.
+                // Loud, because a write taking this path lands somewhere the owner-pinned READ
+                // path will never look - it stays wrong until the owner's next heartbeat
+                // self-write supersedes it, and that dependency should be visible in logs.
+                app.logger.warning(
+                    "cluster-nodes record for unknown node \(targetId) routed via HRW fallback - unreadable by the owner-pinned read path until that node's own heartbeat rewrites it."
+                )
             }
         }
 
@@ -328,14 +389,27 @@ enum MetadataStore {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
         return try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
-            if localShard0Exists(key: key) {
-                // Bytes exist, but a tombstoned id is genuinely free to claim again (a username
-                // or bucket name released by a delete must be reusable). Anything else - present,
-                // or present-but-unreadable-right-now - is treated as taken, so a transient read
-                // failure can never clobber a live record.
-                let existing = try? await localGet(app: app, key: key, routing: routing)
-                let isTombstone = existing.map { MetadataEnvelope.decode($0).isTombstone } ?? false
-                guard isTombstone else { return false }
+            // A full gather (with its widen-to-all-known fallback), never a local shard-0 file
+            // check: this node being rank-0 TODAY says nothing about where the record's shards
+            // were placed when it was written - a local-only check under placement drift reads
+            // "absent" for a live record and double-claims a unique id (an access key value, a
+            // username, a bucket name), silently orphaning one of the two claims via LWW later.
+            //
+            // Error policy: a tombstoned id is genuinely free to claim again (a released
+            // username/bucket name must be reusable). Anything else - present, or
+            // present-but-unreadable-right-now - is treated as taken, so a transient read
+            // failure can never clobber a live record.
+            let existing: Data?
+            do {
+                existing = try await localGet(app: app, key: key, routing: routing)
+            } catch {
+                app.logger.warning(
+                    "putIfAbsent for '\(collection)/\(id)' could not verify absence (treating the id as taken): \(error)"
+                )
+                return false
+            }
+            if let existing, !MetadataEnvelope.decode(existing).isTombstone {
+                return false
             }
             try await localWrite(app: app, key: key, value: value, routing: routing)
             return true

@@ -30,7 +30,7 @@ struct LifecycleService {
             let enabledRules = LifecycleConfiguration.fromJSON(rawRules).rules.filter(\.enabled)
             guard !enabledRules.isEmpty else { continue }
 
-            let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucket.name)
+            let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: app, bucket: bucket.name)
 
             for rule in enabledRules {
                 if let expirationDays = rule.expirationDays {

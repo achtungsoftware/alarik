@@ -68,15 +68,65 @@ extension AccessKey {
             AccessKey.self, app: app, collection: MetadataCollections.accessKeys)
     }
 
+    /// `all` plus the listing's completeness verdict - see `LoadCacheLifecycle.reloadAll`, which
+    /// may only reconcile REMOVALS against a listing that is verifiably complete.
+    static func allVerified(
+        app: Application
+    ) async -> (records: [AccessKey], presentIds: Set<String>, complete: Bool) {
+        await MetadataListingService.listVerified(
+            AccessKey.self, app: app, collection: MetadataCollections.accessKeys)
+    }
+
+    /// Secondary index record: `access-keys-by-id/<uuid>` -> the key's value and owner. Carries
+    /// `userId` so a delete-by-id can check ownership without reading the primary record at all -
+    /// revocation must stay possible even while the primary is temporarily unreconstructable.
+    struct IdPointer: Codable, Sendable {
+        let accessKey: String
+        let userId: UUID
+    }
+
+    /// Resolves the by-id pointer, self-healing a dangling one (primary deleted, or a crash
+    /// between the two writes in `create`) - mirrors `User.findByUsername`.
+    static func findIdPointer(app: Application, id: UUID) async throws -> IdPointer? {
+        guard
+            let pointer = try await MetadataStore.get(
+                IdPointer.self, app: app, collection: MetadataCollections.accessKeysById,
+                id: id.uuidString)
+        else { return nil }
+
+        guard
+            let key = try await MetadataStore.get(
+                AccessKey.self, app: app, collection: MetadataCollections.accessKeys,
+                id: pointer.accessKey), key.id == id
+        else {
+            try? await MetadataStore.delete(
+                app: app, collection: MetadataCollections.accessKeysById, id: id.uuidString)
+            return nil
+        }
+        return pointer
+    }
+
     /// Creates the key, failing if `accessKey`'s value is already taken by another key.
     func create(app: Application) async throws -> Bool {
-        try await MetadataStore.putIfAbsent(
+        let claimed = try await MetadataStore.putIfAbsent(
             app: app, collection: MetadataCollections.accessKeys, id: accessKey, value: self)
+        guard claimed else { return false }
+        do {
+            try await MetadataStore.put(
+                app: app, collection: MetadataCollections.accessKeysById, id: id.uuidString,
+                value: IdPointer(accessKey: accessKey, userId: userId))
+        } catch {
+            // Keep the pair consistent: without the pointer the key would be un-revocable
+            // by id whenever a listing hiccups, which defeats the pointer's purpose.
+            try? await MetadataStore.delete(
+                app: app, collection: MetadataCollections.accessKeys, id: accessKey)
+            throw error
+        }
+        return true
     }
 
     func delete(app: Application) async throws {
-        try await MetadataStore.delete(
-            app: app, collection: MetadataCollections.accessKeys, id: accessKey)
+        try await AccessKeyService.delete(app: app, accessKey: accessKey, id: id)
     }
 }
 

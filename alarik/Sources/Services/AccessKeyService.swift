@@ -18,14 +18,29 @@ import Vapor
 import XMLCoder
 
 struct AccessKeyService {
+    /// Pass `id` when the caller already knows it (skips a read); with `nil` the by-id pointer
+    /// is cleaned up best-effort via reading the primary record first. A pointer that survives
+    /// a missed cleanup is self-healed on next use by `AccessKey.findIdPointer`.
     static func delete(
         app: Application,
-        accessKey: String
+        accessKey: String,
+        id: UUID? = nil
     )
         async throws
     {
+        var pointerId = id
+        if pointerId == nil {
+            pointerId = (try? await MetadataStore.get(
+                AccessKey.self, app: app, collection: MetadataCollections.accessKeys,
+                id: accessKey))?.id
+        }
+
         try await MetadataStore.delete(
             app: app, collection: MetadataCollections.accessKeys, id: accessKey)
+        if let pointerId {
+            try? await MetadataStore.delete(
+                app: app, collection: MetadataCollections.accessKeysById, id: pointerId.uuidString)
+        }
 
         // Remove from all caches. Security-sensitive: a revoked key must stop authenticating
         // on every node, not just this one - notify immediately after each removal, not

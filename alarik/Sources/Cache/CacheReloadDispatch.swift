@@ -186,20 +186,25 @@ enum CacheReloadDispatch {
             // comment on `nodeInfo` for the circular-placement reason why. A message from an
             // older binary with no `nodeInfo` (or a caller that genuinely couldn't supply one)
             // falls back to the old re-read, best-effort.
+            // `reconcile`, not raw upsert: broadcast delivery is retried, so a pre-restart
+            // heartbeat message can land AFTER newer post-restart data and would otherwise
+            // regress the entry into staleness. `reconcile` keeps whichever is fresher.
             if let wire = message.nodeInfo {
-                await ClusterNodeCache.shared.upsert(
+                await ClusterNodeCache.shared.reconcile(snapshot: [
                     ClusterNodeInfo(
                         id: wire.id, address: wire.address,
                         status: ClusterNode.Status(rawValue: wire.status) ?? .active,
                         lastHeartbeatAt: wire.lastHeartbeatAt, totalBytes: wire.totalBytes,
-                        availableBytes: wire.availableBytes))
+                        availableBytes: wire.availableBytes)
+                ])
             } else if let node = try await ClusterNode.find(app: app, id: uuid) {
-                await ClusterNodeCache.shared.upsert(
+                await ClusterNodeCache.shared.reconcile(snapshot: [
                     ClusterNodeInfo(
                         id: uuid, address: node.address,
                         status: ClusterNode.Status(rawValue: node.status) ?? .active,
                         lastHeartbeatAt: node.lastHeartbeatAt,
-                        totalBytes: node.totalBytes, availableBytes: node.availableBytes))
+                        totalBytes: node.totalBytes, availableBytes: node.availableBytes)
+                ])
             }
             // Membership genuinely changed (join, status flip, or a heartbeat refresh) - kick
             // off a rebalance walk. Cheap no-op when nothing actually needs to move: the walk

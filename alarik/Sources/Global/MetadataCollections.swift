@@ -28,6 +28,13 @@ enum MetadataCollections {
     /// identifier, and every hot-path lookup (SigV4 auth) is by that value, never by id.
     static let accessKeys = "access-keys"
 
+    /// Secondary index `access-keys-by-id/<uuid>` -> `{accessKey, userId}`. The console
+    /// addresses a key by its UUID for revocation; resolving that through a cluster-wide
+    /// listing makes revocation only as available as the *least* available peer (one busy
+    /// node's timeout turns "revoke" into a wrong 404). This pointer makes it a direct store
+    /// read instead - same pattern as `usersByUsername`.
+    static let accessKeysById = "access-keys-by-id"
+
     static let sharedLinks = "shared-links"
     static let buckets = "buckets"
     static let clusterNodes = "cluster-nodes"
@@ -41,8 +48,8 @@ enum MetadataCollections {
     /// (`MetadataMaintenance`'s tombstone GC and migration sweep). A new collection added above
     /// and forgotten here is simply never swept, so keep the two together.
     static let all: [String] = [
-        users, usersByUsername, accessKeys, sharedLinks, buckets, clusterNodes, oidcProviders,
-        oidcStates,
+        users, usersByUsername, accessKeys, accessKeysById, sharedLinks, buckets, clusterNodes,
+        oidcProviders, oidcStates,
     ]
 
     /// Collections whose deletes remove the record outright instead of leaving a tombstone.

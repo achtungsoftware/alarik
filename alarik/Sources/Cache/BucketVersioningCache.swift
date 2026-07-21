@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 import Foundation
+import Vapor
 
-final actor BucketVersioningCache {
+final actor BucketVersioningCache: StoreBackedCache {
     public static let shared = BucketVersioningCache()
 
     private var map: [String: VersioningStatus] = [:]
@@ -31,8 +32,33 @@ final actor BucketVersioningCache {
     }
 
     /// Get versioning status for a bucket
+    /// Prefer `resolvedStatus(app:bucket:)` over this: a miss here is
+    /// indistinguishable from genuinely-disabled versioning, and answering `.disabled` for a
+    /// bucket this node simply hasn't cached yet makes a write overwrite instead of version.
     func getStatus(for bucketName: String) -> VersioningStatus {
         map[bucketName] ?? .disabled
+    }
+
+    var missLedger = CacheMissLedger<String>()
+
+    // MARK: - StoreBackedCache
+
+    /// The cached status, or `nil` when this node has no entry - lets a caller tell "versioning
+    /// is off" apart from "this node doesn't know yet".
+    func cachedValue(for key: String) -> VersioningStatus? { map[key] }
+
+    func absorb(_ value: VersioningStatus, for key: String) { map[key] = value }
+
+    /// Versioning status with the store as a fallback - the accessor every caller should use.
+    /// Falls back to `.disabled` only when the bucket genuinely cannot be resolved at all, which
+    /// matches the old behaviour for a bucket that really is unversioned or gone.
+    func resolvedStatus(app: Application, bucket: String) async -> VersioningStatus {
+        await resolve(app: app, key: bucket) ?? .disabled
+    }
+
+    func loadFromStore(app: Application, key: String) async throws -> VersioningStatus? {
+        guard let stored = try await Bucket.find(app: app, name: key) else { return nil }
+        return VersioningStatus(rawValue: stored.versioningStatus) ?? .disabled
     }
 
     /// Update versioning status for a bucket

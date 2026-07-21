@@ -262,7 +262,21 @@ enum ObjectRoutingService {
             return .notClustered
         }
 
-        let active = await ClusterNodeCache.shared.activeNodes()
+        var active = await ClusterNodeCache.shared.activeNodes()
+
+        // Too few nodes is far more often "this node hasn't finished learning who its peers are"
+        // than "the cluster is genuinely too small" - a node that booted while its seeds were
+        // briefly down starts out knowing only itself. Re-seed membership and re-check before
+        // rejecting, so a converging node delays a write instead of failing it with a confident
+        // and wrong claim about cluster size. Debounced inside `refreshNow`; only reached on a
+        // path that would otherwise already be returning an error.
+        if (try? PlacementService.ensureErasureCodingAdmission(
+            activeNodeCount: active.count, dataShards: ecConfig.dataShards,
+            parityShards: ecConfig.parityShards)) == nil
+        {
+            await ClusterMembershipLifecycle.shared.refreshNow(app: app)
+            active = await ClusterNodeCache.shared.activeNodes()
+        }
 
         do {
             try PlacementService.ensureErasureCodingAdmission(
@@ -315,12 +329,21 @@ enum ObjectRoutingService {
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
             return (true, [], [])
         }
-        let active = await ClusterNodeCache.shared.activeNodes()
+        var active = await ClusterNodeCache.shared.activeNodes()
         guard !active.isEmpty else { return (true, [], []) }
 
         let count: Int
         if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self] {
             count = Swift.max(PlacementService.replicationFactor, ecConfig.totalShards)
+            // Placement is only meaningful against a complete membership view. A node still
+            // converging (one that booted while its seeds were down knows only itself) computes a
+            // responsible set that omits the nodes actually holding the object, and reports a
+            // perfectly healthy object as missing. Re-seed before deciding - debounced, and only
+            // when the view is already too small to be right.
+            if active.count < ecConfig.totalShards {
+                await ClusterMembershipLifecycle.shared.refreshNow(app: req.application)
+                active = await ClusterNodeCache.shared.activeNodes()
+            }
         } else {
             count = PlacementService.replicationFactor
         }

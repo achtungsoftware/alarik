@@ -17,22 +17,25 @@ limitations under the License.
 import Foundation
 import Vapor
 
-final actor AccessKeySecretKeyMapCache {
+final actor AccessKeySecretKeyMapCache: StoreBackedCache {
 
     public static let shared = AccessKeySecretKeyMapCache()
 
     private var map: [String: String] = [:]
 
-    /// Full replace, not merge - this runs both at boot (map starts empty, so it's equivalent
-    /// either way) and after a LISTEN-outage reconnect (`LoadCacheLifecycle.reloadAll`), where a
-    /// key revoked while disconnected must actually disappear, not just have any *currently
-    /// existing* keys re-upserted on top of a map that still remembers the revoked one forever.
+    var missLedger = CacheMissLedger<String>()
+
+    /// Full replace, not merge. Nothing in the running system calls this - `reloadAll` is
+    /// deliberately upsert-only, because a cluster-wide listing that came back incomplete would
+    /// otherwise evict live credentials. Kept only for tests that exercise replace semantics
+    /// directly; do not wire it into a reload path.
     func load(initialData: [(accessKey: String, secretKey: String)]) {
         map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.accessKey, $0.secretKey) })
     }
 
     func add(accessKey: String, secretKey: String) {
         map[accessKey] = secretKey
+        missLedger.clear(accessKey)
     }
 
     func remove(accessKey: String) {
@@ -53,5 +56,18 @@ final actor AccessKeySecretKeyMapCache {
 
     func getMap() -> [String: String] {
         map
+    }
+
+    // MARK: - StoreBackedCache
+
+    func cachedValue(for key: String) -> String? { map[key] }
+
+    func absorb(_ value: String, for key: String) { map[key] = value }
+
+    func loadFromStore(app: Application, key: String) async throws -> String? {
+        guard let stored = try await AccessKey.find(app: app, accessKey: key) else { return nil }
+        // An expired key is genuinely unusable, matching what a cache reload would have filtered.
+        if let expiry = stored.expirationDate, expiry <= Date() { return nil }
+        return stored.secretKey
     }
 }

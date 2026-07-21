@@ -1,0 +1,104 @@
+/*
+Copyright 2025-present Julian Gerhards
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Foundation
+import Vapor
+
+/// Bounded record of keys an authoritative lookup recently proved absent.
+///
+/// Without it, read-through turns every request carrying a bogus key into a cluster-wide metadata
+/// read - a cheap way for a client to generate expensive work. With it, a key confirmed missing
+/// stays cheap to reject for a few seconds.
+struct CacheMissLedger<Key: Hashable & Sendable>: Sendable {
+    private var misses: [Key: Date] = [:]
+    private let ttl: TimeInterval
+    private let capacity: Int
+
+    init(ttl: TimeInterval = 5, capacity: Int = 1024) {
+        self.ttl = ttl
+        self.capacity = capacity
+    }
+
+    func confirmedMissing(_ key: Key, now: Date = Date()) -> Bool {
+        guard let at = misses[key] else { return false }
+        return now.timeIntervalSince(at) <= ttl
+    }
+
+    mutating func note(_ key: Key, now: Date = Date()) {
+        if misses.count > capacity {
+            misses = misses.filter { now.timeIntervalSince($0.value) <= ttl }
+        }
+        misses[key] = now
+    }
+
+    mutating func clear(_ key: Key) {
+        misses.removeValue(forKey: key)
+    }
+}
+
+/// A cache that is a *projection* of `MetadataStore`, never a source of truth.
+///
+/// Conforming makes the correct behaviour the default: consult the cache, and only when it has no
+/// answer, ask the store. Callers get `resolve(app:key:)` and should prefer it over the raw cache
+/// accessors wherever a miss would otherwise be reported to a client as a definitive answer.
+///
+/// Fails closed and never caches uncertainty: if the store itself cannot be read, that is
+/// reported as "no answer" but deliberately *not* recorded as a miss, so "I couldn't check" can
+/// never harden into "it doesn't exist".
+protocol StoreBackedCache: Actor {
+    associatedtype Key: Hashable & Sendable
+    associatedtype Value: Sendable
+
+    /// This node's cached answer, or `nil` if it has none.
+    func cachedValue(for key: Key) -> Value?
+
+    /// Records an authoritative answer so subsequent lookups hit cache.
+    func absorb(_ value: Value, for key: Key)
+
+    /// Reads the authoritative answer from `MetadataStore`. Throwing means "could not determine",
+    /// which is treated differently from returning `nil` ("determined it does not exist").
+    func loadFromStore(app: Application, key: Key) async throws -> Value?
+
+    /// Per-cache negative-lookup bookkeeping. Conformers just declare storage for it.
+    var missLedger: CacheMissLedger<Key> { get set }
+}
+
+extension StoreBackedCache {
+    /// Cache first, then the authoritative store. The only lookup that may be used to tell a
+    /// client something does not exist.
+    func resolve(app: Application, key: Key) async -> Value? {
+        if let cached = cachedValue(for: key) { return cached }
+        if missLedger.confirmedMissing(key) { return nil }
+
+        let loaded: Value?
+        do {
+            loaded = try await loadFromStore(app: app, key: key)
+        } catch {
+            app.logger.warning(
+                "\(Self.self) could not consult the metadata store; answering 'unknown' rather than 'absent': \(error)"
+            )
+            return nil
+        }
+
+        guard let loaded else {
+            missLedger.note(key)
+            return nil
+        }
+        absorb(loaded, for: key)
+        missLedger.clear(key)
+        return loaded
+    }
+}

@@ -138,6 +138,20 @@ struct InternalUserController: RouteCollection {
             throw Abort(.badRequest, reason: "Invalid access key ID.")
         }
 
+        // Pointer first: a direct store read whose availability doesn't depend on every peer
+        // answering a cluster-wide listing in time. Revocation is the one operation that must
+        // not degrade to a wrong 404 just because a listing was momentarily partial.
+        if let pointer = try await AccessKey.findIdPointer(app: req.application, id: accessKeyId) {
+            guard pointer.userId == auth.userId else {
+                throw Abort(.notFound, reason: "Access key not found.")
+            }
+            try await AccessKeyService.delete(
+                app: req.application, accessKey: pointer.accessKey, id: accessKeyId)
+            return .noContent
+        }
+
+        // Legacy fallback: keys created before the by-id pointer existed have no pointer record,
+        // so resolve them through the listing as before.
         guard
             let accessKey = try await AccessKey.findAll(app: req.application, userId: auth.userId)
                 .first(where: { $0.id == accessKeyId })
@@ -145,7 +159,8 @@ struct InternalUserController: RouteCollection {
             throw Abort(.notFound, reason: "Access key not found.")
         }
 
-        try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
+        try await AccessKeyService.delete(
+            app: req.application, accessKey: accessKey.accessKey, id: accessKey.id)
 
         return .noContent
     }
@@ -209,7 +224,8 @@ struct InternalUserController: RouteCollection {
         let accessKeys = try await AccessKey.findAll(app: req.application, userId: auth.userId)
 
         for accessKey in accessKeys {
-            try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
+            try await AccessKeyService.delete(
+                app: req.application, accessKey: accessKey.accessKey, id: accessKey.id)
         }
 
         // Delete the user - buckets and access keys are already fully torn down above.

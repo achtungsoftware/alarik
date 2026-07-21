@@ -137,6 +137,15 @@ extension Bucket {
             Bucket.self, app: app, collection: MetadataCollections.buckets)
     }
 
+    /// `all` plus the listing's completeness verdict - see `LoadCacheLifecycle.reloadAll`, which
+    /// may only reconcile REMOVALS against a listing that is verifiably complete.
+    static func allVerified(
+        app: Application
+    ) async -> (records: [Bucket], presentIds: Set<String>, complete: Bool) {
+        await MetadataListingService.listVerified(
+            Bucket.self, app: app, collection: MetadataCollections.buckets)
+    }
+
     /// Creates the bucket, failing if the name is already taken.
     func create(app: Application) async throws -> Bool {
         try await MetadataStore.putIfAbsent(

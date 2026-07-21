@@ -898,7 +898,7 @@ struct S3Controller: RouteCollection {
                 req: req, bucketName: bucketName, key: keyPath, peers: peers)
         }
 
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         // Check if this is a copy operation
         if let copySource = try S3Service.parseCopySource(from: req) {
@@ -1807,7 +1807,7 @@ struct S3Controller: RouteCollection {
         // removal, or a plain legacy object - places no new shards and must NOT be blocked by EC
         // admission when the cluster is temporarily below k+m; those route via plain `routeForWrite`.
         let deleteVersionId = req.query[String.self, at: "versionId"]
-        let deleteVersioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let deleteVersioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
         let createsErasureCodedMarker =
             deleteVersionId == nil && deleteVersioningStatus == .enabled
         let usesECDestinationRouting =
@@ -1917,7 +1917,7 @@ struct S3Controller: RouteCollection {
 
         let (objects, quiet) = try parseDeleteObjectsBody(bodyString, requestId: req.id)
 
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         var deleted: [DeletedEntry] = []
         var errors: [DeleteErrorEntry] = []
@@ -2146,7 +2146,7 @@ struct S3Controller: RouteCollection {
         let parts = try S3Service.parseCompleteMultipartBody(bodyString, requestId: req.id)
 
         // Get versioning status
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         // Complete the upload - streams every part into the final object and fsyncs before
         // returning, real blocking file IO, so it's offloaded to the blocking-IO thread pool

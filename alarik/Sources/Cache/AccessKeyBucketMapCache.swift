@@ -17,7 +17,7 @@ limitations under the License.
 import Foundation
 import Vapor
 
-final actor AccessKeyBucketMapCache {
+final actor AccessKeyBucketMapCache: StoreBackedCache {
     public static let shared = AccessKeyBucketMapCache()
 
     private var map: [String: Set<String>] = [:]
@@ -89,5 +89,45 @@ final actor AccessKeyBucketMapCache {
 
     func getMap() -> [String: Set<String>] {
         map
+    }
+
+    // MARK: - StoreBackedCache
+
+    /// Keyed on the pair, because the question this cache answers is "may this key touch this
+    /// bucket" - a per-access-key entry alone cannot express a miss for one specific bucket.
+    struct Grant: Hashable, Sendable {
+        let accessKey: String
+        let bucket: String
+    }
+
+    var missLedger = CacheMissLedger<Grant>()
+
+    /// Whether `accessKey` may act on `bucket`, consulting the store when this node has no
+    /// cached grant - the accessor every caller should use.
+    func canAccess(app: Application, accessKey: String, bucket: String) async -> Bool {
+        await resolve(app: app, key: Grant(accessKey: accessKey, bucket: bucket)) ?? false
+    }
+
+    func cachedValue(for key: Grant) -> Bool? {
+        // Only a positive is cached knowledge. Absence means "not known here", never "denied" -
+        // answering `false` from a cold cache is exactly the false `AccessDenied` this avoids.
+        map[key.accessKey]?.contains(key.bucket) == true ? true : nil
+    }
+
+    func absorb(_ value: Bool, for key: Grant) {
+        guard value else { return }
+        map[key.accessKey, default: []].insert(key.bucket)
+    }
+
+    /// Authoritative answer: the bucket exists and is owned by this access key's user. Resolves
+    /// the owner through `AccessKeyUserMapCache` rather than reading the key record directly, so
+    /// that lookup gets the same cache-then-store treatment instead of a private shortcut.
+    func loadFromStore(app: Application, key: Grant) async throws -> Bool? {
+        guard
+            let ownerId = await AccessKeyUserMapCache.shared.resolvedUserId(
+                app: app, accessKey: key.accessKey)
+        else { return nil }
+        guard let bucket = try await Bucket.find(app: app, name: key.bucket) else { return nil }
+        return bucket.userId == ownerId ? true : nil
     }
 }

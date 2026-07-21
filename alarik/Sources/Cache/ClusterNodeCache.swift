@@ -47,6 +47,17 @@ struct ClusterNodeInfo: Sendable, Equatable {
 
 /// This is every node's in-memory view of cluster membership - `PlacementService` and
 /// `ObjectRoutingService` read `activeNodes(...)` on every request rather than hitting the DB.
+/// Deliberately **not** a `StoreBackedCache`, unlike every other cache here.
+///
+/// The read-through those use resolves a miss by reading `MetadataStore` - but `MetadataStore`
+/// works out *where* to read from using this cache. Repairing membership by consulting the store
+/// would therefore need the very answer it is trying to produce. A node that knows only itself
+/// would ask only itself, and stay wrong.
+///
+/// Membership is repaired along the one path that needs no prior knowledge: re-querying the
+/// statically configured `CLUSTER_SEED_NODES` addresses - see
+/// `ClusterMembershipLifecycle.refreshNow`, which callers invoke before failing an operation
+/// because their view looks too small.
 final actor ClusterNodeCache {
     public static let shared = ClusterNodeCache()
 

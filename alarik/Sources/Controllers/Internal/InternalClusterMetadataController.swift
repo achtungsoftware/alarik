@@ -98,14 +98,19 @@ struct InternalClusterMetadataController: RouteCollection {
         guard let collection = req.query[String.self, at: "collection"] else {
             throw Abort(.badRequest, reason: "Missing collection query parameter")
         }
-        let entries = await MetadataListingService.localEnvelopeEntries(
+        let local = await MetadataListingService.localEnvelopeEntriesVerified(
             app: req.application, collection: collection)
-        let wire = try entries.map {
+        let wire = try local.entries.map {
             MetadataListingService.WireEntry(
                 id: $0.id, value: try $0.envelope.encoded().base64EncodedString())
         }
         let response = Response(status: .ok)
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        // Self-reported completeness: a skipped-unreadable record here must taint the CALLER's
+        // completeness too, or "answered but partial" would be indistinguishable from complete.
+        response.headers.replaceOrAdd(
+            name: MetadataListingService.listingCompleteHeader,
+            value: local.allReadable ? "true" : "false")
         response.body = try Response.Body(data: JSONEncoder().encode(wire))
         return response
     }

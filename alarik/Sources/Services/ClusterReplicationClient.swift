@@ -429,6 +429,52 @@ enum ClusterReplicationClient {
     /// Returns `nil` when the node is unreachable/errored (distinct from `[]` = reachable but holds
     /// no shard), so the gatherer can tell "object genuinely absent" from "can't currently reach a
     /// holder" - the difference between a correct 404 and a correct 503.
+    /// One shard a node holds, together with the generation it belongs to. Two nodes can hold the
+    /// same shard index from DIFFERENT generations (a non-versioned overwrite or a tombstone that
+    /// hasn't reached every holder), and a single node can hold shards from two generations at
+    /// once - so generation is tracked per (node, index), never per node.
+    struct HeldShard: Content, Sendable {
+        let index: Int
+        let etag: String
+        /// Epoch millis, not a `Date`: encoder/decoder date strategies must never be able to
+        /// disagree across nodes about which generation is newer (same reasoning as
+        /// `MetadataEnvelope.updatedAtMillis`).
+        let updatedAtMillis: Int64
+    }
+
+    /// `heldShards` plus each shard's generation, in the SAME round trip. `nil` shard-generation
+    /// (an older peer that only knows how to answer with bare indices) degrades safely: the
+    /// gatherer treats those as unknown-generation, usable only as a fallback.
+    static func heldShardsDetailed(
+        app: Application, node: ClusterNodeInfo, bucketName: String, key: String, versionId: String?
+    ) async -> [HeldShard]? {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
+        let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/ecshards/held" + suffix + "&detail=1")
+        outbound.method = .GET
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        do {
+            let response = try await app.http.client.shared.execute(
+                outbound, timeout: probeTimeout, logger: app.logger)
+            guard response.status == .ok else { return nil }
+            let body = try await response.body.collect(upTo: 256 * 1024)
+            let data = Data(buffer: body)
+            if let detailed = try? JSONDecoder().decode([HeldShard].self, from: data) {
+                return detailed
+            }
+            // Older peer ignored `detail=1` and answered with bare indices - known to hold these
+            // shards, generations unknown (empty etag).
+            if let indices = try? JSONDecoder().decode([Int].self, from: data) {
+                return indices.map { HeldShard(index: $0, etag: "", updatedAtMillis: 0) }
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
     static func heldShards(
         app: Application, node: ClusterNodeInfo, bucketName: String, key: String, versionId: String?
     ) async -> [Int]? {

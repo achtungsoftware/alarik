@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 import Foundation
+import Vapor
 
-final actor AccessKeyUserMapCache {
+final actor AccessKeyUserMapCache: StoreBackedCache {
     public static let shared = AccessKeyUserMapCache()
 
     private var map: [String: UUID] = [:]
@@ -45,5 +46,22 @@ final actor AccessKeyUserMapCache {
 
     func getMap() -> [String: UUID] {
         map
+    }
+
+    // MARK: - StoreBackedCache
+
+    var missLedger = CacheMissLedger<String>()
+
+    func cachedValue(for key: String) -> UUID? { map[key] }
+
+    func absorb(_ value: UUID, for key: String) { map[key] = value }
+
+    func loadFromStore(app: Application, key: String) async throws -> UUID? {
+        try await AccessKey.find(app: app, accessKey: key)?.userId
+    }
+
+    /// The owning user, consulting the store when this node has no cached entry.
+    func resolvedUserId(app: Application, accessKey: String) async -> UUID? {
+        await resolve(app: app, key: accessKey)
     }
 }

@@ -479,11 +479,17 @@ struct InternalBucketController: RouteCollection {
                     app: req.application, candidates: responsible, bucketName: input.bucket,
                     key: input.key, versionId: nil)
                 if !existsRemotely {
-                    for (rank, node) in responsible.enumerated() {
-                        if await ClusterReplicationClient.shardExists(
+                    // Ask each node what it actually holds, rather than whether it holds the
+                    // shard matching its *current* rank. A shard's index is fixed when the object
+                    // is written, but ranks move with membership, so after any membership change
+                    // the two stop lining up - and probing by rank then reports a perfectly
+                    // healthy object as missing. This is the same reason
+                    // `ErasureCodedShardGatherer` discovers held indices instead of assuming them.
+                    for node in responsible {
+                        let held = await ClusterReplicationClient.heldShards(
                             app: req.application, node: node, bucketName: input.bucket,
-                            key: input.key, versionId: nil, shardIndex: rank)
-                        {
+                            key: input.key, versionId: nil)
+                        if let held, !held.isEmpty {
                             existsRemotely = true
                             break
                         }
@@ -584,7 +590,7 @@ struct InternalBucketController: RouteCollection {
         )
 
         // Get bucket versioning status from cache
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         // Write object with versioning support - real blocking file IO, offloaded to the
         // blocking-IO thread pool rather than tying up the async executor. Small uploads arrive
@@ -687,7 +693,7 @@ struct InternalBucketController: RouteCollection {
         // Verify bucket exists and belongs to user
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         // Check if this is a folder (prefix) deletion
         if key.hasSuffix("/") {
@@ -2091,7 +2097,7 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
         // Cluster peers physically hold the exact same version files as this node - unlike
         // ReplicationClient's external replication target, which has no per-version equivalent
         // to prune (see ReplicationClient.replicateDelete) - so this needs to route to (or

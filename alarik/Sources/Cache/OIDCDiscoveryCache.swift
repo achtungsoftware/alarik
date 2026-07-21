@@ -37,6 +37,9 @@ struct OIDCDiscoveryDocument: Content {
 /// This is a separate key collection from `app.jwt.keys` (which signs Alarik's own session
 /// tokens) - mixing the IdP's public keys into that collection would let a token signed by the
 /// IdP be mistaken for a request to verify against Alarik's own HMAC key, or vice versa.
+/// Not a `StoreBackedCache`: this caches documents fetched over HTTP from an external identity
+/// provider, not a projection of `MetadataStore`, so there is no local authoritative record to
+/// fall back to on a miss - the fallback is simply re-fetching from the provider.
 final actor OIDCDiscoveryCache {
 
     public static let shared = OIDCDiscoveryCache()

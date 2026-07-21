@@ -88,10 +88,38 @@ struct InternalClusterErasureCodedController: RouteCollection {
     /// reconstruction) use it to discover where each shard *actually* lives, since a shard's index
     /// no longer implies which node holds it once HRW ranks have drifted on a membership change.
     @Sendable
-    func handleHeld(req: Request) async throws -> [Int] {
+    func handleHeld(req: Request) async throws -> Response {
         let (bucketName, key, versionId) = try bucketKey(req: req)
-        return ErasureCodedObjectHandler.locallyHeldShardIndices(
+        let indices = ErasureCodedObjectHandler.locallyHeldShardIndices(
             bucketName: bucketName, key: key, versionId: versionId)
+
+        let response = Response(status: .ok)
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+
+        // `detail=1` additionally reports each shard's generation (etag + updatedAt), read from
+        // its own header, so the caller can tell divergent copies of the same index apart in the
+        // SAME round trip it already makes for discovery. Absent the flag the response stays the
+        // bare `[Int]` older binaries expect - this endpoint is on the read hot path during a
+        // rolling upgrade, so the wire format must degrade in both directions.
+        guard req.query[String.self, at: "detail"] != nil else {
+            response.body = try Response.Body(data: JSONEncoder().encode(indices))
+            return response
+        }
+
+        let detailed = try await req.application.threadPool.runIfActive {
+            indices.compactMap { index -> ClusterReplicationClient.HeldShard? in
+                let path = ErasureCodedObjectHandler.shardPath(
+                    bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
+                guard let reader = try? ErasureCodedShardReader(path: path) else { return nil }
+                defer { reader.close() }
+                let meta = reader.header.objectMeta
+                return ClusterReplicationClient.HeldShard(
+                    index: index, etag: meta.etag,
+                    updatedAtMillis: Int64(meta.updatedAt.timeIntervalSince1970 * 1000))
+            }
+        }
+        response.body = try Response.Body(data: JSONEncoder().encode(detailed))
+        return response
     }
 
     /// The `ObjectMeta` from any shard this node holds for (bucket, key[, versionId]) - a

@@ -813,8 +813,10 @@ struct S3Service {
 
         guard
             await AccessKeyBucketMapCache.shared.canAccess(
-                accessKey: authInfo.accessKey, bucket: bucketName)
+                app: req.application, accessKey: authInfo.accessKey, bucket: bucketName)
         else {
+            // Reached only after ownership has also been checked against the store, so this is a
+            // real authorization failure rather than an artifact of a cold cache.
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
 

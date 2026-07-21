@@ -281,10 +281,11 @@ struct SigV4Validator {
         let authInfo: S3AuthInfo = try S3AuthParser.parse(request: req)
 
         guard
-            let secretKey = await AccessKeySecretKeyMapCache.shared.secretKey(
-                for: authInfo.accessKey)
+            let secretKey = await AccessKeySecretKeyMapCache.shared.resolve(
+                app: req.application, key: authInfo.accessKey)
         else {
-            // S3's dedicated code for an unknown access key (403)
+            // S3's dedicated code for an unknown access key (403). Reached only after the
+            // authoritative store has also been consulted - see `StoreBackedCache`.
             throw S3Error(
                 status: .forbidden, code: "InvalidAccessKeyId",
                 message: "The access key ID you provided does not exist in our records.")
@@ -757,6 +758,10 @@ struct SigV4Validator {
     static func chunkSignatureValidator(for authInfo: S3AuthInfo) async throws
         -> ChunkSignatureValidator
     {
+        // Cache-only is correct here, unlike `authenticateRequest`: this only runs once that has
+        // already authenticated the same key, and doing so warms the cache via
+        // `StoreBackedCache.resolve`. A miss here means the key was revoked mid-upload, which
+        // should fail.
         guard
             let secretKey = await AccessKeySecretKeyMapCache.shared.secretKey(
                 for: authInfo.accessKey)

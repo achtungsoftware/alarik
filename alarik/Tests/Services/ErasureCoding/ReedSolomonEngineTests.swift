@@ -140,7 +140,7 @@ struct ReedSolomonEngineTests {
 
     @Test("reconstructing with corrupted (silently wrong) survivor data yields the wrong output")
     func corruptedSurvivorPropagatesIncorrectResult() throws {
-        // Not a checksum test (that's Phase 3's job) - just documents that this engine trusts
+        // Not a checksum test - just documents that this engine trusts
         // its inputs completely; corruption detection must happen one layer up.
         let k = 3
         let m = 2

@@ -106,6 +106,23 @@ enum ErasureCodedRebalanceService {
         let active = await ClusterNodeCache.shared.activeNodes()
         let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId ?? target.id
 
+        // A metadata shard this node already holds is pushed verbatim. The reconstruction
+        // below rebuilds a shard from the OTHER shards, which cannot work for a k=1/m=0
+        // record: there are no other shards, so the gather (which excludes this very index)
+        // finds nothing, takes the record as deleted, and returns silently placing nothing.
+        if MetadataNamespace.isReserved(bucketName) {
+            let localPath = ErasureCodedObjectHandler.shardPath(
+                bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+            if FileManager.default.fileExists(atPath: localPath) {
+                if target.id != selfNodeId {
+                    try await ClusterReplicationClient.pushShard(
+                        app: app, to: target, sourcePath: localPath, bucketName: bucketName,
+                        key: key, versionId: versionId, shardIndex: shardIndex)
+                }
+                return
+            }
+        }
+
         // For metadata, discover the TRUE as-written (dataShards, parityShards) rather than
         // trusting the live recompute - see `rebalanceOne`'s identical reasoning. Unlike
         // `rebalanceOne` (which already has this shard's own header in hand), the shard being
@@ -376,37 +393,77 @@ enum ErasureCodedRebalanceService {
             count: dataShards + parityShards)
         let selfRank = responsible.firstIndex(where: { $0.id == selfNodeId })
 
-        // A metadata record seeded while the cluster had few nodes (most notably the founding
-        // node's boot-time admin-user seed, written before any peer exists to fan out to) is
-        // otherwise stuck forever at whatever narrow k/m it was born with, leaving it a single
-        // point of failure long after the cluster grew. Re-reading and re-writing it picks up the
-        // CURRENT wider placement; the stale narrow shard becomes an ordinary orphan the next
-        // walk reclaims.
+        // Control-plane metadata gets its own, deliberately conservative treatment. Three rules,
+        // each learned from a real failure:
         //
-        // Envelope-verbatim on purpose. The payload-level `get`/`put` would be wrong twice here:
-        // it would re-stamp `updatedAtMillis` on what is only a physical move (making a widened
-        // record spuriously win a later conflict), and it reports tombstones as absent - so
-        // tombstones would never widen and would stay pinned to one node, which is exactly the
-        // durability hole this whole path exists to close.
-        if MetadataNamespace.isReserved(bucketName), selfRank == 0 {
-            let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
-            let currentWidth = metadataConfig.effective(activeNodeCount: activeNodes.count)
-            if currentWidth.dataShards + currentWidth.parityShards > dataShards + parityShards,
-                let (collection, id) = MetadataNamespace.splitKey(key)
+        // 1. NEVER reclaimed. The reclaim paths below infer staleness from rank arithmetic that
+        //    assumes the operator-fixed object-data k/m; metadata uses a different, auto-capping
+        //    k/m, so a live record can look stale purely because the widths differ - and deleting
+        //    it destroys a user or credential, not a redundant copy. An orphaned metadata shard
+        //    costs a few KB; deleting a live one is unrecoverable.
+        //
+        // 2. Self-managed collections are skipped outright. `cluster-nodes` records are pinned to
+        //    k=1/m=0 by `resolveRouting` and rewritten by their owner's heartbeat every few
+        //    seconds - "widening" them can never converge (every walk re-fires forever), and
+        //    gap-filling them fights their self-coordinated placement with doomed repair tasks
+        //    that flood the outbox and starve real object repairs (observed as read-repair and
+        //    scrub timeouts). `oidc-states` are single-use and TTL-swept. Both are exactly the
+        //    tombstone-exempt set.
+        //
+        // 3. Durability for a narrow record is added by COPYING, never by re-encoding. A k=1/m=0
+        //    record (the founding node's boot seed: admin user, its access key) IS the payload,
+        //    decodable from any single copy, so replicating shard 0 onto the current responsible
+        //    nodes is purely additive - a failed push leaves the record exactly as durable as
+        //    before. Re-encoding in place to a wider k/m was tried and is catastrophic on
+        //    mid-write failure: the surviving header demands more shards than exist while the one
+        //    readable copy is already gone (this wiped the seeded admin user and locked every
+        //    node out of the cluster).
+        if MetadataNamespace.isReserved(bucketName) {
+            if let (collection, _) = MetadataNamespace.splitKey(key),
+                MetadataCollections.tombstoneExempt.contains(collection)
             {
-                do {
-                    if let envelope = try await MetadataStore.getEnvelope(
-                        app: app, collection: collection, id: id)
-                    {
-                        try await MetadataStore.putEnvelope(
-                            app: app, collection: collection, id: id, envelope: envelope)
-                    }
-                } catch {
-                    app.logger.warning(
-                        "Failed to widen under-replicated metadata record \(key): \(error)")
-                }
                 return false
             }
+
+            if dataShards == 1, parityShards == 0 {
+                let metadataConfig =
+                    app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
+                let width = metadataConfig.effective(activeNodeCount: activeNodes.count)
+                let targets = PlacementService.responsibleNodes(
+                    bucketName: bucketName, key: key, activeNodes: activeNodes,
+                    count: width.dataShards + width.parityShards)
+                for target in targets where target.id != selfNodeId {
+                    // Skip targets that already hold a copy, so repeat walks converge to
+                    // silence instead of re-pushing forever.
+                    if await ClusterReplicationClient.shardExists(
+                        app: app, node: target, bucketName: bucketName, key: key,
+                        versionId: versionId, shardIndex: header.shardIndex)
+                    {
+                        continue
+                    }
+                    do {
+                        // Push the walked shard file verbatim - NOT `reconstructAndPlaceShard`,
+                        // which gathers the OTHER shards to rebuild this one; a k=1/m=0 record
+                        // has no other shards, so that gather finds nothing and silently
+                        // succeeds without placing anything.
+                        try await ClusterReplicationClient.pushShard(
+                            app: app, to: target, sourcePath: path, bucketName: bucketName,
+                            key: key, versionId: versionId, shardIndex: header.shardIndex)
+                        app.logger.info(
+                            "Replicated single-copy metadata record \(key) to node \(target.id).")
+                    } catch {
+                        app.logger.debug(
+                            "Could not place a copy of single-copy metadata record \(key) on \(target.id) (retried on the next walk): \(error)"
+                        )
+                    }
+                }
+            } else if selfRank == 0 {
+                // Properly-width records still get the normal gap-fill sweep.
+                try await sweepGaps(
+                    app: app, bucketName: bucketName, key: key, versionId: versionId,
+                    responsible: responsible)
+            }
+            return false
         }
 
         guard let selfRank else {

@@ -351,7 +351,8 @@ struct InternalAdminController: RouteCollection {
         let accessKeys = try await AccessKey.findAll(app: req.application, userId: userId)
 
         for accessKey in accessKeys {
-            try await AccessKeyService.delete(app: req.application, accessKey: accessKey.accessKey)
+            try await AccessKeyService.delete(
+                app: req.application, accessKey: accessKey.accessKey, id: accessKey.id)
         }
 
         // Delete the user - buckets and access keys are already fully torn down above.

@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 import Foundation
+import Vapor
 
 /// In-memory mirror of every bucket's notification configuration, loaded at boot and kept in
 /// sync on writes - so the object write/delete hot paths can check "does this bucket have any
 /// webhook rules?" with a single actor dictionary lookup and zero database access.
-final actor NotificationConfigCache {
+final actor NotificationConfigCache: StoreBackedCache {
     public static let shared = NotificationConfigCache()
 
     private var map: [String: NotificationConfiguration] = [:]
@@ -53,5 +54,24 @@ final actor NotificationConfigCache {
 
     func getMap() -> [String: NotificationConfiguration] {
         map
+    }
+
+    // MARK: - StoreBackedCache
+
+    var missLedger = CacheMissLedger<String>()
+
+    func cachedValue(for key: String) -> NotificationConfiguration? { map[key] }
+
+    func absorb(_ value: NotificationConfiguration, for key: String) { map[key] = value }
+
+    func loadFromStore(app: Application, key: String) async throws -> NotificationConfiguration? {
+        guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        return LoadCacheLifecycle.notificationConfig(for: bucket)
+    }
+
+    /// The bucket's webhook configuration, consulting the store on a miss. Without this a node
+    /// that hasn't cached the bucket yet silently fires no notifications at all.
+    func resolvedConfig(app: Application, bucket: String) async -> NotificationConfiguration? {
+        await resolve(app: app, key: bucket)
     }
 }

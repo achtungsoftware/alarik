@@ -204,8 +204,8 @@ struct InternalClusterObjectController: RouteCollection {
         }
 
         do {
-            let versioningStatus = await BucketVersioningCache.shared.getStatus(
-                for: meta.bucketName)
+            let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(
+                app: req.application, bucket: meta.bucketName)
             let path: String
             switch versioningStatus {
             case .disabled:
@@ -262,7 +262,7 @@ struct InternalClusterObjectController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
         }
         let versionId = req.query[String.self, at: "versionId"]
-        let versioningStatus = await BucketVersioningCache.shared.getStatus(for: bucketName)
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
         let outcome: S3Service.ObjectDeleteOutcome
         if req.query[Bool.self, at: "coordinate"] == true {

@@ -140,9 +140,39 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         }
     }
 
+    /// Last time `refreshNow` actually queried the seeds, used to debounce it.
+    private var lastForcedRefreshAt: Date?
+    /// A forced refresh is only worth doing this often - concurrent requests all discovering the
+    /// same too-small view must not each fire their own seed fan-out.
+    private static let forcedRefreshInterval: TimeInterval = 1
+
+    /// Re-seeds membership *right now*, for a caller about to fail an operation because its own
+    /// view of the cluster looks too small to proceed.
+    ///
+    /// A node that boots while its seeds happen to be down (several nodes restarting together)
+    /// ends up with a membership cache containing only itself, and starts serving traffic that
+    /// way. The periodic `refreshLoop` repairs this within seconds, but until it does, every
+    /// write is rejected with a confident, wrong error ("requires at least 4 active cluster
+    /// nodes, only 1 are active") while the cluster is in fact perfectly healthy. Refreshing
+    /// before rejecting turns that lie into a brief delay. Debounced, and only ever reached on a
+    /// path that is already failing, so it costs nothing in the normal case.
+    func refreshNow(app: Application) async {
+        guard let config = app.storage[ClusterConfigurationKey.self], !config.seeds.isEmpty else {
+            return
+        }
+        let now = Date()
+        if let last = lastForcedRefreshAt,
+            now.timeIntervalSince(last) < Self.forcedRefreshInterval
+        {
+            return
+        }
+        lastForcedRefreshAt = now
+        await reseedFromConfiguredSeeds(app: app, config: config, triggerCacheReloadOnGrowth: true)
+    }
+
     /// Queries every statically-configured seed in parallel and merges their snapshots into the
-    /// local cache via `upsert` (additive, never drops) - reusable so `refreshLoop` can repeat it
-    /// periodically. This lets two independently-booted subsets of a cluster eventually merge,
+    /// local cache via `reconcile` (additive, never drops, freshest entry wins) - reusable so
+    /// `refreshLoop` can repeat it periodically. This lets two independently-booted subsets of a cluster eventually merge,
     /// since re-querying the fixed seed list sidesteps `ClusterNode.all()`'s fan-out only ever
     /// discovering nodes whose records sit on an already-known peer. Returns whether at least
     /// one seed answered. `triggerCacheReloadOnGrowth`: `false` from `bootstrapMembership` (a
@@ -162,7 +192,12 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             for await result in group {
                 guard let snapshot = result else { continue }
                 anySucceeded = true
-                for node in snapshot { await ClusterNodeCache.shared.upsert(node) }
+                // `reconcile`, never raw upsert: a seed's snapshot is its own possibly-stale
+                // cache. Blindly overwriting lets one lagging peer clobber this node's fresher
+                // entry for a live, heartbeating node - which then silently drops out of
+                // `activeNodes()` (heartbeat looks >60s old) and out of placement, while
+                // health checks (which re-read via listing fan-out) still pass.
+                await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
             }
         }
 

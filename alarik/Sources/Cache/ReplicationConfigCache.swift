@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 import Foundation
+import Vapor
 
 /// In-memory mirror of every bucket's replication configuration, loaded at boot and kept in
 /// sync on writes - so the object write/delete hot paths can check "does this bucket replicate
 /// anywhere?" with a single actor dictionary lookup and zero database access. Mirrors
 /// `NotificationConfigCache` exactly.
-final actor ReplicationConfigCache {
+final actor ReplicationConfigCache: StoreBackedCache {
     public static let shared = ReplicationConfigCache()
 
     private var map: [String: ReplicationConfiguration] = [:]
@@ -54,5 +55,24 @@ final actor ReplicationConfigCache {
 
     func getMap() -> [String: ReplicationConfiguration] {
         map
+    }
+
+    // MARK: - StoreBackedCache
+
+    var missLedger = CacheMissLedger<String>()
+
+    func cachedValue(for key: String) -> ReplicationConfiguration? { map[key] }
+
+    func absorb(_ value: ReplicationConfiguration, for key: String) { map[key] = value }
+
+    func loadFromStore(app: Application, key: String) async throws -> ReplicationConfiguration? {
+        guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        return LoadCacheLifecycle.replicationConfig(for: bucket)
+    }
+
+    /// The bucket's replication configuration, consulting the store on a miss - a miss here means
+    /// writes silently never replicate, which is a durability problem, not just a stale read.
+    func resolvedConfig(app: Application, bucket: String) async -> ReplicationConfiguration? {
+        await resolve(app: app, key: bucket)
     }
 }

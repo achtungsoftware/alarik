@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 import Foundation
+import Vapor
 
 /// Caches already-parsed bucket policies (and public access block settings) so the request hot
 /// path (every anonymous request) never touches the database or re-parses JSON. Both live in one
 /// cache, rather than as two separate actors, since they're loaded/invalidated at the exact same
 /// lifecycle points and together answer one question: "can an anonymous caller in?" Mirrors
 /// BucketVersioningCache.
-final actor BucketPolicyCache {
+final actor BucketPolicyCache: StoreBackedCache {
     public static let shared = BucketPolicyCache()
 
     private var map: [String: BucketPolicy] = [:]
@@ -82,5 +83,46 @@ final actor BucketPolicyCache {
 
     func getPublicAccessBlockMap() -> [String: PublicAccessBlockConfiguration] {
         publicAccessBlockMap
+    }
+
+    // MARK: - StoreBackedCache
+
+    /// Both bucket-authorization values together: one `Bucket` read answers both, and caching
+    /// them as a unit keeps them from disagreeing about whether the bucket was resolvable.
+    struct Authorization: Sendable {
+        let policy: BucketPolicy?
+        let publicAccessBlock: PublicAccessBlockConfiguration?
+    }
+
+    var missLedger = CacheMissLedger<String>()
+
+    func cachedValue(for key: String) -> Authorization? {
+        guard map[key] != nil || publicAccessBlockMap[key] != nil else { return nil }
+        return Authorization(policy: map[key], publicAccessBlock: publicAccessBlockMap[key])
+    }
+
+    func absorb(_ value: Authorization, for key: String) {
+        if let policy = value.policy { map[key] = policy }
+        if let pab = value.publicAccessBlock { publicAccessBlockMap[key] = pab }
+    }
+
+    func loadFromStore(app: Application, key: String) async throws -> Authorization? {
+        guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        return Authorization(
+            policy: LoadCacheLifecycle.parsedPolicy(for: bucket, logger: app.logger),
+            publicAccessBlock: LoadCacheLifecycle.publicAccessBlockIfNonDefault(for: bucket))
+    }
+
+    /// The bucket's policy, consulting the store on a miss - a miss otherwise reads as "no
+    /// policy", which silently changes who is allowed to do what.
+    func resolvedPolicy(app: Application, bucket: String) async -> BucketPolicy? {
+        await resolve(app: app, key: bucket)?.policy
+    }
+
+    /// The bucket's public-access-block configuration, consulting the store on a miss.
+    func resolvedPublicAccessBlock(app: Application, bucket: String) async
+        -> PublicAccessBlockConfiguration?
+    {
+        await resolve(app: app, key: bucket)?.publicAccessBlock
     }
 }

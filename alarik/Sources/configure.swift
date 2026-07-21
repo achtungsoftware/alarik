@@ -178,7 +178,7 @@ public func configure(_ app: Application) async throws {
 
                     for accessKey in expiredAccessKeys {
                         try await AccessKeyService.delete(
-                            app: app, accessKey: accessKey.accessKey)
+                            app: app, accessKey: accessKey.accessKey, id: accessKey.id)
                     }
                 } catch {
                     app.logger.error("Failed to invalidate expired access keys: \(error)")
