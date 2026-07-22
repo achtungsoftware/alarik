@@ -250,8 +250,8 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             let body = try await response.body.collect(upTo: 4 * 1024 * 1024)
             let decoded = try JSONDecoder().decode(
                 [InternalClusterMetadataController.ClusterMemberWire].self, from: Data(buffer: body))
-            return decoded.compactMap { wire -> ClusterNodeInfo? in
-                return ClusterNodeInfo(
+            return decoded.map { wire in
+                ClusterNodeInfo(
                     id: wire.id, address: wire.address, status: wire.status,
                     lastHeartbeatAt: wire.lastHeartbeatAt, totalBytes: wire.totalBytes,
                     availableBytes: wire.availableBytes)
@@ -328,7 +328,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             if let existing = try? await ClusterNode.find(app: app, id: config.nodeId) {
                 node = existing
                 lastKnownJoinedAt = existing.joinedAt
-                lastKnownStatus = ClusterNode.Status(rawValue: existing.status.rawValue) ?? lastKnownStatus
+                lastKnownStatus = existing.status
             } else if let cached = await ClusterNodeCache.shared.get(id: config.nodeId) {
                 // The direct read failed (a convergence hiccup), but this node's in-memory belief
                 // about ITSELF is usually still fresh: an admin-initiated drain reaches this node
@@ -365,13 +365,9 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
                 )
             }
 
-            // Always a valid rawValue here: `node` is either a fresh read-back (whose status was
-            // already parsed successfully above) or built from `lastKnownStatus`, itself always a
-            // real `ClusterNode.Status`.
-            let statusForCache = ClusterNode.Status(rawValue: node.status.rawValue) ?? .active
             await ClusterNodeCache.shared.upsert(
                 ClusterNodeInfo(
-                    id: config.nodeId, address: config.address, status: statusForCache,
+                    id: config.nodeId, address: config.address, status: node.status,
                     lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes)
             )
         }

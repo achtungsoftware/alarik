@@ -92,7 +92,13 @@ enum ErasureCodedWriteCoordinator {
         let quorum = PlacementService.ecQuorumThreshold(
             dataShards: ecConfig.dataShards, parityShards: ecConfig.parityShards)
 
-        if delivered.count < quorum, !peers.isEmpty {
+        // `!peers.isEmpty`, NOT `delivered.count < quorum`: a narrow layout can meet quorum from
+        // the local shard alone (metadata on a 2-node cluster auto-caps to k=1/m=1, whose
+        // threshold is 1), and skipping the fan-out there acked the write as durable while a
+        // perfectly reachable second node sat idle and the only other copy went to the outbox.
+        // Losing that node before the outbox drained lost the record. Attempting delivery costs
+        // nothing extra - undelivered shards fall through to the outbox exactly as before.
+        if !peers.isEmpty {
             await withTaskGroup(of: (shardIndex: Int, ok: Bool).self) { group in
                 for (offset, peer) in peers.enumerated() {
                     let shardIndex = offset + 1

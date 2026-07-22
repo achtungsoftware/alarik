@@ -45,9 +45,7 @@ enum ErasureCodedScrubber {
     /// a no-op. Never throws: a scrub is best-effort maintenance, and any per-shard failure just
     /// leaves that shard for the next pass.
     static func scrub(app: Application) async {
-        guard app.storage[ClusterConfigurationKey.self] != nil,
-            let ecConfig = app.storage[ClusterErasureCodingConfigKey.self]
-        else { return }
+        guard app.storage[ClusterConfigurationKey.self] != nil else { return }
         guard await running.begin() else { return }
         defer { Task { await running.end() } }
 
@@ -75,7 +73,7 @@ enum ErasureCodedScrubber {
                 await healLocalShard(
                     app: app, bucketName: header.objectMeta.bucketName, key: header.objectMeta.key,
                     versionId: header.objectMeta.versionId == "null" ? nil : header.objectMeta.versionId,
-                    shardIndex: header.shardIndex, ecConfig: ecConfig)
+                    shardIndex: header.shardIndex)
             }
             try? await Task.sleep(for: interShardPause)
         }
@@ -97,7 +95,6 @@ enum ErasureCodedScrubber {
     static func verifyAndHealObjectShards(
         app: Application, bucketName: String, key: String, versionId: String?
     ) async -> Bool {
-        guard let ecConfig = app.storage[ClusterErasureCodingConfigKey.self] else { return false }
         let indices = ErasureCodedObjectHandler.locallyHeldShardIndices(
             bucketName: bucketName, key: key, versionId: versionId)
         var healedAny = false
@@ -112,7 +109,7 @@ enum ErasureCodedScrubber {
             healedAny = true
             await healLocalShard(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                shardIndex: index, ecConfig: ecConfig)
+                shardIndex: index)
         }
         return healedAny
     }
@@ -143,8 +140,7 @@ enum ErasureCodedScrubber {
     /// index this node ACTUALLY held (from the filename/header), never its current HRW rank -
     /// rank drifts with membership, the index on disk is ground truth.
     private static func healLocalShard(
-        app: Application, bucketName: String, key: String, versionId: String?, shardIndex: Int,
-        ecConfig: ClusterErasureCodingConfig
+        app: Application, bucketName: String, key: String, versionId: String?, shardIndex: Int
     ) async {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return }
         let finalPath = ErasureCodedObjectHandler.shardPath(

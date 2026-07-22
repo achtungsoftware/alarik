@@ -368,17 +368,6 @@ enum ErasureCodedObjectHandler {
         }
     }
 
-    /// Prefix variant of `listLocalShardZeroEntries` - used by `MetadataListingService` to walk
-    /// one collection at a time (e.g. every key under `"users/"`) rather than a single exact key.
-    /// A distinct function, not a repurposed `key:` parameter: `listLocalShardZeroEntries`'s
-    /// existing exact-match callers (e.g. `ObjectFileHandler.listAllVersions`, listing every
-    /// version of one specific key) must never silently start prefix-matching.
-    static func listLocalShardZeroEntries(bucketName: String, keyPrefix: String) -> [ObjectMeta] {
-        localShardZeroEntries(bucketName: bucketName) { meta in
-            meta.key.hasPrefix(keyPrefix)
-        }
-    }
-
     /// Every locally-held record under `keyPrefix`, discovered from **any** shard index rather
     /// than only shard 0 - at most one entry per key, whichever index this node happens to hold.
     ///
@@ -392,9 +381,21 @@ enum ErasureCodedObjectHandler {
     /// by id, so duplicates collapse.
     static func listLocalShardEntries(bucketName: String, keyPrefix: String) -> [ObjectMeta] {
         let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        // Descend only into the directory the prefix already names, never the whole bucket. A key
+        // maps to a real directory path (`users/<id>` -> `users/<id>.ecshards/`), so a prefix like
+        // `"users/"` is a directory, not just a string filter. Walking the bucket root instead
+        // meant every listing of ONE collection opened, read and JSON-decoded the header of every
+        // `.ecshard` in the whole namespace - every user, access key, bucket and cluster-node
+        // record - purely to throw away the ones whose key didn't match.
+        let searchRoot: String
+        if let lastSlash = keyPrefix.lastIndex(of: "/") {
+            searchRoot = "\(bucketPath)/\(sanitizedKey(String(keyPrefix[..<lastSlash])))"
+        } else {
+            searchRoot = bucketPath
+        }
         guard
             let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: bucketPath),
+                at: URL(fileURLWithPath: searchRoot),
                 includingPropertiesForKeys: [.isDirectoryKey])
         else { return [] }
 
@@ -405,6 +406,8 @@ enum ErasureCodedObjectHandler {
             let header = reader.header
             reader.close()
             guard header.objectMeta.bucketName == bucketName else { continue }
+            // Still checked: the directory scoping above narrows the walk, but a prefix can name
+            // only part of a path component (`"users/ab"`), so the header stays authoritative.
             guard header.objectMeta.key.hasPrefix(keyPrefix) else { continue }
             byKey[header.objectMeta.key] = header.objectMeta
         }

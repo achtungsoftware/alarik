@@ -19,7 +19,7 @@ limitations under the License.
 enum MetadataCollections {
     static let users = "users"
 
-    /// Secondary index `users/by-username/<username>` -> `{"userId": "<uuid>"}`, since a user's
+    /// Secondary index `users-by-username/<username>` -> `{"userId": "<uuid>"}`, since a user's
     /// primary key is its immutable id but usernames must stay unique and are editable - see
     /// `User.findByUsername(app:username:)`.
     static let usersByUsername = "users-by-username"

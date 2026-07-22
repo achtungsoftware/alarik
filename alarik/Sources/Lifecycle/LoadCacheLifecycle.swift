@@ -230,11 +230,9 @@ final class LoadCacheLifecycle: LifecycleHandler {
         // `load`: `ClusterNode.all` is a best-effort cluster-wide fan-out
         // (`MetadataListingService`), so a peer merely slow to answer must not have its
         // (still-fresher) cached entry clobbered by its absence here.
-        let clusterNodes = await ClusterNode.all(app: app)
-        let clusterNodeData = clusterNodes.compactMap { node -> ClusterNodeInfo? in
-            guard let status = ClusterNode.Status(rawValue: node.status.rawValue) else { return nil }
-            return ClusterNodeInfo(
-                id: node.id, address: node.address, status: status,
+        let clusterNodeData = await ClusterNode.all(app: app).map { node in
+            ClusterNodeInfo(
+                id: node.id, address: node.address, status: node.status,
                 lastHeartbeatAt: node.lastHeartbeatAt,
                 totalBytes: node.totalBytes, availableBytes: node.availableBytes)
         }

@@ -589,6 +589,44 @@ struct AdditionalS3AuthTests {
         }
     }
 
+    @Test("a presigned URL dated in the future is not yet valid, however long its expiry")
+    func testPresignedURLDatedInTheFutureIsRejected() async throws {
+        try await withApp { app in
+            let eventLoop = app.eventLoopGroup.next()
+
+            // Signed for two days from now with a 7-day expiry. The window must run FORWARD from
+            // the signed instant - a symmetric `abs(skew) < expires` check would accept this now,
+            // effectively doubling every presigned URL's usable lifetime.
+            let futureDate = Date().addingTimeInterval(2 * 24 * 3600)
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+            formatter.timeZone = TimeZone(identifier: "UTC")
+            let fullDate = formatter.string(from: futureDate)
+            let date = String(fullDate.prefix(8))
+
+            let accessKey = "AKIAIOSFODNN7EXAMPLE"
+            let secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            let credential = "\(accessKey)/\(date)/us-east-1/s3/aws4_request"
+            let encodedCredential =
+                credential.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? credential
+
+            let url =
+                "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=\(encodedCredential)&X-Amz-Date=\(fullDate)&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=abc123"
+            let req = Request(application: app, method: .GET, url: URI(string: url), on: eventLoop)
+            req.headers.add(name: "host", value: "examplebucket.s3.amazonaws.com")
+
+            let authInfo = try S3AuthParser.parse(request: req)
+            let validator = SigV4Validator(secretKey: secretKey)
+
+            do {
+                _ = try validator.validate(request: req, authInfo: authInfo)
+                Issue.record("Expected a not-yet-valid presigned URL to be rejected")
+            } catch let error as S3Error {
+                #expect(error.code == "AccessDenied")
+            }
+        }
+    }
+
     @Test("Parse from header - Unsupported algorithm is rejected")
     func testParseFromHeaderUnsupportedAlgorithm() async throws {
         try await withApp { app in

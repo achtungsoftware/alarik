@@ -20,11 +20,16 @@ import Vapor
 /// Background upkeep for `MetadataStore`: expiring tombstones once they've outlived their purpose,
 /// and persisting schema upgrades that reads have been applying in memory.
 ///
-/// Both passes walk only this node's **local shard-0 entries**, never a cluster-wide listing.
-/// Shard 0 lives on the key's rank-0 node, so every record is swept by exactly one node and the
-/// work partitions itself across the cluster for free - the cost per node stays proportional to
-/// what it stores rather than to how many nodes exist, which is what keeps this viable at large
-/// cluster sizes.
+/// Both passes walk only this node's **local** records, never a cluster-wide listing - so the cost
+/// per node stays proportional to what it stores rather than to how many nodes exist, which is what
+/// keeps this viable at large cluster sizes.
+///
+/// Discovery is any-shard-index (see `ErasureCodedObjectHandler.listLocalShardEntries`), so with
+/// replicated metadata every holder sweeps every record it has - `replicationFactor` passes per
+/// record, not one. That redundancy is deliberate rather than merely tolerated: it means neither
+/// sweep depends on one particular node being up. Both operations converge under repetition - a
+/// purge routes to the record's coordinator, and a migration rewrite carries the original
+/// `updatedAtMillis`, so re-running one is a no-op rather than a conflicting write.
 enum MetadataMaintenance {
     /// How long a tombstone is kept before its bytes are reclaimed.
     ///

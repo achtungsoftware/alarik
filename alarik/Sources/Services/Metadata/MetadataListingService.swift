@@ -156,6 +156,33 @@ enum MetadataListingService {
         return (decoded, listing.presentIds, listing.complete)
     }
 
+    /// This node's own live records, decoded - no network fan-out at all.
+    ///
+    /// For upkeep that only needs to act on what this node stores (expiry sweeps, tombstone GC,
+    /// the migration sweep) rather than on the whole cluster's records. Every holder running it
+    /// independently is the point: the work partitions itself by storage, and no single node's
+    /// availability gates it. Tombstones and undecodable records are skipped.
+    static func localRecords<T: Decodable>(
+        _ type: T.Type, app: Application, collection: String
+    ) async -> [T] {
+        await localEnvelopeEntries(app: app, collection: collection).compactMap { entry in
+            guard !entry.envelope.isTombstone, let payload = entry.envelope.payload else {
+                return nil
+            }
+            let migrated = MetadataMigrations.upgrade(
+                payload: payload, collection: collection,
+                storedVersion: entry.envelope.schemaVersion, logger: app.logger)
+            do {
+                return try Self.decoder.decode(T.self, from: migrated)
+            } catch {
+                app.logger.error(
+                    "Undecodable \(T.self) record '\(collection)/\(entry.id)' skipped by a local sweep - it is stored but unreadable by this binary: \(error)"
+                )
+                return nil
+            }
+        }
+    }
+
     /// This node's own contribution only - no network fan-out. Used both by `list`'s local
     /// portion and directly by `InternalClusterMetadataController.handleList` when serving a
     /// peer's fan-out request (a peer must only ever report what it itself holds, never recurse

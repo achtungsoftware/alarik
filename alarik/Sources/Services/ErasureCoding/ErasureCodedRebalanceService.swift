@@ -229,11 +229,17 @@ enum ErasureCodedRebalanceService {
     ) throws {
         var readers: [Int: ErasureCodedShardReader] = [:]
         defer { for reader in readers.values { reader.close() } }
+        // A survivor that won't open (corrupt header, truncated file) is skipped, not fatal -
+        // the gather deliberately fetched a spare for exactly this, and propagating here failed
+        // the whole repair on the one case the spare exists to absorb. Same treatment
+        // `StripeDecoder.decode` gives an unopenable shard.
         for (index, path) in availablePaths {
-            readers[index] = try ErasureCodedShardReader(path: path)
+            guard let reader = try? ErasureCodedShardReader(path: path) else { continue }
+            readers[index] = reader
         }
-        guard let reference = readers.values.first?.header else {
-            throw ErasureCodedRebalanceError.tooFewSurvivors(needed: dataShards, available: 0)
+        guard readers.count >= dataShards, let reference = readers.values.first?.header else {
+            throw ErasureCodedRebalanceError.tooFewSurvivors(
+                needed: dataShards, available: readers.count)
         }
 
         let header = ErasureCodedShardHeader(
@@ -337,6 +343,17 @@ enum ErasureCodedRebalanceService {
         }
         guard !localShards.isEmpty else { return }
 
+        // One cluster-wide outbox listing for the whole walk, not one per shard. `reclaimIfSafe`
+        // consults it for every stale shard it considers, and after a membership change that is a
+        // large fraction of everything this node holds - a fan-out to every peer per shard.
+        // Staleness is safe here: this is only the FIRST of two gates, and the second (positively
+        // confirming `dataShards` responsible nodes each hold their own correct-index shard) is
+        // re-checked live per shard and is what actually protects the last copy.
+        let outstandingTasks = await OutboxMailbox.listAllAcrossCluster(
+            ErasureCodedReplicationTask.self, app: app,
+            collection: OutboxCollections.erasureCodedReplicationTasks
+        ).filter { $0.state == .pending || $0.state == .failed }
+
         // Bounded concurrency, not one shard at a time: each shard's gap-check/reclaim-safety
         // work is independent, so a sequential loop only adds latency on a node holding many
         // shards. A hard cap (not fully unbounded) keeps a single walk from flooding the
@@ -349,7 +366,8 @@ enum ErasureCodedRebalanceService {
                 group.addTask {
                     try await rebalanceOne(
                         app: app, path: path, header: header, activeNodes: active,
-                        selfNodeId: config.nodeId, ecConfig: ecConfig)
+                        selfNodeId: config.nodeId, ecConfig: ecConfig,
+                        outstandingTasks: outstandingTasks)
                 }
             }
             for _ in 0..<min(maxConcurrentShardRebalances, localShards.count) {
@@ -373,7 +391,8 @@ enum ErasureCodedRebalanceService {
     /// still gated on outstanding work (see `ClusterRebalanceService`'s identical reasoning).
     private static func rebalanceOne(
         app: Application, path: String, header: ErasureCodedShardHeader,
-        activeNodes: [ClusterNodeInfo], selfNodeId: UUID, ecConfig: ClusterErasureCodingConfig
+        activeNodes: [ClusterNodeInfo], selfNodeId: UUID, ecConfig: ClusterErasureCodingConfig,
+        outstandingTasks: [ErasureCodedReplicationTask]
     ) async throws -> Bool {
         let bucketName = header.objectMeta.bucketName
         let key = header.objectMeta.key
@@ -477,7 +496,7 @@ enum ErasureCodedRebalanceService {
             return try await reclaimIfSafe(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
                 staleShardIndex: header.shardIndex, responsible: responsible,
-                requiredDataShards: dataShards)
+                requiredDataShards: dataShards, outstandingTasks: outstandingTasks)
         }
 
         guard selfRank == 0 else {
@@ -488,7 +507,7 @@ enum ErasureCodedRebalanceService {
                 return try await reclaimIfSafe(
                     app: app, bucketName: bucketName, key: key, versionId: versionId,
                     staleShardIndex: header.shardIndex, responsible: responsible,
-                    requiredDataShards: dataShards)
+                    requiredDataShards: dataShards, outstandingTasks: outstandingTasks)
             }
             return false
         }
@@ -630,21 +649,16 @@ enum ErasureCodedRebalanceService {
     /// closes that gap.
     private static func reclaimIfSafe(
         app: Application, bucketName: String, key: String, versionId: String?,
-        staleShardIndex: Int, responsible: [ClusterNodeInfo], requiredDataShards: Int
+        staleShardIndex: Int, responsible: [ClusterNodeInfo], requiredDataShards: Int,
+        outstandingTasks: [ErasureCodedReplicationTask]
     ) async throws -> Bool {
         // Scoped to this version: an in-flight repair of a *different* version of the same key
-        // mustn't hold this version's stale shard hostage. Cluster-wide fan-out for the same
-        // reason `enqueueReconstructTasks` needs one - an outstanding repair's target (and thus
-        // its mailbox owner) could be any node, not just this one.
-        let keyTasks = await OutboxMailbox.listAllAcrossCluster(
-            ErasureCodedReplicationTask.self, app: app,
-            collection: OutboxCollections.erasureCodedReplicationTasks
-        ).filter {
-            $0.bucketName == bucketName && $0.key == key
-                && ($0.state == .pending
-                    || $0.state == .failed)
-        }
-        let outstanding = keyTasks.filter { $0.versionId == versionId }.count
+        // mustn't hold this version's stale shard hostage. `outstandingTasks` is the walk-wide
+        // cluster fan-out taken once in `rebalance` - an outstanding repair's target (and thus its
+        // mailbox owner) could be any node, not just this one.
+        let outstanding = outstandingTasks.filter {
+            $0.bucketName == bucketName && $0.key == key && $0.versionId == versionId
+        }.count
         guard outstanding == 0 else { return true }
 
         // Positive safety gate: only drop this stale shard once at least `dataShards` of the

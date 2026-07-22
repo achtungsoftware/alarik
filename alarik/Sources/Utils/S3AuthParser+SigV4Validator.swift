@@ -364,23 +364,28 @@ struct SigV4Validator {
                 status: .badRequest, code: "InvalidArgument", message: "Invalid x-amz-date format")
         }
 
-        let skew = abs(Date().timeIntervalSince(requestDate))
+        // Signed age: positive once the signed instant has passed, negative while it is still
+        // in the future. Kept directional - `abs` would make a URL valid for `expires` seconds on
+        // BOTH sides of its signed time, so one dated a week ahead would already work today.
+        let age = Date().timeIntervalSince(requestDate)
+        let maxClockSkew: TimeInterval = 15 * 60
 
         // Query auth is bounded by its own X-Amz-Expires window (like S3, where a
         // presigned URL can be valid for up to 7 days); the 15-minute skew rule applies
         // only to header auth - imposing it on presigned URLs would silently cap every
         // URL's usable lifetime at 15 minutes regardless of the requested expiry.
         if authInfo.expires == nil {
-            guard skew < 15 * 60 else {
+            guard abs(age) < maxClockSkew else {
                 throw S3Error(
                     status: .forbidden, code: "RequestTimeTooSkewed",
                     message: "Request time skew exceeds 15 minutes")
             }
         }
 
-        // Expires check for query auth
+        // Expires check for query auth: valid from the signed instant until it elapses. The
+        // negative allowance is clock skew between signer and server, not a usable head start.
         if let expires = authInfo.expires {
-            guard skew < Double(expires) else {
+            guard age > -maxClockSkew, age < Double(expires) else {
                 throw S3Error(
                     status: .forbidden, code: "AccessDenied", message: "Request has expired")
             }
@@ -389,6 +394,12 @@ struct SigV4Validator {
         // Derive signing key once (4 HMAC operations) - reused for all validation attempts
         let kSigning = try deriveSigningKey(
             date: authInfo.date, region: authInfo.region, service: authInfo.service)
+
+        // Resolved and verified once, outside the combination loop below. It depends on neither
+        // `sorted` nor `emptyValueEquals`, and verifying it inside meant a buffered request whose
+        // signature matched on the last combination hashed its entire body four times.
+        let payloadHash = try resolveAndVerifyPayloadHash(
+            request: request, isQueryAuth: authInfo.expires != nil)
 
         // Try multiple combinations to handle different client implementations:
         // - sorted=true: AWS spec compliant query param sorting
@@ -399,7 +410,8 @@ struct SigV4Validator {
             for emptyValueEquals in [true, false] {
                 if try validateWithQuerySort(
                     request: request, authInfo: authInfo, sorted: sorted,
-                    emptyValueEquals: emptyValueEquals, signingKey: kSigning
+                    emptyValueEquals: emptyValueEquals, signingKey: kSigning,
+                    payloadHash: payloadHash
                 ) {
                     return true
                 }
@@ -426,7 +438,8 @@ struct SigV4Validator {
         authInfo: S3AuthInfo,
         sorted: Bool,
         emptyValueEquals: Bool,
-        signingKey: Data
+        signingKey: Data,
+        payloadHash: String
     ) throws -> Bool {
         // Create canonical request
         let canonicalRequest = try createCanonicalRequest(
@@ -434,7 +447,8 @@ struct SigV4Validator {
             signedHeaders: authInfo.signedHeaders,
             isQueryAuth: authInfo.expires != nil,
             sortQueryParams: sorted,
-            emptyValueEquals: emptyValueEquals
+            emptyValueEquals: emptyValueEquals,
+            payloadHash: payloadHash
         )
 
         let stringToSign = createStringToSign(
@@ -467,12 +481,46 @@ struct SigV4Validator {
         return false
     }
 
+    /// The payload hash that goes into the canonical request, verified against the actual body
+    /// where one is present and already buffered. A streaming route defers the body check to its
+    /// consumer (`StreamingBodySpooler`), which hashes the real bytes - deferral, not a skip.
+    private func resolveAndVerifyPayloadHash(request: Request, isQueryAuth: Bool) throws -> String {
+        guard !isQueryAuth else { return "UNSIGNED-PAYLOAD" }
+
+        let payloadHash = try getRequestValue(for: "x-amz-content-sha256", request: request)
+        guard !payloadHash.isEmpty else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument",
+                message: "Missing required x-amz-content-sha256 header")
+        }
+        guard payloadHash != "UNSIGNED-PAYLOAD",
+            payloadHash != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        else { return payloadHash }
+
+        if let bodyBuffer = request.body.data {
+            let computedHash = Crypto.SHA256.hash(data: bodyBuffer.readableBytesView).hexString()
+            guard computedHash == payloadHash else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidDigest", message: "Payload hash mismatch")
+            }
+        } else if !Self.hasUnbufferedBody(request) {
+            // No body at all: must match the empty payload hash.
+            guard payloadHash == Self.emptyPayloadHash else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidDigest",
+                    message: "Payload hash mismatch for empty body")
+            }
+        }
+        return payloadHash
+    }
+
     private func createCanonicalRequest(
         request: Request,
         signedHeaders: [String],
         isQueryAuth: Bool,
         sortQueryParams: Bool,
-        emptyValueEquals: Bool
+        emptyValueEquals: Bool,
+        payloadHash: String
     ) throws -> String {
         let method = request.method.rawValue
         // Canonical URI
@@ -582,45 +630,6 @@ struct SigV4Validator {
         // Signed headers - cache the result
         let signedHeadersString = sortedHeaders.joined(separator: ";")
 
-        // Payload hash
-        let payloadHash: String
-        if isQueryAuth {
-            payloadHash = "UNSIGNED-PAYLOAD"
-        } else {
-            payloadHash = try getRequestValue(for: "x-amz-content-sha256", request: request)
-            guard !payloadHash.isEmpty else {
-                throw S3Error(
-                    status: .badRequest, code: "InvalidArgument",
-                    message: "Missing required x-amz-content-sha256 header")
-            }
-        }
-
-        // Optional: Verify payload hash if not unsigned or streaming
-        if !isQueryAuth && payloadHash != "UNSIGNED-PAYLOAD"
-            && payloadHash != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        {
-            if let bodyBuffer = request.body.data {
-                let bodyView = bodyBuffer.readableBytesView
-                let computedHash = Crypto.SHA256.hash(data: bodyView).hexString()
-                guard computedHash == payloadHash else {
-                    throw S3Error(
-                        status: .badRequest, code: "InvalidDigest", message: "Payload hash mismatch"
-                    )
-                }
-            } else if Self.hasUnbufferedBody(request) {
-                // The route uses `body: .stream`, so the payload hasn't arrived yet - the
-                // signature over the *declared* hash is still fully verified here; the body
-                // consumer (StreamingBodySpooler / S3Service.collectBodyData) is responsible
-                // for hashing the actual bytes and rejecting on mismatch. Deferral, not a skip.
-            } else {
-                // No body: must match empty payload hash
-                guard payloadHash == Self.emptyPayloadHash else {
-                    throw S3Error(
-                        status: .badRequest, code: "InvalidDigest",
-                        message: "Payload hash mismatch for empty body")
-                }
-            }
-        }
         return method + "\n" + path + "\n" + queryString + "\n" + canonicalHeaders + "\n"
             + signedHeadersString + "\n" + payloadHash
     }

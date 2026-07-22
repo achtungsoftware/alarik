@@ -112,7 +112,6 @@ enum ErasureCodedShardGatherer {
                 return results
             }
 
-        var anyUnreachable = false
         var reportedIndices: Set<Int> = []
         var reachableRanks: Set<Int> = []
         for entry in discovered {
@@ -121,8 +120,6 @@ enum ErasureCodedShardGatherer {
                 if let rank = responsible.firstIndex(where: { $0.id == entry.node.id }) {
                     reachableRanks.insert(rank)
                 }
-            } else {
-                anyUnreachable = true
             }
         }
         let allHeldIndices = reportedIndices

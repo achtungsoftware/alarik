@@ -113,6 +113,15 @@ public func configure(_ app: Application) async throws {
 
     if let jwt = Environment.sanitizedGet("JWT") {
         await app.jwt.keys.add(hmac: HMACKey(from: jwt), digestAlgorithm: .sha256)
+    } else if app.environment == .production {
+        // Refusing to boot, not warning and continuing: the fallback key below is a literal in a
+        // public repository, so anyone can mint a valid admin session token against a production
+        // deployment that happens to be missing this variable. A log line is not a defence when
+        // the process comes up and starts serving anyway.
+        throw ConfigurationError(
+            description:
+                "JWT is required in the production environment - no key was provided, and the insecure development fallback is never used here. Set the JWT environment variable to a strong secret."
+        )
     } else {
         app.logger.error(
             "No JWT key provided in environment variable 'JWT'. Falling back to an insecure default key. Please set a secure JWT key before deploying to production."
@@ -170,8 +179,16 @@ public func configure(_ app: Application) async throws {
             delay: .minutes(1)
         ) { task in
             Task {
+                // Local records, not `all(app:)`. A cluster-wide listing here meant every node
+                // fanned out to every other node twice a minute purely to rediscover records it
+                // already holds - O(nodes^2) of pure upkeep traffic. Sweeping what this node
+                // stores keeps the cost proportional to stored data, and every holder running it
+                // means the sweep never depends on one particular node being up (the deletes are
+                // idempotent, so overlap is free). Same reasoning as `MetadataMaintenance`.
                 do {
-                    let expiredAccessKeys = await AccessKey.all(app: app).filter {
+                    let expiredAccessKeys = await MetadataListingService.localRecords(
+                        AccessKey.self, app: app, collection: MetadataCollections.accessKeys
+                    ).filter {
                         guard let expirationDate = $0.expirationDate else { return false }
                         return expirationDate <= Date.now
                     }
@@ -185,7 +202,9 @@ public func configure(_ app: Application) async throws {
                 }
 
                 do {
-                    let expiredSharedLinks = await SharedLink.all(app: app).filter {
+                    let expiredSharedLinks = await MetadataListingService.localRecords(
+                        SharedLink.self, app: app, collection: MetadataCollections.sharedLinks
+                    ).filter {
                         guard let expiresAt = $0.expiresAt else { return false }
                         return expiresAt <= Date.now
                     }
@@ -409,7 +428,7 @@ private func additionalCorsOrigins(consoleBaseUrl: String) -> [String] {
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         ]
-    } else if consoleBaseUrl.lowercased() == "http://127.0.0.0:3000" {
+    } else if consoleBaseUrl.lowercased() == "http://127.0.0.1:3000" {
         return [
             "http://localhost:3000",
             "http://0.0.0.0:3000",
@@ -421,4 +440,10 @@ private func additionalCorsOrigins(consoleBaseUrl: String) -> [String] {
         "http://0.0.0.0:3000",
         "http://127.0.0.1:3000",
     ]
+}
+
+/// A fatal misconfiguration detected during `configure` - boot stops rather than starting a node
+/// that would be unsafe or silently wrong.
+struct ConfigurationError: Error, CustomStringConvertible {
+    let description: String
 }
