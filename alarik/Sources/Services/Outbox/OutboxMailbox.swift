@@ -29,6 +29,10 @@ import Vapor
 /// striping comes from best-effort mirroring to a handful of other nodes, needed only for the two
 /// collections with no independent ground truth (`NotificationDelivery`/`ReplicationTask`).
 enum OutboxMailbox {
+    /// Synthetic bucket name used only to feed HRW when electing an owner for a task. Not a real
+    /// bucket - it just namespaces the hash so task placement can't collide with object placement.
+    static let outboxPlacementBucket = "outbox-promotion"
+
     /// How many total copies (owner + mirrors) a non-backstopped task is kept at. `1` disables
     /// mirroring outright (single-node deployments have no peers to mirror to anyway).
     static let defaultReplicaCount = 2
@@ -63,16 +67,41 @@ enum OutboxMailbox {
         let ids = OutboxMailboxFileHandler.listTaskIds(
             root: OutboxMailboxFileHandler.rootPath, collection: collection, ownerNodeId: selfId)
 
-        var rows: [Row] = []
-        rows.reserveCapacity(min(ids.count, limit))
+        // Skip not-yet-due work with a `stat` rather than a read-and-decode. A backed-up queue is
+        // mostly tasks sitting on an exponential backoff, so decoding all of them on every tick to
+        // discover they aren't due yet is the dominant cost. A file with no usable hint is read as
+        // before, so this can only ever save work, never hide a due task.
+        var candidates: [(id: UUID, hint: Date)] = []
+        candidates.reserveCapacity(ids.count)
         for id in ids {
-            guard let row = readOwned(Row.self, collection: collection, ownerNodeId: selfId, taskId: id)
-            else { continue }
-            guard row.state == "pending", row.nextAttemptAt <= now else { continue }
-            rows.append(row)
+            let path = OutboxMailboxFileHandler.taskPath(
+                root: OutboxMailboxFileHandler.rootPath, collection: collection,
+                ownerNodeId: selfId, taskId: id)
+            guard let hint = OutboxMailboxFileHandler.dueHint(path: path) else {
+                candidates.append((id, .distantPast))  // unknown - always inspect
+                continue
+            }
+            guard hint <= now else { continue }
+            candidates.append((id, hint))
         }
-        rows.sort { $0.nextAttemptAt < $1.nextAttemptAt }
-        return Array(rows.prefix(limit))
+
+        // Oldest-due first, so a bounded tick drains the most overdue work rather than an
+        // arbitrary slice of it.
+        candidates.sort { $0.hint < $1.hint }
+
+        var rows: [Row] = []
+        rows.reserveCapacity(min(candidates.count, limit))
+        for candidate in candidates {
+            guard
+                let row = readOwned(
+                    Row.self, collection: collection, ownerNodeId: selfId, taskId: candidate.id)
+            else { continue }
+            // The decoded values stay authoritative - the hint only decided what to read.
+            guard row.state == OutboxRowState.pending, row.nextAttemptAt <= now else { continue }
+            rows.append(row)
+            if rows.count == limit { break }
+        }
+        return rows
     }
 
     /// Rewrites an existing task in place (bump attempts, back off, mark failed) - a local
@@ -82,7 +111,8 @@ enum OutboxMailbox {
         let path = OutboxMailboxFileHandler.taskPath(
             root: OutboxMailboxFileHandler.rootPath, collection: collection,
             ownerNodeId: row.ownerNodeId, taskId: row.id)
-        try OutboxMailboxFileHandler.write(path: path, data: try JSONEncoder().encode(row))
+        try OutboxMailboxFileHandler.write(
+            path: path, data: try JSONEncoder().encode(row), dueAt: row.nextAttemptAt)
     }
 
     /// Deletes a completed task - both the owner's copy and any backup mirror, since a done task
@@ -121,17 +151,17 @@ enum OutboxMailbox {
         return ids.compactMap { readOwned(Row.self, collection: collection, ownerNodeId: selfId, taskId: $0) }
     }
 
-    /// Purges this node's own owned tasks that are `failedStateValue` and older than `olderThan`.
+    /// Purges this node's own owned tasks that are `.failed` and older than `olderThan`.
     /// Purging is inherently per-node (each node only ever holds tasks it owns), so the periodic
     /// purge tick already running on every node is exactly the right cadence - no separate
     /// cluster-wide sweep needed.
     static func purgeExpiredFailures<Row: OutboxMailboxRow>(
-        _ type: Row.Type, app: Application, collection: String, failedStateValue: String,
+        _ type: Row.Type, app: Application, collection: String,
         olderThan: TimeInterval = 7 * 24 * 3600
     ) {
         let cutoff = Date().addingTimeInterval(-olderThan)
         for row in allOwnedTasks(Row.self, app: app, collection: collection)
-        where row.state == failedStateValue && row.createdAt < cutoff {
+        where row.state == .failed && row.createdAt < cutoff {
             remove(row, collection: collection)
         }
     }
@@ -154,7 +184,7 @@ enum OutboxMailbox {
     /// updated row on success, `nil` if this node doesn't own that id (the caller broadcasts to
     /// every node and only the actual owner will find and reset it).
     static func retryOwned<Row: OutboxMailboxRow>(
-        _ type: Row.Type, app: Application, collection: String, taskId: UUID, failedStateValue: String
+        _ type: Row.Type, app: Application, collection: String, taskId: UUID
     ) -> Row? {
         guard
             let row = readOwned(
@@ -163,7 +193,7 @@ enum OutboxMailbox {
         row.attempts = 0
         row.nextAttemptAt = Date()
         row.lastError = nil
-        if row.state == failedStateValue { row.state = "pending" }
+        if row.state == .failed { row.state = .pending }
         try? update(row, collection: collection)
         return row
     }
@@ -347,8 +377,13 @@ enum OutboxMailbox {
     ) async {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return }
         let selfId = config.nodeId
-        let active = await ClusterNodeCache.shared.activeNodes()
-        let activeIds = Set(active.map(\.id))
+        // Liveness decides WHETHER to promote (is the owner gone?); stable placement decides WHO
+        // promotes. Electing from the live set would let two nodes with slightly different
+        // heartbeat views each elect themselves and both promote the same task - a webhook
+        // delivered twice, a replication task run twice. `placementNodes()` is the same on every
+        // node, so the election is unanimous; self must still be in it to be eligible.
+        let activeIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
+        let electorate = await ClusterNodeCache.shared.placementNodes()
 
         let backupEntries = OutboxMailboxFileHandler.listAllOwnerTaskIds(
             root: OutboxMailboxFileHandler.backupRootPath, collection: collection)
@@ -357,9 +392,14 @@ enum OutboxMailbox {
         for (ownerNodeId, taskId) in backupEntries {
             guard !activeIds.contains(ownerNodeId) else { continue }
 
+            // Elect among nodes that are both placement members AND currently reachable, so a
+            // task isn't handed to a node that is itself down; every node computes this from the
+            // same two sets.
+            let eligible = electorate.filter { activeIds.contains($0.id) }
             let winner = PlacementService.responsibleNodes(
-                bucketName: "outbox-promotion", key: "\(collection)/\(ownerNodeId)/\(taskId)",
-                activeNodes: active, count: 1
+                bucketName: outboxPlacementBucket,
+                key: "\(collection)/\(ownerNodeId)/\(taskId)",
+                activeNodes: eligible, count: 1
             ).first
             guard winner?.id == selfId else { continue }
 
@@ -395,8 +435,10 @@ enum OutboxMailbox {
             ownerNodeId: departingNodeId)
         guard !ids.isEmpty else { return }
 
-        let active = await ClusterNodeCache.shared.activeNodes().filter { $0.id != departingNodeId }
-        guard let newOwner = active.first else { return }
+        let candidates = await ClusterNodeCache.shared.activeNodes().filter {
+            $0.id != departingNodeId
+        }
+        guard !candidates.isEmpty else { return }
 
         for id in ids {
             let path = OutboxMailboxFileHandler.taskPath(
@@ -408,6 +450,15 @@ enum OutboxMailbox {
                 OutboxMailboxFileHandler.remove(path: path)
                 continue
             }
+            // HRW per task, not one node for all of them: `activeNodes()` is backed by a
+            // dictionary and has no stable order, so taking its first element both picks an
+            // arbitrary node and dumps a draining node's entire backlog onto that one peer.
+            guard
+                let newOwner = PlacementService.responsibleNodes(
+                    bucketName: outboxPlacementBucket, key: "\(collection)/\(id)",
+                    activeNodes: candidates, count: 1
+                ).first
+            else { continue }
             row.ownerNodeId = newOwner.id
             await enqueue(app: app, collection: collection, row: row)
             OutboxMailboxFileHandler.remove(path: path)
@@ -462,9 +513,9 @@ enum OutboxMailbox {
     /// self) - exactly one will actually own `taskId` and reset its backoff; the rest silently
     /// no-op. Returns `true` if any node reported success.
     static func retryAcrossCluster<Row: OutboxMailboxRow>(
-        _ type: Row.Type, app: Application, collection: String, taskId: UUID, failedStateValue: String
+        _ type: Row.Type, app: Application, collection: String, taskId: UUID
     ) async -> Bool {
-        if retryOwned(Row.self, app: app, collection: collection, taskId: taskId, failedStateValue: failedStateValue)
+        if retryOwned(Row.self, app: app, collection: collection, taskId: taskId)
             != nil
         {
             return true

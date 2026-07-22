@@ -217,7 +217,7 @@ struct InternalAdminController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let allBuckets = try await Bucket.all(app: req.application)
+        let allBuckets = await Bucket.all(app: req.application)
             .sorted { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
         let page = try allBuckets.paginated(for: req)
 
@@ -344,7 +344,7 @@ struct InternalAdminController: RouteCollection {
         // every other cluster node's physical copies orphaned - invisible until a bucket with
         // the same name is created again (bucket paths are name-derived, not id-derived), at
         // which point the "deleted" data silently resurfaces under the new bucket.
-        let buckets = try await Bucket.all(app: req.application).filter { $0.userId == userId }
+        let buckets = await Bucket.all(app: req.application).filter { $0.userId == userId }
 
         for bucket in buckets {
             try await BucketService.delete(

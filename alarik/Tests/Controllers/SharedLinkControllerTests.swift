@@ -132,12 +132,12 @@ struct SharedLinkControllerTests {
             // The hourly cleanup deletes rows where expires_at <= now - a NULL expiry must
             // never match that filter, or non-expiring links would silently vanish within an
             // hour of creation.
-            let expired = try await SharedLink.all(app: app).filter {
+            let expired = await SharedLink.all(app: app).filter {
                 guard let expiresAt = $0.expiresAt else { return false }
                 return expiresAt <= Date.now
             }
             #expect(expired.isEmpty)
-            #expect(try await SharedLink.all(app: app).count == 1)
+            #expect(await SharedLink.all(app: app).count == 1)
         }
     }
 

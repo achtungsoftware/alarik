@@ -381,7 +381,7 @@ struct S3Controller: RouteCollection {
         let key = try await S3Service.parseAndAuthenticateWithDB(req: req)
         let userId = key.userId
 
-        let buckets = try await Bucket.all(app: req.application).filter { $0.userId == userId }
+        let buckets = await Bucket.all(app: req.application).filter { $0.userId == userId }
 
         let xmlData: Data = try ListAllMyBucketsResultDTO.s3XMLContainer(buckets)
         return S3Service.buildXMLResponse(data: xmlData)
@@ -623,7 +623,7 @@ struct S3Controller: RouteCollection {
         let xml = try await S3Service.collectBodyString(req: req)
         let tagging = try Tagging.parse(xml: xml, requestId: req.id)
 
-        bucket.tags = tagging.toJSON()
+        bucket.tags = tagging.tags
         try await bucket.save(app: req.application)
 
         return S3Service.buildStandardResponse(status: .noContent, requestId: req.id)
@@ -657,7 +657,7 @@ struct S3Controller: RouteCollection {
         let xml = try await S3Service.collectBodyString(req: req)
         let configuration = try LifecycleConfiguration.parse(xml: xml, requestId: req.id)
 
-        bucket.lifecycleRules = configuration.toJSON()
+        bucket.lifecycleRules = configuration.rules
         try await bucket.save(app: req.application)
 
         return S3Service.buildStandardResponse(status: .ok, requestId: req.id)

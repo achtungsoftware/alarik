@@ -22,12 +22,10 @@ import Vapor
 /// waiting for the real once-an-hour interval.
 struct LifecycleService {
     static func runSweep(app: Application) async throws {
-        let buckets = try await Bucket.all(app: app)
+        let buckets = await Bucket.all(app: app)
 
         for bucket in buckets {
-            guard let rawRules = bucket.lifecycleRules else { continue }
-
-            let enabledRules = LifecycleConfiguration.fromJSON(rawRules).rules.filter(\.enabled)
+            let enabledRules = (bucket.lifecycleRules ?? []).filter(\.enabled)
             guard !enabledRules.isEmpty else { continue }
 
             let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: app, bucket: bucket.name)

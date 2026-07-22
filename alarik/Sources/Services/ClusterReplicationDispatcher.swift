@@ -27,7 +27,6 @@ enum ClusterReplicationDispatcher {
         maxAttempts: maxAttempts,
         maxConcurrentDeliveries: 4,
         logContext: "Cluster replication",
-        failedStateValue: ClusterReplicationTask.State.failed.rawValue,
         fetchDue: { app, limit in
             await OutboxMailbox.retryPendingEnqueues(
                 ClusterReplicationTask.self, app: app,
@@ -44,7 +43,7 @@ enum ClusterReplicationDispatcher {
             // gone, nothing else will ever retry this exact row (ownership means only this node
             // ever sees it), so it will skip harmlessly forever, same as the old shared-table
             // design already tolerated for this exact scenario.
-            if row.operation == ClusterReplicationTask.Operation.put.rawValue {
+            if row.operation == .put {
                 let hasLocalCopy =
                     (try? await app.threadPool.runIfActive {
                         try ObjectFileHandler.resolvePath(
@@ -58,16 +57,14 @@ enum ClusterReplicationDispatcher {
                     throw ClusterReplicationDispatcherError.unknownTarget(row.targetNodeId)
                 }
                 switch row.operation {
-                case ClusterReplicationTask.Operation.put.rawValue:
+                case .put:
                     try await ClusterReplicationClient.pushObject(
                         app: app, to: node, bucketName: row.bucketName, key: row.key,
                         versionId: row.versionId)
-                case ClusterReplicationTask.Operation.delete.rawValue:
+                case .delete:
                     try await ClusterReplicationClient.deleteObject(
                         app: app, to: node, bucketName: row.bucketName, key: row.key,
                         versionId: row.versionId)
-                default:
-                    throw ClusterReplicationDispatcherError.unknownOperation(row.operation)
                 }
                 return .success
             } catch {
@@ -86,8 +83,7 @@ enum ClusterReplicationDispatcher {
         purgeExpired: { app in
             OutboxMailbox.purgeExpiredFailures(
                 ClusterReplicationTask.self, app: app,
-                collection: OutboxCollections.clusterReplicationTasks,
-                failedStateValue: ClusterReplicationTask.State.failed.rawValue)
+                collection: OutboxCollections.clusterReplicationTasks)
         }
     )
 
@@ -97,13 +93,10 @@ enum ClusterReplicationDispatcher {
 }
 
 private enum ClusterReplicationDispatcherError: Error, CustomStringConvertible {
-    case unknownOperation(String)
     case unknownTarget(UUID)
 
     var description: String {
         switch self {
-        case .unknownOperation(let operation):
-            "Unknown cluster replication task operation: \(operation)"
         case .unknownTarget(let id):
             "Target node \(id) is not in the active membership cache"
         }

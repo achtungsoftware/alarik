@@ -579,7 +579,7 @@ enum ErasureCodedRebalanceService {
             collection: OutboxCollections.erasureCodedReplicationTasks
         ).filter {
             $0.bucketName == bucketName && $0.key == key
-                && $0.operation == ErasureCodedReplicationTask.Operation.put.rawValue
+                && $0.operation == .put
         }
 
         // Dedup key includes versionId: without it, a pending task for one version of this key
@@ -592,16 +592,15 @@ enum ErasureCodedRebalanceService {
         var coveredPairs: Set<String> = []
         for task in existingTasks {
             let pair = pairKey(task.versionId, task.shardIndex, task.targetNodeId)
-            if task.state == ErasureCodedReplicationTask.State.pending.rawValue {
+            if task.state == .pending {
                 coveredPairs.insert(pair)
-            } else if task.state == ErasureCodedReplicationTask.State.failed.rawValue {
+            } else if task.state == .failed {
                 // Dead-lettered - reset it in place on its owning node via the cross-node retry
                 // RPC (rather than deleting and recreating, which would require reaching directly
                 // into a peer's mailbox directory) so a stalled repair actually gets retried.
                 let retried = await OutboxMailbox.retryAcrossCluster(
                     ErasureCodedReplicationTask.self, app: app,
-                    collection: OutboxCollections.erasureCodedReplicationTasks, taskId: task.id,
-                    failedStateValue: ErasureCodedReplicationTask.State.failed.rawValue)
+                    collection: OutboxCollections.erasureCodedReplicationTasks, taskId: task.id)
                 if retried { coveredPairs.insert(pair) }
             }
         }
@@ -642,8 +641,8 @@ enum ErasureCodedRebalanceService {
             collection: OutboxCollections.erasureCodedReplicationTasks
         ).filter {
             $0.bucketName == bucketName && $0.key == key
-                && ($0.state == ErasureCodedReplicationTask.State.pending.rawValue
-                    || $0.state == ErasureCodedReplicationTask.State.failed.rawValue)
+                && ($0.state == .pending
+                    || $0.state == .failed)
         }
         let outstanding = keyTasks.filter { $0.versionId == versionId }.count
         guard outstanding == 0 else { return true }

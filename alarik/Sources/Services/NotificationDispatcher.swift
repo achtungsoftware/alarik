@@ -27,7 +27,6 @@ enum NotificationDispatcher {
         maxAttempts: maxAttempts,
         maxConcurrentDeliveries: 8,
         logContext: "Webhook delivery",
-        failedStateValue: NotificationDelivery.State.failed.rawValue,
         fetchDue: { app, limit in
             await OutboxMailbox.retryPendingEnqueues(
                 NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
@@ -61,8 +60,7 @@ enum NotificationDispatcher {
         describeFailure: { row in "\(row.url) (bucket: \(row.bucketName))" },
         purgeExpired: { app in
             OutboxMailbox.purgeExpiredFailures(
-                NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries,
-                failedStateValue: NotificationDelivery.State.failed.rawValue)
+                NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
         }
     )
 

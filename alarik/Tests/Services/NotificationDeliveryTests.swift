@@ -113,7 +113,7 @@ struct NotificationDeliveryTests {
             id: UUID(), url: receiver.url, secret: secret, events: events,
             prefix: prefix, suffix: suffix, enabled: true)
         let config = NotificationConfiguration(rules: [rule])
-        bucketModel.notificationConfig = config.toJSON()
+        bucketModel.notificationConfig = config
         try await bucketModel.save(app: app)
         await NotificationConfigCache.shared.setConfig(for: bucket, config: config)
         return rule
@@ -418,8 +418,7 @@ struct NotificationDeliveryTests {
             // never saw or resent it.
             let bucket = try #require(
                 try await Bucket.find(app: app, name: "secret-mask-bucket"))
-            let storedSecret = NotificationConfiguration.fromJSON(bucket.notificationConfig ?? "")
-                .rules.first?.secret
+            let storedSecret = bucket.notificationConfig?.rules.first?.secret
             #expect(storedSecret == "super-secret-value")
         }
     }
@@ -444,7 +443,7 @@ struct NotificationDeliveryTests {
                 prefix: nil, suffix: nil, enabled: true)
             let config = NotificationConfiguration(rules: [ruleA, ruleB])
             let bucket = try await Bucket.find(app: app, name: "purge-bucket")!
-            bucket.notificationConfig = config.toJSON()
+            bucket.notificationConfig = config
             try await bucket.save(app: app)
             await NotificationConfigCache.shared.setConfig(for: "purge-bucket", config: config)
 
@@ -594,7 +593,7 @@ struct NotificationDeliveryTests {
                 await NotificationDispatcher.shared.drain()
                 if let row = ownedDeliveries(app).first(where: { $0.bucketName == "retry-health-bucket" })
                 {
-                    if row.state == NotificationDelivery.State.failed.rawValue {
+                    if row.state == .failed {
                         isFailed = true
                         break
                     }
@@ -607,7 +606,7 @@ struct NotificationDeliveryTests {
 
             let deadRow = try #require(
                 ownedDeliveries(app).first(where: { $0.bucketName == "retry-health-bucket" }))
-            #expect(deadRow.state == NotificationDelivery.State.failed.rawValue)
+            #expect(deadRow.state == .failed)
 
             // Now let the receiver succeed and retry via the API
             await receiver.state.setFailFirst(0)

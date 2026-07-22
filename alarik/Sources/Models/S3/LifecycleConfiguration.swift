@@ -164,23 +164,4 @@ struct LifecycleConfiguration: Equatable {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\(ruleElements)</LifecycleConfiguration>"
     }
 
-    /// JSON-encoded storage representation - parsed rules, not raw XML passthrough like
-    /// `BucketPolicy`, since these need to be evaluated programmatically by `LifecycleService`.
-    func toJSON() -> String {
-        guard let data = try? JSONEncoder().encode(rules),
-            let json = String(data: data, encoding: .utf8)
-        else {
-            return "[]"
-        }
-        return json
-    }
-
-    static func fromJSON(_ json: String) -> LifecycleConfiguration {
-        guard let data = json.data(using: .utf8),
-            let rules = try? JSONDecoder().decode([LifecycleRule].self, from: data)
-        else {
-            return LifecycleConfiguration(rules: [])
-        }
-        return LifecycleConfiguration(rules: rules)
-    }
 }

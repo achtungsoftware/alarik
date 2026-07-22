@@ -313,7 +313,7 @@ enum ClusterListingService {
     static func ownedStatsAllBuckets(
         app: Application, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
     ) async throws -> (sizeBytes: Int64, objectCount: Int) {
-        let buckets = try await Bucket.all(app: app)
+        let buckets = await Bucket.all(app: app)
         var sizeBytes: Int64 = 0
         var objectCount = 0
         for bucket in buckets {

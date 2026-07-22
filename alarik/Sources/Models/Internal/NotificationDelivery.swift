@@ -23,12 +23,6 @@ import Foundation
 /// truth rediscovers "this webhook still needs firing", so `ownerNodeId` is a real stored field,
 /// and lost owner copies need `OutboxMailbox`'s backup-mirroring/promotion to survive an outage.
 final class NotificationDelivery: @unchecked Sendable, Codable {
-    enum State: String {
-        case pending
-        /// Retries exhausted - kept for a few days so failures are inspectable, then purged
-        /// by the hourly cleanup task.
-        case failed
-    }
 
     let id: UUID
     var bucketName: String
@@ -42,7 +36,7 @@ final class NotificationDelivery: @unchecked Sendable, Codable {
 
     var attempts: Int
     var nextAttemptAt: Date
-    var state: String
+    var state: OutboxRowState
 
     /// The reason the most recent delivery attempt failed - an HTTP status ("HTTP 503") or a
     /// transport error description. Nil until the first failure; not cleared on success since
@@ -70,7 +64,7 @@ final class NotificationDelivery: @unchecked Sendable, Codable {
         self.payload = payload
         self.attempts = 0
         self.nextAttemptAt = Date()
-        self.state = State.pending.rawValue
+        self.state = .pending
         self.createdAt = Date()
         self.ownerNodeId = ownerNodeId
     }

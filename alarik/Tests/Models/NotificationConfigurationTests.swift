@@ -43,14 +43,9 @@ struct NotificationConfigurationTests {
                 events: ["s3:ObjectRemoved:Delete"], prefix: nil, suffix: nil, enabled: false),
         ])
 
-        let restored = NotificationConfiguration.fromJSON(config.toJSON())
+        let restored = try JSONDecoder().decode(
+            NotificationConfiguration.self, from: try JSONEncoder().encode(config))
         #expect(restored == config)
-    }
-
-    @Test("fromJSON on garbage returns empty config")
-    func fromJSONGarbage() {
-        #expect(NotificationConfiguration.fromJSON("not json").rules.isEmpty)
-        #expect(NotificationConfiguration.fromJSON("").rules.isEmpty)
     }
 
     // MARK: - Rule matching

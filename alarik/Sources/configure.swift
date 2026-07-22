@@ -171,7 +171,7 @@ public func configure(_ app: Application) async throws {
         ) { task in
             Task {
                 do {
-                    let expiredAccessKeys = try await AccessKey.all(app: app).filter {
+                    let expiredAccessKeys = await AccessKey.all(app: app).filter {
                         guard let expirationDate = $0.expirationDate else { return false }
                         return expirationDate <= Date.now
                     }
@@ -185,7 +185,7 @@ public func configure(_ app: Application) async throws {
                 }
 
                 do {
-                    let expiredSharedLinks = try await SharedLink.all(app: app).filter {
+                    let expiredSharedLinks = await SharedLink.all(app: app).filter {
                         guard let expiresAt = $0.expiresAt else { return false }
                         return expiresAt <= Date.now
                     }

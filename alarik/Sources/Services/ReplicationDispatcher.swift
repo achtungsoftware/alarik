@@ -27,7 +27,6 @@ enum ReplicationDispatcher {
         maxAttempts: maxAttempts,
         maxConcurrentDeliveries: 4,
         logContext: "Replication",
-        failedStateValue: ReplicationTask.State.failed.rawValue,
         fetchDue: { app, limit in
             await OutboxMailbox.retryPendingEnqueues(
                 ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
@@ -41,14 +40,12 @@ enum ReplicationDispatcher {
         attemptDelivery: { row, app in
             do {
                 switch row.operation {
-                case ReplicationTask.Operation.put.rawValue:
+                case .put:
                     try await ReplicationClient.replicatePut(
                         app: app, target: row, bucketName: row.bucketName, key: row.key,
                         versionId: row.versionId)
-                case ReplicationTask.Operation.delete.rawValue:
+                case .delete:
                     try await ReplicationClient.replicateDelete(target: row, key: row.key)
-                default:
-                    throw ReplicationDispatcherError.unknownOperation(row.operation)
                 }
                 return .success
             } catch {
@@ -60,23 +57,11 @@ enum ReplicationDispatcher {
         describeFailure: { row in "\(row.key) to \(row.endpoint) (bucket: \(row.bucketName))" },
         purgeExpired: { app in
             OutboxMailbox.purgeExpiredFailures(
-                ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks,
-                failedStateValue: ReplicationTask.State.failed.rawValue)
+                ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
         }
     )
 
     static func purgeExpiredFailures(app: Application) async throws {
         try await shared.purgeExpiredFailures(app: app)
-    }
-}
-
-private enum ReplicationDispatcherError: Error, CustomStringConvertible {
-    case unknownOperation(String)
-
-    var description: String {
-        switch self {
-        case .unknownOperation(let operation):
-            "Unknown replication task operation: \(operation)"
-        }
     }
 }

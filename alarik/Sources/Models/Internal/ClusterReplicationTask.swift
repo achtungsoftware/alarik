@@ -23,14 +23,8 @@ import Foundation
 /// `targetNodeId` alias: delivery pushes the object FROM the node holding the local copy TO
 /// `targetNodeId`, so the mailbox owner is always the *enqueuing* node, never the target.
 final class ClusterReplicationTask: @unchecked Sendable, Codable {
-    enum State: String {
-        case pending
-        /// Retries exhausted - kept for a few days so failures are inspectable, then purged by
-        /// the hourly cleanup task, same as `ReplicationTask`.
-        case failed
-    }
 
-    enum Operation: String {
+    enum Operation: String, Codable, Sendable {
         case put
         case delete
     }
@@ -39,7 +33,7 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
     /// synchronous write" from "moving data because membership changed" from "removing a copy
     /// this node is no longer responsible for" without a separate job-tracking table (see
     /// `ClusterRebalanceService`).
-    enum Reason: String, CaseIterable {
+    enum Reason: String, Codable, Sendable, CaseIterable {
         case write
         case rebalance
         case reclaim
@@ -49,12 +43,12 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
     var bucketName: String
     var key: String
     var versionId: String?
-    var operation: String
+    var operation: Operation
     var targetNodeId: UUID
-    var reason: String
+    var reason: Reason
     var attempts: Int
     var nextAttemptAt: Date
-    var state: String
+    var state: OutboxRowState
     var lastError: String?
     let createdAt: Date
 
@@ -76,12 +70,12 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
         self.bucketName = bucketName
         self.key = key
         self.versionId = versionId
-        self.operation = operation.rawValue
+        self.operation = operation
         self.targetNodeId = targetNodeId
-        self.reason = reason.rawValue
+        self.reason = reason
         self.attempts = 0
         self.nextAttemptAt = Date()
-        self.state = State.pending.rawValue
+        self.state = .pending
         self.createdAt = Date()
         self.ownerNodeId = ownerNodeId
     }

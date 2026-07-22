@@ -707,7 +707,7 @@ struct UserControllerTests {
             try BucketHandler.create(name: "testbucket")
 
             // Verify bucket exists
-            let bucketsBefore = try await Bucket.all(app: app)
+            let bucketsBefore = await Bucket.all(app: app)
             #expect(bucketsBefore.count == 1)
 
             // Delete user
@@ -720,7 +720,7 @@ struct UserControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let bucketsAfter = try await Bucket.all(app: app)
+            let bucketsAfter = await Bucket.all(app: app)
             #expect(bucketsAfter.isEmpty)
         }
     }

@@ -97,7 +97,7 @@ struct BucketServiceTests {
             let readBack = try ObjectFileHandler.read(from: path, loadData: true)
             #expect(readBack.1 == data)
 
-            let buckets = try await Bucket.all(app: app).filter { $0.name == "dup-bucket" }
+            let buckets = await Bucket.all(app: app).filter { $0.name == "dup-bucket" }
             #expect(buckets.count == 1)
         }
     }

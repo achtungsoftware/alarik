@@ -84,7 +84,7 @@ enum ClusterRebalanceService {
         let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else { return }
 
-        let buckets = try await Bucket.all(app: app)
+        let buckets = await Bucket.all(app: app)
         var hasGatedReclaims = false
         for bucket in buckets {
             let bucketHasGatedReclaims = try await rebalanceBucket(
@@ -157,9 +157,9 @@ enum ClusterRebalanceService {
                 let candidateKeys = Set(copyCandidates.map(\.key))
                 let existingCopyTasks = ownedTasksForBucket.filter {
                     candidateKeys.contains($0.key)
-                        && $0.operation == ClusterReplicationTask.Operation.put.rawValue
-                        && ($0.state == ClusterReplicationTask.State.pending.rawValue
-                            || $0.state == ClusterReplicationTask.State.failed.rawValue)
+                        && $0.operation == .put
+                        && ($0.state == .pending
+                            || $0.state == .failed)
                 }
 
                 func pairKey(_ key: String, _ targetNodeId: UUID) -> String {
@@ -169,7 +169,7 @@ enum ClusterRebalanceService {
                 var pendingPairs: Set<String> = []
                 var failedTasksToRetry: [ClusterReplicationTask] = []
                 for task in existingCopyTasks {
-                    if task.state == ClusterReplicationTask.State.pending.rawValue {
+                    if task.state == .pending {
                         pendingPairs.insert(pairKey(task.key, task.targetNodeId))
                     } else {
                         failedTasksToRetry.append(task)
@@ -201,8 +201,8 @@ enum ClusterRebalanceService {
                 let reclaimKeys = Set(reclaimCandidates.map(\.key))
                 let outstandingTasks = ownedTasksForBucket.filter {
                     reclaimKeys.contains($0.key)
-                        && ($0.state == ClusterReplicationTask.State.pending.rawValue
-                            || $0.state == ClusterReplicationTask.State.failed.rawValue)
+                        && ($0.state == .pending
+                            || $0.state == .failed)
                 }
 
                 // A dead-lettered (`.failed`) copy task is retries-exhausted - the dispatcher
@@ -215,8 +215,8 @@ enum ClusterRebalanceService {
                 // failures retrying (and thus gating reclaim) for as long as they keep failing,
                 // closing that silent-data-loss window instead of just waiting it out.
                 let deadLetteredCopies = outstandingTasks.filter {
-                    $0.state == ClusterReplicationTask.State.failed.rawValue
-                        && $0.operation == ClusterReplicationTask.Operation.put.rawValue
+                    $0.state == .failed
+                        && $0.operation == .put
                 }
                 if !deadLetteredCopies.isEmpty {
                     let retriedCopyTasks = deadLetteredCopies.map { task in

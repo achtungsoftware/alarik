@@ -42,7 +42,11 @@ enum OutboxMailboxFileHandler {
     }
 
     /// Atomically writes `data` to `path`, creating any missing parent directories first.
-    static func write(path: String, data: Data) throws {
+    /// `dueAt` stamps the file's modification time with the task's next attempt time, so the
+    /// dispatcher can skip not-yet-due work with a `stat` instead of a read-and-decode. Purely an
+    /// optimization hint - the decoded `nextAttemptAt` stays authoritative, and a file whose mtime
+    /// is missing or wrong only costs the read it would have done anyway.
+    static func write(path: String, data: Data, dueAt: Date? = nil) throws {
         let directory = (path as NSString).deletingLastPathComponent
         if !FileManager.default.fileExists(atPath: directory) {
             try FileManager.default.createDirectory(
@@ -52,6 +56,10 @@ enum OutboxMailboxFileHandler {
         do {
             try writer.write(data)
             try writer.finish()
+            if let dueAt {
+                try? FileManager.default.setAttributes(
+                    [.modificationDate: dueAt], ofItemAtPath: path)
+            }
         } catch {
             writer.abort()
             throw error
@@ -73,6 +81,12 @@ enum OutboxMailboxFileHandler {
     /// Every task id directly under `root/collection/ownerNodeId/` - a single shallow directory
     /// listing, cost proportional to this one owner's own backlog in this one collection, never
     /// cluster-wide.
+    /// The due-time hint stamped on a task file, without reading or decoding it. `nil` when the
+    /// file has no usable hint, which callers must treat as "might be due" rather than skipping.
+    static func dueHint(path: String) -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date
+    }
+
     static func listTaskIds(root: String, collection: String, ownerNodeId: UUID) -> [UUID] {
         let directory = taskDirectory(root: root, collection: collection, ownerNodeId: ownerNodeId)
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory) else {

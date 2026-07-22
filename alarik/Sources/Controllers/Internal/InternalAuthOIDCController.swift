@@ -39,7 +39,7 @@ struct InternalAuthOIDCController: RouteCollection {
 
     @Sendable
     func providers(req: Request) async throws -> [OIDCProvider.PublicDTO] {
-        let providers = try await OIDCProvider.all(app: req.application)
+        let providers = await OIDCProvider.all(app: req.application)
             .filter { $0.enabled }
             .sorted { $0.createdAt < $1.createdAt }
 

@@ -187,34 +187,6 @@ struct TaggingTests {
         #expect(parsed.tags == original.tags)
     }
 
-    // MARK: - toJSON() / fromJSON()
-
-    @Test("toJSON/fromJSON round-trip")
-    func testJSONRoundTrip() {
-        let original = Tagging(tags: ["env": "prod", "team": "storage"])
-        let json = original.toJSON()
-        let restored = Tagging.fromJSON(json)
-        #expect(restored.tags == original.tags)
-    }
-
-    @Test("toJSON - empty tags produces an empty object")
-    func testToJSONEmptyTags() {
-        let tagging = Tagging(tags: [:])
-        #expect(tagging.toJSON() == "{}")
-    }
-
-    @Test("fromJSON - malformed JSON falls back to empty tags rather than crashing")
-    func testFromJSONMalformedFallsBackToEmpty() {
-        let tagging = Tagging.fromJSON("not valid json")
-        #expect(tagging.tags.isEmpty)
-    }
-
-    @Test("fromJSON - empty string falls back to empty tags")
-    func testFromJSONEmptyStringFallsBackToEmpty() {
-        let tagging = Tagging.fromJSON("")
-        #expect(tagging.tags.isEmpty)
-    }
-
     // MARK: - Equatable
 
     @Test("Equatable - same tags are equal regardless of insertion order")

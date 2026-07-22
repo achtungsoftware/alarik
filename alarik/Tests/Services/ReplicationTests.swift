@@ -673,8 +673,7 @@ struct ReplicationTests {
             // never saw or resent it.
             let bucket = try #require(
                 try await Bucket.find(app: app, name: "repl-src-secretmask"))
-            let storedSecret = ReplicationConfiguration.fromJSON(bucket.replicationConfig ?? "")
-                .targets.first?.secretAccessKey
+            let storedSecret = bucket.replicationConfig?.targets.first?.secretAccessKey
             #expect(storedSecret == "super-secret-value")
         }
     }
@@ -879,7 +878,7 @@ struct ReplicationTests {
             for _ in 0..<(ReplicationDispatcher.maxAttempts + 2) {
                 await ReplicationDispatcher.shared.drain()
                 if let row = ownedTasks(app).first(where: { $0.bucketName == "repl-src-deadletter" }) {
-                    if row.state == ReplicationTask.State.failed.rawValue {
+                    if row.state == .failed {
                         isFailed = true
                         break
                     }
@@ -1121,7 +1120,7 @@ struct ReplicationTests {
             // rather than silently losing the replication.
             let task = try #require(ownedTasks(app).first)
             #expect(task.key == "e.txt")
-            #expect(task.state == ReplicationTask.State.pending.rawValue)
+            #expect(task.state == .pending)
 
             // Fix the destination and confirm the fallback eventually delivers.
             try await createBucket(app, bucketName: "repl-dst-syncfail-missing")

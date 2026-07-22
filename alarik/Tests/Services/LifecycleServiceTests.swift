@@ -50,7 +50,7 @@ struct LifecycleServiceTests {
         try await user.create(app: app)
 
         let bucket = Bucket(name: name, userId: user.id, versioningStatus: versioningStatus)
-        bucket.lifecycleRules = LifecycleConfiguration(rules: rules).toJSON()
+        bucket.lifecycleRules = rules
         try await bucket.save(app: app)
 
         try BucketHandler.create(name: name)

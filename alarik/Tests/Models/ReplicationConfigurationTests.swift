@@ -48,15 +48,9 @@ struct ReplicationConfigurationTests {
         let r = rule(targetId: t.id, prefix: "images/", replicateDeletes: true, replicateExisting: true)
         let config = ReplicationConfiguration(targets: [t], rules: [r])
 
-        let restored = ReplicationConfiguration.fromJSON(config.toJSON())
+        let restored = try JSONDecoder().decode(
+            ReplicationConfiguration.self, from: try JSONEncoder().encode(config))
         #expect(restored == config)
-    }
-
-    @Test("fromJSON on garbage returns empty config")
-    func fromJSONGarbage() {
-        #expect(ReplicationConfiguration.fromJSON("not json").targets.isEmpty)
-        #expect(ReplicationConfiguration.fromJSON("not json").rules.isEmpty)
-        #expect(ReplicationConfiguration.fromJSON("").rules.isEmpty)
     }
 
     @Test("JSON round-trip preserves synchronous: true")
@@ -65,7 +59,8 @@ struct ReplicationConfigurationTests {
         let r = rule(targetId: t.id, synchronous: true)
         let config = ReplicationConfiguration(targets: [t], rules: [r])
 
-        let restored = ReplicationConfiguration.fromJSON(config.toJSON())
+        let restored = try JSONDecoder().decode(
+            ReplicationConfiguration.self, from: try JSONEncoder().encode(config))
         #expect(restored.rules.first?.synchronous == true)
     }
 
@@ -78,9 +73,10 @@ struct ReplicationConfigurationTests {
         let json = """
             {"targets":[],"rules":[{"id":"\(ruleId.uuidString)","targetId":"\(targetId.uuidString)","prefix":null,"replicateDeletes":false,"replicateExisting":false,"enabled":true}]}
             """
-        let config = ReplicationConfiguration.fromJSON(json)
-        // A real decode failure falls back to `.empty` - asserting a non-empty rule set here
-        // proves the whole config decoded successfully despite the missing key.
+        let config = try JSONDecoder().decode(
+            ReplicationConfiguration.self, from: Data(json.utf8))
+        // Decoding throws on a real failure, so reaching this point already proves the whole
+        // config decoded successfully despite the missing key.
         #expect(config.rules.count == 1)
         #expect(config.rules.first?.synchronous == false)
     }

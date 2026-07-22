@@ -22,14 +22,19 @@ import XMLCoder
 /// already a natural, immutable, globally-unique identifier (S3 buckets can't be renamed), so it
 /// doubles as the primary key directly, the same pattern `AccessKey`/`SharedLink`/`OIDCProvider`
 /// already use for their own natural keys - no secondary index needed.
-final class Bucket: Content, @unchecked Sendable, Codable {
+final class Bucket: Content, @unchecked Sendable, MetadataRecord {
     let id: UUID
     var name: String
     var userId: UUID
     var creationDate: Date?
     var versioningStatus: String
 
-    /// Raw JSON bucket policy document, or nil if no policy has been set
+    /// The bucket policy document exactly as the client PUT it, or nil if none is set.
+    ///
+    /// Deliberately a raw string, unlike the structured config below: S3's GetBucketPolicy must
+    /// hand back the same document that was PUT, so this is an opaque pass-through blob rather
+    /// than something Alarik owns the shape of. `BucketPolicy.parseAndValidate` produces the
+    /// parsed form used for authorization decisions (cached in `BucketPolicyCache`).
     var policy: String?
 
     /// Public Access Block settings - see `PublicAccessBlockConfiguration`. `blockPublicAcls`/
@@ -40,19 +45,18 @@ final class Bucket: Content, @unchecked Sendable, Codable {
     var blockPublicPolicy: Bool
     var restrictPublicBuckets: Bool
 
-    /// JSON-encoded `[String: String]` tag-set, or nil if no tags have been set - see `Tagging`.
-    var tags: String?
+    /// Tag-set, or nil if no tags have been set - see `Tagging`.
+    var tags: [String: String]?
 
-    /// JSON-encoded `[LifecycleRule]`, or nil if no lifecycle configuration has been set - see
+    /// Lifecycle rules, or nil if no lifecycle configuration has been set - see
     /// `LifecycleConfiguration`.
-    var lifecycleRules: String?
+    var lifecycleRules: [LifecycleRule]?
 
-    /// JSON-encoded `NotificationConfiguration` (webhook rules), or nil if none configured.
-    var notificationConfig: String?
+    /// Webhook notification rules, or nil if none configured.
+    var notificationConfig: NotificationConfiguration?
 
-    /// JSON-encoded `ReplicationConfiguration` (remote targets + rules), or nil if none
-    /// configured.
-    var replicationConfig: String?
+    /// Remote replication targets + rules, or nil if none configured.
+    var replicationConfig: ReplicationConfiguration?
 
     init(id: UUID = UUID(), name: String, userId: UUID) {
         self.id = id
@@ -124,43 +128,11 @@ final class Bucket: Content, @unchecked Sendable, Codable {
 // MARK: - MetadataStore access
 
 extension Bucket {
+    static var metadataCollection: String { MetadataCollections.buckets }
+    var metadataId: String { name }
+
     static func find(app: Application, name: String) async throws -> Bucket? {
-        try await MetadataStore.get(
-            Bucket.self, app: app, collection: MetadataCollections.buckets, id: name)
-    }
-
-    /// Every bucket cluster-wide - a full-collection fan-out (see `MetadataListingService`'s doc
-    /// comment). Only ever called from admin/console/background-sweep paths (bucket listing,
-    /// cache warm/reload, rebalance/lifecycle walks), never per-S3-request - the hot per-request
-    /// bucket lookup is always `find(app:name:)`, a single point read.
-    static func all(app: Application) async throws -> [Bucket] {
-        await MetadataListingService.list(
-            Bucket.self, app: app, collection: MetadataCollections.buckets)
-    }
-
-    /// `all` plus the listing's completeness verdict - see `LoadCacheLifecycle.reloadAll`, which
-    /// may only reconcile REMOVALS against a listing that is verifiably complete.
-    static func allVerified(
-        app: Application
-    ) async -> (records: [Bucket], presentIds: Set<String>, complete: Bool) {
-        await MetadataListingService.listVerified(
-            Bucket.self, app: app, collection: MetadataCollections.buckets)
-    }
-
-    /// Creates the bucket, failing if the name is already taken.
-    func create(app: Application) async throws -> Bool {
-        try await MetadataStore.putIfAbsent(
-            app: app, collection: MetadataCollections.buckets, id: name, value: self)
-    }
-
-    func save(app: Application) async throws {
-        try await MetadataStore.put(
-            app: app, collection: MetadataCollections.buckets, id: name, value: self)
-    }
-
-    func delete(app: Application) async throws {
-        try await MetadataStore.delete(
-            app: app, collection: MetadataCollections.buckets, id: name)
+        try await find(app: app, key: name)
     }
 }
 

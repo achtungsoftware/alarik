@@ -42,7 +42,7 @@ struct InternalAdminOIDCProviderController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let providers = try await OIDCProvider.all(app: req.application)
+        let providers = await OIDCProvider.all(app: req.application)
             .sorted { $0.createdAt > $1.createdAt }
 
         return try providers.paginated(for: req).map { $0.toResponseDTO() }

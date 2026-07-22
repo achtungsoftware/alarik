@@ -336,27 +336,17 @@ struct LifecycleConfigurationTests {
         #expect(parsed == original)
     }
 
-    // MARK: - toJSON() / fromJSON()
+    // MARK: - Codable
 
-    @Test("toJSON/fromJSON round-trip")
-    func testJSONRoundTrip() {
-        let original = LifecycleConfiguration(rules: [
+    @Test("Codable round-trip preserves every rule field")
+    func testCodableRoundTrip() throws {
+        let original = [
             LifecycleRule(
                 id: "rule1", enabled: true, prefix: "logs/", expirationDays: 30,
                 noncurrentVersionExpirationDays: 7, abortIncompleteMultipartUploadDays: 3)
-        ])
-        let restored = LifecycleConfiguration.fromJSON(original.toJSON())
+        ]
+        let restored = try JSONDecoder().decode(
+            [LifecycleRule].self, from: try JSONEncoder().encode(original))
         #expect(restored == original)
-    }
-
-    @Test("fromJSON - malformed JSON falls back to no rules rather than crashing")
-    func testFromJSONMalformedFallsBackToEmpty() {
-        let config = LifecycleConfiguration.fromJSON("not valid json")
-        #expect(config.rules.isEmpty)
-    }
-
-    @Test("toJSON - empty rules produces an empty array")
-    func testToJSONEmptyRules() {
-        #expect(LifecycleConfiguration(rules: []).toJSON() == "[]")
     }
 }

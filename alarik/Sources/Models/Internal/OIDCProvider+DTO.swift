@@ -26,7 +26,7 @@ import struct Foundation.UUID
 /// instance to the provider, not an individual user.
 ///
 /// Backed by `MetadataStore`, not Fluent - primary record at `oidc-providers/<id>`.
-final class OIDCProvider: @unchecked Sendable, Codable {
+final class OIDCProvider: @unchecked Sendable, MetadataRecord {
     let id: UUID
     var name: String
     var issuerURL: String
@@ -67,25 +67,11 @@ final class OIDCProvider: @unchecked Sendable, Codable {
 // MARK: - MetadataStore access
 
 extension OIDCProvider {
+    static var metadataCollection: String { MetadataCollections.oidcProviders }
+    var metadataId: String { id.uuidString }
+
     static func find(app: Application, id: UUID) async throws -> OIDCProvider? {
-        try await MetadataStore.get(
-            OIDCProvider.self, app: app, collection: MetadataCollections.oidcProviders,
-            id: id.uuidString)
-    }
-
-    static func all(app: Application) async throws -> [OIDCProvider] {
-        await MetadataListingService.list(
-            OIDCProvider.self, app: app, collection: MetadataCollections.oidcProviders)
-    }
-
-    func save(app: Application) async throws {
-        try await MetadataStore.put(
-            app: app, collection: MetadataCollections.oidcProviders, id: id.uuidString, value: self)
-    }
-
-    func delete(app: Application) async throws {
-        try await MetadataStore.delete(
-            app: app, collection: MetadataCollections.oidcProviders, id: id.uuidString)
+        try await find(app: app, key: id.uuidString)
     }
 }
 

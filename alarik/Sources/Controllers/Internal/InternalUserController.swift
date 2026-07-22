@@ -112,7 +112,7 @@ struct InternalUserController: RouteCollection {
             app: req.application, cache: "accessKeyUser", op: .upsert, key: create.accessKey)
 
         // Map the new access key to all existing buckets for this user
-        let userBuckets = try await Bucket.all(app: req.application).filter {
+        let userBuckets = await Bucket.all(app: req.application).filter {
             $0.userId == auth.userId
         }
 
@@ -210,7 +210,7 @@ struct InternalUserController: RouteCollection {
         // removal - see InternalAdminController.deleteUser for why a raw `forceDelete` leaves
         // every other cluster node's physical copies orphaned, ready to silently resurface if a
         // bucket with the same name is ever created again.
-        let buckets = try await Bucket.all(app: req.application).filter {
+        let buckets = await Bucket.all(app: req.application).filter {
             $0.userId == auth.userId
         }
 

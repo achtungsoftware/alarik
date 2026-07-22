@@ -51,7 +51,7 @@ struct InternalClusterMetadataController: RouteCollection {
     struct ClusterMemberWire: Codable, Sendable {
         let id: UUID
         let address: String
-        let status: String
+        let status: ClusterNode.Status
         let lastHeartbeatAt: Date
         let totalBytes: Int64?
         let availableBytes: Int64?
@@ -66,7 +66,7 @@ struct InternalClusterMetadataController: RouteCollection {
         let nodes = await ClusterNodeCache.shared.all()
         let wire = nodes.map {
             ClusterMemberWire(
-                id: $0.id, address: $0.address, status: $0.status.rawValue,
+                id: $0.id, address: $0.address, status: $0.status,
                 lastHeartbeatAt: $0.lastHeartbeatAt, totalBytes: $0.totalBytes,
                 availableBytes: $0.availableBytes)
         }

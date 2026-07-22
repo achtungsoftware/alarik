@@ -100,22 +100,4 @@ struct Tagging: Equatable {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>\(tagElements)</TagSet></Tagging>"
     }
 
-    /// JSON-encoded storage representation, mirroring how `BucketPolicy`/`policy` stores its
-    /// raw form as a single string column.
-    func toJSON() -> String {
-        guard let data = try? JSONEncoder().encode(tags), let json = String(data: data, encoding: .utf8)
-        else {
-            return "{}"
-        }
-        return json
-    }
-
-    static func fromJSON(_ json: String) -> Tagging {
-        guard let data = json.data(using: .utf8),
-            let tags = try? JSONDecoder().decode([String: String].self, from: data)
-        else {
-            return Tagging(tags: [:])
-        }
-        return Tagging(tags: tags)
-    }
 }

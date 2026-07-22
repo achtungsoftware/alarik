@@ -123,7 +123,7 @@ struct ClusterReplicationServiceTests {
                     ClusterReplicationTask.self, app: app,
                     collection: OutboxCollections.clusterReplicationTasks
                 ).first(where: { $0.id == task.id }))
-            #expect(reloaded.state == ClusterReplicationTask.State.pending.rawValue)
+            #expect(reloaded.state == .pending)
             #expect(reloaded.attempts == 0)
             #expect(reloaded.lastError == nil)
         }

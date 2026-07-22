@@ -105,7 +105,7 @@ enum CacheReloadDispatch {
             // read finds, never remove what it doesn't.
             let accessKey = message.key
             if let key = try await AccessKey.find(app: app, accessKey: accessKey) {
-                let buckets = try await Bucket.all(app: app).filter { $0.userId == key.userId }
+                let buckets = await Bucket.all(app: app).filter { $0.userId == key.userId }
                 for bucket in buckets {
                     await AccessKeyBucketMapCache.shared.add(accessKey: accessKey, bucketName: bucket.name)
                 }
@@ -153,8 +153,8 @@ enum CacheReloadDispatch {
         case ("notificationConfig", .upsert):
             // Never remove on a `Bucket.find` miss (ambiguous) - but `notificationConfig`
             // returning nil, like `publicAccessBlockIfNonDefault`, has no parse-failure path
-            // (`fromJSON` never throws, always definitive), so it's always safe to clear a stale
-            // entry once the bucket is confirmed found.
+            // (it's a decoded field, not a blob parsed here), so it's always safe to clear a
+            // stale entry once the bucket is confirmed found.
             if let bucket = try await Bucket.find(app: app, name: bucketName) {
                 if let config = LoadCacheLifecycle.notificationConfig(for: bucket) {
                     await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
@@ -193,7 +193,7 @@ enum CacheReloadDispatch {
                 await ClusterNodeCache.shared.reconcile(snapshot: [
                     ClusterNodeInfo(
                         id: wire.id, address: wire.address,
-                        status: ClusterNode.Status(rawValue: wire.status) ?? .active,
+                        status: wire.status,
                         lastHeartbeatAt: wire.lastHeartbeatAt, totalBytes: wire.totalBytes,
                         availableBytes: wire.availableBytes)
                 ])
@@ -201,7 +201,7 @@ enum CacheReloadDispatch {
                 await ClusterNodeCache.shared.reconcile(snapshot: [
                     ClusterNodeInfo(
                         id: uuid, address: node.address,
-                        status: ClusterNode.Status(rawValue: node.status) ?? .active,
+                        status: ClusterNode.Status(rawValue: node.status.rawValue) ?? .active,
                         lastHeartbeatAt: node.lastHeartbeatAt,
                         totalBytes: node.totalBytes, availableBytes: node.availableBytes)
                 ])

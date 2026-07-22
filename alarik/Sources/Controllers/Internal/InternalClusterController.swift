@@ -134,15 +134,15 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        let nodes = try await ClusterNode.all(app: req.application)
+        let nodes = await ClusterNode.all(app: req.application)
             .sorted { $0.joinedAt < $1.joinedAt }
         let now = Date()
         return nodes.map { node -> ClusterNodeDTO in
             let isHealthy =
-                node.status == ClusterNode.Status.active.rawValue
+                node.status == .active
                 && now.timeIntervalSince(node.lastHeartbeatAt) <= ClusterNodeCache.heartbeatStaleness
             return ClusterNodeDTO(
-                id: node.id, address: node.address, status: node.status, joinedAt: node.joinedAt,
+                id: node.id, address: node.address, status: node.status.rawValue, joinedAt: node.joinedAt,
                 lastHeartbeatAt: node.lastHeartbeatAt, isHealthy: isHealthy,
                 totalBytes: node.totalBytes, availableBytes: node.availableBytes,
                 isNearFull: ClusterCapacityPolicy.isNearFull(
@@ -165,7 +165,7 @@ struct InternalClusterController: RouteCollection {
             throw Abort(.notFound, reason: "Cluster node not found")
         }
 
-        node.status = ClusterNode.Status.draining.rawValue
+        node.status = .draining
         try await node.save(app: req.application)
 
         // Any outstanding task that exists to keep this node in sync as a *responsible* replica
@@ -176,7 +176,7 @@ struct InternalClusterController: RouteCollection {
         await OutboxMailbox.purgeByTargetNodeAcrossCluster(
             ClusterReplicationTask.self, app: req.application,
             collection: OutboxCollections.clusterReplicationTasks, targetNodeId: nodeId
-        ) { $0.targetNodeId == nodeId && $0.reason != ClusterReplicationTask.Reason.reclaim.rawValue }
+        ) { $0.targetNodeId == nodeId && $0.reason != .reclaim }
 
         // Same cleanup for the EC shard-repair outbox - a stale row aimed at this node's now-
         // obsolete rank is equally pointless. Unlike legacy replication, EC has no `.reclaim`-
@@ -205,7 +205,7 @@ struct InternalClusterController: RouteCollection {
         CacheInvalidationService.notify(
             app: req.application, cache: "clusterNode", op: .upsert, key: nodeId.uuidString,
             nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
-                id: nodeId, address: node.address, status: ClusterNode.Status.draining.rawValue,
+                id: nodeId, address: node.address, status: .draining,
                 lastHeartbeatAt: node.lastHeartbeatAt, totalBytes: node.totalBytes,
                 availableBytes: node.availableBytes))
         // `CacheReloadDispatch`'s `("clusterNode", .upsert)` case triggers a rebalance walk on
@@ -258,11 +258,11 @@ struct InternalClusterController: RouteCollection {
 
         var byReason: [String: Int] = [:]
         var pendingCount = 0
-        for task in tasks where task.state == ClusterReplicationTask.State.pending.rawValue {
+        for task in tasks where task.state == .pending {
             pendingCount += 1
-            byReason[task.reason, default: 0] += 1
+            byReason[task.reason.rawValue, default: 0] += 1
         }
-        let failedCount = tasks.filter { $0.state == ClusterReplicationTask.State.failed.rawValue }.count
+        let failedCount = tasks.filter { $0.state == .failed }.count
 
         return RebalanceStatusDTO(
             pendingCount: pendingCount, failedCount: failedCount, pendingByReason: byReason,
@@ -284,17 +284,17 @@ struct InternalClusterController: RouteCollection {
             ClusterReplicationTask.self, app: req.application,
             collection: OutboxCollections.clusterReplicationTasks
         ).filter {
-            $0.state == ClusterReplicationTask.State.pending.rawValue
-                || $0.state == ClusterReplicationTask.State.failed.rawValue
+            $0.state == .pending
+                || $0.state == .failed
         }
         .sorted { $0.attempts > $1.attempts }
         .prefix(200)
 
         return tasks.map { task in
             ReplicationTaskDetailDTO(
-                id: task.id, bucketName: task.bucketName, key: task.key, operation: task.operation,
-                targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
-                nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
+                id: task.id, bucketName: task.bucketName, key: task.key, operation: task.operation.rawValue,
+                targetNodeId: task.targetNodeId, reason: task.reason.rawValue, attempts: task.attempts,
+                nextAttemptAt: task.nextAttemptAt, state: task.state.rawValue, lastError: task.lastError)
         }
     }
 
@@ -319,11 +319,11 @@ struct InternalClusterController: RouteCollection {
 
         var byReason: [String: Int] = [:]
         var pendingCount = 0
-        for task in tasks where task.state == ErasureCodedReplicationTask.State.pending.rawValue {
+        for task in tasks where task.state == .pending {
             pendingCount += 1
-            byReason[task.reason, default: 0] += 1
+            byReason[task.reason.rawValue, default: 0] += 1
         }
-        let failedCount = tasks.filter { $0.state == ErasureCodedReplicationTask.State.failed.rawValue }
+        let failedCount = tasks.filter { $0.state == .failed }
             .count
 
         return ErasureCodingStatusDTO(
@@ -370,8 +370,8 @@ struct InternalClusterController: RouteCollection {
             ErasureCodedReplicationTask.self, app: req.application,
             collection: OutboxCollections.erasureCodedReplicationTasks
         ).filter {
-            $0.state == ErasureCodedReplicationTask.State.pending.rawValue
-                || $0.state == ErasureCodedReplicationTask.State.failed.rawValue
+            $0.state == .pending
+                || $0.state == .failed
         }
         .sorted { $0.attempts > $1.attempts }
         .prefix(200)
@@ -379,9 +379,9 @@ struct InternalClusterController: RouteCollection {
         return tasks.map { task in
             ErasureCodedTaskDetailDTO(
                 id: task.id, bucketName: task.bucketName, key: task.key, versionId: task.versionId,
-                shardIndex: task.shardIndex, operation: task.operation,
-                targetNodeId: task.targetNodeId, reason: task.reason, attempts: task.attempts,
-                nextAttemptAt: task.nextAttemptAt, state: task.state, lastError: task.lastError)
+                shardIndex: task.shardIndex, operation: task.operation.rawValue,
+                targetNodeId: task.targetNodeId, reason: task.reason.rawValue, attempts: task.attempts,
+                nextAttemptAt: task.nextAttemptAt, state: task.state.rawValue, lastError: task.lastError)
         }
     }
 

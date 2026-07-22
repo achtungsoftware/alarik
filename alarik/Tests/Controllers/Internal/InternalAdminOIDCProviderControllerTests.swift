@@ -109,7 +109,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(body.enabled == true)
                 })
 
-            let providers = try await OIDCProvider.all(app: app)
+            let providers = await OIDCProvider.all(app: app)
             #expect(providers.count == 1)
             #expect(providers.first?.clientSecret == "shh")
         }
@@ -134,7 +134,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .unauthorized)
                 })
 
-            let providers = try await OIDCProvider.all(app: app)
+            let providers = await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -158,7 +158,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .badRequest)
                 })
 
-            let providers = try await OIDCProvider.all(app: app)
+            let providers = await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -255,7 +255,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .noContent)
                 })
 
-            let providers = try await OIDCProvider.all(app: app)
+            let providers = await OIDCProvider.all(app: app)
             #expect(providers.isEmpty)
         }
     }
@@ -275,7 +275,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     #expect(res.status == .unauthorized)
                 })
 
-            let providers = try await OIDCProvider.all(app: app)
+            let providers = await OIDCProvider.all(app: app)
             #expect(providers.count == 1)
         }
     }

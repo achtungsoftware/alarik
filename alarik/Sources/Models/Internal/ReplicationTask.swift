@@ -23,14 +23,8 @@ import Foundation
 /// the immutable versioned payload from `ObjectFileHandler` at delivery time. Backed by
 /// `OutboxMailbox`, not Fluent - `ownerNodeId` is a real stored field (see `NotificationDelivery`).
 final class ReplicationTask: @unchecked Sendable, Codable {
-    enum State: String {
-        case pending
-        /// Retries exhausted - kept for a few days so failures are inspectable, then purged
-        /// by the hourly cleanup task.
-        case failed
-    }
 
-    enum Operation: String {
+    enum Operation: String, Codable, Sendable {
         case put
         case delete
     }
@@ -50,10 +44,10 @@ final class ReplicationTask: @unchecked Sendable, Codable {
     var region: String
     var key: String
     var versionId: String?
-    var operation: String
+    var operation: Operation
     var attempts: Int
     var nextAttemptAt: Date
-    var state: String
+    var state: OutboxRowState
 
     /// The reason the most recent attempt failed - an HTTP status or a transport error
     /// description. Nil until the first failure; not cleared on success since a successful row
@@ -85,10 +79,10 @@ final class ReplicationTask: @unchecked Sendable, Codable {
         self.region = target.region
         self.key = key
         self.versionId = versionId
-        self.operation = operation.rawValue
+        self.operation = operation
         self.attempts = 0
         self.nextAttemptAt = Date()
-        self.state = State.pending.rawValue
+        self.state = .pending
         self.createdAt = Date()
         self.ownerNodeId = ownerNodeId
     }

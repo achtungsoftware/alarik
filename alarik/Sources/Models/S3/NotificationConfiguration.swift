@@ -73,7 +73,7 @@ struct NotificationRule: Codable, Equatable {
 }
 
 /// A bucket's full notification configuration (`?notification` subresource / console
-/// "Webhooks" settings). Stored JSON-encoded on the bucket row, like tags and lifecycle rules.
+/// "Webhooks" settings). Stored as-is on the bucket record, like tags and lifecycle rules.
 struct NotificationConfiguration: Codable, Equatable {
     var rules: [NotificationRule]
 
@@ -82,24 +82,6 @@ struct NotificationConfiguration: Codable, Equatable {
     static let maxRuleCount = 16
 
     static let empty = NotificationConfiguration(rules: [])
-
-    func toJSON() -> String {
-        guard let data = try? JSONEncoder().encode(self),
-            let json = String(data: data, encoding: .utf8)
-        else {
-            return #"{"rules":[]}"#
-        }
-        return json
-    }
-
-    static func fromJSON(_ json: String) -> NotificationConfiguration {
-        guard let data = json.data(using: .utf8),
-            let config = try? JSONDecoder().decode(NotificationConfiguration.self, from: data)
-        else {
-            return .empty
-        }
-        return config
-    }
 
     /// Builds the S3 `GET ?notification` response. Webhook rules are surfaced as
     /// QueueConfigurations with an `arn:alarik:webhook:::{id}` ARN - S3's XML shape has no

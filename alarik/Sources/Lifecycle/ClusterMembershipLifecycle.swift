@@ -251,9 +251,8 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             let decoded = try JSONDecoder().decode(
                 [InternalClusterMetadataController.ClusterMemberWire].self, from: Data(buffer: body))
             return decoded.compactMap { wire -> ClusterNodeInfo? in
-                guard let status = ClusterNode.Status(rawValue: wire.status) else { return nil }
                 return ClusterNodeInfo(
-                    id: wire.id, address: wire.address, status: status,
+                    id: wire.id, address: wire.address, status: wire.status,
                     lastHeartbeatAt: wire.lastHeartbeatAt, totalBytes: wire.totalBytes,
                     availableBytes: wire.availableBytes)
             }
@@ -275,7 +274,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         if let existing = try? await ClusterNode.find(app: app, id: config.nodeId) {
             node = existing
             node.address = config.address
-            node.status = ClusterNode.Status.active.rawValue
+            node.status = .active
             node.lastHeartbeatAt = now
             node.totalBytes = totalBytes
             node.availableBytes = availableBytes
@@ -306,7 +305,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         CacheInvalidationService.notify(
             app: app, cache: "clusterNode", op: .upsert, key: config.nodeId.uuidString,
             nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
-                id: config.nodeId, address: config.address, status: ClusterNode.Status.active.rawValue,
+                id: config.nodeId, address: config.address, status: .active,
                 lastHeartbeatAt: now, totalBytes: totalBytes, availableBytes: availableBytes))
     }
 
@@ -329,7 +328,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             if let existing = try? await ClusterNode.find(app: app, id: config.nodeId) {
                 node = existing
                 lastKnownJoinedAt = existing.joinedAt
-                lastKnownStatus = ClusterNode.Status(rawValue: existing.status) ?? lastKnownStatus
+                lastKnownStatus = ClusterNode.Status(rawValue: existing.status.rawValue) ?? lastKnownStatus
             } else if let cached = await ClusterNodeCache.shared.get(id: config.nodeId) {
                 // The direct read failed (a convergence hiccup), but this node's in-memory belief
                 // about ITSELF is usually still fresh: an admin-initiated drain reaches this node
@@ -369,7 +368,7 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             // Always a valid rawValue here: `node` is either a fresh read-back (whose status was
             // already parsed successfully above) or built from `lastKnownStatus`, itself always a
             // real `ClusterNode.Status`.
-            let statusForCache = ClusterNode.Status(rawValue: node.status) ?? .active
+            let statusForCache = ClusterNode.Status(rawValue: node.status.rawValue) ?? .active
             await ClusterNodeCache.shared.upsert(
                 ClusterNodeInfo(
                     id: config.nodeId, address: config.address, status: statusForCache,
@@ -383,27 +382,15 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             try? await Task.sleep(for: .seconds(Self.membershipRefreshInterval))
             guard !Task.isCancelled else { return }
 
-            do {
-                let rows = try await ClusterNode.all(app: app)
-                let snapshot = rows.compactMap { row -> ClusterNodeInfo? in
-                    // Fail closed on an unrecognized status rather than defaulting to the
-                    // most-trusting `.active` state - a record this node can't interpret must
-                    // never silently become eligible for placement/forwarding.
-                    guard let status = ClusterNode.Status(rawValue: row.status) else {
-                        app.logger.error(
-                            "Cluster node \(row.id) has unrecognized status '\(row.status)' - excluding it from this refresh"
-                        )
-                        return nil
-                    }
-                    return ClusterNodeInfo(
-                        id: row.id, address: row.address, status: status,
-                        lastHeartbeatAt: row.lastHeartbeatAt,
-                        totalBytes: row.totalBytes, availableBytes: row.availableBytes)
-                }
-                await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
-            } catch {
-                app.logger.error("Cluster membership refresh failed: \(error)")
+            // `all` degrades to a partial listing rather than throwing, and `status` is a typed
+            // enum - a malformed record fails at decode, which is where it belongs.
+            let snapshot = await ClusterNode.all(app: app).map { row in
+                ClusterNodeInfo(
+                    id: row.id, address: row.address, status: row.status,
+                    lastHeartbeatAt: row.lastHeartbeatAt,
+                    totalBytes: row.totalBytes, availableBytes: row.availableBytes)
             }
+            await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
 
             // Re-query the static seed list too, not just the listing fan-out above - see
             // `reseedFromConfiguredSeeds`'s doc comment for why the fan-out alone can leave two

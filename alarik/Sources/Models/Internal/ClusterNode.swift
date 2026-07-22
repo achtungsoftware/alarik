@@ -25,8 +25,8 @@ import struct Foundation.UUID
 /// This is also the one collection with a genuine bootstrap circularity: placing *any* metadata
 /// record needs `ClusterNodeCache.shared.activeNodes()`, but membership itself lives here -
 /// `ClusterMembershipLifecycle` seeds the local cache from `CLUSTER_SEED_NODES` first to break it.
-final class ClusterNode: @unchecked Sendable, Codable {
-    enum Status: String {
+final class ClusterNode: @unchecked Sendable, MetadataRecord {
+    enum Status: String, Codable, Sendable {
         /// Serving traffic normally - eligible to be a placement candidate.
         case active
         /// Being decommissioned: excluded from new placement immediately, but its existing data
@@ -43,7 +43,7 @@ final class ClusterNode: @unchecked Sendable, Codable {
     /// forwarded client requests and cluster-replication pushes.
     var address: String
 
-    var status: String
+    var status: Status
     var joinedAt: Date
 
     /// Updated on every heartbeat tick. A node is treated as unavailable by every other node once
@@ -67,7 +67,7 @@ final class ClusterNode: @unchecked Sendable, Codable {
     ) {
         self.id = id
         self.address = address
-        self.status = status.rawValue
+        self.status = status
         self.joinedAt = joinedAt
         self.lastHeartbeatAt = lastHeartbeatAt
         self.totalBytes = totalBytes
@@ -78,22 +78,10 @@ final class ClusterNode: @unchecked Sendable, Codable {
 // MARK: - MetadataStore access
 
 extension ClusterNode {
+    static var metadataCollection: String { MetadataCollections.clusterNodes }
+    var metadataId: String { id.uuidString }
+
     static func find(app: Application, id: UUID) async throws -> ClusterNode? {
-        try await MetadataStore.get(
-            ClusterNode.self, app: app, collection: MetadataCollections.clusterNodes,
-            id: id.uuidString)
-    }
-
-    /// Every cluster member - a full-collection fan-out. Membership is small and low-churn
-    /// (one record per node), and this is only ever called from admin-console/boot-time-reload
-    /// paths, never per-S3-request - the hot path is always `ClusterNodeCache`, in-memory.
-    static func all(app: Application) async throws -> [ClusterNode] {
-        await MetadataListingService.list(
-            ClusterNode.self, app: app, collection: MetadataCollections.clusterNodes)
-    }
-
-    func save(app: Application) async throws {
-        try await MetadataStore.put(
-            app: app, collection: MetadataCollections.clusterNodes, id: id.uuidString, value: self)
+        try await find(app: app, key: id.uuidString)
     }
 }

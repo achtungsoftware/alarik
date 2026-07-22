@@ -591,12 +591,15 @@ enum MetadataStore {
     ) async throws -> Bool {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        // Losing the claim means another coordinator is claiming this same name right now, so the
-        // name is taken from this caller's point of view - same answer as finding it present.
-        let claimed = try await withClaimQuorum(
-            app: app, routing: routing, collection: collection, id: id
-        ) {
-            try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+        // Key lock OUTSIDE the claim, never inside. Two concurrent creates of the same name on
+        // THIS node must serialize on the lock and let the loser see the winner's record (a clean
+        // "already exists"); if they raced for the claim instead, the loser would fail its own
+        // node's reservation and surface a retryable error for a name that is simply taken. It
+        // also means only one request per key per node ever reaches the quorum RPC.
+        let claimed = try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+            try await withClaimQuorum(
+                app: app, routing: routing, collection: collection, id: id
+            ) {
                 // A full gather, never a local shard-0 file check: being rank-0 today says nothing
                 // about where this record's shards were placed when it was written.
                 //
@@ -629,12 +632,12 @@ enum MetadataStore {
     ) async throws -> Data? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
-        // Same majority claim as `putIfAbsent`: single-use means two coordinators must not both
-        // be able to consume the record. Losing the claim reads as "already consumed".
-        let consumed = try await withClaimQuorum(
-            app: app, routing: routing, collection: collection, id: id
-        ) {
-            try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+        // Same majority claim as `putIfAbsent`, and the same lock-outside-claim ordering: local
+        // consumers serialize on the lock, so only one of them ever contends for the quorum.
+        let consumed = try await MetadataKeyLock.shared.withLock(collection: collection, key: id) {
+            try await withClaimQuorum(
+                app: app, routing: routing, collection: collection, id: id
+            ) {
                 guard let stored = try await localGet(app: app, key: key, routing: routing),
                     !MetadataEnvelope.decode(stored).isTombstone
                 else { return Data?.none }
@@ -703,6 +706,13 @@ enum MetadataStore {
         guard !routing.responsible.isEmpty, let selfNodeId = routing.selfNodeId else {
             return try await directLocalRead(app: app, key: key)
         }
+
+        // Do NOT "optimize" this into a local-only read when this node already holds a whole copy
+        // (metadata is k=1, so it does). The gather is what resolves disagreement between replicas
+        // by newest generation - skipping it would happily serve a copy this node holds but that a
+        // newer write never reached, which is exactly how a deleted record (a revoked access key)
+        // comes back to life. The extra probes are the price of that correctness, and they are
+        // paid only on a cache miss, never per request.
 
         // Every KNOWN node, not `activeNodes()` - a `.draining` node (notably this node itself,
         // mid-drain) is excluded from `activeNodes()` by design, since that set drives NEW

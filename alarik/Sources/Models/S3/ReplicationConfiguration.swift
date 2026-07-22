@@ -113,7 +113,7 @@ struct ReplicationRule: Codable, Equatable {
 }
 
 /// A bucket's full replication configuration (`?replication` subresource / console
-/// "Replication" settings). Stored JSON-encoded on the bucket row, like tags, lifecycle rules,
+/// "Replication" settings). Stored as-is on the bucket record, like tags, lifecycle rules,
 /// and webhook notification rules.
 struct ReplicationConfiguration: Codable, Equatable {
     var targets: [ReplicationTarget]
@@ -126,24 +126,6 @@ struct ReplicationConfiguration: Codable, Equatable {
 
     func target(for id: UUID) -> ReplicationTarget? {
         targets.first { $0.id == id }
-    }
-
-    func toJSON() -> String {
-        guard let data = try? JSONEncoder().encode(self),
-            let json = String(data: data, encoding: .utf8)
-        else {
-            return #"{"targets":[],"rules":[]}"#
-        }
-        return json
-    }
-
-    static func fromJSON(_ json: String) -> ReplicationConfiguration {
-        guard let data = json.data(using: .utf8),
-            let config = try? JSONDecoder().decode(ReplicationConfiguration.self, from: data)
-        else {
-            return .empty
-        }
-        return config
     }
 
     /// Builds the S3 `GET ?replication` response, AWS's `ReplicationConfiguration` XML shape.

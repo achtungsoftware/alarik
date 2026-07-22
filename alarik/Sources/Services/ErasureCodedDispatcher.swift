@@ -33,7 +33,6 @@ enum ErasureCodedDispatcher {
         maxAttempts: maxAttempts,
         maxConcurrentDeliveries: 4,
         logContext: "EC shard replication",
-        failedStateValue: ErasureCodedReplicationTask.State.failed.rawValue,
         fetchDue: { app, limit in
             await OutboxMailbox.retryPendingEnqueues(
                 ErasureCodedReplicationTask.self, app: app,
@@ -48,11 +47,11 @@ enum ErasureCodedDispatcher {
         attemptDelivery: { row, app in
             do {
                 switch row.operation {
-                case ErasureCodedReplicationTask.Operation.put.rawValue:
+                case .put:
                     try await ErasureCodedRebalanceService.reconstructAndPlaceShard(
                         app: app, bucketName: row.bucketName, key: row.key, versionId: row.versionId,
                         shardIndex: row.shardIndex, targetNodeId: row.targetNodeId)
-                case ErasureCodedReplicationTask.Operation.delete.rawValue:
+                case .delete:
                     // Ownership already guarantees row.targetNodeId == this node, so this is
                     // always this node's own shard directory - remove it directly rather than
                     // looping an HTTP DELETE through to itself. Whole-directory, not a specific
@@ -60,8 +59,6 @@ enum ErasureCodedDispatcher {
                     try? FileManager.default.removeItem(
                         atPath: ErasureCodedObjectHandler.shardBasePath(
                             bucketName: row.bucketName, key: row.key, versionId: row.versionId))
-                default:
-                    throw ErasureCodedDispatcherError.unknownOperation(row.operation)
                 }
                 return .success
             } catch {
@@ -80,23 +77,11 @@ enum ErasureCodedDispatcher {
         purgeExpired: { app in
             OutboxMailbox.purgeExpiredFailures(
                 ErasureCodedReplicationTask.self, app: app,
-                collection: OutboxCollections.erasureCodedReplicationTasks,
-                failedStateValue: ErasureCodedReplicationTask.State.failed.rawValue)
+                collection: OutboxCollections.erasureCodedReplicationTasks)
         }
     )
 
     static func purgeExpiredFailures(app: Application) async throws {
         try await shared.purgeExpiredFailures(app: app)
-    }
-}
-
-enum ErasureCodedDispatcherError: Error, CustomStringConvertible {
-    case unknownOperation(String)
-
-    var description: String {
-        switch self {
-        case .unknownOperation(let operation):
-            "Unknown EC replication task operation: \(operation)"
-        }
     }
 }

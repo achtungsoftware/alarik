@@ -208,7 +208,7 @@ struct CacheInvalidationServiceTests {
                     id: UUID(), url: "https://example.com/hook", secret: nil,
                     events: ["s3:ObjectCreated:*"], prefix: nil, suffix: nil, enabled: true)
             ])
-            bucket.notificationConfig = config.toJSON()
+            bucket.notificationConfig = config
             try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(
@@ -237,7 +237,7 @@ struct CacheInvalidationServiceTests {
                         id: UUID(), targetId: targetId, prefix: nil, replicateDeletes: false,
                         replicateExisting: false, enabled: true)
                 ])
-            bucket.replicationConfig = config.toJSON()
+            bucket.replicationConfig = config
             try await bucket.save(app: app)
 
             await CacheReloadDispatch.apply(

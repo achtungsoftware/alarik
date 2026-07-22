@@ -230,9 +230,9 @@ final class LoadCacheLifecycle: LifecycleHandler {
         // `load`: `ClusterNode.all` is a best-effort cluster-wide fan-out
         // (`MetadataListingService`), so a peer merely slow to answer must not have its
         // (still-fresher) cached entry clobbered by its absence here.
-        let clusterNodes = try await ClusterNode.all(app: app)
+        let clusterNodes = await ClusterNode.all(app: app)
         let clusterNodeData = clusterNodes.compactMap { node -> ClusterNodeInfo? in
-            guard let status = ClusterNode.Status(rawValue: node.status) else { return nil }
+            guard let status = ClusterNode.Status(rawValue: node.status.rawValue) else { return nil }
             return ClusterNodeInfo(
                 id: node.id, address: node.address, status: status,
                 lastHeartbeatAt: node.lastHeartbeatAt,
@@ -273,17 +273,13 @@ final class LoadCacheLifecycle: LifecycleHandler {
     /// nil when there are no rules - an empty rule set behaves identically to not being in the
     /// cache (`NotificationConfigCache.config(for:)`'s nil fast path).
     static func notificationConfig(for bucket: Bucket) -> NotificationConfiguration? {
-        guard let raw = bucket.notificationConfig else { return nil }
-        let config = NotificationConfiguration.fromJSON(raw)
-        guard !config.rules.isEmpty else { return nil }
+        guard let config = bucket.notificationConfig, !config.rules.isEmpty else { return nil }
         return config
     }
 
     /// nil when there are no rules - same reasoning as `notificationConfig(for:)`.
     static func replicationConfig(for bucket: Bucket) -> ReplicationConfiguration? {
-        guard let raw = bucket.replicationConfig else { return nil }
-        let config = ReplicationConfiguration.fromJSON(raw)
-        guard !config.rules.isEmpty else { return nil }
+        guard let config = bucket.replicationConfig, !config.rules.isEmpty else { return nil }
         return config
     }
 }

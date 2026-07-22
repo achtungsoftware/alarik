@@ -185,7 +185,7 @@ struct ClusterRebalanceServiceTests {
                 ClusterReplicationTask.self, app: app, collection: OutboxCollections.clusterReplicationTasks
             ).filter {
                 $0.bucketName == bucketName && $0.key == key
-                    && $0.operation == ClusterReplicationTask.Operation.put.rawValue
+                    && $0.operation == .put
             }
 
             // Exactly the pre-inserted rows survive, one per other-responsible target - no

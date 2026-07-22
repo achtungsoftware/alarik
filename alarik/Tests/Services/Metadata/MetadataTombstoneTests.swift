@@ -319,7 +319,7 @@ struct MetadataTombstoneTests {
 
             let found = try await AccessKey.find(app: app, accessKey: key.accessKey)
             #expect(found == nil)
-            let all = try await AccessKey.all(app: app).map(\.accessKey)
+            let all = await AccessKey.all(app: app).map(\.accessKey)
             #expect(all.contains(key.accessKey) == false)
         }
     }

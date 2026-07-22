@@ -515,7 +515,7 @@ struct InternalAdminControllerTests {
             #expect(!FileManager.default.fileExists(atPath: bucket2URL.path))
 
             // Verify buckets are deleted from DB (cascade)
-            let remainingBuckets = try await Bucket.all(app: app).filter { $0.userId == userId! }
+            let remainingBuckets = await Bucket.all(app: app).filter { $0.userId == userId! }
             #expect(remainingBuckets.isEmpty)
         }
     }

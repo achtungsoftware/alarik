@@ -60,7 +60,7 @@ struct InternalBucketController: RouteCollection {
             self.id = delivery.id
             self.ruleId = delivery.ruleId
             self.url = delivery.url
-            self.state = delivery.state
+            self.state = delivery.state.rawValue
             self.attempts = delivery.attempts
             self.nextAttemptAt = delivery.nextAttemptAt
             self.lastError = delivery.lastError
@@ -134,8 +134,8 @@ struct InternalBucketController: RouteCollection {
             self.endpoint = task.endpoint
             self.key = task.key
             self.versionId = task.versionId
-            self.operation = task.operation
-            self.state = task.state
+            self.operation = task.operation.rawValue
+            self.state = task.state.rawValue
             self.attempts = task.attempts
             self.nextAttemptAt = task.nextAttemptAt
             self.lastError = task.lastError
@@ -278,7 +278,7 @@ struct InternalBucketController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
 
-        var buckets = try await Bucket.all(app: req.application).filter { $0.userId == auth.userId }
+        var buckets = await Bucket.all(app: req.application).filter { $0.userId == auth.userId }
         buckets.sort { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
 
         if let search, !search.isEmpty {
@@ -528,7 +528,7 @@ struct InternalBucketController: RouteCollection {
     func listSharedLinks(req: Request) async throws -> Page<SharedLink.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
-        let links = try await SharedLink.all(app: req.application)
+        let links = await SharedLink.all(app: req.application)
             .filter { $0.userId == auth.userId }
             .sorted { $0.createdAt > $1.createdAt }
 
@@ -1253,10 +1253,7 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let rawTags = bucket.tags else {
-            return TagsDTO(tags: [:])
-        }
-        return TagsDTO(tags: Tagging.fromJSON(rawTags).tags)
+        return TagsDTO(tags: bucket.tags ?? [:])
     }
 
     /// Sets the bucket's tags, overwriting any existing tags entirely - matches the
@@ -1274,11 +1271,10 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        let tagging = Tagging(tags: input.tags)
-        bucket.tags = tagging.toJSON()
+        bucket.tags = input.tags
         try await bucket.save(app: req.application)
 
-        return TagsDTO(tags: tagging.tags)
+        return TagsDTO(tags: input.tags)
     }
 
     @Sendable
@@ -1311,11 +1307,8 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let raw = bucket.notificationConfig else {
-            return NotificationConfigDTO(rules: [])
-        }
         return NotificationConfigDTO(
-            rules: Self.maskedNotificationRules(NotificationConfiguration.fromJSON(raw).rules))
+            rules: Self.maskedNotificationRules(bucket.notificationConfig?.rules ?? []))
     }
 
     /// Replaces the bucket's webhook rules wholesale. Validates every rule, assigns ids to
@@ -1341,9 +1334,7 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
         let existingRulesById = Dictionary(
-            uniqueKeysWithValues:
-                (bucket.notificationConfig.map { NotificationConfiguration.fromJSON($0).rules } ?? [])
-                .map { ($0.id, $0) })
+            uniqueKeysWithValues: (bucket.notificationConfig?.rules ?? []).map { ($0.id, $0) })
 
         // Validate + normalize each rule (fresh id for new rules so ids are always server-owned)
         let normalizedRules = try input.rules.map { rule -> NotificationRule in
@@ -1379,7 +1370,7 @@ struct InternalBucketController: RouteCollection {
         }
 
         let config = NotificationConfiguration(rules: normalizedRules)
-        bucket.notificationConfig = normalizedRules.isEmpty ? nil : config.toJSON()
+        bucket.notificationConfig = normalizedRules.isEmpty ? nil : config
         try await bucket.save(app: req.application)
 
         await NotificationConfigCache.shared.setConfig(for: bucketName, config: config)
@@ -1413,8 +1404,7 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let raw = bucket.notificationConfig,
-            let rule = NotificationConfiguration.fromJSON(raw).rules.first(where: { $0.id == ruleId })
+        guard let rule = bucket.notificationConfig?.rules.first(where: { $0.id == ruleId })
         else {
             throw Abort(.notFound, reason: "Notification rule not found")
         }
@@ -1477,8 +1467,7 @@ struct InternalBucketController: RouteCollection {
 
         let retried = await OutboxMailbox.retryAcrossCluster(
             NotificationDelivery.self, app: req.application,
-            collection: OutboxCollections.notificationDeliveries, taskId: deliveryId,
-            failedStateValue: NotificationDelivery.State.failed.rawValue)
+            collection: OutboxCollections.notificationDeliveries, taskId: deliveryId)
         guard retried else {
             throw Abort(.notFound, reason: "Delivery not found")
         }
@@ -1486,7 +1475,7 @@ struct InternalBucketController: RouteCollection {
         // Mirrors exactly what `OutboxMailbox.retryOwned` just reset on whichever node actually
         // owns this delivery - avoids a second cluster-wide fetch just to read back what's
         // already known.
-        delivery.state = NotificationDelivery.State.pending.rawValue
+        delivery.state = .pending
         delivery.attempts = 0
         delivery.nextAttemptAt = Date()
         delivery.lastError = nil
@@ -1509,11 +1498,8 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let raw = bucket.replicationConfig else {
-            return ReplicationTargetsDTO(targets: [])
-        }
         return ReplicationTargetsDTO(
-            targets: Self.maskedReplicationTargets(ReplicationConfiguration.fromJSON(raw).targets))
+            targets: Self.maskedReplicationTargets(bucket.replicationConfig?.targets ?? []))
     }
 
     /// Replaces the bucket's replication targets wholesale. Validates every target's endpoint
@@ -1540,8 +1526,7 @@ struct InternalBucketController: RouteCollection {
 
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
-        let existingConfig =
-            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0) } ?? .empty
+        let existingConfig = bucket.replicationConfig ?? .empty
         let existingTargetsById = Dictionary(
             uniqueKeysWithValues: existingConfig.targets.map { ($0.id, $0) })
 
@@ -1591,7 +1576,7 @@ struct InternalBucketController: RouteCollection {
 
         let config = ReplicationConfiguration(targets: normalizedTargets, rules: adjustedRules)
         bucket.replicationConfig =
-            (normalizedTargets.isEmpty && adjustedRules.isEmpty) ? nil : config.toJSON()
+            (normalizedTargets.isEmpty && adjustedRules.isEmpty) ? nil : config
         try await bucket.save(app: req.application)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
@@ -1611,10 +1596,7 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let raw = bucket.replicationConfig else {
-            return ReplicationRulesDTO(rules: [])
-        }
-        return ReplicationRulesDTO(rules: ReplicationConfiguration.fromJSON(raw).rules)
+        return ReplicationRulesDTO(rules: bucket.replicationConfig?.rules ?? [])
     }
 
     /// Replaces the bucket's replication rules wholesale. A non-empty rule set requires the
@@ -1648,8 +1630,7 @@ struct InternalBucketController: RouteCollection {
                 reason: "Replication rules require the bucket's versioning to be Enabled.")
         }
 
-        let existingTargets =
-            bucket.replicationConfig.map { ReplicationConfiguration.fromJSON($0).targets } ?? []
+        let existingTargets = bucket.replicationConfig?.targets ?? []
         let targetIds = Set(existingTargets.map(\.id))
 
         let normalizedRules = try input.rules.map { rule -> ReplicationRule in
@@ -1666,7 +1647,7 @@ struct InternalBucketController: RouteCollection {
 
         let config = ReplicationConfiguration(targets: existingTargets, rules: normalizedRules)
         bucket.replicationConfig =
-            (existingTargets.isEmpty && normalizedRules.isEmpty) ? nil : config.toJSON()
+            (existingTargets.isEmpty && normalizedRules.isEmpty) ? nil : config
         try await bucket.save(app: req.application)
 
         await ReplicationConfigCache.shared.setConfig(for: bucketName, config: config)
@@ -1707,10 +1688,9 @@ struct InternalBucketController: RouteCollection {
         let bucket = try await requireOwnedBucket(
             req: req, bucketName: bucketName, userId: auth.userId)
 
-        guard let raw = bucket.replicationConfig else {
+        guard let config = bucket.replicationConfig else {
             throw Abort(.notFound, reason: "Replication rule not found")
         }
-        let config = ReplicationConfiguration.fromJSON(raw)
         guard let rule = config.rules.first(where: { $0.id == ruleId }) else {
             throw Abort(.notFound, reason: "Replication rule not found")
         }
@@ -1797,7 +1777,7 @@ struct InternalBucketController: RouteCollection {
 
         let retried = await OutboxMailbox.retryAcrossCluster(
             ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
-            taskId: taskId, failedStateValue: ReplicationTask.State.failed.rawValue)
+            taskId: taskId)
         guard retried else {
             throw Abort(.notFound, reason: "Replication task not found")
         }
@@ -1805,7 +1785,7 @@ struct InternalBucketController: RouteCollection {
         // Mirrors exactly what `OutboxMailbox.retryOwned` just reset on whichever node actually
         // owns this task - avoids a second cluster-wide fetch just to read back what's already
         // known.
-        task.state = ReplicationTask.State.pending.rawValue
+        task.state = .pending
         task.attempts = 0
         task.nextAttemptAt = Date()
         task.lastError = nil

@@ -22,7 +22,7 @@ import struct Foundation.UUID
 /// but editable, unlike the immutable id, so uniqueness is enforced through a separate pointer
 /// object (`users/by-username/<username>` -> `{"userId": "<uuid>"}`) rather than the primary key
 /// itself - see `findByUsername`/`create`/`rename` below.
-final class User: @unchecked Sendable, Codable, Authenticatable {
+final class User: @unchecked Sendable, MetadataRecord, Authenticatable {
     let id: UUID
     var name: String
     var username: String
@@ -74,9 +74,11 @@ extension User {
         case usernameTaken
     }
 
+    static var metadataCollection: String { MetadataCollections.users }
+    var metadataId: String { id.uuidString }
+
     static func find(app: Application, id: UUID) async throws -> User? {
-        try await MetadataStore.get(
-            User.self, app: app, collection: MetadataCollections.users, id: id.uuidString)
+        try await find(app: app, key: id.uuidString)
     }
 
     /// Resolves the username pointer, then the primary record - self-healing if either half is
@@ -99,7 +101,8 @@ extension User {
     }
 
     /// Creates a brand-new user, atomically claiming `username`. Throws `UserError.usernameTaken`
-    /// if another user already holds it.
+    /// if another user already holds it. Overrides the `MetadataRecord` default, which knows
+    /// nothing about the username pointer.
     func create(app: Application) async throws {
         let claimed = try await MetadataStore.putIfAbsent(
             app: app, collection: MetadataCollections.usersByUsername, id: username,
@@ -114,14 +117,6 @@ extension User {
                 app: app, collection: MetadataCollections.usersByUsername, id: username)
             throw error
         }
-    }
-
-    /// Overwrites the primary record in place - callers whose edit might also change `username`
-    /// must go through `rename` first (that's the only field with a secondary index to keep
-    /// consistent); every other field is safe to mutate and `save` directly.
-    func save(app: Application) async throws {
-        try await MetadataStore.put(
-            app: app, collection: MetadataCollections.users, id: id.uuidString, value: self)
     }
 
     /// Retargets the username pointer before updating the primary record, in that order, so a
@@ -144,6 +139,7 @@ extension User {
             app: app, collection: MetadataCollections.usersByUsername, id: previousUsername)
     }
 
+    /// Overrides the `MetadataRecord` default - the username pointer has to go too.
     func delete(app: Application) async throws {
         try await MetadataStore.delete(
             app: app, collection: MetadataCollections.users, id: id.uuidString)

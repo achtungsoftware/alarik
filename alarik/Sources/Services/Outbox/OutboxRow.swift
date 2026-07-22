@@ -23,8 +23,19 @@ import Foundation
 /// persist/remove are injected closures), so any row type can conform as long as it's a
 /// reference type - mutations inside `GenericOutboxDispatcher.deliver` must stay visible to the
 /// `persist` closure called right after, without threading a `var` binding through.
+/// Delivery state shared by every outbox row. Previously each task type declared its own
+/// identical `pending`/`failed` enum and then stored it as a `String`, so every call site compared
+/// against `.rawValue`. One `Codable` enum on the protocol makes invalid states unrepresentable and
+/// lets call sites read `row.state == .pending`.
+enum OutboxRowState: String, Codable, Sendable {
+    /// Awaiting its next attempt.
+    case pending
+    /// Dead-lettered after exhausting its attempts - retained for inspection, never auto-retried.
+    case failed
+}
+
 protocol OutboxRow: AnyObject, Sendable {
-    var state: String { get set }
+    var state: OutboxRowState { get set }
     var nextAttemptAt: Date { get set }
     var attempts: Int { get set }
     var lastError: String? { get set }

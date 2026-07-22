@@ -65,7 +65,7 @@ struct InternalClusterControllerTests {
             let failedTask = ClusterReplicationTask(
                 bucketName: "b", key: "k\(UUID())", versionId: nil, operation: .delete,
                 targetNodeId: UUID(), reason: .reclaim, ownerNodeId: selfNodeId)
-            failedTask.state = ClusterReplicationTask.State.failed.rawValue
+            failedTask.state = .failed
             try OutboxMailbox.update(failedTask, collection: OutboxCollections.clusterReplicationTasks)
 
             try await app.test(

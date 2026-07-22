@@ -129,26 +129,24 @@ struct InternalClusterOutboxController: RouteCollection {
             retried =
                 OutboxMailbox.retryOwned(
                     NotificationDelivery.self, app: req.application, collection: collection,
-                    taskId: taskId, failedStateValue: NotificationDelivery.State.failed.rawValue) != nil
+                    taskId: taskId) != nil
             if retried { NotificationDispatcher.shared.wake() }
         case OutboxCollections.replicationTasks:
             retried =
                 OutboxMailbox.retryOwned(
-                    ReplicationTask.self, app: req.application, collection: collection, taskId: taskId,
-                    failedStateValue: ReplicationTask.State.failed.rawValue) != nil
+                    ReplicationTask.self, app: req.application, collection: collection, taskId: taskId) != nil
             if retried { ReplicationDispatcher.shared.wake() }
         case OutboxCollections.clusterReplicationTasks:
             retried =
                 OutboxMailbox.retryOwned(
                     ClusterReplicationTask.self, app: req.application, collection: collection,
-                    taskId: taskId, failedStateValue: ClusterReplicationTask.State.failed.rawValue) != nil
+                    taskId: taskId) != nil
             if retried { ClusterReplicationDispatcher.shared.wake() }
         case OutboxCollections.erasureCodedReplicationTasks:
             retried =
                 OutboxMailbox.retryOwned(
                     ErasureCodedReplicationTask.self, app: req.application, collection: collection,
-                    taskId: taskId,
-                    failedStateValue: ErasureCodedReplicationTask.State.failed.rawValue) != nil
+                    taskId: taskId) != nil
             if retried { ErasureCodedDispatcher.shared.wake() }
         default:
             throw Abort(.badRequest, reason: "Unknown outbox collection '\(collection)'")
@@ -207,7 +205,7 @@ struct InternalClusterOutboxController: RouteCollection {
         case OutboxCollections.clusterReplicationTasks:
             OutboxMailbox.removeOwned(ClusterReplicationTask.self, app: req.application, collection: collection) {
                 $0.targetNodeId == targetNodeId
-                    && $0.reason != ClusterReplicationTask.Reason.reclaim.rawValue
+                    && $0.reason != .reclaim
             }
         case OutboxCollections.erasureCodedReplicationTasks:
             OutboxMailbox.removeOwned(ErasureCodedReplicationTask.self, app: req.application, collection: collection) {

@@ -23,7 +23,7 @@ import struct Foundation.UUID
 /// always by that value, never by id - so unlike `User`, no secondary index is needed at all.
 /// `id` is kept only for API compatibility (the console addresses a key by id for deletion) - see
 /// `find(app:id:userId:)`, which lists this small per-user collection and filters in memory.
-final class AccessKey: @unchecked Sendable, Codable {
+final class AccessKey: @unchecked Sendable, MetadataRecord {
     let id: UUID
     var userId: UUID
     var accessKey: String
@@ -51,30 +51,18 @@ final class AccessKey: @unchecked Sendable, Codable {
 // MARK: - MetadataStore access
 
 extension AccessKey {
+    static var metadataCollection: String { MetadataCollections.accessKeys }
+    var metadataId: String { accessKey }
+
     static func find(app: Application, accessKey: String) async throws -> AccessKey? {
-        try await MetadataStore.get(
-            AccessKey.self, app: app, collection: MetadataCollections.accessKeys, id: accessKey)
+        try await find(app: app, key: accessKey)
     }
 
     /// Every access key belonging to `userId` - a full-collection listing filtered in memory.
     /// Access keys are a shallow, low-churn collection (see `MetadataListingService`'s doc
     /// comment), so this is only ever called from admin/console paths, never per-S3-request.
     static func findAll(app: Application, userId: UUID) async throws -> [AccessKey] {
-        try await all(app: app).filter { $0.userId == userId }
-    }
-
-    static func all(app: Application) async throws -> [AccessKey] {
-        await MetadataListingService.list(
-            AccessKey.self, app: app, collection: MetadataCollections.accessKeys)
-    }
-
-    /// `all` plus the listing's completeness verdict - see `LoadCacheLifecycle.reloadAll`, which
-    /// may only reconcile REMOVALS against a listing that is verifiably complete.
-    static func allVerified(
-        app: Application
-    ) async -> (records: [AccessKey], presentIds: Set<String>, complete: Bool) {
-        await MetadataListingService.listVerified(
-            AccessKey.self, app: app, collection: MetadataCollections.accessKeys)
+        await all(app: app).filter { $0.userId == userId }
     }
 
     /// Secondary index record: `access-keys-by-id/<uuid>` -> the key's value and owner. Carries
@@ -107,6 +95,7 @@ extension AccessKey {
     }
 
     /// Creates the key, failing if `accessKey`'s value is already taken by another key.
+    /// Overrides the `MetadataRecord` default to keep the by-id pointer in step with the primary.
     func create(app: Application) async throws -> Bool {
         let claimed = try await MetadataStore.putIfAbsent(
             app: app, collection: MetadataCollections.accessKeys, id: accessKey, value: self)
@@ -125,6 +114,7 @@ extension AccessKey {
         return true
     }
 
+    /// Overrides the `MetadataRecord` default - the by-id pointer has to go too.
     func delete(app: Application) async throws {
         try await AccessKeyService.delete(app: app, accessKey: accessKey, id: id)
     }

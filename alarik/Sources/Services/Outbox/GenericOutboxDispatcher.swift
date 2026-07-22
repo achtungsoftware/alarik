@@ -60,7 +60,6 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
     private let batchSize: Int
     private let maxConcurrentDeliveries: Int
     private let logContext: String
-    private let failedStateValue: String
     private let fetchDue: @Sendable (Application, Int) async throws -> [Row]
     private let dedupKey: (@Sendable (Row) -> String)?
     private let attemptDelivery: @Sendable (Row, Application) async -> OutboxDeliveryOutcome
@@ -79,7 +78,6 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         batchSize: Int = 50,
         maxConcurrentDeliveries: Int,
         logContext: String,
-        failedStateValue: String,
         fetchDue: @escaping @Sendable (Application, Int) async throws -> [Row],
         dedupKey: (@Sendable (Row) -> String)? = nil,
         attemptDelivery: @escaping @Sendable (Row, Application) async -> OutboxDeliveryOutcome,
@@ -92,7 +90,6 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         self.batchSize = batchSize
         self.maxConcurrentDeliveries = maxConcurrentDeliveries
         self.logContext = logContext
-        self.failedStateValue = failedStateValue
         self.fetchDue = fetchDue
         self.dedupKey = dedupKey
         self.attemptDelivery = attemptDelivery
@@ -146,7 +143,6 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
 
         let maxAttempts = self.maxAttempts
         let logContext = self.logContext
-        let failedStateValue = self.failedStateValue
         let attemptDelivery = self.attemptDelivery
         let persist = self.persist
         let remove = self.remove
@@ -179,7 +175,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                     group.addTask {
                         let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
-                            failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
+ attemptDelivery: attemptDelivery,
                             persist: persist, remove: remove, describeFailure: describeFailure)
                         return (key, skipped)
                     }
@@ -193,7 +189,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                     group.addTask {
                         let skipped = await Self.deliver(
                             row, app: app, maxAttempts: maxAttempts, logContext: logContext,
-                            failedStateValue: failedStateValue, attemptDelivery: attemptDelivery,
+ attemptDelivery: attemptDelivery,
                             persist: persist, remove: remove, describeFailure: describeFailure)
                         return (key, skipped)
                     }
@@ -220,7 +216,6 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
     @discardableResult
     private static func deliver(
         _ row: Row, app: Application, maxAttempts: Int, logContext: String,
-        failedStateValue: String,
         attemptDelivery: @Sendable (Row, Application) async -> OutboxDeliveryOutcome,
         persist: @Sendable (Row, Application) async throws -> Void,
         remove: @Sendable (Row, Application) async throws -> Void,
@@ -239,7 +234,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
             row.attempts += 1
             row.lastError = "\(error)"
             if row.attempts >= maxAttempts {
-                row.state = failedStateValue
+                row.state = .failed
                 app.logger.warning(
                     "\(logContext) failed permanently after \(row.attempts) attempts: \(describeFailure(row))"
                 )

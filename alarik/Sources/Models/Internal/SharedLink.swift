@@ -23,7 +23,7 @@ import Vapor
 ///
 /// Backed by `MetadataStore`, not Fluent - `id` doubles as the primary key directly (already a
 /// natural immutable identifier, unlike `User`'s mutable username).
-final class SharedLink: @unchecked Sendable, Codable {
+final class SharedLink: @unchecked Sendable, MetadataRecord {
     let id: UUID
     var userId: UUID
     var bucketName: String
@@ -56,24 +56,10 @@ final class SharedLink: @unchecked Sendable, Codable {
 // MARK: - MetadataStore access
 
 extension SharedLink {
+    static var metadataCollection: String { MetadataCollections.sharedLinks }
+    var metadataId: String { id.uuidString }
+
     static func find(app: Application, id: UUID) async throws -> SharedLink? {
-        try await MetadataStore.get(
-            SharedLink.self, app: app, collection: MetadataCollections.sharedLinks,
-            id: id.uuidString)
-    }
-
-    static func all(app: Application) async throws -> [SharedLink] {
-        await MetadataListingService.list(
-            SharedLink.self, app: app, collection: MetadataCollections.sharedLinks)
-    }
-
-    func save(app: Application) async throws {
-        try await MetadataStore.put(
-            app: app, collection: MetadataCollections.sharedLinks, id: id.uuidString, value: self)
-    }
-
-    func delete(app: Application) async throws {
-        try await MetadataStore.delete(
-            app: app, collection: MetadataCollections.sharedLinks, id: id.uuidString)
+        try await find(app: app, key: id.uuidString)
     }
 }

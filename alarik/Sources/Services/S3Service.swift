@@ -665,8 +665,7 @@ struct S3Service {
     /// empty `<NotificationConfiguration/>` (200) rather than a 404 when none is set (verified
     /// against the GetBucketNotificationConfiguration API reference).
     static func handleNotificationGet(bucket: Bucket?) -> Response {
-        let config: NotificationConfiguration =
-            bucket?.notificationConfig.map(NotificationConfiguration.fromJSON) ?? .empty
+        let config = bucket?.notificationConfig ?? .empty
         return buildXMLResponse(data: Data(config.toXML().utf8))
     }
 
@@ -674,37 +673,38 @@ struct S3Service {
     /// ReplicationConfigurationNotFoundError if none has ever been set (verified against the
     /// GetBucketReplication API reference - unlike ?notification, which returns an empty 200).
     static func handleReplicationGet(bucket: Bucket?, requestId: String) throws -> Response {
-        guard let raw = bucket?.replicationConfig else {
+        guard let config = bucket?.replicationConfig else {
             throw S3Error(
                 status: .notFound, code: "ReplicationConfigurationNotFoundError",
                 message: "The replication configuration was not found.", requestId: requestId)
         }
-        return buildXMLResponse(data: Data(ReplicationConfiguration.fromJSON(raw).toXML().utf8))
+        return buildXMLResponse(data: Data(config.toXML().utf8))
     }
 
     /// Handles GET ?lifecycle on a bucket. Matches S3: a 404 NoSuchLifecycleConfiguration
     /// if none has ever been set (verified against the GetBucketLifecycleConfiguration API
     /// reference).
     static func handleLifecycleGet(bucket: Bucket?, requestId: String) throws -> Response {
-        guard let rawRules = bucket?.lifecycleRules else {
+        guard let rules = bucket?.lifecycleRules else {
             throw S3Error(
                 status: .notFound, code: "NoSuchLifecycleConfiguration",
                 message: "The lifecycle configuration does not exist.", requestId: requestId)
         }
-        return buildXMLResponse(data: Data(LifecycleConfiguration.fromJSON(rawRules).toXML().utf8))
+        return buildXMLResponse(
+            data: Data(LifecycleConfiguration(rules: rules).toXML().utf8))
     }
 
     /// Handles GET ?tagging on a bucket. Matches S3: a 404 NoSuchTagSet if no tag set has
     /// ever been configured (verified against the GetBucketTagging API reference) - unlike
     /// object tagging, which always returns 200 with a possibly-empty TagSet.
     static func handleBucketTaggingGet(bucket: Bucket?, requestId: String) throws -> Response {
-        guard let rawTags = bucket?.tags else {
+        guard let tags = bucket?.tags else {
             throw S3Error(
                 status: .notFound, code: "NoSuchTagSet",
                 message: "There is no tag set associated with the bucket.",
                 requestId: requestId)
         }
-        return buildXMLResponse(data: Data(Tagging.fromJSON(rawTags).toXML().utf8))
+        return buildXMLResponse(data: Data(Tagging(tags: tags).toXML().utf8))
     }
 
     /// Handles GET ?publicAccessBlock - returns the bucket's Public Access Block configuration.
