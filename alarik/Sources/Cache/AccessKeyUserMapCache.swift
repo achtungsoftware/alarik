@@ -64,7 +64,7 @@ final actor AccessKeyUserMapCache: StoreBackedCache {
         // check would hand SigV4 a working secret for a credential that has already expired.
         if stored.expirationDate.map({ $0 > Date() }) ?? true {
             await AccessKeySecretKeyMapCache.shared.add(
-                accessKey: key, secretKey: stored.secretKey)
+                accessKey: key, secretKey: stored.secretKey, expiresAt: stored.expirationDate)
         }
         return stored.userId
     }

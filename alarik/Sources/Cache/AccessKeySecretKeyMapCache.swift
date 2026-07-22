@@ -17,11 +17,29 @@ limitations under the License.
 import Foundation
 import Vapor
 
+/// A cached credential: the secret SigV4 signs with, plus the instant it stops being usable.
+///
+/// The expiry travels WITH the secret rather than being checked only when the record is loaded
+/// from the store. Caching a bare secret meant expiry was enforced solely by the background sweep
+/// that deletes expired records - so a key stayed fully usable for up to a sweep interval past its
+/// own expiry, and longer on any node that missed the removal broadcast. A time-limited credential
+/// has to stop working because time passed, not because a sweep got around to it.
+struct AccessKeyCredential: Sendable, Equatable {
+    let secretKey: String
+    /// `nil` means the key never expires.
+    let expiresAt: Date?
+
+    func isValid(now: Date = Date()) -> Bool {
+        guard let expiresAt else { return true }
+        return expiresAt > now
+    }
+}
+
 final actor AccessKeySecretKeyMapCache: StoreBackedCache {
 
     public static let shared = AccessKeySecretKeyMapCache()
 
-    private var map: [String: String] = [:]
+    private var map: [String: AccessKeyCredential] = [:]
 
     var missLedger = CacheMissLedger<String>()
 
@@ -30,11 +48,16 @@ final actor AccessKeySecretKeyMapCache: StoreBackedCache {
     /// otherwise evict live credentials. Kept only for tests that exercise replace semantics
     /// directly; do not wire it into a reload path.
     func load(initialData: [(accessKey: String, secretKey: String)]) {
-        map = Dictionary(uniqueKeysWithValues: initialData.map { ($0.accessKey, $0.secretKey) })
+        map = Dictionary(
+            uniqueKeysWithValues: initialData.map {
+                ($0.accessKey, AccessKeyCredential(secretKey: $0.secretKey, expiresAt: nil))
+            })
     }
 
-    func add(accessKey: String, secretKey: String) {
-        map[accessKey] = secretKey
+    /// `expiresAt` defaults to "never expires" - callers that HAVE the key's expiration date must
+    /// pass it, or the cached copy outlives the credential it represents.
+    func add(accessKey: String, secretKey: String, expiresAt: Date? = nil) {
+        map[accessKey] = AccessKeyCredential(secretKey: secretKey, expiresAt: expiresAt)
         missLedger.clear(accessKey)
     }
 
@@ -42,36 +65,48 @@ final actor AccessKeySecretKeyMapCache: StoreBackedCache {
         map.removeValue(forKey: accessKey)
     }
 
+    /// The secret, or nil if the key is unknown OR has expired. Expiry is enforced here, not just
+    /// at load time, so a key that expires while cached stops signing immediately.
     func secretKey(for accessKey: String) -> String? {
-        map[accessKey]
+        guard let credential = map[accessKey], credential.isValid() else { return nil }
+        return credential.secretKey
     }
 
+    /// Whether a still-valid credential is cached for this key. An expired one reads as absent.
     func exists(accessKey: String) -> Bool {
-        map[accessKey] != nil
+        map[accessKey]?.isValid() == true
     }
 
     func keys(for secretKey: String) -> [String] {
-        map.filter { $0.value == secretKey }.map { $0.key }
+        map.filter { $0.value.secretKey == secretKey }.map { $0.key }
     }
 
+    /// Access key -> secret, for the reconcile pass and debug dumps. Expired entries are included
+    /// deliberately: the only caller that reads the values reconciles cache membership against a
+    /// cluster listing, and an expired-but-not-yet-deleted key is still a record that exists.
     func getMap() -> [String: String] {
-        map
+        map.mapValues(\.secretKey)
     }
 
     // MARK: - StoreBackedCache
 
-    func cachedValue(for key: String) -> String? { map[key] }
+    func cachedValue(for key: String) -> AccessKeyCredential? {
+        guard let credential = map[key], credential.isValid() else { return nil }
+        return credential
+    }
 
-    func absorb(_ value: String, for key: String) { map[key] = value }
+    func absorb(_ value: AccessKeyCredential, for key: String) { map[key] = value }
 
-    func loadFromStore(app: Application, key: String) async throws -> String? {
+    func loadFromStore(app: Application, key: String) async throws -> AccessKeyCredential? {
         guard let stored = try await AccessKey.find(app: app, accessKey: key) else { return nil }
+        let credential = AccessKeyCredential(
+            secretKey: stored.secretKey, expiresAt: stored.expirationDate)
         // An expired key is genuinely unusable, matching what a cache reload would have filtered.
-        if let expiry = stored.expirationDate, expiry <= Date() { return nil }
+        guard credential.isValid() else { return nil }
         // Seed the owner mapping from this same record. The authorization check that follows on
         // the auth path resolves the owner next, and would otherwise gather the identical record
         // a second time - two cluster-wide reads per request until the caches warm.
         await AccessKeyUserMapCache.shared.add(accessKey: key, userId: stored.userId)
-        return stored.secretKey
+        return credential
     }
 }

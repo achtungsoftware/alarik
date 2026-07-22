@@ -248,7 +248,7 @@ public func configure(_ app: Application) async throws {
             ) { task in
                 Task {
                     do {
-                        try await LoadCacheLifecycle.reloadAll(app: app)
+                        try await LoadCacheLifecycle.reloadAll(app: app, gated: true)
                     } catch {
                         app.logger.error("Periodic full cache reload failed: \(error)")
                     }

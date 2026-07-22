@@ -100,7 +100,8 @@ struct InternalUserController: RouteCollection {
         // Add to caches
         await AccessKeySecretKeyMapCache.shared.add(
             accessKey: create.accessKey,
-            secretKey: create.secretKey
+            secretKey: create.secretKey,
+            expiresAt: create.expirationDate
         )
         CacheInvalidationService.notify(
             app: req.application, cache: "accessKeySecret", op: .upsert, key: create.accessKey)

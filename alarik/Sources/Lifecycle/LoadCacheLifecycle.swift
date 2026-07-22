@@ -89,7 +89,45 @@ final class LoadCacheLifecycle: LifecycleHandler {
     /// `ClusterNodeCache.reconcile`'s reasoning below - a merely-incomplete fan-out and a genuine
     /// departure are indistinguishable from a listing snapshot alone, so this function must never
     /// treat "absent from this one fan-out" as removal.
-    static func reloadAll(app: Application) async throws {
+    /// `gated` is for the periodic safety-net tick ONLY, and defaults to off.
+    ///
+    /// The digest gate reasons "nothing in the store changed, so every cache is already correct".
+    /// That inference only holds when the caches were correct to begin with - it says nothing
+    /// about a cache that is empty or has been cleared, because emptying a cache doesn't change
+    /// the store. Boot is exactly that case: the caches start empty while the store sits
+    /// unchanged, so a gated load there would skip the very work boot exists to do. Every caller
+    /// that runs because the cache state is in question (boot, boot catch-up, discovering a peer)
+    /// must therefore stay ungated; only the timer, which runs when nothing is known to have
+    /// happened, may skip.
+    static func reloadAll(app: Application, gated: Bool = false) async throws {
+        // Membership first, and never gated: `cluster-nodes` records are rewritten by every
+        // heartbeat, so their digest always differs and gating on it would never skip anything.
+        // This is also the durable backstop for membership now that the 5-second refresh tick is
+        // bounded gossip rather than a full collection pull - it recovers a node that is
+        // registered on disk but has fallen out of every live peer's cache.
+        // `reconcile`, not `load`: `ClusterNode.all` is a best-effort fan-out, so a peer merely
+        // slow to answer must not have its (still-fresher) cached entry clobbered by its absence.
+        let clusterNodeData = await ClusterNode.all(app: app).map { node in
+            ClusterNodeInfo(
+                id: node.id, address: node.address, status: node.status,
+                lastHeartbeatAt: node.lastHeartbeatAt,
+                totalBytes: node.totalBytes, availableBytes: node.availableBytes)
+        }
+        await ClusterNodeCache.shared.reconcile(snapshot: clusterNodeData)
+
+        // Everything below re-pulls whole collections from every peer. In a cluster where nothing
+        // has been created or revoked since the last cycle - the normal state - that is pure
+        // waste, so a digest comparison decides whether it is worth doing at all. The gate fails
+        // open: any unreachable peer or probe error counts as "changed".
+        //
+        // The digests are refreshed even when `gated` is false, so an ungated load still updates
+        // the baseline - otherwise the next gated tick would compare against a stale one and
+        // redo work that just happened.
+        let changed = await MetadataReloadGate.shared.changedSinceLastCheck(
+            app: app,
+            collections: [MetadataCollections.accessKeys, MetadataCollections.buckets])
+        if gated && !changed { return }
+
         // Load all non-expired access keys
         let keyListing = await AccessKey.allVerified(app: app)
         let keys = keyListing.records.filter {
@@ -110,10 +148,12 @@ final class LoadCacheLifecycle: LifecycleHandler {
         // Build cache mappings
         var bucketData: [(accessKey: String, bucketName: String)] = []
         var userMappingData: [(accessKey: String, userId: UUID)] = []
-        var secretKeyData: [(accessKey: String, secretKey: String)] = []
+        var secretKeyData: [(accessKey: String, secretKey: String, expiresAt: Date?)] = []
 
         for key in keys {
-            secretKeyData.append((accessKey: key.accessKey, secretKey: key.secretKey))
+            secretKeyData.append(
+                (accessKey: key.accessKey, secretKey: key.secretKey,
+                 expiresAt: key.expirationDate))
 
             let userID = key.userId
 
@@ -127,8 +167,9 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
         }
 
-        for (accessKey, secretKey) in secretKeyData {
-            await AccessKeySecretKeyMapCache.shared.add(accessKey: accessKey, secretKey: secretKey)
+        for (accessKey, secretKey, expiresAt) in secretKeyData {
+            await AccessKeySecretKeyMapCache.shared.add(
+                accessKey: accessKey, secretKey: secretKey, expiresAt: expiresAt)
         }
         for (accessKey, userId) in userMappingData {
             await AccessKeyUserMapCache.shared.add(accessKey: accessKey, userId: userId)
@@ -225,18 +266,6 @@ final class LoadCacheLifecycle: LifecycleHandler {
             }
         }
 
-        // Load cluster membership cache - harmless empty load when cluster mode is off, since no
-        // node ever registers itself into the `cluster-nodes` collection then. `reconcile`, not
-        // `load`: `ClusterNode.all` is a best-effort cluster-wide fan-out
-        // (`MetadataListingService`), so a peer merely slow to answer must not have its
-        // (still-fresher) cached entry clobbered by its absence here.
-        let clusterNodeData = await ClusterNode.all(app: app).map { node in
-            ClusterNodeInfo(
-                id: node.id, address: node.address, status: node.status,
-                lastHeartbeatAt: node.lastHeartbeatAt,
-                totalBytes: node.totalBytes, availableBytes: node.availableBytes)
-        }
-        await ClusterNodeCache.shared.reconcile(snapshot: clusterNodeData)
     }
 
     // MARK: - Per-bucket mappers

@@ -70,7 +70,8 @@ enum CacheReloadDispatch {
             let accessKey = message.key
             if let key = try await AccessKey.find(app: app, accessKey: accessKey) {
                 await AccessKeySecretKeyMapCache.shared.add(
-                    accessKey: key.accessKey, secretKey: key.secretKey)
+                    accessKey: key.accessKey, secretKey: key.secretKey,
+                    expiresAt: key.expirationDate)
             }
         case ("accessKeySecret", .remove):
             await AccessKeySecretKeyMapCache.shared.remove(accessKey: message.key)

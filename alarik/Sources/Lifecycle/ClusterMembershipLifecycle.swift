@@ -38,11 +38,21 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
 
     /// How often this node refreshes its own heartbeat.
     static let heartbeatInterval: Int64 = 10
-    /// How often this node pulls the full membership collection to refresh peer liveness/status.
-    /// Longer than the heartbeat interval - a safety-net poll, not the primary propagation path
-    /// (that's `CacheReloadDispatch`'s broadcast handling) - bounding how long a single dropped
-    /// `registerSelf` broadcast can leave a peer believing a restarted node is still absent.
+    /// How often this node exchanges membership views with a few peers. A safety net, not the
+    /// primary propagation path (that's `CacheReloadDispatch`'s broadcast handling) - it bounds
+    /// how long a single dropped `registerSelf` broadcast can leave a peer believing a restarted
+    /// node is still absent.
     static let membershipRefreshInterval: Int64 = 5
+
+    /// How many peers one refresh tick talks to.
+    ///
+    /// Bounded on purpose. Polling *every* peer costs O(N) requests per node per tick, so
+    /// O(N^2) cluster-wide every `membershipRefreshInterval` - unnoticeable at four nodes and
+    /// ruinous at a thousand, where it would dominate all other traffic. Random-peer anti-entropy
+    /// converges in O(log N) rounds instead, because each exchange merges two complete views
+    /// rather than one node interrogating everybody. `ClusterNodeCache.reconcile` is already the
+    /// merge function that makes this safe: additive, freshest-entry-wins, order-independent.
+    private static let gossipFanout = 3
 
     private var heartbeatTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
@@ -181,12 +191,54 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     private func reseedFromConfiguredSeeds(
         app: Application, config: ClusterConfiguration, triggerCacheReloadOnGrowth: Bool
     ) async -> Bool {
+        await exchangeMembership(
+            app: app, config: config, addresses: config.seeds,
+            triggerCacheReloadOnGrowth: triggerCacheReloadOnGrowth)
+    }
+
+    /// One anti-entropy round against a bounded, randomly chosen set of peers - the periodic
+    /// replacement for polling every peer (and for pulling the whole `cluster-nodes` collection)
+    /// on every tick.
+    ///
+    /// A configured seed is always kept in the sample when any is set. That is what preserves the
+    /// one property random peer choice alone can't: two subsets of a cluster that booted without
+    /// ever seeing each other share no known peers, so they can only ever meet through the static
+    /// seed list. Everything else in the sample is drawn from live membership, so the round costs
+    /// `gossipFanout` requests regardless of cluster size.
+    @discardableResult
+    private func gossipMembership(app: Application, config: ClusterConfiguration) async -> Bool {
+        let peerAddresses = await ClusterNodeCache.shared.all()
+            .filter { $0.id != config.nodeId }
+            .map(\.address)
+
+        var sample = Array(peerAddresses.shuffled().prefix(Self.gossipFanout))
+        if let seed = config.seeds.randomElement() {
+            if let existing = sample.firstIndex(of: seed) {
+                sample.swapAt(0, existing)
+            } else {
+                sample = [seed] + sample.prefix(Self.gossipFanout - 1)
+            }
+        }
+        guard !sample.isEmpty else { return false }
+
+        return await exchangeMembership(
+            app: app, config: config, addresses: sample, triggerCacheReloadOnGrowth: true)
+    }
+
+    /// Queries each address's membership snapshot in parallel and merges them into the local
+    /// cache. Returns whether at least one answered.
+    @discardableResult
+    private func exchangeMembership(
+        app: Application, config: ClusterConfiguration, addresses: [String],
+        triggerCacheReloadOnGrowth: Bool
+    ) async -> Bool {
+        guard !addresses.isEmpty else { return false }
         let knownBefore = Set(await ClusterNodeCache.shared.all().map(\.id))
         var anySucceeded = false
         await withTaskGroup(of: [ClusterNodeInfo]?.self) { group in
-            for seedAddress in config.seeds {
+            for address in addresses {
                 group.addTask {
-                    await self.querySeed(app: app, address: seedAddress, config: config)
+                    await self.queryMembers(app: app, address: address, config: config)
                 }
             }
             for await result in group {
@@ -230,7 +282,9 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         return anySucceeded
     }
 
-    private func querySeed(app: Application, address: String, config: ClusterConfiguration) async
+    /// Reads one peer's own membership snapshot. Used for both the static-seed reseed and the
+    /// periodic gossip round - the endpoint is the same either way.
+    private func queryMembers(app: Application, address: String, config: ClusterConfiguration) async
         -> [ClusterNodeInfo]?
     {
         var outbound = HTTPClientRequest(url: address + "/internal/cluster/members")
@@ -373,29 +427,22 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         }
     }
 
+    /// Periodic membership anti-entropy: one bounded gossip round per tick.
+    ///
+    /// Deliberately does NOT pull the whole `cluster-nodes` collection here any more. That read is
+    /// a cluster-wide listing fan-out (every peer scanning its own disk) and running it every
+    /// `membershipRefreshInterval` on every node was the single largest source of steady-state
+    /// traffic in the system. Gossip carries the same information - a peer's `/members` response
+    /// IS its full membership view - at a cost that doesn't grow with the cluster.
+    ///
+    /// The durable records still get read, just far less often: `LoadCacheLifecycle.reloadAll`
+    /// reconciles `ClusterNode.all` on its own (much slower) cadence, which is what recovers a
+    /// node that is registered on disk but has fallen out of every live peer's cache.
     private func refreshLoop(app: Application, config: ClusterConfiguration) async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(Self.membershipRefreshInterval))
             guard !Task.isCancelled else { return }
-
-            // `all` degrades to a partial listing rather than throwing, and `status` is a typed
-            // enum - a malformed record fails at decode, which is where it belongs.
-            let snapshot = await ClusterNode.all(app: app).map { row in
-                ClusterNodeInfo(
-                    id: row.id, address: row.address, status: row.status,
-                    lastHeartbeatAt: row.lastHeartbeatAt,
-                    totalBytes: row.totalBytes, availableBytes: row.availableBytes)
-            }
-            await ClusterNodeCache.shared.reconcile(snapshot: snapshot)
-
-            // Re-query the static seed list too, not just the listing fan-out above - see
-            // `reseedFromConfiguredSeeds`'s doc comment for why the fan-out alone can leave two
-            // independently-booted subsets of a cluster permanently unaware of each other.
-            // Ordered after the listing-based reconcile (which can only ever shrink the cache) so
-            // any node it dropped that's still genuinely reachable via a seed is restored within
-            // the same tick, rather than staying dropped until the next cycle.
-            await reseedFromConfiguredSeeds(
-                app: app, config: config, triggerCacheReloadOnGrowth: true)
+            await gossipMembership(app: app, config: config)
         }
     }
 }

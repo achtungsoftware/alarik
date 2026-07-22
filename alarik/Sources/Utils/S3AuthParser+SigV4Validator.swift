@@ -281,17 +281,19 @@ struct SigV4Validator {
         let authInfo: S3AuthInfo = try S3AuthParser.parse(request: req)
 
         guard
-            let secretKey = await AccessKeySecretKeyMapCache.shared.resolve(
+            let credential = await AccessKeySecretKeyMapCache.shared.resolve(
                 app: req.application, key: authInfo.accessKey)
         else {
             // S3's dedicated code for an unknown access key (403). Reached only after the
-            // authoritative store has also been consulted - see `StoreBackedCache`.
+            // authoritative store has also been consulted - see `StoreBackedCache`. An EXPIRED
+            // key lands here too: the cache refuses it on expiry rather than waiting for the
+            // sweep that deletes the record, so a time-limited credential stops working on time.
             throw S3Error(
                 status: .forbidden, code: "InvalidAccessKeyId",
                 message: "The access key ID you provided does not exist in our records.")
         }
 
-        let validator: SigV4Validator = SigV4Validator(secretKey: secretKey)
+        let validator: SigV4Validator = SigV4Validator(secretKey: credential.secretKey)
         let isValid: Bool = try validator.validate(request: req, authInfo: authInfo)
         if !isValid {
             // S3's dedicated code for a failed signature check (403)

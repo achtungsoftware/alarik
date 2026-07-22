@@ -32,6 +32,8 @@ struct InternalClusterMetadataController: RouteCollection {
         cluster.on(.POST, "delete", use: handleDelete)
         cluster.on(.POST, "consume-if-present", use: handleConsumeIfPresent)
         cluster.get("list", use: handleList)
+        // Cheap "has anything changed here" probe - see `MetadataReloadGate`.
+        cluster.get("digest", use: handleDigest)
 
         // Distributed claim used to keep unique names unique across coordinators.
         cluster.on(.POST, "claim", use: handleClaim)
@@ -140,6 +142,21 @@ struct InternalClusterMetadataController: RouteCollection {
             name: MetadataListingService.listingCompleteHeader,
             value: local.allReadable ? "true" : "false")
         response.body = try Response.Body(data: JSONEncoder().encode(wire))
+        return response
+    }
+
+    /// This node's fingerprint for one collection, so a caller can decide whether pulling the
+    /// actual records is worth it. Reports only what this node itself holds, like `handleList`.
+    @Sendable
+    func handleDigest(req: Request) async throws -> Response {
+        guard let collection = req.query[String.self, at: "collection"] else {
+            throw Abort(.badRequest, reason: "Missing collection query parameter")
+        }
+        let digest = await MetadataDigestService.shared.localDigest(
+            app: req.application, collection: collection)
+        let response = Response(status: .ok)
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        response.body = try Response.Body(data: JSONEncoder().encode(digest))
         return response
     }
 
