@@ -19,6 +19,13 @@ export default defineNuxtConfig({
     devtools: { enabled: false },
     modules: ["@nuxt/ui", "nuxt-charts"],
     css: ["~/assets/css/main.css"],
+    nitro: {
+        // Suppresses the post-build `.output` file tree listing, whose `generateFSTree` leaks
+        // badly enough to exhaust Node's default ~2 GB heap right after the bundle is finished
+        // (nuxt/nuxt#27141 - closed as upstream, still unfixed). Cosmetic output only; the build
+        // itself needs a fraction of the memory the listing does.
+        logLevel: 1,
+    },
     routeRules: {
         // renders only on client-side
         "/**": { ssr: false, prerender: false },

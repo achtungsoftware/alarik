@@ -9,7 +9,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# Copy the entire project and build it
+ENV NODE_OPTIONS=--max-old-space-size=3072
 COPY . .
 RUN npm run build
 
