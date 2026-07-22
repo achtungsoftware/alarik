@@ -2248,6 +2248,309 @@ done
     && pass "A public-read policy set through one node is enforced by every node for anonymous reads." \
     || fail "A bucket policy set on one node is not applied on every node."
 
+# ── Test: a public-read policy REMOVED on one node stops anonymous reads everywhere ──
+# The removal path, not the set path (covered above). A policy that lingers anywhere in the
+# cluster after being deleted is a live data exposure, so every node must stop serving.
+echo ""
+echo "=== Test: deleting a bucket policy revokes anonymous access on every node ==="
+aws --endpoint-url "${ENDPOINTS[1]}" s3api delete-bucket-policy --bucket "$POLICY_BUCKET" >/dev/null 2>&1
+sleep 3
+POLICY_REVOKE_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" "${ENDPOINTS[$i]}/$POLICY_BUCKET/public.txt")
+    if [ "$CODE" == "200" ]; then
+        POLICY_REVOKE_OK=0
+        echo "  node $i still serves the object anonymously (HTTP $CODE)"
+    fi
+done
+[ "$POLICY_REVOKE_OK" -eq 1 ] \
+    && pass "Deleting a bucket policy through one node stops anonymous reads on every node." \
+    || fail "A deleted bucket policy is still being honoured somewhere in the cluster."
+
+# ── Test: concurrent same-name access key creation across every node stays unique ──
+# The unique-name claim quorum (MetadataStore.withClaimQuorum / ClaimElectorate) applied to the
+# access-keys collection specifically. Two nodes both winning here would mint two credentials
+# sharing one access key id but with DIFFERENT secrets - whichever replica a request happens to
+# read would decide whether the caller authenticates.
+echo ""
+echo "=== Test: concurrent same-name access key creation resolves to exactly one key ==="
+AK_RACE_OK=1
+for round in 1 2 3; do
+    RACE_AK="AKIACLAIMRACE00000$round"
+    RACE_CODES=$(mktemp -d)
+    # Collect and wait on THESE pids specifically, never a bare `wait` - the node server
+    # processes are background jobs of this same shell, so `wait` with no argument blocks until
+    # the whole cluster exits.
+    AK_RACE_PIDS=()
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        (
+            curl -s -o /dev/null -w "%{http_code}" -X POST "${ENDPOINTS[$i]}/api/v1/users/accessKeys" \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                -d "{\"accessKey\":\"$RACE_AK\",\"secretKey\":\"raceSecret${round}0123456789abcdefGH\"}" \
+                >"$RACE_CODES/$i"
+        ) &
+        AK_RACE_PIDS+=("$!")
+    done
+    for pid in "${AK_RACE_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+    CREATED=$(grep -l -E '^(200|201)$' "$RACE_CODES"/* 2>/dev/null | wc -l | tr -d ' ')
+    sleep 2
+    # The listing is the durable check: exactly one record must exist cluster-wide, regardless of
+    # how many callers were told "created".
+    LISTED=$(curl -s "${ENDPOINTS[0]}/api/v1/users/accessKeys?per=500" -H "Authorization: Bearer $TOKEN" \
+        | jq --arg k "$RACE_AK" '[.items[] | select(.accessKey == $k)] | length')
+    if [ "$CREATED" != "1" ] || [ "${LISTED:-0}" != "1" ]; then
+        AK_RACE_OK=0
+        echo "  round $round: $CREATED node(s) reported success, $LISTED key(s) exist"
+    fi
+    rm -rf "$RACE_CODES"
+done
+[ "$AK_RACE_OK" -eq 1 ] \
+    && pass "Concurrent same-name access key creation from every node yields exactly one key each time." \
+    || fail "Concurrent access key creation produced a duplicate or lost the key entirely."
+
+# ── Test: revoking an access key by id through a node that didn't create it ────
+# Exercises the access-keys-by-id secondary index: the console addresses a key by UUID, but the
+# primary record is keyed by the access key VALUE, so revocation from any node depends on that
+# pointer record having replicated. A revoke that 404s or half-applies leaves a live credential.
+echo ""
+echo "=== Test: an access key revoked by id through another node dies cluster-wide ==="
+REVOKE_AK="AKIAREVOKEBYID000001"
+REVOKE_SK="revokeSecret0123456789abcdefGHIJKL"
+REVOKE_ID=$(curl -s -X POST "${ENDPOINTS[0]}/api/v1/users/accessKeys" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"accessKey\":\"$REVOKE_AK\",\"secretKey\":\"$REVOKE_SK\"}" | jq -r '.id // empty')
+if [ -z "$REVOKE_ID" ]; then
+    fail "Could not create the access key to revoke."
+else
+    sleep 3
+    # Prove it works first, so a later failure means "revoked", not "never worked".
+    AWS_ACCESS_KEY_ID="$REVOKE_AK" AWS_SECRET_ACCESS_KEY="$REVOKE_SK" \
+        aws --endpoint-url "${ENDPOINTS[2]}" s3 ls >/dev/null 2>&1
+    REVOKE_WORKED_FIRST=$?
+    # Revoke through node 3, which is neither where it was created nor necessarily rank-0 for it.
+    REVOKE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+        "${ENDPOINTS[3]}/api/v1/users/accessKeys/$REVOKE_ID" -H "Authorization: Bearer $TOKEN")
+    sleep 3
+    REVOKE_OK=1
+    [ "$REVOKE_WORKED_FIRST" -eq 0 ] || { REVOKE_OK=0; echo "  the key never authenticated before revocation"; }
+    case "$REVOKE_CODE" in
+        200 | 204) ;;
+        *) REVOKE_OK=0; echo "  revoke through node 3 returned HTTP $REVOKE_CODE" ;;
+    esac
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        if AWS_ACCESS_KEY_ID="$REVOKE_AK" AWS_SECRET_ACCESS_KEY="$REVOKE_SK" \
+            aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls >/dev/null 2>&1; then
+            REVOKE_OK=0
+            echo "  node $i still accepts the revoked key"
+        fi
+    done
+    [ "$REVOKE_OK" -eq 1 ] \
+        && pass "An access key revoked by id through a different node stops authenticating on every node." \
+        || fail "Revoking an access key by id through another node did not take effect cluster-wide."
+fi
+
+# ── Test: renaming a user retargets its username pointer cluster-wide ─────────
+# `User.rename` claims the new username, rewrites the primary, then releases the old one - three
+# records across two collections. A half-applied rename either loses the account (no username
+# resolves to it) or permanently burns the old name.
+echo ""
+echo "=== Test: a user rename repoints the username index on every node ==="
+OLD_USERNAME="renameme$RANDOM"
+NEW_USERNAME="renamed$RANDOM"
+RENAME_PW="RenamePass123!"
+RENAME_ID=$(curl -s -X POST "${ENDPOINTS[0]}/api/v1/admin/users" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"name\":\"Rename Target\",\"username\":\"$OLD_USERNAME\",\"password\":\"$RENAME_PW\",\"isAdmin\":false}" \
+    | jq -r '.id // empty')
+if [ -z "$RENAME_ID" ]; then
+    fail "Could not create the user to rename."
+else
+    sleep 2
+    RENAME_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${ENDPOINTS[2]}/api/v1/admin/users" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"id\":\"$RENAME_ID\",\"name\":\"Rename Target\",\"username\":\"$NEW_USERNAME\",\"isAdmin\":false}")
+    sleep 3
+    RENAME_OK=1
+    [ "$RENAME_CODE" == "200" ] || { RENAME_OK=0; echo "  rename through node 2 returned HTTP $RENAME_CODE"; }
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        NEW_TOK=$(curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/login" -H "Content-Type: application/json" \
+            -d "{\"username\":\"$NEW_USERNAME\",\"password\":\"$RENAME_PW\"}" | jq -r '.token // empty')
+        [ -n "$NEW_TOK" ] || { RENAME_OK=0; echo "  node $i cannot log in under the new username"; }
+        OLD_TOK=$(curl -s -X POST "${ENDPOINTS[$i]}/api/v1/users/login" -H "Content-Type: application/json" \
+            -d "{\"username\":\"$OLD_USERNAME\",\"password\":\"$RENAME_PW\"}" | jq -r '.token // empty')
+        [ -z "$OLD_TOK" ] || { RENAME_OK=0; echo "  node $i still logs in under the OLD username"; }
+    done
+    # The freed name must be genuinely reusable, not left permanently claimed by a stale pointer.
+    REUSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${ENDPOINTS[3]}/api/v1/admin/users" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"name\":\"Reuser\",\"username\":\"$OLD_USERNAME\",\"password\":\"$RENAME_PW\",\"isAdmin\":false}")
+    case "$REUSE_CODE" in
+        200 | 201) ;;
+        *) RENAME_OK=0; echo "  the freed username could not be reused (HTTP $REUSE_CODE)" ;;
+    esac
+    [ "$RENAME_OK" -eq 1 ] \
+        && pass "Renaming a user repoints its username index cluster-wide and frees the old name for reuse." \
+        || fail "A user rename did not propagate correctly across the cluster."
+fi
+
+# ── Test: a deleted bucket name can be recreated (tombstone-aware putIfAbsent) ──
+# A delete writes a tombstone rather than removing bytes, so `putIfAbsent` has to treat a
+# tombstoned id as free. If it didn't, every deleted bucket name would be burned forever; if it
+# resurrected the old record instead, the "new" bucket would come back holding the old objects.
+echo ""
+echo "=== Test: a deleted bucket name is immediately reusable and comes back empty ==="
+REUSE_BUCKET="cluster-name-reuse-$RANDOM"
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$REUSE_BUCKET" >/dev/null 2>&1
+echo "first generation" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://$REUSE_BUCKET/ghost.txt" >/dev/null 2>&1
+sleep 2
+aws --endpoint-url "${ENDPOINTS[1]}" s3 rm "s3://$REUSE_BUCKET/ghost.txt" >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[1]}" s3api delete-bucket --bucket "$REUSE_BUCKET" >/dev/null 2>&1
+sleep 3
+RECREATE_CODE=$(aws --endpoint-url "${ENDPOINTS[2]}" s3api create-bucket --bucket "$REUSE_BUCKET" >/dev/null 2>&1; echo $?)
+sleep 3
+REUSE_OK=1
+[ "$RECREATE_CODE" -eq 0 ] || { REUSE_OK=0; echo "  the deleted bucket name could not be recreated"; }
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    LISTED_KEYS=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-objects-v2 --bucket "$REUSE_BUCKET" \
+        --query 'length(Contents || `[]`)' --output text 2>/dev/null)
+    if [ "${LISTED_KEYS:-0}" != "0" ]; then
+        REUSE_OK=0
+        echo "  node $i sees $LISTED_KEYS ghost object(s) in the recreated bucket"
+    fi
+done
+[ "$REUSE_OK" -eq 1 ] \
+    && pass "A deleted bucket name is immediately reusable and the recreated bucket is empty on every node." \
+    || fail "Recreating a deleted bucket name failed or resurrected the old contents."
+
+# ── Test: structured bucket configuration replicates cluster-wide ─────────────
+# Tags and lifecycle rules are stored as real typed fields on the bucket record (not JSON-string
+# blobs), so this checks the whole round trip - parse, store, replicate, re-serialize - reading
+# back through nodes other than the ones that wrote each piece.
+echo ""
+echo "=== Test: bucket tags and lifecycle rules set on one node are readable on every node ==="
+CONFIG_BUCKET="cluster-bucket-config-$RANDOM"
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$CONFIG_BUCKET" >/dev/null 2>&1
+aws --endpoint-url "${ENDPOINTS[1]}" s3api put-bucket-tagging --bucket "$CONFIG_BUCKET" \
+    --tagging 'TagSet=[{Key=env,Value=prod},{Key=team,Value=storage}]' >/dev/null 2>&1
+LIFECYCLE_JSON=$(mktemp)
+cat >"$LIFECYCLE_JSON" <<'LCEOF'
+{"Rules":[{"ID":"expire-logs","Status":"Enabled","Filter":{"Prefix":"logs/"},"Expiration":{"Days":30}}]}
+LCEOF
+aws --endpoint-url "${ENDPOINTS[2]}" s3api put-bucket-lifecycle-configuration --bucket "$CONFIG_BUCKET" \
+    --lifecycle-configuration "file://$LIFECYCLE_JSON" >/dev/null 2>&1
+sleep 3
+CONFIG_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    ENV_TAG=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api get-bucket-tagging --bucket "$CONFIG_BUCKET" \
+        --query 'TagSet[?Key==`env`].Value | [0]' --output text 2>/dev/null)
+    [ "$ENV_TAG" == "prod" ] || { CONFIG_OK=0; echo "  node $i returned env tag '$ENV_TAG' (want 'prod')"; }
+    LC_DAYS=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api get-bucket-lifecycle-configuration \
+        --bucket "$CONFIG_BUCKET" --query 'Rules[?ID==`expire-logs`].Expiration.Days | [0]' \
+        --output text 2>/dev/null)
+    [ "$LC_DAYS" == "30" ] || { CONFIG_OK=0; echo "  node $i returned lifecycle days '$LC_DAYS' (want '30')"; }
+done
+rm -f "$LIFECYCLE_JSON"
+[ "$CONFIG_OK" -eq 1 ] \
+    && pass "Bucket tags and lifecycle rules written through different nodes read back identically on every node." \
+    || fail "Structured bucket configuration did not replicate correctly across the cluster."
+
+# ── Test: a whole collection stays completely listable from every node ────────
+# Metadata listing is a per-collection fan-out where each node contributes only what it holds.
+# One node contributing a partial answer shows up exactly here: a record created through node A
+# is simply missing from node B's list, with no error anywhere. Enough records, spread across
+# every node, to make a dropped contribution visible rather than lucky.
+echo ""
+echo "=== Test: every node lists every record of a collection, whoever created it ==="
+LISTING_PREFIX="cluster-listing-$RANDOM"
+LISTING_COUNT=12
+for n in $(seq 1 "$LISTING_COUNT"); do
+    TARGET=$(( (n - 1) % NODE_COUNT ))
+    aws --endpoint-url "${ENDPOINTS[$TARGET]}" s3api create-bucket \
+        --bucket "$LISTING_PREFIX-$n" >/dev/null 2>&1
+done
+LISTING_AK_COUNT=6
+for n in $(seq 1 "$LISTING_AK_COUNT"); do
+    TARGET=$(( (n - 1) % NODE_COUNT ))
+    curl -s -o /dev/null -X POST "${ENDPOINTS[$TARGET]}/api/v1/users/accessKeys" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"accessKey\":\"AKIALISTING00000000$n\",\"secretKey\":\"listingSecret${n}0123456789abcdefG\"}"
+done
+sleep 5
+LISTING_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    SEEN_BUCKETS=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-buckets \
+        --query "length(Buckets[?starts_with(Name, \`$LISTING_PREFIX\`)])" --output text 2>/dev/null)
+    if [ "${SEEN_BUCKETS:-0}" != "$LISTING_COUNT" ]; then
+        LISTING_OK=0
+        echo "  node $i lists $SEEN_BUCKETS/$LISTING_COUNT buckets"
+    fi
+    SEEN_KEYS=$(curl -s "${ENDPOINTS[$i]}/api/v1/users/accessKeys?per=500" -H "Authorization: Bearer $TOKEN" \
+        | jq '[.items[] | select((.accessKey // "") | startswith("AKIALISTING"))] | length')
+    if [ "${SEEN_KEYS:-0}" != "$LISTING_AK_COUNT" ]; then
+        LISTING_OK=0
+        echo "  node $i lists $SEEN_KEYS/$LISTING_AK_COUNT access keys"
+    fi
+done
+[ "$LISTING_OK" -eq 1 ] \
+    && pass "Every node lists all $LISTING_COUNT buckets and all $LISTING_AK_COUNT access keys, regardless of which node created each." \
+    || fail "A cluster-wide collection listing came back incomplete on at least one node."
+
+# ── Test: metadata survives a rolling restart of the entire cluster ───────────
+# Every node restarted in turn, so no single process ever holds the only in-memory copy of
+# anything. Caches are memory-only, so everything checked afterwards has to have been genuinely
+# durable in the erasure-coded store and re-read after boot - the closest this suite gets to a
+# full control-plane cold start with no external database to fall back on.
+echo ""
+echo "=== Test: the control plane survives a rolling restart of every node ==="
+ROLLING_BUCKET="cluster-rolling-$RANDOM"
+ROLLING_AK="AKIAROLLINGRESTART01"
+ROLLING_SK="rollingSecret0123456789abcdefGHIJ"
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket "$ROLLING_BUCKET" >/dev/null 2>&1
+curl -s -o /dev/null -X POST "${ENDPOINTS[1]}/api/v1/users/accessKeys" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"accessKey\":\"$ROLLING_AK\",\"secretKey\":\"$ROLLING_SK\"}"
+echo "durable payload" | aws --endpoint-url "${ENDPOINTS[0]}" s3 cp - "s3://$ROLLING_BUCKET/durable.txt" >/dev/null 2>&1
+sleep 3
+
+ROLLING_RESTART_OK=1
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    kill_node "$i"
+    if ! restart_node "$i"; then
+        ROLLING_RESTART_OK=0
+        echo "  node $i did not come back up"
+    fi
+done
+sleep 5
+
+if [ "$ROLLING_RESTART_OK" -ne 1 ]; then
+    fail "A node failed to restart during the rolling restart - skipping the metadata checks."
+else
+    # A fresh login, not the pre-restart TOKEN: this must exercise the users collection and its
+    # username pointer being re-read from disk, not a token that happens to still verify.
+    ROLLING_OK=1
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        POST_TOKEN=$(login "${ENDPOINTS[$i]}")
+        if [ -z "$POST_TOKEN" ] || [ "$POST_TOKEN" == "null" ]; then
+            ROLLING_OK=0
+            echo "  node $i cannot log in after the rolling restart"
+            continue
+        fi
+        if ! AWS_ACCESS_KEY_ID="$ROLLING_AK" AWS_SECRET_ACCESS_KEY="$ROLLING_SK" \
+            aws --endpoint-url "${ENDPOINTS[$i]}" s3 ls "s3://$ROLLING_BUCKET/" >/dev/null 2>&1; then
+            ROLLING_OK=0
+            echo "  node $i does not accept the pre-restart access key"
+        fi
+        BODY=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp "s3://$ROLLING_BUCKET/durable.txt" - 2>/dev/null)
+        [ "$BODY" == "durable payload" ] \
+            || { ROLLING_OK=0; echo "  node $i cannot read the pre-restart object"; }
+    done
+    TOKEN=$(login "${ENDPOINTS[0]}")
+    NODES_RESP=$(curl -s "${ENDPOINTS[0]}/api/v1/admin/cluster/nodes" -H "Authorization: Bearer $TOKEN")
+    [ "$ROLLING_OK" -eq 1 ] \
+        && pass "Users, access keys, buckets and objects all survive a rolling restart of all $NODE_COUNT nodes." \
+        || fail "The control plane did not fully survive a rolling restart of every node."
+fi
+
 # ── Test: adding a brand-new node propagates metadata and migrates data to it ──
 # The rest of the suite runs at a fixed 4 nodes. This is the only test that grows the cluster:
 # it writes data, starts a real 5th node seeded to the existing four, and checks that the new
