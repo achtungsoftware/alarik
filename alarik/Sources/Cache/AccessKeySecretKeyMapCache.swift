@@ -68,6 +68,10 @@ final actor AccessKeySecretKeyMapCache: StoreBackedCache {
         guard let stored = try await AccessKey.find(app: app, accessKey: key) else { return nil }
         // An expired key is genuinely unusable, matching what a cache reload would have filtered.
         if let expiry = stored.expirationDate, expiry <= Date() { return nil }
+        // Seed the owner mapping from this same record. The authorization check that follows on
+        // the auth path resolves the owner next, and would otherwise gather the identical record
+        // a second time - two cluster-wide reads per request until the caches warm.
+        await AccessKeyUserMapCache.shared.add(accessKey: key, userId: stored.userId)
         return stored.secretKey
     }
 }

@@ -29,6 +29,25 @@ import Vapor
 /// striping comes from best-effort mirroring to a handful of other nodes, needed only for the two
 /// collections with no independent ground truth (`NotificationDelivery`/`ReplicationTask`).
 enum OutboxMailbox {
+    /// Shared, not per-row: the sweeps below decode one row per file across the whole backlog.
+    private static let decoder = JSONDecoder()
+
+    /// Decodes a task file, or discards it after saying so. Every caller here deletes the file on
+    /// failure - a row nothing can decode would otherwise be retried forever - so this must never
+    /// be silent: the file IS the task, and the discard is a webhook that never fires or a
+    /// replication that never happens, with no other record that it was ever queued.
+    private static func decodeOrDiscard<Row: OutboxMailboxRow>(
+        _ type: Row.Type, data: Data, path: String, app: Application
+    ) -> Row? {
+        do {
+            return try decoder.decode(Row.self, from: data)
+        } catch {
+            app.logger.error(
+                "Discarding undecodable \(Row.self) task file '\(path)' - the queued work is lost, not retried: \(error)"
+            )
+            return nil
+        }
+    }
     /// Synthetic bucket name used only to feed HRW when electing an owner for a task. Not a real
     /// bucket - it just namespaces the hash so task placement can't collide with object placement.
     static let outboxPlacementBucket = "outbox-promotion"
@@ -135,7 +154,7 @@ enum OutboxMailbox {
             root: OutboxMailboxFileHandler.rootPath, collection: collection, ownerNodeId: ownerNodeId,
             taskId: taskId)
         guard let data = OutboxMailboxFileHandler.read(path: path) else { return nil }
-        return try? JSONDecoder().decode(Row.self, from: data)
+        return try? decoder.decode(Row.self, from: data)
     }
 
     /// This node's own owned tasks in `collection`, unfiltered (unlike `dueTasks`, includes
@@ -246,7 +265,7 @@ enum OutboxMailbox {
                 root: OutboxMailboxFileHandler.pendingEnqueueRootPath, collection: collection,
                 ownerNodeId: ownerNodeId, taskId: taskId)
             guard let data = OutboxMailboxFileHandler.read(path: spoolPath),
-                let row = try? JSONDecoder().decode(Row.self, from: data)
+                let row = decodeOrDiscard(Row.self, data: data, path: spoolPath, app: app)
             else {
                 OutboxMailboxFileHandler.remove(path: spoolPath)
                 continue
@@ -407,7 +426,7 @@ enum OutboxMailbox {
                 root: OutboxMailboxFileHandler.backupRootPath, collection: collection,
                 ownerNodeId: ownerNodeId, taskId: taskId)
             guard let data = OutboxMailboxFileHandler.read(path: backupPath),
-                let row = try? JSONDecoder().decode(Row.self, from: data)
+                let row = decodeOrDiscard(Row.self, data: data, path: backupPath, app: app)
             else {
                 OutboxMailboxFileHandler.remove(path: backupPath)
                 continue
@@ -445,7 +464,7 @@ enum OutboxMailbox {
                 root: OutboxMailboxFileHandler.rootPath, collection: collection,
                 ownerNodeId: departingNodeId, taskId: id)
             guard let data = OutboxMailboxFileHandler.read(path: path),
-                let row = try? JSONDecoder().decode(Row.self, from: data)
+                let row = decodeOrDiscard(Row.self, data: data, path: path, app: app)
             else {
                 OutboxMailboxFileHandler.remove(path: path)
                 continue
@@ -503,7 +522,7 @@ enum OutboxMailbox {
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
             guard response.status == .ok else { return [] }
             let body = try await response.body.collect(upTo: 64 * 1024 * 1024)
-            return try JSONDecoder().decode([Row].self, from: Data(buffer: body))
+            return try decoder.decode([Row].self, from: Data(buffer: body))
         } catch {
             return []
         }

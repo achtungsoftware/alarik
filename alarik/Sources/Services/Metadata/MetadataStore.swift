@@ -471,6 +471,12 @@ enum MetadataStore {
     /// who coordinates a key and both run a check-then-write. A single node grants at most one
     /// live reservation per name, so only one of them can hold a majority - the other backs off
     /// instead of writing a duplicate. Standalone (no peers) is trivially a majority of one.
+    ///
+    /// Only the record's OWNERS form the electorate. This node can end up coordinating a key it
+    /// doesn't own - every owner unreachable, or a forwarded write whose sender resolved a
+    /// membership view this node disagrees with - and in that case its own reservation must not
+    /// vote. Counting it would let two such coordinators each pair their local grant with a
+    /// different single owner and both claim the same name.
     private static func withClaimQuorum<T>(
         app: Application, routing: Routing, collection: String, id: String,
         body: () async throws -> T
@@ -479,14 +485,18 @@ enum MetadataStore {
         let token = UUID()
         // Owners other than this node; the local grant is taken directly.
         let peers = owners.filter { $0.id != routing.selfNodeId }
-        let required = owners.isEmpty ? 1 : owners.count / 2 + 1
+        let electorate = ClaimElectorate(
+            ownerIds: owners.map(\.id), selfNodeId: routing.selfNodeId)
 
         await MetadataClaimRegistry.shared.purgeExpired()
-        var granted = await MetadataClaimRegistry.shared.reserve(
-            collection: collection, id: id, token: token) ? 1 : 0
+        // Always taken, even when it doesn't vote: it is what stops two concurrent requests on
+        // THIS node from both proceeding, independently of the cluster-wide majority.
+        let reservedLocally = await MetadataClaimRegistry.shared.reserve(
+            collection: collection, id: id, token: token)
+        var granted = (reservedLocally && electorate.localVotes) ? 1 : 0
         var grantedPeers: [ClusterNodeInfo] = []
 
-        if granted > 0, !peers.isEmpty {
+        if reservedLocally, !peers.isEmpty {
             let outcomes = await withTaskGroup(of: (ClusterNodeInfo, Bool).self) { group in
                 for peer in peers {
                     group.addTask {
@@ -520,7 +530,7 @@ enum MetadataStore {
             }
         }
 
-        guard granted >= required else {
+        guard granted >= electorate.required else {
             await releaseAll()
             return nil
         }

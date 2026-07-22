@@ -27,6 +27,10 @@ import Vapor
 /// merging and deduping by id. Best-effort throughout: an unreachable node just contributes
 /// nothing to a given call, rather than failing the whole listing.
 enum MetadataListingService {
+    /// Shared, not per-record: a listing decodes one entry per record, and `JSONDecoder` is
+    /// stateless across `decode` calls. Same reasoning as `MetadataStore`'s own decoder.
+    private static let decoder = JSONDecoder()
+
     /// A record as callers consume it: `value` is the record's own bytes, already unwrapped from
     /// its envelope and migrated to the current schema. Tombstoned ids never appear.
     struct Entry: Sendable {
@@ -142,7 +146,7 @@ enum MetadataListingService {
         decoded.reserveCapacity(listing.entries.count)
         for entry in listing.entries {
             do {
-                decoded.append(try JSONDecoder().decode(T.self, from: entry.value))
+                decoded.append(try Self.decoder.decode(T.self, from: entry.value))
             } catch {
                 app.logger.error(
                     "Undecodable \(T.self) record '\(collection)/\(entry.id)' excluded from this listing - it is stored but unreadable by this binary: \(error)"
@@ -285,12 +289,23 @@ enum MetadataListingService {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
             guard response.status == .ok else { return nil }
-            let peerComplete = response.headers.first(name: listingCompleteHeader) != "false"
+            var peerComplete = response.headers.first(name: listingCompleteHeader) != "false"
             let body = try await response.body.collect(upTo: 256 * 1024 * 1024)
-            let decoded = try JSONDecoder().decode([WireEntry].self, from: Data(buffer: body))
-            let entries = decoded.compactMap { entry -> EnvelopeEntry? in
-                guard let data = Data(base64Encoded: entry.value) else { return nil }
-                return EnvelopeEntry(id: entry.id, envelope: MetadataEnvelope.decode(data))
+            let decoded = try Self.decoder.decode([WireEntry].self, from: Data(buffer: body))
+            var entries: [EnvelopeEntry] = []
+            entries.reserveCapacity(decoded.count)
+            for entry in decoded {
+                // Never silent, and never "complete": an entry the peer sent but this node can't
+                // read is missing from the merged listing exactly like an unreachable peer's
+                // records are, and callers may only reconcile REMOVALS against a complete view.
+                guard let data = Data(base64Encoded: entry.value) else {
+                    app.logger.error(
+                        "Peer \(node.address) sent an undecodable value for '\(collection)/\(entry.id)' - excluded from this listing."
+                    )
+                    peerComplete = false
+                    continue
+                }
+                entries.append(EnvelopeEntry(id: entry.id, envelope: MetadataEnvelope.decode(data)))
             }
             return (entries, peerComplete)
         } catch {

@@ -16,9 +16,9 @@ limitations under the License.
 
 import Foundation
 
-/// A plain, `Sendable` snapshot of a `ClusterNode` row - the cache never exposes the Fluent
-/// model class itself (same reasoning as every other `{Thing}Cache`: callers get a value type,
-/// never something that could accidentally be saved back to the DB from a cache read).
+/// A plain, `Sendable` snapshot of a `ClusterNode` record - the cache never exposes the model
+/// class itself (same reasoning as every other `{Thing}Cache`: callers get a value type, never a
+/// reference they could mutate and `save` back to `MetadataStore` straight out of a cache read).
 struct ClusterNodeInfo: Sendable, Equatable {
     let id: UUID
     let address: String

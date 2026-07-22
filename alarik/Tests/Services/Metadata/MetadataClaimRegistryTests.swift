@@ -124,3 +124,46 @@ struct MetadataClaimRegistryTests {
         #expect(winners == 1, "expected exactly one grant, got \(winners)")
     }
 }
+
+/// The other half of the majority rule: who is allowed to vote at all.
+@Suite("ClaimElectorate tests")
+struct ClaimElectorateTests {
+    private static let owners = [UUID(), UUID(), UUID()]
+
+    @Test("an owner votes, and three owners need two grants")
+    func ownerVotes() {
+        let electorate = ClaimElectorate(ownerIds: Self.owners, selfNodeId: Self.owners[1])
+        #expect(electorate.required == 2)
+        #expect(electorate.localVotes)
+    }
+
+    @Test("a coordinator that isn't an owner does not vote")
+    func nonOwnerDoesNotVote() {
+        // The regression: counting a non-owner's own reservation let it reach a majority of 3
+        // owners with a single owner's grant, so two such coordinators - each reaching a
+        // different owner - could both create the same name.
+        let electorate = ClaimElectorate(ownerIds: Self.owners, selfNodeId: UUID())
+        #expect(electorate.required == 2)
+        #expect(electorate.localVotes == false)
+    }
+
+    @Test("standalone (no owners) is a majority of one, and self votes")
+    func standaloneIsMajorityOfOne() {
+        let electorate = ClaimElectorate(ownerIds: [], selfNodeId: UUID())
+        #expect(electorate.required == 1)
+        #expect(electorate.localVotes)
+    }
+
+    @Test("a node with no identity at all never votes")
+    func unknownSelfDoesNotVote() {
+        let electorate = ClaimElectorate(ownerIds: Self.owners, selfNodeId: nil)
+        #expect(electorate.localVotes == false)
+    }
+
+    @Test("majority is strict for both even and odd owner counts")
+    func majorityIsStrict() {
+        #expect(ClaimElectorate(ownerIds: Array(Self.owners.prefix(1)), selfNodeId: nil).required == 1)
+        #expect(ClaimElectorate(ownerIds: Array(Self.owners.prefix(2)), selfNodeId: nil).required == 2)
+        #expect(ClaimElectorate(ownerIds: Self.owners, selfNodeId: nil).required == 2)
+    }
+}

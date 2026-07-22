@@ -32,14 +32,27 @@ struct CacheMissLedger<Key: Hashable & Sendable>: Sendable {
         self.capacity = capacity
     }
 
+    /// Entries currently held, expired ones included - the bound `note` enforces.
+    var count: Int { misses.count }
+
     func confirmedMissing(_ key: Key, now: Date = Date()) -> Bool {
         guard let at = misses[key] else { return false }
         return now.timeIntervalSince(at) <= ttl
     }
 
     mutating func note(_ key: Key, now: Date = Date()) {
-        if misses.count > capacity {
+        if misses.count >= capacity {
             misses = misses.filter { now.timeIntervalSince($0.value) <= ttl }
+            // The TTL sweep frees nothing when every entry is still fresh - which is exactly what
+            // a spray of DISTINCT bogus keys produces, the case this ledger exists to survive.
+            // Without a hard eviction the map grows unbounded and every insert pays an O(n) scan,
+            // turning the defence into the amplifier. Halving amortises the sort across inserts.
+            if misses.count >= capacity {
+                let excess = misses.count - capacity / 2
+                for stale in misses.sorted(by: { $0.value < $1.value }).prefix(excess) {
+                    misses.removeValue(forKey: stale.key)
+                }
+            }
         }
         misses[key] = now
     }

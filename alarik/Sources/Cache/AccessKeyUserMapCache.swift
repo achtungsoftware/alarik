@@ -30,6 +30,7 @@ final actor AccessKeyUserMapCache: StoreBackedCache {
 
     func add(accessKey: String, userId: UUID) {
         map[accessKey] = userId
+        missLedger.clear(accessKey)
     }
 
     func remove(accessKey: String) {
@@ -57,7 +58,15 @@ final actor AccessKeyUserMapCache: StoreBackedCache {
     func absorb(_ value: UUID, for key: String) { map[key] = value }
 
     func loadFromStore(app: Application, key: String) async throws -> UUID? {
-        try await AccessKey.find(app: app, accessKey: key)?.userId
+        guard let stored = try await AccessKey.find(app: app, accessKey: key) else { return nil }
+        // Seed the secret from the same record - but only while the key is still valid.
+        // `AccessKeySecretKeyMapCache` deliberately refuses an expired key, and seeding past that
+        // check would hand SigV4 a working secret for a credential that has already expired.
+        if stored.expirationDate.map({ $0 > Date() }) ?? true {
+            await AccessKeySecretKeyMapCache.shared.add(
+                accessKey: key, secretKey: stored.secretKey)
+        }
+        return stored.userId
     }
 
     /// The owning user, consulting the store when this node has no cached entry.

@@ -549,12 +549,7 @@ struct SigV4Validator {
         var headerLookup: [String: [String]] = [:]
         headerLookup.reserveCapacity(sortedHeaders.count)
         for (name, value) in request.headers {
-            let lowercased = name.lowercased()
-            if headerLookup[lowercased] != nil {
-                headerLookup[lowercased]!.append(value)
-            } else {
-                headerLookup[lowercased] = [value]
-            }
+            headerLookup[name.lowercased(), default: []].append(value)
         }
 
         // Build a case-insensitive query param lookup too, for headers that are only signed

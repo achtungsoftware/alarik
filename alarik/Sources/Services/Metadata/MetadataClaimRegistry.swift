@@ -23,6 +23,33 @@ import Foundation
 /// of the record's owners to grant, so two claimants racing the same name can never both proceed:
 /// the second cannot reach a majority. Reservations expire so a claimant that dies mid-claim
 /// can't block the name forever.
+/// Who gets to vote on a claim, and how many votes carry it.
+///
+/// A pure value rather than arithmetic inline in `MetadataStore.withClaimQuorum`, because the
+/// rule is subtle and getting it wrong reintroduces duplicate names silently: **only the record's
+/// owners vote**. A node can end up coordinating a key it does not own - every owner unreachable,
+/// or a forwarded write whose sender resolved a membership view this node disagrees with - and
+/// counting its own reservation there would let two such coordinators each pair their local grant
+/// with a *different* single owner and both claim the same name.
+struct ClaimElectorate: Equatable {
+    /// Grants needed to carry the claim.
+    let required: Int
+    /// Whether this node's own reservation is one of those grants.
+    let localVotes: Bool
+
+    init(ownerIds: [UUID], selfNodeId: UUID?) {
+        // No owners at all is the standalone (non-clustered) case: this node is the whole
+        // cluster, so its own grant is trivially a majority of one.
+        guard !ownerIds.isEmpty else {
+            self.required = 1
+            self.localVotes = true
+            return
+        }
+        self.required = ownerIds.count / 2 + 1
+        self.localVotes = selfNodeId.map(ownerIds.contains) ?? false
+    }
+}
+
 actor MetadataClaimRegistry {
     static let shared = MetadataClaimRegistry()
 
