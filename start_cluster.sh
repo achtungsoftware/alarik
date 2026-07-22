@@ -1,1 +1,1 @@
-docker compose -f docker-compose.cluster.dev.yml up --build -d
+docker compose -f docker-compose.cluster.yml up --build -d
