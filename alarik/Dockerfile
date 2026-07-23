@@ -59,8 +59,17 @@ WORKDIR /app
 # Copy the built binary from build stage
 COPY --from=build --chown=alarik:alarik /build/.build/release/Alarik /app/
 
-# Create Storage directory with proper permissions
-RUN mkdir -p /app/Storage && chown -R alarik:alarik /app/Storage
+# Create Storage directory with proper permissions.
+#
+# `chmod 755 /app` is load-bearing, not tidiness. `useradd --create-home` gives the home
+# directory mode 750, which means a container started with `user:` set to anything other than
+# this image's own uid cannot even TRAVERSE /app - it fails before storage ownership is ever
+# consulted. NAS platforms (TrueNAS, Unraid, Synology) routinely pin a uid/gid that way, so the
+# image has to be runnable as an arbitrary uid. The directory holds no secrets; the data lives
+# in Storage, whose ownership still governs who may write.
+RUN mkdir -p /app/Storage \
+    && chown -R alarik:alarik /app/Storage \
+    && chmod 755 /app
 
 # Switch to non-root user
 USER alarik:alarik
