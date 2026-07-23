@@ -184,24 +184,49 @@ struct S3KeyGeneratorTests {
         #expect(matches != nil)
     }
 
-    @Test("Access Key ID has no obvious patterns")
-    func testAccessKeyIdNoPatterns() {
-        let keys = (0..<10).map { _ in S3KeyGenerator.generateAccessKeyId() }
+    /// The longest identical-character run this test rejects.
+    ///
+    /// Deliberately not 4. A key is 20 draws from a 36-symbol alphabet, so a run of 4 occurs in
+    /// about 1 of every 2,750 keys - roughly 1 in 277 runs of this test, since it checks 10 keys.
+    /// That made this test fail spuriously, and the assertion was wrong on its own terms: a
+    /// uniform generator *must* produce `FFFF` occasionally, and one that never did would be
+    /// non-uniform, which is strictly worse. 8 is far past anything a working generator produces
+    /// (below 1 in 10^9 per run) while still catching one that is stuck or degenerate - those
+    /// emit a run of 20, not 8.
+    private static let maxPlausibleRun = 8
 
-        // Check that we don't see repeated sequences
+    @Test("Access Key IDs show no sign of a stuck or degenerate generator")
+    func testAccessKeyIdNoPatterns() {
+        let keys = (0..<200).map { _ in S3KeyGenerator.generateAccessKeyId() }
+
+        // 1. No implausibly long identical run - the signature of a generator returning a
+        //    constant, rather than of ordinary randomness.
         for key in keys {
             let chars = Array(key)
-            var hasLongRepetition = false
-            for i in 0..<(chars.count - 3) {
-                if chars[i] == chars[i + 1] && chars[i + 1] == chars[i + 2]
-                    && chars[i + 2] == chars[i + 3]
-                {
-                    hasLongRepetition = true
-                    break
-                }
+            var longestRun = 1
+            var currentRun = 1
+            for i in 1..<chars.count {
+                currentRun = chars[i] == chars[i - 1] ? currentRun + 1 : 1
+                longestRun = max(longestRun, currentRun)
             }
-            #expect(!hasLongRepetition, "Key should not have 4+ repeated characters: \(key)")
+            #expect(
+                longestRun < Self.maxPlausibleRun,
+                "Key has a run of \(longestRun) identical characters, which a working generator effectively never produces: \(key)"
+            )
         }
+
+        // 2. The whole alphabet gets used. 200 keys is 4,000 draws over 36 symbols (~111 each),
+        //    so a symbol going missing means the generator is biased or drawing from a smaller
+        //    set - the actual "obvious pattern" worth catching.
+        let alphabet = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        let observed = Set(keys.joined())
+        #expect(
+            observed == alphabet,
+            "Generator never emitted \(alphabet.subtracting(observed).sorted()) across 4,000 draws")
+
+        // 3. Keys don't repeat. A constant or fixed-seed generator passes both checks above and
+        //    fails this one.
+        #expect(Set(keys).count == keys.count, "Generated access key IDs are not unique")
     }
 
     @Test("Secret Key bytes are cryptographically random")
