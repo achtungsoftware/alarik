@@ -6,7 +6,7 @@ description: |
   cluster membership all live in Alarik's own erasure-coded store alongside object data.
 type: application
 version: 0.1.0
-appVersion: "1.0.0-beta-8"
+appVersion: "1.0.0-beta-9"
 home: https://github.com/achtungsoftware/alarik
 sources:
   - https://github.com/achtungsoftware/alarik
