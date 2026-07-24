@@ -66,11 +66,17 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
 
     func didBootAsync(_ app: Application) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
-            return  // Cluster mode off - nothing to register.
+            // Cluster mode off - nothing to register, and no peers to discover, so the
+            // membership half of readiness is satisfied trivially.
+            await NodeReadiness.shared.markMembershipReady()
+            return
         }
         guard heartbeatTask == nil, refreshTask == nil else { return }
 
         await bootstrapMembership(app: app, config: config)
+        // Ready as soon as the peer list is seeded - deliberately BEFORE `registerSelf`, whose
+        // durable write can fail transiently without making this node any less able to serve.
+        await NodeReadiness.shared.markMembershipReady()
         // Never let a transient registration failure crash the whole node: `didBootAsync`
         // throwing is fatal to the process. `registerSelf` can throw `coordinatorUnreachable` if
         // this node isn't rank-0 for its own record and the peer that is happens to be slow right

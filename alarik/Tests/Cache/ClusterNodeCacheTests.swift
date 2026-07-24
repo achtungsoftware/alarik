@@ -126,4 +126,45 @@ struct ClusterNodeCacheTests {
         #expect(active.count == 1)
         #expect(active.first?.address == "http://fresh:8080")
     }
+
+    @Test("reachablePeers keeps active and draining, drops only removed")
+    func reachablePeersDropsRemoved() async {
+        let cache = ClusterNodeCache()
+        let now = Date()
+        await cache.load(initialData: [
+            // A draining node is still live and may hold records mid-migration, so a listing must
+            // still reach it - unlike a removed node, which is decommissioned and only times out.
+            ClusterNodeInfo(id: UUID(), address: "http://active:8080", status: .active, lastHeartbeatAt: now),
+            ClusterNodeInfo(id: UUID(), address: "http://draining:8080", status: .draining, lastHeartbeatAt: now),
+            ClusterNodeInfo(id: UUID(), address: "http://removed:8080", status: .removed, lastHeartbeatAt: now),
+        ])
+
+        let reachable = Set(await cache.reachablePeers().map(\.address))
+        #expect(reachable == ["http://active:8080", "http://draining:8080"])
+    }
+
+    @Test("a decommissioned node is not resurrected by a lagging same-heartbeat snapshot")
+    func removedStaysRemovedAgainstStaleSnapshot() async {
+        let cache = ClusterNodeCache()
+        let id = UUID()
+        let hb = Date()
+        await cache.upsert(
+            ClusterNodeInfo(id: id, address: "http://n:8080", status: .removed, lastHeartbeatAt: hb))
+
+        // A peer that missed the decommission still gossips the node as draining, same heartbeat.
+        // Reconciling that must NOT flip it back - that would bring the retired ghost back to life.
+        await cache.reconcile(snapshot: [
+            ClusterNodeInfo(id: id, address: "http://n:8080", status: .draining, lastHeartbeatAt: hb)
+        ])
+        #expect(await cache.get(id: id)?.status == .removed)
+
+        // But a genuine restart - a strictly newer heartbeat, re-registering active - DOES revive
+        // it, so decommissioning is never a permanent lock-out.
+        await cache.reconcile(snapshot: [
+            ClusterNodeInfo(
+                id: id, address: "http://n:8080", status: .active,
+                lastHeartbeatAt: hb.addingTimeInterval(1))
+        ])
+        #expect(await cache.get(id: id)?.status == .active)
+    }
 }

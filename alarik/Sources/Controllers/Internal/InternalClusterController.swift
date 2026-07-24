@@ -119,6 +119,7 @@ struct InternalClusterController: RouteCollection {
         let cluster = routes.grouped("admin").grouped("cluster")
         cluster.grouped("nodes").get(use: listNodes)
         cluster.grouped("nodes", ":nodeId", "drain").post(use: drainNode)
+        cluster.grouped("nodes", ":nodeId", "decommission").post(use: decommissionNode)
         cluster.grouped("resync").post(use: resync)
         cluster.grouped("rebalance", "status").get(use: rebalanceStatus)
         cluster.grouped("rebalance", "tasks").get(use: rebalanceTasks)
@@ -217,6 +218,57 @@ struct InternalClusterController: RouteCollection {
             app: req.application, reason: .membershipChange)
         await ErasureCodedRebalanceService.scheduleRebalance(
             app: req.application, reason: .membershipChange)
+
+        return .ok
+    }
+
+    /// Marks a fully-drained node `.removed` - the final, deliberate step of decommissioning it,
+    /// taken once its data has migrated off and its process is about to be stopped for good.
+    ///
+    /// `.draining` and `.removed` are both excluded from placement, so why the distinction? A
+    /// draining node is still a live cluster member that may hold records mid-migration, so every
+    /// metadata listing still fans out to it. A removed node is gone: its process is stopping and
+    /// its data is already elsewhere. Leaving a decommissioned node as `.draining` means every
+    /// listing keeps probing an address that will never answer - a per-listing timeout, and worse,
+    /// a permanently "incomplete" listing that blocks the removal-reconciliation pass in
+    /// `reloadAll`. Marking it `.removed` is what lets the fan-out finally stop calling it (see
+    /// `ClusterNodeCache.reachablePeers`).
+    ///
+    /// Requires the node to be `.draining` already: you drain first (which migrates data off and
+    /// is what makes removal safe), then decommission. A node whose process later restarts under
+    /// the same identity re-registers itself `.active`, so this is not a permanent tombstone.
+    @Sendable
+    func decommissionNode(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireAdmin()
+
+        guard let nodeId = req.parameters.get("nodeId", as: UUID.self),
+            let node = try await ClusterNode.find(app: req.application, id: nodeId)
+        else {
+            throw Abort(.notFound, reason: "Cluster node not found")
+        }
+        guard node.status == .draining else {
+            throw Abort(
+                .conflict,
+                reason:
+                    "A node must be drained before it can be decommissioned (current status: \(node.status.rawValue)). Drain it first and wait for its data to migrate off."
+            )
+        }
+
+        node.status = .removed
+        try await node.save(app: req.application)
+
+        await ClusterNodeCache.shared.upsert(
+            ClusterNodeInfo(
+                id: nodeId, address: node.address, status: .removed,
+                lastHeartbeatAt: node.lastHeartbeatAt,
+                totalBytes: node.totalBytes, availableBytes: node.availableBytes))
+        CacheInvalidationService.notify(
+            app: req.application, cache: "clusterNode", op: .upsert, key: nodeId.uuidString,
+            nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
+                id: nodeId, address: node.address, status: .removed,
+                lastHeartbeatAt: node.lastHeartbeatAt, totalBytes: node.totalBytes,
+                availableBytes: node.availableBytes))
 
         return .ok
     }

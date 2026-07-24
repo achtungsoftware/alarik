@@ -2152,7 +2152,17 @@ else
     # placement would drop the dead node and reassign its keys.
     echo "  waiting out the heartbeat-staleness window (~65s)..."
     sleep 65
-    OWNERS_AFTER=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+    # Poll the AFTER read too, exactly like the baseline above. The placement endpoint enumerates
+    # objects via a listing fan-out, which with a node down can transiently time out and return an
+    # object-missing (empty) result - that is a listing hiccup, not an ownership change, and
+    # reading only once would let it masquerade as a failure. The property under test is that a
+    # NON-empty result equals the baseline, so keep polling until the object reappears.
+    OWNERS_AFTER=""
+    for _ in $(seq 1 20); do
+        OWNERS_AFTER=$(responsible_ids cluster-ownership-test own.txt | sort | tr '\n' ' ')
+        [ -n "$OWNERS_AFTER" ] && break
+        sleep 1
+    done
     if [ "$OWNERS_BEFORE" == "$OWNERS_AFTER" ]; then
         pass "A key's ownership set is identical before and after a node became unreachable."
     else

@@ -1,0 +1,114 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "alarik.serviceAccountName" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+{{/*
+Voluntary disruptions - draining a Kubernetes node, an cluster upgrade - can otherwise evict
+several pods at once. Erasure-coded reads need `dataShards` nodes holding shards, so taking the
+cluster below that makes objects temporarily unreadable even though nothing has actually failed.
+This bounds concurrent voluntary eviction; see `alarik.pdbMinAvailable` for the arithmetic.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "alarik.fullname" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ include "alarik.pdbMinAvailable" . }}
+  selector:
+    matchLabels:
+      {{- include "alarik.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+{{/*
+Inter-node traffic is authenticated by CLUSTER_SECRET but NOT encrypted, so it must not traverse a
+network anyone else can read. This confines peer traffic to pods of this release and admits client
+traffic only from explicitly named selectors.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "alarik.fullname" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "alarik.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Peer-to-peer: shard transfers, metadata forwarding, membership exchange.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "alarik.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+    # The console needs the S3/API port like any other client.
+    {{- if .Values.console.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "alarik.console.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.allowedClients }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+    {{- end }}
+{{- end }}
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "alarik.fullname" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "alarik.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

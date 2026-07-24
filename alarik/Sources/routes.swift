@@ -18,6 +18,11 @@ import Vapor
 
 func routes(_ app: Application) throws {
 
+    // Unauthenticated liveness/readiness probes, top-level because that is where orchestrators
+    // look for them. Registered before the S3 collection so the constant paths are unambiguous -
+    // `MetadataNamespace.reservedRootPaths` keeps a bucket from ever being named after one.
+    try app.register(collection: HealthProbeController())
+
     // API - INTERNAL
     let apiV1: any RoutesBuilder = app.grouped("api", "v1")
     try apiV1.register(collection: InternalUserController())

@@ -1,0 +1,197 @@
+# Default values for the Alarik chart.
+
+# ── Scale ────────────────────────────────────────────────────────────────────
+#
+# replicaCount must be at least erasureCoding.dataShards + erasureCoding.parityShards, or every
+# write is refused: a cluster cannot place a stripe it has nowhere to put. The chart refuses to
+# render rather than letting you discover that on the first upload.
+#
+# There is no hard upper bound, but the control plane's periodic reconciliation talks to every
+# peer, so very large clusters spend proportionally more on upkeep. Tens of replicas are
+# comfortable; if you are planning hundreds, read docs/horizontal-scaling first.
+replicaCount: 4
+
+image:
+  repository: ghcr.io/achtungsoftware/alarik
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Erasure coding ───────────────────────────────────────────────────────────
+#
+# Object data is split into `dataShards` data + `parityShards` parity shards, one per node. The
+# cluster survives losing `parityShards` nodes and needs `dataShards` to read. Usable capacity is
+# dataShards / (dataShards + parityShards).
+#
+# 2+2 across 4 replicas: tolerates 2 node losses, 50% usable. The application default is 4+2,
+# which needs at least 6 replicas.
+erasureCoding:
+  dataShards: 2
+  parityShards: 2
+
+# Control-plane metadata is REPLICATED, not striped - every responsible node holds a whole copy,
+# so any single reachable node can answer "does this bucket exist" alone. Leave dataShards at 1;
+# raising it means no node can answer without contacting others. See
+# ClusterMetadataErasureCodingConfig for the full reasoning.
+metadataErasureCoding:
+  dataShards: 1
+  parityShards: 2
+
+# ── Credentials ──────────────────────────────────────────────────────────────
+#
+# Leave existingSecret empty to have the chart create a Secret from the values below. Supply
+# existingSecret to manage these out-of-band (sealed-secrets, external-secrets, vault, ...).
+#
+# The Secret must contain: CLUSTER_SECRET, JWT, ADMIN_PASSWORD, DEFAULT_SECRET_KEY.
+auth:
+  existingSecret: ""
+  # REQUIRED. Shared secret authenticating inter-node traffic. Same value on every pod.
+  clusterSecret: ""
+  # REQUIRED in production. Signs console session tokens; the server refuses to boot without it.
+  # Must be identical across pods or a session issued by one is rejected by another.
+  jwt: ""
+  adminUsername: alarik
+  adminPassword: ""
+  # Optional S3 credentials seeded for the admin account on first boot.
+  defaultAccessKey: ""
+  defaultSecretKey: ""
+
+# ── Application config ───────────────────────────────────────────────────────
+config:
+  # Externally reachable base URL of the S3 API - used for shared-link URLs and OIDC callbacks.
+  # Point this at your Ingress/LoadBalancer, not at a pod.
+  apiBaseUrl: "http://localhost:8080"
+  consoleBaseUrl: "http://localhost:3000"
+  region: "us-east-1"
+  logLevel: "info"
+  # Flush uploads to stable storage before acknowledging. Leave on for real data.
+  fsync: true
+  allowAccountCreation: false
+  # How long a deleted record's tombstone is kept. This is the maximum time a node may be offline
+  # and still rejoin safely - a node away longer can resurrect records deleted while it was gone.
+  tombstoneGraceDays: 7
+  # Percentage of free disk below which a node stops coordinating new writes.
+  minFreePercent: 10
+  # Extra environment variables, as a plain map.
+  extraEnv: {}
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  size: 100Gi
+  # Leave empty for the cluster default StorageClass.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  # ReadWriteOnce is correct here: each pod owns its own volume exclusively. Alarik replicates
+  # across pods itself, so shared/RWX storage would duplicate that work, not add to it.
+
+# ── Services ─────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: alarik.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ── Availability ─────────────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  # Voluntary disruptions (node drains, cluster upgrades) must not take down so many pods at once
+  # that reads fall below erasure-coding quorum. Left empty, the chart computes the minimum that
+  # keeps `dataShards` replicas available.
+  minAvailable: ""
+
+# Restrict inter-node traffic to pods of this release. Inter-node traffic is authenticated by
+# CLUSTER_SECRET but NOT encrypted, so it belongs on a private path.
+networkPolicy:
+  enabled: false
+  # Extra selectors allowed to reach the S3 API port (your ingress controller, app namespaces).
+  allowedClients: []
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+# How long a pod gets to finish in-flight requests on shutdown. Alarik's own drain budget is 30s,
+# so give it comfortably more than that.
+terminationGracePeriodSeconds: 60
+
+# Pause before SIGTERM, so the Service has withdrawn this pod's endpoint before it stops
+# answering. Covers the gap where kube-proxy has not yet propagated the removal and requests are
+# still being routed here - the difference between a rolling update being invisible to clients and
+# it dropping a couple of requests per pod. Must stay well under terminationGracePeriodSeconds.
+preStopDelaySeconds: 5
+
+nodeSelector: {}
+tolerations: []
+# Spread pods across physical nodes. Anti-affinity is what makes erasure coding mean anything:
+# k+m shards on one machine survive nothing. `soft` schedules anyway if there aren't enough
+# nodes; `hard` refuses, leaving pods Pending until capacity exists.
+podAntiAffinity: soft
+affinity: {}
+topologySpreadConstraints: []
+
+podAnnotations: {}
+podLabels: {}
+
+securityContext:
+  # The image's own user. Any uid works - /app is world-traversable - but the volume must be
+  # writable by whatever you choose, which fsGroup handles.
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  runAsNonRoot: true
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ── Console (optional web UI) ────────────────────────────────────────────────
+console:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/achtungsoftware/alarik-console
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 3000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: console.alarik.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []

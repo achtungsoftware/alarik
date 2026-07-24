@@ -112,8 +112,16 @@ final actor ClusterNodeCache {
         if existing.lastHeartbeatAt != snapshot.lastHeartbeatAt {
             return existing.lastHeartbeatAt > snapshot.lastHeartbeatAt
         }
-        // Same heartbeat: prefer a cached non-active status (a drain/removal the snapshot missed)
-        // over the snapshot's active one.
+        // Same heartbeat, so no newer information about the node itself - only a deliberate
+        // operator action should change its standing, never a lagging snapshot:
+        //
+        // - A decommissioned (`.removed`) node stays removed. Otherwise a peer that missed the
+        //   removal and still gossips the node as `.draining` would flip it back, resurrecting the
+        //   very ghost decommissioning exists to retire. Only a genuinely fresher heartbeat (a
+        //   node re-registering `.active` after a restart - the branch above) may revive it.
+        // - A drained (`.draining`) node likewise isn't promoted back to `.active` by a stale
+        //   snapshot that simply hasn't heard about the drain yet.
+        if existing.status == .removed && snapshot.status != .removed { return true }
         return existing.status != .active && snapshot.status == .active
     }
 
@@ -131,6 +139,20 @@ final actor ClusterNodeCache {
 
     func all() -> [ClusterNodeInfo] {
         Array(nodes.values)
+    }
+
+    /// Every node worth trying to reach for a cluster-wide read - the peer set for metadata
+    /// listing fan-out and the widen-to-all-holders fallback.
+    ///
+    /// This is `all()` minus `.removed` nodes, and deliberately NOT `activeNodes()`: a `.draining`
+    /// node is still live and may hold records mid-migration, so it must stay in the set or those
+    /// records vanish from every listing until the drain completes. A `.removed` node is the
+    /// opposite - decommissioned, data already migrated off, process stopping - so probing it only
+    /// ever costs a timeout and, because a peer that never answers taints listing completeness,
+    /// keeps the removal-reconciliation pass in `reloadAll` from ever running. Dropping it here is
+    /// what makes decommissioning actually quiet the cluster down rather than just relabel a ghost.
+    func reachablePeers() -> [ClusterNodeInfo] {
+        nodes.values.filter { $0.status != .removed }
     }
 
     /// Who *owns* a key: every registered, non-draining node, regardless of whether it is

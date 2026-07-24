@@ -130,6 +130,30 @@ enum ClusterRebalanceService {
             var reclaimCandidates: [(key: String, versionId: String?)] = []
 
             for entry in versions + deleteMarkers {
+                // Erasure-coded objects are NOT this walk's business, even though
+                // `listAllVersions` deliberately reports them (it is the shared listing used by
+                // the S3 API, which must see both formats). Their redistribution is
+                // `ErasureCodedRebalanceService`'s job, shard by shard.
+                //
+                // Enqueuing a plain copy task for one produces a row nothing can ever complete:
+                // the plain dispatcher looks for a `.obj` local copy, an EC object has none, and
+                // a missing copy yields `.skip` - which by design leaves the row untouched and
+                // pending. Every rebalance walk then adds more. The visible symptom is that
+                // `rebalance/status` never reaches zero in an erasure-coded deployment, so the
+                // documented "drain until pending is zero" workflow can never finish.
+                //
+                // `"null"` must be normalised to nil first, the same way every other EC call site
+                // does: a non-versioned object carries the literal string in `objectMeta`, and
+                // passing it through unchanged builds a versioned shard path that never exists -
+                // so the check would quietly answer "not erasure-coded" for exactly the
+                // non-versioned objects it most needs to catch.
+                let entryVersionId = entry.versionId == "null" ? nil : entry.versionId
+                if ErasureCodedObjectHandler.holdsAnyLocalShard(
+                    bucketName: bucketName, key: entry.key, versionId: entryVersionId)
+                {
+                    continue
+                }
+
                 let responsible = PlacementService.responsibleNodes(
                     bucketName: bucketName, key: entry.key, activeNodes: activeNodes)
                 if responsible.contains(where: { $0.id == selfNodeId }) {

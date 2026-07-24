@@ -34,7 +34,22 @@ sedi "s/public let alarikVersion = \".*\"/public let alarikVersion = \"$VERSION\
 sedi "s/appVersion: \".*\"/appVersion: \"$VERSION\"/" \
     "$SCRIPT_DIR/console/nuxt.config.ts"
 
+# Update the Helm chart's appVersion - it selects the image tag the chart deploys, so leaving it
+# behind would ship a chart that installs the previous release. Anchored to a line start so it
+# can't also rewrite the chart's own `version:` (the chart's revision, which is independent of
+# the app's and is bumped by hand when the templates change).
+sedi "s/^appVersion: \".*\"/appVersion: \"$VERSION\"/" \
+    "$SCRIPT_DIR/charts/alarik/Chart.yaml"
+
 echo "Updated version strings in source files"
+
+# Fail loudly rather than publishing images the chart won't reference.
+CHART_APP_VERSION=$(grep '^appVersion:' "$SCRIPT_DIR/charts/alarik/Chart.yaml" | sed 's/^appVersion: *"\(.*\)"/\1/')
+if [ "$CHART_APP_VERSION" != "$VERSION" ]; then
+    echo "ERROR: charts/alarik/Chart.yaml appVersion is '$CHART_APP_VERSION', expected '$VERSION'."
+    echo "       The chart would deploy the wrong image tag - aborting before anything is pushed."
+    exit 1
+fi
 
 # Login to GHCR (requires GITHUB_TOKEN or gh auth)
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin 2>/dev/null || \

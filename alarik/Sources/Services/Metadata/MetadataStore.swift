@@ -730,7 +730,7 @@ enum MetadataStore {
         // longer read data it still physically holds locally. Draining only means "don't place
         // new writes here", never "can't serve reads of what's already here" - so widen to every
         // known node rather than reuse the placement-only active set.
-        let allKnown = await ClusterNodeCache.shared.all()
+        let allKnown = await ClusterNodeCache.shared.reachablePeers()
         let hasWiderFallback = allKnown.count > routing.responsible.count
 
         do {

@@ -1,0 +1,52 @@
+{{/*
+Headless Service: peer DNS only, never client traffic.
+
+`clusterIP: None` gives each pod a stable per-pod A record, which is what CLUSTER_NODE_ADDRESS
+points at. `publishNotReadyAddresses: true` is required, not optional: a joining pod is by
+definition not ready yet (it is still bootstrapping membership), and if its address were withheld
+until it became ready it could never be reached by the peers it needs in order to become ready.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "alarik.headlessServiceName" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "alarik.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+{{/*
+Client Service: the S3 endpoint.
+
+Plain round-robin with no session affinity, because any node can serve any request - a read is
+gathered from wherever the shards live, and a write is forwarded to its coordinator. Unlike the
+headless Service above, this one routes to READY pods only, so a converging node never receives
+client traffic.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "alarik.fullname" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "alarik.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

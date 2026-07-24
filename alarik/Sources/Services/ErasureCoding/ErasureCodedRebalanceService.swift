@@ -496,7 +496,8 @@ enum ErasureCodedRebalanceService {
             return try await reclaimIfSafe(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
                 staleShardIndex: header.shardIndex, responsible: responsible,
-                requiredDataShards: dataShards, outstandingTasks: outstandingTasks)
+                requiredDataShards: dataShards, selfNodeId: selfNodeId,
+                outstandingTasks: outstandingTasks)
         }
 
         guard selfRank == 0 else {
@@ -507,7 +508,8 @@ enum ErasureCodedRebalanceService {
                 return try await reclaimIfSafe(
                     app: app, bucketName: bucketName, key: key, versionId: versionId,
                     staleShardIndex: header.shardIndex, responsible: responsible,
-                    requiredDataShards: dataShards, outstandingTasks: outstandingTasks)
+                    requiredDataShards: dataShards, selfNodeId: selfNodeId,
+                    outstandingTasks: outstandingTasks)
             }
             return false
         }
@@ -650,7 +652,7 @@ enum ErasureCodedRebalanceService {
     private static func reclaimIfSafe(
         app: Application, bucketName: String, key: String, versionId: String?,
         staleShardIndex: Int, responsible: [ClusterNodeInfo], requiredDataShards: Int,
-        outstandingTasks: [ErasureCodedReplicationTask]
+        selfNodeId: UUID, outstandingTasks: [ErasureCodedReplicationTask]
     ) async throws -> Bool {
         // Scoped to this version: an in-flight repair of a *different* version of the same key
         // mustn't hold this version's stale shard hostage. `outstandingTasks` is the walk-wide
@@ -661,8 +663,52 @@ enum ErasureCodedRebalanceService {
         }.count
         guard outstanding == 0 else { return true }
 
+        // Hand this index off to the node that should own it BEFORE dropping it. This is what
+        // makes a drain non-destructive. A draining node is excluded from placement, so every
+        // shard it holds reaches this reclaim path with `selfRank == nil` - and simply deleting
+        // here dropped the ONLY copy of the index whenever nothing else reconstructed it in time.
+        // The gap-fill sweep can't be relied on to: it runs from a holder, and the very node that
+        // SHOULD hold this index by definition doesn't yet, so if it is rank-0 no node sweeps at
+        // all; and at exactly k+m nodes there is zero placement slack, so a reconstruct has
+        // nowhere to land. Pushing our copy to the rightful owner sidesteps all of that - it is
+        // the same index, so it's a verbatim copy, not a reconstruction.
+        //
+        // A failed or impossible hand-off means KEEP the shard (return gated) and retry next
+        // walk. Deleting anyway is precisely the data loss this guards against - the shard is
+        // still a valid, readable copy in the meantime.
+        if staleShardIndex < responsible.count {
+            let rightfulOwner = responsible[staleShardIndex]
+            if rightfulOwner.id != selfNodeId {
+                let alreadyHeld = await ClusterReplicationClient.shardExists(
+                    app: app, node: rightfulOwner, bucketName: bucketName, key: key,
+                    versionId: versionId, shardIndex: staleShardIndex)
+                if !alreadyHeld {
+                    let localPath = ErasureCodedObjectHandler.shardPath(
+                        bucketName: bucketName, key: key, versionId: versionId,
+                        shardIndex: staleShardIndex)
+                    do {
+                        try await ClusterReplicationClient.pushShard(
+                            app: app, to: rightfulOwner, sourcePath: localPath,
+                            bucketName: bucketName, key: key, versionId: versionId,
+                            shardIndex: staleShardIndex)
+                    } catch {
+                        app.logger.warning(
+                            "Kept shard \(staleShardIndex) of '\(bucketName)/\(key)' - could not hand it to its owner \(rightfulOwner.id) yet, retrying next walk: \(error)"
+                        )
+                        return true
+                    }
+                }
+            }
+        } else {
+            // The index has no owner in the current (shrunk) membership - keep it rather than
+            // discard a copy that cannot be re-placed until the cluster grows back to k+m.
+            return true
+        }
+
         // Positive safety gate: only drop this stale shard once at least `dataShards` of the
-        // currently-responsible nodes independently hold their own correct-index shard.
+        // currently-responsible nodes independently hold their own correct-index shard. Redundant
+        // with the hand-off above for the drain case (the owner now holds it), but still the
+        // correct gate for the reindex case where this is a leftover old-rank duplicate.
         // Parallel, not sequential - see `sweepGaps`'s identical reasoning.
         let healthyCount = await withTaskGroup(of: Bool.self, returning: Int.self) { group in
             for (rank, node) in responsible.enumerated() {

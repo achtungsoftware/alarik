@@ -1,0 +1,195 @@
+{{- include "alarik.validateReplicas" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "alarik.fullname" . }}
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+spec:
+  # A StatefulSet, not a Deployment: each pod owns a distinct slice of the data and must come back
+  # with the SAME identity and the SAME volume. Stable placement means a rescheduled pod resumes
+  # owning its keys rather than reshuffling the keyspace.
+  serviceName: {{ include "alarik.headlessServiceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  # OrderedReady so pod 0 is always up first and can act as the founding member every later pod
+  # seeds from. It also makes rolling updates strictly one-at-a-time, which is what keeps erasure
+  # coding above quorum throughout.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "alarik.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "alarik.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll pods when config or credentials change; without this a ConfigMap edit silently
+        # applies only to pods that happen to restart later.
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "alarik.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Alarik's own shutdown budget is 30s for in-flight requests; the pod must outlast it.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if eq .Values.podAntiAffinity "hard" }}
+      affinity:
+        # Erasure coding across pods that share a machine protects against nothing - one node loss
+        # takes every shard with it. `hard` refuses to schedule rather than pretend.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "alarik.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- else if eq .Values.podAntiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "alarik.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: alarik
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Downward API gives each pod its own stable DNS name - the StatefulSet guarantee that
+            # makes peer addressing work without any service discovery of our own.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CLUSTER_NODE_ADDRESS
+              value: "http://$(POD_NAME).{{ include "alarik.headlessServiceName" . }}.$(POD_NAMESPACE).svc.cluster.local:8080"
+            - name: CLUSTER_SEED_NODES
+              value: {{ include "alarik.seedNodes" . | quote }}
+            - name: CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "alarik.secretName" . }}
+                  key: CLUSTER_SECRET
+            - name: JWT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "alarik.secretName" . }}
+                  key: JWT
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "alarik.secretName" . }}
+                  key: ADMIN_PASSWORD
+            - name: DEFAULT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "alarik.secretName" . }}
+                  key: DEFAULT_SECRET_KEY
+          envFrom:
+            - configMapRef:
+                name: {{ include "alarik.fullname" . }}-config
+          # Liveness deliberately ignores cluster health. A node whose peers are unreachable is
+          # still perfectly alive; restarting it would turn a partition into a cluster-wide
+          # restart loop.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Readiness gates CLIENT traffic on convergence: a node that is up but has not yet
+          # learned its peers or loaded its caches would answer InvalidAccessKeyId/NoSuchBucket to
+          # perfectly valid requests. Generous failureThreshold so a rejoining node is given time
+          # to converge instead of being flapped.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          # Startup probe covers a slow first boot (large local store to walk) without forcing a
+          # long initialDelay onto the liveness probe for the whole pod lifetime.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          # Endpoint propagation is not instant: when a pod is deleted, kube-proxy needs a
+          # moment to remove it from the Service's endpoints, and until it does, requests still
+          # arrive. Without this pause the container stops accepting them first and those
+          # in-flight requests fail - measured as a couple of failed requests per pod during a
+          # rolling update. Sleeping first lets the endpoint be withdrawn while the server is
+          # still answering, so the drain is invisible to clients.
+          #
+          # This is NOT a data drain (see scale-down.sh for that). It delays SIGTERM by a few
+          # seconds and moves no shards, so it is safe on every restart - which is exactly why
+          # it can live here while draining deliberately does not.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.preStopDelaySeconds }}"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: storage
+              mountPath: /app/Storage
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- else }}
+      volumes:
+        - name: storage
+          emptyDir: {}
+  {{- end }}

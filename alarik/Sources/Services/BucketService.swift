@@ -26,10 +26,12 @@ struct BucketService {
     )
         async throws
     {
-        // Defense in depth: `.alarik.sys` is already unreachable via the bucket-name validator's
-        // character class (it can't start with `.`), but this is the single low-level chokepoint
-        // every bucket creation path funnels through, so it's guarded explicitly here too rather
-        // than relying solely on validation upstream.
+        // Load-bearing, not merely defense in depth. `.alarik.sys` is indeed already unreachable
+        // via the bucket-name validator's character class (it can't start with `.`), but
+        // `MetadataNamespace.reservedRootPaths` also covers the probe endpoints, and those ARE
+        // valid S3 bucket names - nothing upstream rejects them. Since this is the single
+        // low-level chokepoint every creation path funnels through, it is the only place that
+        // reliably stops a bucket being created that path-style routing could never reach again.
         guard !MetadataNamespace.isReserved(bucketName) else {
             throw S3Error(
                 status: .forbidden, code: "InvalidBucketName",

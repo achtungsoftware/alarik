@@ -37,6 +37,11 @@ final class LoadCacheLifecycle: LifecycleHandler {
         } catch {
             app.logger.error("Failed to load cache: \(error)")
         }
+        // Marked even when the load threw. A failed boot load leaves this node no worse off than
+        // any node whose fan-out came back partial, and the catch-up retries below keep filling
+        // gaps - whereas never becoming ready would keep a recoverable node out of service
+        // permanently, which is the worse failure.
+        await NodeReadiness.shared.markCacheLoaded()
 
         if app.storage[ClusterConfigurationKey.self] != nil {
             Task {

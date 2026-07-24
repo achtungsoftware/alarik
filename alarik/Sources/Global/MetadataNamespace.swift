@@ -28,10 +28,19 @@ enum MetadataNamespace {
     /// directly, rather than going through that validator, must still explicitly exclude it.
     static let bucketName = ".alarik.sys"
 
-    /// True when `name` is the reserved metadata pseudo-bucket - every path that enumerates,
-    /// creates, or validates real bucket names must exclude/reject it.
+    /// Top-level paths served by something other than S3 path-style bucket routing.
+    ///
+    /// Vapor resolves a constant path segment ahead of a `:bucketName` parameter, so a bucket
+    /// named after one of these would be silently unreachable over path-style addressing - it
+    /// could be created and then never read back. Both are valid S3 bucket names, so the
+    /// collision is real rather than theoretical, and it is refused at creation instead.
+    static let reservedRootPaths: Set<String> = ["livez", "readyz"]
+
+    /// True when `name` is the reserved metadata pseudo-bucket, or collides with a top-level
+    /// route - every path that enumerates, creates, or validates real bucket names must
+    /// exclude/reject it.
     static func isReserved(_ name: String) -> Bool {
-        name == bucketName
+        name == bucketName || reservedRootPaths.contains(name)
     }
 
     /// Builds the object key for one record within a collection, e.g.

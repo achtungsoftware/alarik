@@ -160,7 +160,7 @@ enum ErasureCodedScrubber {
         // Attempt 1: fetch a healthy same-index copy from any peer. This is the ONLY heal that
         // can work for a k=1/m=0 record (there are no other indices to reconstruct from), and
         // it's cheaper than reconstruction whenever a duplicate copy exists.
-        let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
+        let peers = await ClusterNodeCache.shared.reachablePeers().filter { $0.id != config.nodeId }
         if !peers.isEmpty,
             let tempPath = try? await ClusterReplicationClient.fetchShard(
                 app: app, candidates: peers, bucketName: bucketName, key: key,

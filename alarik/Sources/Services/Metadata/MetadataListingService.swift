@@ -84,11 +84,13 @@ enum MetadataListingService {
         complete = complete && local.allReadable
 
         if let config = app.storage[ClusterConfigurationKey.self] {
-            // Every KNOWN peer, not `activeNodes()` - a `.draining` peer is excluded from
+            // `reachablePeers()`, not `activeNodes()` - a `.draining` peer is excluded from
             // `activeNodes()` for placement, but can still physically hold records that haven't
-            // finished migrating off it yet. Excluding it here would make those records vanish
-            // from every other node's listing until the drain finishes.
-            let peers = await ClusterNodeCache.shared.all().filter { $0.id != config.nodeId }
+            // finished migrating off it yet, so excluding it here would make those records vanish
+            // from every other node's listing until the drain finishes. It also isn't raw `all()`:
+            // a `.removed` (decommissioned) peer is gone for good and only ever times out, which
+            // would keep this listing perpetually `complete == false` - see `reachablePeers`.
+            let peers = await ClusterNodeCache.shared.reachablePeers().filter { $0.id != config.nodeId }
             let liveIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
             if !peers.isEmpty {
                 await withTaskGroup(of: (entries: [EnvelopeEntry], ok: Bool).self) { group in

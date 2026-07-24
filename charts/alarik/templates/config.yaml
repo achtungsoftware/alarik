@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "alarik.fullname" . }}-config
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+data:
+  API_BASE_URL: {{ .Values.config.apiBaseUrl | quote }}
+  CONSOLE_BASE_URL: {{ .Values.config.consoleBaseUrl | quote }}
+  ALARIK_REGION: {{ .Values.config.region | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  ALARIK_FSYNC: {{ .Values.config.fsync | quote }}
+  ALLOW_ACCOUNT_CREATION: {{ .Values.config.allowAccountCreation | quote }}
+  ADMIN_USERNAME: {{ .Values.auth.adminUsername | quote }}
+  {{- if .Values.auth.defaultAccessKey }}
+  DEFAULT_ACCESS_KEY: {{ .Values.auth.defaultAccessKey | quote }}
+  {{- end }}
+  CLUSTER_EC_DATA_SHARDS: {{ .Values.erasureCoding.dataShards | quote }}
+  CLUSTER_EC_PARITY_SHARDS: {{ .Values.erasureCoding.parityShards | quote }}
+  CLUSTER_METADATA_EC_DATA_SHARDS: {{ .Values.metadataErasureCoding.dataShards | quote }}
+  CLUSTER_METADATA_EC_PARITY_SHARDS: {{ .Values.metadataErasureCoding.parityShards | quote }}
+  CLUSTER_METADATA_TOMBSTONE_GRACE_DAYS: {{ .Values.config.tombstoneGraceDays | quote }}
+  CLUSTER_MIN_FREE_PERCENT: {{ .Values.config.minFreePercent | quote }}
+  {{- range $key, $value := .Values.config.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- if not .Values.auth.existingSecret }}
+---
+{{/*
+Generated only when auth.existingSecret is unset. Values are REQUIRED rather than defaulted: a
+chart that invents a cluster secret or JWT would hand every install the same one, and CLUSTER_SECRET
+is a trust boundary for unencrypted inter-node traffic.
+
+`lookup` reuses whatever is already stored on an upgrade, so re-running `helm upgrade` without
+re-supplying the values does not silently rotate the JWT (invalidating every session) or the
+cluster secret (partitioning the cluster from itself).
+*/}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace (printf "%s-auth" (include "alarik.fullname" .))) }}
+{{- $clusterSecret := .Values.auth.clusterSecret }}
+{{- $jwt := .Values.auth.jwt }}
+{{- if and (not $clusterSecret) $existing }}{{- $clusterSecret = (index $existing.data "CLUSTER_SECRET" | b64dec) }}{{- end }}
+{{- if and (not $jwt) $existing }}{{- $jwt = (index $existing.data "JWT" | b64dec) }}{{- end }}
+{{- if not $clusterSecret }}
+{{- fail "auth.clusterSecret is required. It authenticates all inter-node traffic and must be identical on every pod. Generate one with: openssl rand -base64 32" }}
+{{- end }}
+{{- if not $jwt }}
+{{- fail "auth.jwt is required. It signs console session tokens, the server refuses to boot without it in production, and it must be identical on every pod or a session issued by one is rejected by another. Generate one with: openssl rand -base64 48" }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "alarik.fullname" . }}-auth
+  labels:
+    {{- include "alarik.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  CLUSTER_SECRET: {{ $clusterSecret | quote }}
+  JWT: {{ $jwt | quote }}
+  ADMIN_PASSWORD: {{ .Values.auth.adminPassword | default "alarik" | quote }}
+  DEFAULT_SECRET_KEY: {{ .Values.auth.defaultSecretKey | default "" | quote }}
+{{- end }}

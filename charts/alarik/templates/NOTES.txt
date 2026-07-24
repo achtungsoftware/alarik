@@ -1,0 +1,66 @@
+Alarik {{ .Chart.AppVersion }} installed as "{{ .Release.Name }}" in namespace {{ .Release.Namespace }}.
+
+  Replicas:        {{ .Values.replicaCount }}
+  Erasure coding:  k={{ .Values.erasureCoding.dataShards }} m={{ .Values.erasureCoding.parityShards }}  (survives losing {{ .Values.erasureCoding.parityShards }} node(s); {{ div (mul .Values.erasureCoding.dataShards 100) (add .Values.erasureCoding.dataShards .Values.erasureCoding.parityShards) }}% of raw capacity usable)
+  Metadata:        replicated across {{ add .Values.metadataErasureCoding.dataShards .Values.metadataErasureCoding.parityShards }} nodes (whole copies, so any one can answer alone)
+
+1. Watch the cluster form. Pods start in order, and each becomes Ready only once it has
+   discovered its peers and loaded its caches - until then the Service deliberately keeps client
+   traffic away from it:
+
+     kubectl --namespace {{ .Release.Namespace }} rollout status statefulset/{{ include "alarik.fullname" . }}
+
+2. Reach the S3 API:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+     http://{{ .host }}
+{{- end }}
+{{- else }}
+     kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "alarik.fullname" . }} 8080:{{ .Values.service.port }}
+
+   Then point any S3 client at http://localhost:8080 (path-style addressing).
+{{- end }}
+
+{{- if .Values.console.enabled }}
+
+3. Reach the console:
+{{- if .Values.console.ingress.enabled }}
+{{- range .Values.console.ingress.hosts }}
+     http://{{ .host }}
+{{- end }}
+{{- else }}
+     kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "alarik.fullname" . }}-console 3000:{{ .Values.console.service.port }}
+{{- end }}
+
+   Sign in as {{ .Values.auth.adminUsername }} with the password from:
+     kubectl --namespace {{ .Release.Namespace }} get secret {{ include "alarik.secretName" . }} -o jsonpath='{.data.ADMIN_PASSWORD}' | base64 -d
+{{- end }}
+
+{{ if not .Values.ingress.enabled }}
+NOTE: config.apiBaseUrl is {{ .Values.config.apiBaseUrl | quote }}. Shared-link URLs and OIDC
+callbacks are generated from it, so set it to the address clients actually use once you expose
+this beyond port-forwarding.
+{{- end }}
+
+SCALING
+
+  Up:   kubectl --namespace {{ .Release.Namespace }} scale statefulset {{ include "alarik.fullname" . }} --replicas=N
+        Safe at any time. New pods join, and existing nodes migrate a share of the data onto them
+        automatically.
+
+  Down: ./scale-down.sh {{ include "alarik.fullname" . }} N {{ .Release.Namespace }}
+        Use the script, NOT `kubectl scale`. Removing a pod outright leaves the shards it held
+        missing until a manual resync notices; the script drains each pod first so its data moves
+        onto the remaining nodes before it goes away.
+
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is DISABLED. Pod storage is an emptyDir, so all data - objects, users,
+buckets and access keys alike - is destroyed when a pod restarts. Never run this way outside a
+throwaway test.
+{{- end }}
+{{- if not .Values.networkPolicy.enabled }}
+
+NOTE: inter-node traffic is authenticated by CLUSTER_SECRET but NOT encrypted. Keep it on a
+private network, or enable networkPolicy.enabled to confine it to this release's pods.
+{{- end }}
