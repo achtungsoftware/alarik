@@ -201,6 +201,28 @@ function nodeAddress(id: string): string {
 
 const storageTotal = computed(() => nodeStorage.value.reduce((sum, s) => sum + s.sizeBytes, 0));
 
+// ── Topology selection ────────────────────────────────────────────────────────
+// Clicking a node in the canvas selects it here; the detail panel beside the canvas reads this.
+const selectedNodeId = ref<string | null>(null);
+const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedNodeId.value) ?? null);
+const selectedNodeStorage = computed(() => nodeStorage.value.find((s) => s.nodeId === selectedNodeId.value) ?? null);
+const selectedNodeSharePct = computed(() => {
+    const bytes = selectedNodeStorage.value?.sizeBytes ?? 0;
+    return storageTotal.value > 0 ? (bytes / storageTotal.value) * 100 : 0;
+});
+const selectedNodeFreePct = computed(() => {
+    const n = selectedNode.value;
+    if (!n || n.totalBytes == null || n.availableBytes == null || n.totalBytes === 0) return null;
+    return (n.availableBytes / n.totalBytes) * 100;
+});
+// Migration is happening whenever either backlog is non-empty - drives the edge "flow" animation.
+const topologyRebalancePending = computed(() => rebalanceStatus.value.pendingCount + erasureCodingStatus.value.pendingCount);
+// Drop the selection if the node leaves the cluster (e.g. decommissioned), so the panel can't
+// dangle on a node that no longer exists.
+watch(nodes, (list) => {
+    if (selectedNodeId.value && !list.some((n) => n.id === selectedNodeId.value)) selectedNodeId.value = null;
+});
+
 const storageChartData = computed(() => nodeStorage.value.map((s) => s.sizeBytes));
 const storageChartCategories = computed(() => {
     const categories: Record<string, { name: string; color: string }> = {};
@@ -642,6 +664,107 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                     title="Cluster degraded"
                     :description="degradedDescription"
                 />
+
+                <UCard v-if="nodes.length > 0" variant="subtle" :ui="{ body: '!p-0' }">
+                    <template #header>
+                        <CardHeader title="Topology" size="sm">
+                            <template #rightContent>
+                                <span class="text-xs text-muted hidden sm:inline">Click a node for details</span>
+                            </template>
+                        </CardHeader>
+                    </template>
+                    <div class="grid lg:grid-cols-[minmax(0,1fr)_20rem]">
+                        <div class="min-w-0 border-b lg:border-b-0 lg:border-r border-default">
+                            <ClusterTopologyCanvas
+                                :nodes="nodes"
+                                :storage="nodeStorage"
+                                :node-color="nodeColor"
+                                :selected-id="selectedNodeId"
+                                :rebalance-pending="topologyRebalancePending"
+                                @select="selectedNodeId = $event"
+                            />
+                        </div>
+
+                        <!-- Detail panel: the selected node, or a prompt when nothing is selected. -->
+                        <div class="p-4">
+                            <div v-if="!selectedNode" class="h-full min-h-40 flex flex-col items-center justify-center text-center gap-2 text-muted">
+                                <UIcon name="i-lucide-mouse-pointer-click" class="w-6 h-6" />
+                                <p class="text-sm">Select a node to inspect it</p>
+                            </div>
+                            <div v-else class="flex flex-col gap-4">
+                                <div class="flex items-start justify-between gap-2">
+                                    <div class="flex items-center gap-2 min-w-0">
+                                        <span
+                                            class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                            :style="{ backgroundColor: nodeColor(selectedNode.id) }"
+                                        />
+                                        <span class="font-medium truncate">{{ shortAddress(selectedNode.address) }}</span>
+                                    </div>
+                                    <UBadge
+                                        :color="selectedNode.status === 'active' ? 'success' : selectedNode.status === 'draining' ? 'warning' : 'neutral'"
+                                        variant="subtle"
+                                        size="sm"
+                                    >
+                                        {{ selectedNode.status }}
+                                    </UBadge>
+                                </div>
+
+                                <div class="flex flex-col gap-2.5 text-sm">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="text-muted">Health</span>
+                                        <span class="flex items-center gap-1.5">
+                                            <span :class="`inline-block w-2 h-2 rounded-full ${selectedNode.isHealthy ? 'bg-success' : 'bg-error'}`" />
+                                            {{ selectedNode.isHealthy ? "Healthy" : "Unreachable" }}
+                                        </span>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="text-muted">Last heartbeat</span>
+                                        <span>{{ formatAge(selectedNode.lastHeartbeatAt) }}</span>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="text-muted">Joined</span>
+                                        <span class="text-right">{{ new Date(selectedNode.joinedAt).toLocaleDateString() }}</span>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="text-muted">Objects</span>
+                                        <span>{{ selectedNodeStorage?.objectCount ?? "—" }}</span>
+                                    </div>
+
+                                    <div class="flex flex-col gap-1 pt-1">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="text-muted">Storage share</span>
+                                            <span>{{ formatBytes(selectedNodeStorage?.sizeBytes ?? 0) }} · {{ Math.round(selectedNodeSharePct) }}%</span>
+                                        </div>
+                                        <UProgress :model-value="selectedNodeSharePct" :max="100" size="sm" :style="{ '--ui-primary': nodeColor(selectedNode.id) }" />
+                                    </div>
+
+                                    <div v-if="selectedNodeFreePct !== null" class="flex flex-col gap-1 pt-1">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="text-muted">Free space</span>
+                                            <span class="flex items-center gap-1.5">
+                                                {{ selectedNodeFreePct.toFixed(1) }}%
+                                                <UBadge v-if="selectedNode.isNearFull" color="warning" variant="subtle" size="sm">Low</UBadge>
+                                            </span>
+                                        </div>
+                                        <UProgress :model-value="selectedNodeFreePct" :max="100" size="sm" :color="selectedNode.isNearFull ? 'warning' : 'primary'" />
+                                    </div>
+                                </div>
+
+                                <UButton
+                                    v-if="selectedNode.status === 'active'"
+                                    label="Drain Node"
+                                    icon="i-lucide-log-out"
+                                    color="warning"
+                                    variant="subtle"
+                                    size="sm"
+                                    block
+                                    :loading="nodeActionLoading[selectedNode.id] ?? false"
+                                    @click="drainNode(selectedNode)"
+                                />
+                            </div>
+                        </div>
+                    </div>
+                </UCard>
 
                 <div class="grid grid-cols-2 lg:grid-cols-4 gap-6">
                     <DetailKeyValueCard title="Healthy Nodes" icon="i-lucide-server" :value="`${healthyCount}/${nodes.length}`" />

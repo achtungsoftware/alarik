@@ -23,6 +23,7 @@
 Alarik is a high-performance, S3-compatible object storage system written in **Swift**, licensed under the **Apache 2.0** license. It aims to deliver exceptional speed, developer-friendly ergonomics, and a modern cloud-native core. See [Documentation](https://alarik.io/docs)
 
 <img src="assets/console_browser_dark.png" />
+<img src="assets/cluster_dark.png" />
 
 ## Why Alarik?
 
@@ -102,7 +103,7 @@ The goal: a self-hosted, high-speed S3 system built for today’s workloads, wit
 | Feature | Notes |
 | --- | --- |
 | No external database | Buckets, users, access keys, policies, and cluster membership itself all live in Alarik's own storage - replicated whole to several nodes so any one of them can serve them alone - and `Storage/` is the only thing to back up |
-| Erasure-coded object data | Reed-Solomon `k` data + `m` parity shards across nodes (MinIO/Ceph-style), rebuildable from any `k` - the durability of replication at ~1.3-1.5x overhead instead of 3x |
+| Erasure-coded object data | Reed-Solomon `k` data + `m` parity shards across nodes, rebuildable from any `k` - the durability of replication at ~1.3-1.5x overhead |
 | Coordination-free placement | Rendezvous (HRW) hashing places each object's shards deterministically, no range-sharding hotspots or coordinator |
 | Any node serves any request | An entry node forwards to a responsible node transparently - no client-visible routing logic |
 | Quorum writes | A write acks once a quorum of shards land durably, with async catch-up for stragglers |
