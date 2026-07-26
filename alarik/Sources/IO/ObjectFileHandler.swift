@@ -436,7 +436,9 @@ struct ObjectFileHandler {
             let enumerator = FileManager.default.enumerator(
                 at: bucketURL,
                 includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
+                // No .skipsHiddenFiles: dot-prefixed keys (e.g. ".env") are real
+                // objects. Internal artifacts are excluded by the .obj filter below.
+                options: []
             )
         else {
             return ([], [], false, nil)
@@ -1002,7 +1004,9 @@ struct ObjectFileHandler {
             let enumerator = FileManager.default.enumerator(
                 at: bucketURL,
                 includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
+                // No .skipsHiddenFiles: dot-prefixed keys are real objects.
+                // Internal artifacts are excluded by the .obj filter below.
+                options: []
             )
         else {
             return ([], [], [], false, nil, nil)

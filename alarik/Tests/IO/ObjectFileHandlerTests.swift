@@ -622,6 +622,24 @@ struct ObjectFileHandlerTests {
         #expect(nextMarker == nil)
     }
 
+    @Test("List objects includes dot-prefixed keys")
+    func listObjectsDotPrefixed() throws {
+        let bucketName = try createTestBucket()
+        defer { cleanupBucket(name: bucketName) }
+
+        try createTestObject(bucketName: bucketName, key: ".env")
+        try createTestObject(bucketName: bucketName, key: ".hidden/config")
+        try createTestObject(bucketName: bucketName, key: "visible.txt")
+
+        let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: bucketName)
+
+        let keys = Set(objects.map { $0.key })
+        #expect(keys.contains(".env"))
+        #expect(keys.contains(".hidden/config"))
+        #expect(keys.contains("visible.txt"))
+        #expect(objects.count == 3)
+    }
+
     @Test("List objects returns multiple objects sorted by key")
     func listObjectsMultipleSorted() throws {
         let bucketName = try createTestBucket()

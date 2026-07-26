@@ -151,7 +151,9 @@ struct BucketHandler {
             let enumerator = fileManager.enumerator(
                 at: url,
                 includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
+                // No .skipsHiddenFiles: dot-prefixed keys are real objects and
+                // must count toward folder/bucket size and object counts.
+                options: []
             )
         else {
             return (0, 0)

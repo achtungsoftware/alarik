@@ -447,7 +447,7 @@ struct InternalAdminController: RouteCollection {
 
 
     private static func calculateDirectorySize(at url: URL) -> Int64 {
-        let fileManager = FileManager.default
+        let fileManager: FileManager = FileManager.default
         guard fileManager.fileExists(atPath: url.path) else {
             return 0
         }
@@ -456,7 +456,9 @@ struct InternalAdminController: RouteCollection {
             let enumerator = fileManager.enumerator(
                 at: url,
                 includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
+                // No .skipsHiddenFiles: this is a raw disk-usage total, so it must
+                // include dot-prefixed objects and the .alarik.sys metadata store.
+                options: []
             )
         else {
             return 0

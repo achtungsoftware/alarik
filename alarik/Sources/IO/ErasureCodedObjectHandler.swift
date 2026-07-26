@@ -326,7 +326,7 @@ enum ErasureCodedObjectHandler {
     /// by `ErasureCodedRebalanceService`'s self-scoped membership-change walk. A node only ever
     /// physically holds the shard(s) it's currently or previously responsible for, so this is
     /// inherently local, same as every other cluster-rebalance walk in this codebase.
-    /// Deliberately does **not** pass `.skipsHiddenFiles`, unlike the bucket-scoped walks. This
+    /// Deliberately does **not** pass `.skipsHiddenFiles`. This
     /// one starts at `rootURL` and descends *into* each bucket directory - and the control-plane
     /// namespace is `.alarik.sys`, which is dot-prefixed and therefore hidden. With that option
     /// set this walk returned zero metadata shards, so the rebalance walk and the bit-rot
@@ -422,7 +422,9 @@ enum ErasureCodedObjectHandler {
             let enumerator = FileManager.default.enumerator(
                 at: URL(fileURLWithPath: bucketPath),
                 includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles])
+                // No .skipsHiddenFiles: dot-prefixed keys are real objects; the
+                // "0.ecshard" filter below excludes everything else.
+                options: [])
         else { return [] }
 
         var results: [ObjectMeta] = []
