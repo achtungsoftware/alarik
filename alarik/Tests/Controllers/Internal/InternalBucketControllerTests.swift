@@ -1697,6 +1697,61 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("Delete folder - Versioned objects are actually pruned, every version")
+    func testDeleteFolderVersionedPrunesAllVersions() async throws {
+        // The regression this guards: folder delete used to list current objects and then delete
+        // them at the NON-versioned path (versionId nil, status .disabled). On a versioning-enabled
+        // bucket the objects live at `.versions/<id>` paths, so that delete found nothing, removed
+        // nothing, and still returned 204 - "Deletion Successful" while everything remained.
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "vdelete-bucket")
+
+            // Two versions of one key, plus a second key, all under the folder - and a keeper
+            // outside it. All written through the VERSIONED storage path.
+            try await putVersionedObject(app, bucketName: "vdelete-bucket", key: "vfolder/file1.txt", content: "v1")
+            try await putVersionedObject(app, bucketName: "vdelete-bucket", key: "vfolder/file1.txt", content: "v2")
+            try await putVersionedObject(app, bucketName: "vdelete-bucket", key: "vfolder/file2.txt", content: "data")
+            try await putVersionedObject(app, bucketName: "vdelete-bucket", key: "keep.txt", content: "keep")
+
+            try await app.test(
+                .DELETE, "/api/v1/objects?bucket=vdelete-bucket&key=vfolder/",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            // The folder's objects must be gone from the current-object listing; only the keeper
+            // remains. (Under the bug, the versioned files survived and still appeared here.)
+            try await app.test(
+                .GET, "/api/v1/objects?bucket=vdelete-bucket",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.count == 1)
+                    #expect(page.items.first?.key == "keep.txt")
+                })
+
+            // And it must be a genuine prune - EVERY historical version of a pruned key removed,
+            // not merely hidden behind a delete marker.
+            try await app.test(
+                .GET, "/api/v1/objects/versions?bucket=vdelete-bucket&key=vfolder/file1.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let versions = try res.content.decode([ObjectMeta.ResponseDTO].self)
+                    #expect(versions.isEmpty)
+                })
+        }
+    }
+
     @Test("Delete folder - Nested folder deletion works")
     func testDeleteNestedFolder() async throws {
         try await withApp { app in

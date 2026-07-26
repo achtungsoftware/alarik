@@ -725,39 +725,58 @@ struct InternalBucketController: RouteCollection {
                 throw Abort(.internalServerError, reason: "Invalid prefix for deletion")
             }
 
-            var marker: String? = nil
+            // Enumerate every VERSION and delete marker under the prefix, cluster-wide - NOT just
+            // the current objects. A folder delete is a permanent prune, so on a versioning-enabled
+            // bucket each stored version must be removed by its real versionId. The previous code
+            // listed only current objects (a ListObjectsV2-style listing) and then deleted them at
+            // the non-versioned path (versionId nil) - but a versioned object lives at a
+            // `.versions/<id>` path, so that delete found nothing, removed nothing, and still
+            // reported success. That is exactly the "folder delete says Successful but nothing is
+            // gone" symptom on a versioned bucket. `listAllVersions` reports a non-versioned object
+            // (matching S3) as versionId "null", which `deleteVersion` maps back to the plain path,
+            // so this single loop prunes versioned and non-versioned buckets alike.
+            var keyMarker: String? = nil
+            var versionIdMarker: String? = nil
             var failedKeys = 0
             repeat {
-                let (objects, _, isTruncated, nextMarker) = try await ClusterListingService.listObjects(
-                    req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
-                    maxKeys: 1000, marker: marker)
-                for object in objects {
+                let (versions, deleteMarkers, _, isTruncated, nextKeyMarker, nextVersionIdMarker) =
+                    try await ClusterListingService.listAllVersions(
+                        req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
+                        keyMarker: keyMarker, versionIdMarker: versionIdMarker, maxKeys: 1000)
+                for object in versions + deleteMarkers {
+                    let targetVersionId = object.versionId ?? "null"
                     // A per-key delete can fail (a responsible peer being unreachable) - unlike
                     // the local-disk-only deletePrefix this replaced, whose only failure mode was
                     // a local IO error. Rather than silently reporting the whole folder deleted
                     // when some objects survived, count the failures and surface them below.
-                    let outcome: S3Service.ObjectDeleteOutcome
                     do {
-                        outcome = try await ClusterReplicationService.deleteObjectClusterWide(
-                            req: req, bucketName: bucketName, key: object.key, versionId: nil,
-                            versioningStatus: .disabled)
+                        _ = try await ClusterReplicationService.deleteObjectClusterWide(
+                            req: req, bucketName: bucketName, key: object.key,
+                            versionId: targetVersionId, versioningStatus: .disabled)
                     } catch {
                         failedKeys += 1
                         req.logger.warning(
-                            "Folder delete: failed to delete '\(object.key)' under '\(sanitizedPrefix)': \(error)"
+                            "Folder delete: failed to delete '\(object.key)' (version \(targetVersionId)) under '\(sanitizedPrefix)': \(error)"
                         )
                         continue
                     }
-                    await NotificationService.emit(
-                        event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
-                        size: nil, etag: nil, versionId: outcome.versionId,
-                        requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
+                    // A delete marker being removed isn't itself an object-removed event; only emit
+                    // for a real object version.
+                    if !object.isDeleteMarker {
+                        await NotificationService.emit(
+                            event: .objectRemovedDelete, bucketName: bucketName, key: object.key,
+                            size: nil, etag: nil, versionId: targetVersionId,
+                            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
+                    }
                     await ReplicationService.enqueueDelete(
                         app: req.application, bucketName: bucketName, key: object.key,
-                        versionId: nil)
+                        versionId: targetVersionId)
                 }
-                marker = isTruncated ? nextMarker : nil
-            } while marker != nil
+                // Advance past what was just processed. Marker positions are absolute in the sorted
+                // key/version space, so deleting items at or before the marker never skips the rest.
+                keyMarker = isTruncated ? nextKeyMarker : nil
+                versionIdMarker = isTruncated ? nextVersionIdMarker : nil
+            } while keyMarker != nil
 
             if failedKeys > 0 {
                 throw Abort(
