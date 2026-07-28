@@ -372,7 +372,9 @@ struct S3Controller: RouteCollection {
         // Validate conditional request headers
         try S3Service.validateConditionalHeaders(req: req, meta: meta)
 
-        return S3Service.buildVersionedObjectMetadataResponse(meta: meta)
+        let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta)
+        S3Service.addChecksumHeadersIfRequested(req: req, meta: meta, to: response)
+        return response
     }
 
     // GET / (List all buckets)
@@ -968,8 +970,13 @@ struct S3Controller: RouteCollection {
             meta.tags = tagging.tags
         }
 
+        // A single-part PUT's checksum is a full-object checksum over the whole body (validated by
+        // the spooler from the aws-chunked trailer or an x-amz-checksum-* header).
+        meta.checksum = spooled.checksum
+
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
+        S3Service.addChecksumHeaders(spooled.checksum, to: &headers)
 
         let writtenVersionId: String?
         if let ecWriteFanOut {
@@ -1470,6 +1477,25 @@ struct S3Controller: RouteCollection {
             etag = sourceMeta.etag
         }
 
+        // Checksum: a copy is a single-object operation, so the destination gets a fresh
+        // FULL_OBJECT checksum computed over the copied bytes - in the algorithm requested on the
+        // copy, else the source's algorithm (S3 recomputes rather than carrying the value over,
+        // since a multipart source's stored checksum wouldn't match a single-object destination).
+        // Skipped entirely when neither is present, to avoid a full read on plain copies.
+        let checksumAlgorithm =
+            S3Service.requestedChecksumAlgorithm(req) ?? sourceMeta.checksum?.algorithm
+        var destinationChecksum: ObjectChecksum?
+        if let checksumAlgorithm {
+            let value = try await S3Service.offloadBlockingIO(req) {
+                try ObjectFileHandler.flexibleChecksumOfFileRegion(
+                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize,
+                    algorithm: checksumAlgorithm)
+            }
+            destinationChecksum = value.map {
+                ObjectChecksum(algorithm: checksumAlgorithm, value: $0, type: .fullObject)
+            }
+        }
+
         let destinationMeta = ObjectMeta(
             bucketName: destinationBucket,
             key: destinationKey,
@@ -1478,11 +1504,13 @@ struct S3Controller: RouteCollection {
             etag: etag,
             metadata: userMetadata,
             updatedAt: Date(),
-            tags: tags
+            tags: tags,
+            checksum: destinationChecksum
         )
 
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/xml")
+        S3Service.addChecksumHeaders(destinationChecksum, to: &headers)
 
         // Write with versioning support - payload window-copied from the source file. Real
         // blocking file IO (open/read/write/fsync/rename), so it's offloaded rather than
@@ -1560,11 +1588,16 @@ struct S3Controller: RouteCollection {
         }
 
         // Build copy result response (S3 returns XML for copy operations)
+        var copyChecksumXML = ""
+        if let destinationChecksum {
+            let tag = "Checksum\(destinationChecksum.algorithm.uppercased())"
+            copyChecksumXML = "\n    <\(tag)>\(destinationChecksum.value)</\(tag)>"
+        }
         let copyResult = """
             <?xml version="1.0" encoding="UTF-8"?>
             <CopyObjectResult>
                 <LastModified>\(ISO8601DateFormatter().string(from: destinationMeta.updatedAt))</LastModified>
-                <ETag>"\(etag)"</ETag>
+                <ETag>"\(etag)"</ETag>\(copyChecksumXML)
             </CopyObjectResult>
             """
 
@@ -1595,6 +1628,13 @@ struct S3Controller: RouteCollection {
                 key: keyPath,
                 uploadId: uploadId
             )
+        }
+
+        // GetObjectAttributes - GET ?attributes, its own permission (strict auth, not in the
+        // public whitelist), returns object metadata (ETag/Checksum/ObjectParts/Size/StorageClass).
+        if S3Service.queryParameterNames(from: req.url.query ?? "").contains("attributes") {
+            return try await handleGetObjectAttributes(
+                req: req, bucketName: bucketName, key: keyPath)
         }
 
         // GetObjectTagging - a different permission than GetObject in S3, not covered by
@@ -1770,8 +1810,14 @@ struct S3Controller: RouteCollection {
         let bodyLength = byteRange?.length ?? payloadSize
 
         if bodyLength > Constants.streamingThreshold {
-            return S3Service.buildStreamingObjectResponse(
+            let response = S3Service.buildStreamingObjectResponse(
                 req: req, meta: meta, path: path, payloadOffset: payloadOffset, range: byteRange)
+            // Only on a whole-object GET: the stored checksum covers the whole object, so a client
+            // (e.g. aws s3 cp's parallel ranged download) must never validate it against one range.
+            if byteRange == nil {
+                S3Service.addChecksumHeadersIfRequested(req: req, meta: meta, to: response)
+            }
+            return response
         }
 
         // Small payloads: one buffered read is cheaper than a threadpool round trip. The
@@ -1787,8 +1833,14 @@ struct S3Controller: RouteCollection {
                 message: "We encountered an internal error. Please try again.",
                 requestId: req.id)
         }
-        return S3Service.buildVersionedObjectMetadataResponse(
+        let response = S3Service.buildVersionedObjectMetadataResponse(
             meta: freshMeta, includeBody: true, data: data, range: byteRange)
+        // Whole-object GET only (see the streaming branch above): a ranged response must not carry
+        // the whole-object checksum, or a ranged download will validate it against partial bytes.
+        if byteRange == nil {
+            S3Service.addChecksumHeadersIfRequested(req: req, meta: freshMeta, to: response)
+        }
+        return response
     }
 
     // DELETE /:bucketName/*key
@@ -2112,11 +2164,20 @@ struct S3Controller: RouteCollection {
             }
         }
 
+        // The checksum algorithm (if any) is pinned here for the whole upload - each part must use
+        // it, and CompleteMultipartUpload combines the parts into the object's checksum. The
+        // optional x-amz-checksum-type (FULL_OBJECT / COMPOSITE) is honored where the algorithm
+        // allows a choice.
+        let checksumAlgorithm = S3Service.requestedChecksumAlgorithm(req)
+        let checksumType = req.headers.first(name: "x-amz-checksum-type")?.uppercased()
+
         let uploadId = try MultipartFileHandler.createUpload(
             bucketName: bucketName,
             key: key,
             contentType: contentType,
-            metadata: metadata
+            metadata: metadata,
+            checksumAlgorithm: checksumAlgorithm,
+            checksumType: checksumType
         )
 
         let xml = """
@@ -2128,7 +2189,12 @@ struct S3Controller: RouteCollection {
             </InitiateMultipartUploadResult>
             """
 
-        return S3Service.buildXMLResponse(data: Data(xml.utf8))
+        let response = S3Service.buildXMLResponse(data: Data(xml.utf8))
+        if let checksumAlgorithm {
+            response.headers.replaceOrAdd(
+                name: "x-amz-checksum-algorithm", value: checksumAlgorithm.uppercased())
+        }
+        return response
     }
 
     /// CompleteMultipartUpload - POST /:bucket/:key?uploadId=X
@@ -2164,6 +2230,7 @@ struct S3Controller: RouteCollection {
         let etag: String
         let versionId: String?
         let finalSize: Int
+        var objectChecksum: ObjectChecksum?
         do {
             if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self],
                 case .local(let ecPeers) = try await ObjectRoutingService.erasureCodedRoutingDecision(
@@ -2199,6 +2266,7 @@ struct S3Controller: RouteCollection {
                 }
                 etag = plan.etag
                 finalSize = plan.totalSize
+                objectChecksum = plan.objectMeta.checksum
                 usedEC = true
             } else {
                 let result = try await S3Service.offloadBlockingIO(req) {
@@ -2212,6 +2280,7 @@ struct S3Controller: RouteCollection {
                 etag = result.etag
                 versionId = result.versionId
                 finalSize = result.size
+                objectChecksum = result.checksum
             }
         } catch let error as NSError {
             // Convert NSError to S3Error
@@ -2239,6 +2308,17 @@ struct S3Controller: RouteCollection {
         if let versionId = versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
         }
+        S3Service.addChecksumHeaders(objectChecksum, to: &headers)
+
+        // The COMPOSITE object checksum is also reported in the result body, as
+        // `<Checksum{ALGO}>value-N</Checksum{ALGO}>` plus `<ChecksumType>COMPOSITE</ChecksumType>`.
+        var checksumXML = ""
+        if let objectChecksum {
+            checksumXML = """
+                    <Checksum\(objectChecksum.algorithm.uppercased())>\(objectChecksum.value)</Checksum\(objectChecksum.algorithm.uppercased())>
+                    <ChecksumType>\(objectChecksum.type.rawValue)</ChecksumType>
+                """
+        }
 
         // Build XML response
         let location = "/\(bucketName)/\(key)"
@@ -2249,7 +2329,7 @@ struct S3Controller: RouteCollection {
                 <Bucket>\(bucketName.xmlEscaped)</Bucket>
                 <Key>\(key.xmlEscaped)</Key>
                 <ETag>"\(etag)"</ETag>
-            </CompleteMultipartUploadResult>
+            \(checksumXML)</CompleteMultipartUploadResult>
             """
 
         return Response(status: .ok, headers: headers, body: .init(string: xml))
@@ -2299,6 +2379,9 @@ struct S3Controller: RouteCollection {
         // spool file becomes the part file via rename - no copy at all. Real blocking file
         // IO either way, so it's offloaded to the blocking-IO thread pool.
         let storage = spooled.storage
+        // The part's per-part checksum (base64 raw digest) feeds the object's COMPOSITE checksum
+        // at CompleteMultipartUpload; store it alongside the part.
+        let partChecksum = spooled.checksum?.value
         let etag: String = try await S3Service.offloadBlockingIO(req) {
             switch storage {
             case .memory(let data):
@@ -2306,7 +2389,8 @@ struct S3Controller: RouteCollection {
                     bucketName: bucketName,
                     uploadId: uploadId,
                     partNumber: partNumber,
-                    data: data
+                    data: data,
+                    checksum: partChecksum
                 )
             case .file(let spoolPath):
                 return try MultipartFileHandler.writePartStreamed(
@@ -2315,13 +2399,16 @@ struct S3Controller: RouteCollection {
                     partNumber: partNumber,
                     spoolPath: spoolPath,
                     etag: spooled.md5Hex,
-                    size: spooled.size
+                    size: spooled.size,
+                    checksum: partChecksum
                 )
             }
         }
 
         var headers = HTTPHeaders()
         headers.add(name: "ETag", value: S3Service.quoteETag(etag))
+        // Echo the part checksum (no type header at part level, matching S3).
+        S3Service.addChecksumHeaders(spooled.checksum, to: &headers, includeType: false)
 
         return Response(status: .ok, headers: headers)
     }
@@ -2461,19 +2548,32 @@ struct S3Controller: RouteCollection {
             partNumberMarker: partNumberMarker
         )
 
+        // When the upload pinned a checksum algorithm, ListParts reports the algorithm and each
+        // part's stored checksum (as a `Checksum<ALGO>` element).
+        let checksumAlgorithm = MultipartFileHandler.uploadChecksumAlgorithm(
+            bucketName: bucketName, uploadId: uploadId)
+        let checksumTag = checksumAlgorithm.map { "Checksum\($0.uppercased())" }
+
         // Build XML response
         var partsXml = ""
         for part in parts {
+            var partChecksumXml = ""
+            if let checksumTag, let value = part.checksum {
+                partChecksumXml = "\n                <\(checksumTag)>\(value)</\(checksumTag)>"
+            }
             partsXml += """
                     <Part>
                         <PartNumber>\(part.partNumber)</PartNumber>
                         <LastModified>\(part.lastModified.iso8601String)</LastModified>
                         <ETag>"\(part.etag)"</ETag>
-                        <Size>\(part.size)</Size>
+                        <Size>\(part.size)</Size>\(partChecksumXml)
                     </Part>
                 """
         }
 
+        let algorithmXml =
+            checksumAlgorithm.map { "\n    <ChecksumAlgorithm>\($0.uppercased())</ChecksumAlgorithm>" }
+            ?? ""
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -2483,12 +2583,114 @@ struct S3Controller: RouteCollection {
                 <PartNumberMarker>\(partNumberMarker)</PartNumberMarker>
                 <NextPartNumberMarker>\(nextPartNumberMarker ?? 0)</NextPartNumberMarker>
                 <MaxParts>\(maxParts)</MaxParts>
-                <IsTruncated>\(isTruncated)</IsTruncated>
+                <IsTruncated>\(isTruncated)</IsTruncated>\(algorithmXml)
             \(partsXml)
             </ListPartsResult>
             """
 
         return S3Service.buildXMLResponse(data: Data(xml.utf8))
+    }
+
+    /// GetObjectAttributes - GET /:bucket/:key?attributes. Returns the subset of object attributes
+    /// named in the `x-amz-object-attributes` header. Resolves the object exactly like HeadObject.
+    @Sendable
+    private func handleGetObjectAttributes(
+        req: Request, bucketName: String, key: String
+    ) async throws -> Response {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+        let versionId = req.query[String.self, at: "versionId"]
+
+        let (isLocal, candidates, responsible) =
+            await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: bucketName, key: key)
+        if !isLocal {
+            return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
+        }
+        if !(await Self.hasLocalECShard(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            responsible: responsible)),
+            let forwarded = try await forwardIfNeeded(req: req, bucketName: bucketName, key: key)
+        {
+            return forwarded
+        }
+
+        let meta = try await Self.resolveObjectMetaEitherFormat(
+            req: req, bucketName: bucketName, key: key, versionId: versionId,
+            responsible: responsible)
+        if meta.isDeleteMarker && versionId == nil {
+            throw S3Error(
+                status: .notFound, code: "NoSuchKey",
+                message: "The specified key does not exist.", requestId: req.id)
+        }
+
+        let requested = Set(
+            (req.headers.first(name: "x-amz-object-attributes") ?? "")
+                .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+
+        var body = ""
+        if requested.contains("ETag") {
+            body += "\n    <ETag>\(meta.etag)</ETag>"
+        }
+        if requested.contains("Checksum"), let checksum = meta.checksum {
+            let tag = "Checksum\(checksum.algorithm.uppercased())"
+            body +=
+                "\n    <Checksum><\(tag)>\(checksum.value)</\(tag)>"
+                + "<ChecksumType>\(checksum.type.rawValue)</ChecksumType></Checksum>"
+        }
+        if requested.contains("ObjectParts") {
+            body += Self.objectPartsXML(meta: meta)
+        }
+        if requested.contains("StorageClass") {
+            body += "\n    <StorageClass>STANDARD</StorageClass>"
+        }
+        if requested.contains("ObjectSize") {
+            body += "\n    <ObjectSize>\(meta.size)</ObjectSize>"
+        }
+
+        let xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <GetObjectAttributesOutput xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\(body)
+            </GetObjectAttributesOutput>
+            """
+        var headers = HTTPHeaders()
+        headers.add(name: .contentType, value: "application/xml")
+        headers.add(name: "Last-Modified", value: meta.updatedAt.rfc1123String)
+        if let versionId = meta.versionId {
+            headers.add(name: "x-amz-version-id", value: versionId)
+        }
+        return Response(status: .ok, headers: headers, body: .init(string: xml))
+    }
+
+    /// The `<ObjectParts>` block for GetObjectAttributes: full per-part detail when we retained it
+    /// (checksummed multipart objects), otherwise just the count parsed from the multipart ETag.
+    private static func objectPartsXML(meta: ObjectMeta) -> String {
+        if let parts = meta.parts {
+            let algorithm = meta.checksum?.algorithm.uppercased()
+            var partsBody = ""
+            for part in parts {
+                var partChecksum = ""
+                if let algorithm, let value = part.checksum {
+                    partChecksum = "<Checksum\(algorithm)>\(value)</Checksum\(algorithm)>"
+                }
+                partsBody +=
+                    "\n        <Part><PartNumber>\(part.partNumber)</PartNumber>"
+                    + "<Size>\(part.size)</Size>\(partChecksum)</Part>"
+            }
+            return """
+
+                    <ObjectParts>
+                        <TotalPartsCount>\(parts.count)</TotalPartsCount>
+                        <PartNumberMarker>0</PartNumberMarker>
+                        <MaxParts>\(parts.count)</MaxParts>
+                        <IsTruncated>false</IsTruncated>\(partsBody)
+                    </ObjectParts>
+                """
+        }
+        // A multipart object without retained per-part detail: report the count from the ETag.
+        if meta.etag.contains("-"), let count = Int(meta.etag.split(separator: "-").last ?? "") {
+            return "\n    <ObjectParts><TotalPartsCount>\(count)</TotalPartsCount></ObjectParts>"
+        }
+        return ""
     }
 
     /// ListMultipartUploads - GET /:bucket?uploads

@@ -1988,6 +1988,151 @@ echo ""
 echo "=== Per-Version Tagging Tests Complete ==="
 echo ""
 
+# ── Trailing checksum (aws-chunked flexible-checksum) uploads ─────────────────
+# Modern AWS SDKs/CLIs send PutObject/UploadPart bodies as aws-chunked with a trailing
+# checksum (x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER). `--checksum-algorithm`
+# forces this framing regardless of the CLI's default, so these deterministically exercise the
+# server-side trailer decode + checksum validation.
+echo "=== Trailing Checksum Tests ==="
+
+CHK_BUCKET="checksum-trailer-bucket"
+aws_s3 s3 mb s3://$CHK_BUCKET
+
+CHK_BODY=$(mktemp)
+head -c 300000 /dev/urandom > "$CHK_BODY"
+CHK_MD5=$(md5 -q "$CHK_BODY" 2>/dev/null || md5sum "$CHK_BODY" | cut -d' ' -f1)
+
+# Two CRCs (IEEE + Castagnoli), one 64-bit CRC (the modern SDK default), one hash.
+for ALGO in CRC32 CRC32C CRC64NVME SHA256; do
+    echo "Testing put-object with a $ALGO trailing checksum..."
+    PUT_OUT=$(aws_s3 s3api put-object --bucket $CHK_BUCKET --key "chk-$ALGO.bin" \
+        --body "$CHK_BODY" --checksum-algorithm $ALGO --output json 2>&1)
+    if echo "$PUT_OUT" | jq -e '.ETag' >/dev/null 2>&1; then
+        pass "put-object with a $ALGO trailing checksum succeeded."
+    else
+        fail "put-object with a $ALGO trailing checksum failed."
+        echo "  Response: $PUT_OUT"
+    fi
+
+    CHK_DL=$(mktemp)
+    aws_s3 s3 cp s3://$CHK_BUCKET/chk-$ALGO.bin "$CHK_DL" >/dev/null 2>&1
+    CHK_DL_MD5=$(md5 -q "$CHK_DL" 2>/dev/null || md5sum "$CHK_DL" | cut -d' ' -f1)
+    if [ "$CHK_MD5" == "$CHK_DL_MD5" ]; then
+        pass "$ALGO trailing-checksum object round-trips byte-for-byte (framing stripped)."
+    else
+        fail "$ALGO trailing-checksum object is corrupted (MD5 mismatch)."
+        echo "  Original: $CHK_MD5, Downloaded: $CHK_DL_MD5"
+    fi
+    rm -f "$CHK_DL"
+done
+
+# The real-world regression: a plain `aws s3 cp` with a recent CLI defaults to a trailing
+# checksum (this is exactly what was failing with "Payload hash mismatch"). Whatever the CLI
+# defaults to - CRC32 or the newer CRC64NVME - it must upload and round-trip cleanly.
+echo "Testing default aws s3 cp upload (SDK-default trailing checksum)..."
+aws_s3 s3 cp "$CHK_BODY" s3://$CHK_BUCKET/default-cp.bin >/dev/null 2>&1
+DEFAULT_DL=$(mktemp)
+aws_s3 s3 cp s3://$CHK_BUCKET/default-cp.bin "$DEFAULT_DL" >/dev/null 2>&1
+DEFAULT_DL_MD5=$(md5 -q "$DEFAULT_DL" 2>/dev/null || md5sum "$DEFAULT_DL" | cut -d' ' -f1)
+if [ "$CHK_MD5" == "$DEFAULT_DL_MD5" ]; then
+    pass "Default aws s3 cp upload round-trips (SDK-default trailing checksum accepted)."
+else
+    fail "Default aws s3 cp upload did not round-trip."
+    echo "  Original: $CHK_MD5, Downloaded: $DEFAULT_DL_MD5"
+fi
+rm -f "$DEFAULT_DL"
+
+# A large single-part PUT (put-object never multiparts, up to 5 GB) with a trailing checksum.
+echo "Testing a large single-part PUT with a CRC32 trailing checksum..."
+CHK_LARGE=$(mktemp)
+dd if=/dev/urandom of="$CHK_LARGE" bs=1M count=12 2>/dev/null
+CHK_LARGE_MD5=$(md5 -q "$CHK_LARGE" 2>/dev/null || md5sum "$CHK_LARGE" | cut -d' ' -f1)
+aws_s3 s3api put-object --bucket $CHK_BUCKET --key large-chk.bin --body "$CHK_LARGE" \
+    --checksum-algorithm CRC32 >/dev/null 2>&1
+CHK_LARGE_DL=$(mktemp)
+aws_s3 s3 cp s3://$CHK_BUCKET/large-chk.bin "$CHK_LARGE_DL" >/dev/null 2>&1
+CHK_LARGE_DL_MD5=$(md5 -q "$CHK_LARGE_DL" 2>/dev/null || md5sum "$CHK_LARGE_DL" | cut -d' ' -f1)
+if [ "$CHK_LARGE_MD5" == "$CHK_LARGE_DL_MD5" ]; then
+    pass "Large CRC32 trailing-checksum upload round-trips byte-for-byte."
+else
+    fail "Large CRC32 trailing-checksum upload is corrupted (MD5 mismatch)."
+fi
+
+# The stored single-object checksum is a FULL_OBJECT checksum, returned only on demand.
+echo "Testing stored single-object checksum retrieval (checksum-mode ENABLED)..."
+SINGLE_HEAD=$(aws_s3 s3api head-object --bucket $CHK_BUCKET --key large-chk.bin \
+    --checksum-mode ENABLED 2>&1)
+SINGLE_CRC=$(echo "$SINGLE_HEAD" | jq -r '.ChecksumCRC32 // empty')
+SINGLE_TYPE=$(echo "$SINGLE_HEAD" | jq -r '.ChecksumType // empty')
+if [ -n "$SINGLE_CRC" ] && [ "$SINGLE_TYPE" == "FULL_OBJECT" ]; then
+    pass "Single-object CRC32 is stored and returned as FULL_OBJECT."
+else
+    fail "Single-object checksum not returned as expected (crc=$SINGLE_CRC type=$SINGLE_TYPE)."
+fi
+# Without checksum-mode, no checksum headers come back.
+PLAIN_HEAD=$(aws_s3 s3api head-object --bucket $CHK_BUCKET --key large-chk.bin 2>&1)
+if [ -z "$(echo "$PLAIN_HEAD" | jq -r '.ChecksumCRC32 // empty')" ]; then
+    pass "HeadObject omits the checksum unless checksum-mode is ENABLED."
+else
+    fail "HeadObject returned a checksum without checksum-mode ENABLED."
+fi
+
+# GetObjectAttributes returns the stored checksum and size.
+echo "Testing GetObjectAttributes..."
+ATTRS=$(aws_s3 s3api get-object-attributes --bucket $CHK_BUCKET --key large-chk.bin \
+    --object-attributes ETag Checksum ObjectSize 2>&1)
+ATTR_CRC=$(echo "$ATTRS" | jq -r '.Checksum.ChecksumCRC32 // empty')
+ATTR_SIZE=$(echo "$ATTRS" | jq -r '.ObjectSize // empty')
+if [ -n "$ATTR_CRC" ] && [ "$ATTR_SIZE" -gt 0 ]; then
+    pass "GetObjectAttributes returns the checksum and object size."
+else
+    fail "GetObjectAttributes did not return the expected attributes."
+    echo "  Response: $ATTRS"
+fi
+
+# A real multipart upload with a pinned SHA256 algorithm yields a COMPOSITE object checksum
+# (the checksum-of-part-checksums, with a -N part-count suffix).
+echo "Testing multipart upload with a COMPOSITE SHA256 checksum..."
+MP_KEY="mp-composite.bin"
+MP_P1=$(mktemp); MP_P2=$(mktemp)
+dd if=/dev/urandom of="$MP_P1" bs=1M count=6 2>/dev/null
+dd if=/dev/urandom of="$MP_P2" bs=1M count=6 2>/dev/null
+MP_UID=$(aws_s3 s3api create-multipart-upload --bucket $CHK_BUCKET --key $MP_KEY \
+    --checksum-algorithm SHA256 | jq -r '.UploadId')
+MP_PART1=$(aws_s3 s3api upload-part --bucket $CHK_BUCKET --key $MP_KEY --part-number 1 \
+    --upload-id "$MP_UID" --body "$MP_P1" --checksum-algorithm SHA256)
+MP_PART2=$(aws_s3 s3api upload-part --bucket $CHK_BUCKET --key $MP_KEY --part-number 2 \
+    --upload-id "$MP_UID" --body "$MP_P2" --checksum-algorithm SHA256)
+MP_E1=$(echo "$MP_PART1" | jq -r '.ETag'); MP_C1=$(echo "$MP_PART1" | jq -r '.ChecksumSHA256')
+MP_E2=$(echo "$MP_PART2" | jq -r '.ETag'); MP_C2=$(echo "$MP_PART2" | jq -r '.ChecksumSHA256')
+if [ -n "$MP_C1" ] && [ "$MP_C1" != "null" ]; then
+    pass "UploadPart echoed a per-part SHA256 checksum."
+else
+    fail "UploadPart did not return a per-part checksum."
+fi
+MP_COMPLETE=$(aws_s3 s3api complete-multipart-upload --bucket $CHK_BUCKET --key $MP_KEY \
+    --upload-id "$MP_UID" \
+    --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$MP_E1,\"ChecksumSHA256\":\"$MP_C1\"},{\"PartNumber\":2,\"ETag\":$MP_E2,\"ChecksumSHA256\":\"$MP_C2\"}]}")
+MP_COMPOSITE=$(echo "$MP_COMPLETE" | jq -r '.ChecksumSHA256 // empty')
+MP_TYPE=$(echo "$MP_COMPLETE" | jq -r '.ChecksumType // empty')
+if [[ "$MP_COMPOSITE" == *"-2" ]] && [ "$MP_TYPE" == "COMPOSITE" ]; then
+    pass "CompleteMultipartUpload returned a COMPOSITE SHA256 checksum with a -2 suffix."
+else
+    fail "Composite checksum not as expected (checksum=$MP_COMPOSITE type=$MP_TYPE)."
+fi
+MP_HEAD=$(aws_s3 s3api head-object --bucket $CHK_BUCKET --key $MP_KEY --checksum-mode ENABLED 2>&1)
+if [ "$(echo "$MP_HEAD" | jq -r '.ChecksumSHA256 // empty')" == "$MP_COMPOSITE" ]; then
+    pass "HeadObject returns the stored COMPOSITE checksum."
+else
+    fail "HeadObject composite checksum mismatch."
+fi
+
+rm -f "$CHK_BODY" "$CHK_LARGE" "$CHK_LARGE_DL" "$MP_P1" "$MP_P2"
+
+echo ""
+echo "=== Trailing Checksum Tests Complete ==="
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "=== Results: $PASS_COUNT passed, $FAIL_COUNT failed ==="
 [ "$FAIL_COUNT" -eq 0 ] && exit 0 || exit 1

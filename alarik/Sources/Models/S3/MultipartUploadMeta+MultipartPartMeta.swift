@@ -24,6 +24,13 @@ struct MultipartUploadMeta: Codable {
     let contentType: String
     let metadata: [String: String]
     let initiated: Date
+    /// The flexible-checksum algorithm pinned at CreateMultipartUpload (lowercase suffix, e.g.
+    /// `sha256`), used to combine the parts into the object's checksum. Optional - uploads created
+    /// without a checksum algorithm, or before this field existed, decode as nil.
+    var checksumAlgorithm: String? = nil
+    /// The checksum type the client requested (`FULL_OBJECT` / `COMPOSITE`), if any. The effective
+    /// type is still constrained by the algorithm at completion (see `multipartChecksumType`).
+    var checksumType: String? = nil
 }
 
 /// Metadata stored for each uploaded part
@@ -32,4 +39,7 @@ struct MultipartPartMeta: Codable {
     let etag: String
     let size: Int
     let lastModified: Date
+    /// This part's base64 checksum in the upload's pinned algorithm (the raw digest, base64), or
+    /// nil when the part was uploaded without one. Feeds the COMPOSITE object checksum at complete.
+    var checksum: String? = nil
 }

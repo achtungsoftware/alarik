@@ -36,6 +36,16 @@ struct ObjectMeta: Codable {
     /// decoding correctly from their on-disk `.obj` files.
     var tags: [String: String]?
 
+    /// The flexible checksum stored with this object (algorithm + base64 value + type), or nil for
+    /// objects uploaded without one. Optional for the same backward-compat reason as `tags` -
+    /// objects written before this field existed must keep decoding from their on-disk `.obj`.
+    var checksum: ObjectChecksum?
+
+    /// Per-part detail for a multipart object, retained so GetObjectAttributes can report each
+    /// part's size and checksum. Only populated for checksummed multipart uploads (keeps plain
+    /// multipart metadata lean); nil for single-part objects.
+    var parts: [ObjectPart]?
+
     init(
         bucketName: String,
         key: String,
@@ -47,7 +57,9 @@ struct ObjectMeta: Codable {
         versionId: String? = nil,
         isLatest: Bool = true,
         isDeleteMarker: Bool = false,
-        tags: [String: String]? = nil
+        tags: [String: String]? = nil,
+        checksum: ObjectChecksum? = nil,
+        parts: [ObjectPart]? = nil
     ) {
         self.bucketName = bucketName
         self.key = key
@@ -60,12 +72,22 @@ struct ObjectMeta: Codable {
         self.isLatest = isLatest
         self.isDeleteMarker = isDeleteMarker
         self.tags = tags
+        self.checksum = checksum
+        self.parts = parts
     }
 
     /// Generates a new version ID (UUID without dashes)
     static func generateVersionId() -> String {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
+}
+
+/// One part of a completed multipart object, retained for GetObjectAttributes' ObjectParts.
+struct ObjectPart: Codable, Equatable {
+    var partNumber: Int
+    var size: Int
+    /// This part's base64 checksum in the object's algorithm, or nil if the part had none.
+    var checksum: String?
 }
 
 struct ListBucketResult: Encodable {

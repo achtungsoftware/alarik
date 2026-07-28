@@ -182,6 +182,41 @@ struct S3Service {
         return response
     }
 
+    /// The flexible-checksum algorithm a CreateMultipartUpload pins for the whole upload: the
+    /// lowercase S3 suffix (`crc32`/`crc32c`/`crc64nvme`/`sha1`/`sha256`), or nil when none is named
+    /// or it's one we don't implement (e.g. `md5`). Accepts either the REST header or the SDK hint.
+    static func requestedChecksumAlgorithm(_ req: Request) -> String? {
+        guard
+            let raw = req.headers.first(name: "x-amz-checksum-algorithm")
+                ?? req.headers.first(name: "x-amz-sdk-checksum-algorithm")
+        else { return nil }
+        let algorithm = raw.lowercased()
+        return TrailerChecksum(trailerHeaderName: "x-amz-checksum-\(algorithm)") != nil
+            ? algorithm : nil
+    }
+
+    /// Adds the `x-amz-checksum-<algo>` (and `x-amz-checksum-type`) headers a PutObject /
+    /// UploadPart / CompleteMultipartUpload response echoes back after storing a checksum.
+    static func addChecksumHeaders(
+        _ checksum: ObjectChecksum?, to headers: inout HTTPHeaders, includeType: Bool = true
+    ) {
+        guard let checksum else { return }
+        headers.replaceOrAdd(name: checksum.headerName, value: checksum.value)
+        if includeType {
+            headers.replaceOrAdd(name: "x-amz-checksum-type", value: checksum.type.rawValue)
+        }
+    }
+
+    /// Adds the stored checksum to a GET/HEAD response, but only when the client asked for it with
+    /// `x-amz-checksum-mode: ENABLED` (S3 omits checksum headers otherwise).
+    static func addChecksumHeadersIfRequested(req: Request, meta: ObjectMeta, to response: Response) {
+        guard req.headers.first(name: "x-amz-checksum-mode")?.uppercased() == "ENABLED",
+            let checksum = meta.checksum
+        else { return }
+        response.headers.replaceOrAdd(name: checksum.headerName, value: checksum.value)
+        response.headers.replaceOrAdd(name: "x-amz-checksum-type", value: checksum.type.rawValue)
+    }
+
     static func buildObjectMetadataResponse(
         meta: ObjectMeta,
         status: HTTPStatus = .ok,

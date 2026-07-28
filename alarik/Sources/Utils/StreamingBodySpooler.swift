@@ -35,6 +35,9 @@ struct SpooledBody {
     let md5Hex: String
     let md5Base64: String
     let sha256Hex: String
+    /// The flexible checksum the client supplied and this spool validated (via the aws-chunked
+    /// trailer or an `x-amz-checksum-*` header), for storing with the object. nil when none given.
+    let checksum: ObjectChecksum?
 
     /// Removes the spool file, if any. Call from every exit path once the payload has been
     /// consumed (or the request failed) - the spool is a transient, never the stored object
@@ -54,8 +57,20 @@ struct SpooledBody {
 /// - the configured max body size is enforced as bytes arrive, not after
 enum StreamingBodySpooler {
 
-    private static let streamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-    private static let unsignedPayloadHash = "UNSIGNED-PAYLOAD"
+    /// Builds the checksum computer for whatever algorithm the request's `x-amz-trailer` header
+    /// declares, or nil when none is declared or it names an algorithm we don't implement (those
+    /// bodies are still decoded and stored - just not checksum-verified, see `TrailerChecksum`).
+    private static func trailerChecksum(from req: Request) -> TrailerChecksum? {
+        guard let trailer = req.headers.first(name: "x-amz-trailer") else { return nil }
+        for name in trailer.split(separator: ",") {
+            if let checksum = TrailerChecksum(
+                trailerHeaderName: name.trimmingCharacters(in: .whitespaces))
+            {
+                return checksum
+            }
+        }
+        return nil
+    }
 
     /// Wraps a streaming-body route handler so that if `operation` throws before ever touching
     /// `req.body` (an early auth/admission rejection), the body still gets drained instead of
@@ -98,7 +113,7 @@ enum StreamingBodySpooler {
     static func needsWholeBodyHashVerification(
         isChunked: Bool, isQueryAuth: Bool, declaredSha: String?
     ) -> Bool {
-        !isChunked && !isQueryAuth && declaredSha != nil && declaredSha != unsignedPayloadHash
+        !isChunked && !isQueryAuth && declaredSha != nil && declaredSha != S3PayloadHash.unsigned
     }
 
     /// Deletes leftover spool files from a previous unclean shutdown. Safe to call at boot:
@@ -119,18 +134,25 @@ enum StreamingBodySpooler {
     /// encoding.
     static func spool(req: Request, authInfo: S3AuthInfo?) async throws -> SpooledBody {
         let declaredSha = req.headers.first(name: "x-amz-content-sha256")
-        let isChunked = declaredSha == streamingPayloadHash
+        let isChunked = S3PayloadHash.isStreaming(declaredSha)
 
         var decoder: StreamingChunkDecoder? = nil
-        if isChunked {
-            guard let authInfo else {
-                throw S3Error(
-                    status: .forbidden, code: "AccessDenied", message: "Access Denied",
-                    requestId: req.id)
+        if let declaredSha, isChunked {
+            var signatureValidator: ChunkSignatureValidator? = nil
+            if S3PayloadHash.hasChunkSignatures(declaredSha) {
+                guard let authInfo else {
+                    throw S3Error(
+                        status: .forbidden, code: "AccessDenied", message: "Access Denied",
+                        requestId: req.id)
+                }
+                signatureValidator = try await SigV4Validator.chunkSignatureValidator(
+                    for: authInfo)
             }
+            let expectsTrailer = S3PayloadHash.hasTrailer(declaredSha)
             decoder = StreamingChunkDecoder(
-                signatureValidator: try await SigV4Validator.chunkSignatureValidator(
-                    for: authInfo))
+                signatureValidator: signatureValidator,
+                expectsTrailer: expectsTrailer,
+                trailerChecksum: expectsTrailer ? Self.trailerChecksum(from: req) : nil)
         }
 
         var sink = SpoolSink(requestId: req.id, threadPool: req.application.threadPool)
@@ -146,6 +168,20 @@ enum StreamingBodySpooler {
         let needsWholeBodySha256 = needsWholeBodyHashVerification(
             isChunked: isChunked, isQueryAuth: isQueryAuth, declaredSha: declaredSha)
 
+        // Precalculated-checksum form: instead of a trailer, a client can send the value directly
+        // as an `x-amz-checksum-<algo>` header (typical for non-chunked PUTs). Compute it over the
+        // payload and validate below, exactly like the trailer path. A pure trailer request has no
+        // such value header (only `x-amz-trailer`), so this never double-counts.
+        var headerChecksum: TrailerChecksum? = nil
+        var headerChecksumExpected: String? = nil
+        for (name, value) in req.headers {
+            if let computer = TrailerChecksum(trailerHeaderName: name) {
+                headerChecksum = computer
+                headerChecksumExpected = value.trimmingCharacters(in: .whitespaces)
+                break
+            }
+        }
+
         var md5 = Insecure.MD5()
         var sha256 = needsWholeBodySha256 ? Crypto.SHA256() : nil
         var size = 0
@@ -154,6 +190,7 @@ enum StreamingBodySpooler {
         func consume(_ payload: ByteBufferView) async throws {
             md5.update(data: payload)
             sha256?.update(data: payload)
+            headerChecksum?.update(payload)
             size += payload.count
             guard size <= maxBodySize else {
                 throw S3Error(
@@ -209,6 +246,22 @@ enum StreamingBodySpooler {
             }
         }
 
+        // The stored object checksum: the trailer (validated in the decoder) takes precedence;
+        // otherwise the precalculated header form is validated here now the bytes have arrived.
+        var checksum = decoder?.validatedChecksum
+        if checksum == nil, let headerChecksum, let expected = headerChecksumExpected {
+            let computed = headerChecksum.finalizeBase64()
+            guard computed == expected else {
+                throw S3Error(
+                    status: .badRequest, code: "BadDigest",
+                    message:
+                        "The \(headerChecksum.headerName) you specified did not match the "
+                        + "calculated checksum.", requestId: req.id)
+            }
+            let algorithm = String(headerChecksum.headerName.dropFirst("x-amz-checksum-".count))
+            checksum = ObjectChecksum(algorithm: algorithm, value: expected, type: .fullObject)
+        }
+
         let md5Digest = md5.finalize()
         let storage = await sink.finish()
         return SpooledBody(
@@ -216,7 +269,8 @@ enum StreamingBodySpooler {
             size: size,
             md5Hex: md5Digest.hexString(),
             md5Base64: Data(md5Digest).base64EncodedString(),
-            sha256Hex: sha256Hex
+            sha256Hex: sha256Hex,
+            checksum: checksum
         )
     }
 }
@@ -331,33 +385,64 @@ private struct SpoolSink {
 }
 
 /// Incremental aws-chunked decoder: feeds arriving `ByteBuffer`s through a small state
-/// machine, emitting only decoded payload bytes and verifying each chunk's SigV4 signature
-/// as soon as that chunk's payload has fully passed through.
+/// machine, emitting only decoded payload bytes.
 ///
-/// Wire format per chunk: `<hex-size>;chunk-signature=<sig>\r\n<payload>\r\n`, terminated by
-/// a zero-size chunk (whose signature is also verified). Trailers after the final chunk are
-/// ignored.
+/// Handles the three SigV4 streaming forms (see `S3PayloadHash`):
+/// - signed chunks (`<hex>;chunk-signature=<sig>\r\n<payload>\r\n`), each verified against the
+///   SigV4 chunk-signature chain as its payload passes through;
+/// - unsigned chunks (`<hex>\r\n<payload>\r\n`), which carry no signature - integrity rests on
+///   TLS plus the optional checksum trailer;
+/// - a trailer after the terminating zero chunk (`x-amz-checksum-<algo>:<base64>\r\n\r\n`),
+///   whose checksum is recomputed over the decoded payload and compared, for algorithms we
+///   implement (`TrailerChecksum`).
+///
+/// The terminating zero chunk's own (empty-payload) signature is verified in the signed forms.
+/// The trailer's own `x-amz-trailer-signature` is not verified: in the signed forms every payload
+/// byte is already authenticated by the chunk-signature chain, so the trailer signature adds no
+/// payload-integrity guarantee; in the unsigned form there is no chain to anchor it to.
 final class StreamingChunkDecoder {
     private enum State {
         case sizeLine
         case payload(remaining: Int)
         case trailingCRLF(remaining: Int)
+        case trailer
         case done
     }
 
     private var state: State = .sizeLine
     private var lineBuffer: [UInt8] = []
-    private var signatureValidator: ChunkSignatureValidator
+    /// nil for the unsigned streaming form, where chunks carry no `chunk-signature`.
+    private var signatureValidator: ChunkSignatureValidator?
+    private let expectsTrailer: Bool
+    /// Accumulates over the whole decoded payload (spans all chunks), to check the checksum
+    /// trailer. nil when the request declared no trailer checksum we can compute.
+    private var trailerChecksum: TrailerChecksum?
+    private var trailerChecksumVerified = false
+    private var trailerBytesConsumed = 0
+    /// The checksum the trailer declared and this decoder validated, for storing with the object.
+    private(set) var validatedChecksum: ObjectChecksum?
     private var chunkHasher = Crypto.SHA256()
     private var pendingSignature = ""
     private(set) var decodedLength = 0
 
     private static let maxSizeLineLength = 4096
+    private static let maxTrailerBytes = 8192
     private static let emptyPayloadHash =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-    init(signatureValidator: ChunkSignatureValidator) {
+    /// - Parameters:
+    ///   - signatureValidator: verifies each chunk signature; nil for the unsigned streaming form.
+    ///   - expectsTrailer: whether trailer headers follow the terminating zero chunk.
+    ///   - trailerChecksum: recomputes the declared trailer checksum over the payload; nil when
+    ///     none was declared or its algorithm is one we don't implement (then accepted unverified).
+    init(
+        signatureValidator: ChunkSignatureValidator?,
+        expectsTrailer: Bool = false,
+        trailerChecksum: TrailerChecksum? = nil
+    ) {
         self.signatureValidator = signatureValidator
+        self.expectsTrailer = expectsTrailer
+        self.trailerChecksum = trailerChecksum
     }
 
     /// Feeds one arriving buffer through the state machine. `emit` receives each decoded
@@ -369,8 +454,7 @@ final class StreamingChunkDecoder {
         while pos < view.endIndex {
             switch state {
             case .done:
-                // Trailer bytes after the zero chunk - ignored (parity with the buffered
-                // decoder, which stops at the final chunk)
+                // Bytes after the trailer's terminating blank line - nothing more to consume.
                 return
 
             case .sizeLine:
@@ -398,7 +482,10 @@ final class StreamingChunkDecoder {
                 let take = Swift.min(remaining, available)
                 let end = view.index(pos, offsetBy: take)
                 let slice = view[pos..<end]
-                chunkHasher.update(data: slice)
+                if signatureValidator != nil {
+                    chunkHasher.update(data: slice)
+                }
+                trailerChecksum?.update(slice)
                 try await emit(slice)
                 pos = end
                 if take == remaining {
@@ -420,13 +507,49 @@ final class StreamingChunkDecoder {
                     remaining -= 1
                 }
                 state = remaining == 0 ? .sizeLine : .trailingCRLF(remaining: remaining)
+
+            case .trailer:
+                var completedLine = false
+                while pos < view.endIndex {
+                    let byte = view[pos]
+                    pos = view.index(after: pos)
+                    // Bound the whole trailer section, not just one line: trailer bytes aren't
+                    // emitted as payload, so they bypass the body-size limit in the spool loop.
+                    trailerBytesConsumed += 1
+                    guard trailerBytesConsumed <= Self.maxTrailerBytes else {
+                        throw S3Error(
+                            status: .badRequest, code: "InvalidArgument",
+                            message: "Trailer too large")
+                    }
+                    if byte == 10 {
+                        completedLine = true
+                        break
+                    }
+                    lineBuffer.append(byte)
+                }
+                if completedLine {
+                    let done = try consumeTrailerLine()
+                    if done {
+                        try finalizeTrailer()
+                        state = .done
+                    }
+                }
             }
         }
     }
 
     /// Must be called after the last buffer: verifies the terminating zero chunk arrived and
-    /// the decoded byte count matches the signed x-amz-decoded-content-length.
+    /// the decoded byte count matches the signed x-amz-decoded-content-length. Tolerates a
+    /// trailer whose closing blank line never arrived, as long as the declared checksum did.
     func verifyComplete(declaredDecodedLength: Int?) throws {
+        if case .trailer = state {
+            // A last trailer line with no closing blank line: parse the residue, then finalize.
+            if !lineBuffer.isEmpty {
+                _ = try consumeTrailerLine()
+            }
+            try finalizeTrailer()
+            state = .done
+        }
         guard case .done = state else {
             throw S3Error(
                 status: .badRequest, code: "IncompleteBody",
@@ -449,7 +572,7 @@ final class StreamingChunkDecoder {
             lineBuffer.removeLast()
         }
         // Chunks after the first are preceded by a CRLF handled in .trailingCRLF, so the line
-        // here is always exactly `<hex>;chunk-signature=<sig>`
+        // here is exactly `<hex>` (unsigned) or `<hex>;chunk-signature=<sig>` (signed).
         guard let line = String(bytes: lineBuffer, encoding: .utf8) else {
             throw S3Error(
                 status: .badRequest, code: "InvalidArgument", message: "Invalid chunk size line")
@@ -457,33 +580,84 @@ final class StreamingChunkDecoder {
         lineBuffer.removeAll(keepingCapacity: true)
 
         let parts = line.components(separatedBy: ";")
-        guard parts.count == 2, parts[1].hasPrefix("chunk-signature=") else {
-            throw S3Error(
-                status: .badRequest, code: "InvalidArgument", message: "Missing chunk-signature")
-        }
         guard let chunkSize = Int(parts[0], radix: 16), chunkSize >= 0 else {
             throw S3Error(
                 status: .badRequest, code: "InvalidArgument", message: "Invalid chunk size hex")
         }
-        pendingSignature = String(parts[1].dropFirst("chunk-signature=".count))
+        if signatureValidator != nil {
+            guard parts.count == 2, parts[1].hasPrefix("chunk-signature=") else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidArgument",
+                    message: "Missing chunk-signature")
+            }
+            pendingSignature = String(parts[1].dropFirst("chunk-signature=".count))
+        }
 
         if chunkSize == 0 {
-            // Final chunk: empty payload, signature still part of the chain
-            try signatureValidator.verify(
-                chunkPayloadHashHex: Self.emptyPayloadHash,
-                declaredSignature: pendingSignature)
-            state = .done
+            // Final chunk: empty payload, signature still part of the chain in the signed forms.
+            try signatureValidator?.verify(
+                chunkPayloadHashHex: Self.emptyPayloadHash, declaredSignature: pendingSignature)
+            state = expectsTrailer ? .trailer : .done
         } else {
             decodedLength += chunkSize
-            chunkHasher = Crypto.SHA256()
+            if signatureValidator != nil {
+                chunkHasher = Crypto.SHA256()
+            }
             state = .payload(remaining: chunkSize)
         }
     }
 
     private func finishChunk() throws {
-        let chunkHash = chunkHasher.finalize().hexString()
-        try signatureValidator.verify(
-            chunkPayloadHashHex: chunkHash, declaredSignature: pendingSignature)
+        if signatureValidator != nil {
+            let chunkHash = chunkHasher.finalize().hexString()
+            try signatureValidator?.verify(
+                chunkPayloadHashHex: chunkHash, declaredSignature: pendingSignature)
+        }
         state = .trailingCRLF(remaining: 2)
+    }
+
+    /// Parses one accumulated trailer line. Returns true when it was the terminating blank line.
+    /// Validates the declared checksum trailer against the payload as soon as it arrives.
+    private func consumeTrailerLine() throws -> Bool {
+        if lineBuffer.last == 13 {
+            lineBuffer.removeLast()
+        }
+        guard let line = String(bytes: lineBuffer, encoding: .utf8) else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument", message: "Invalid trailer")
+        }
+        lineBuffer.removeAll(keepingCapacity: true)
+
+        if line.isEmpty { return true }
+
+        guard let colon = line.firstIndex(of: ":") else {
+            // A trailer line without a colon (e.g. stray whitespace) - ignore it.
+            return false
+        }
+        let name = line[..<colon].lowercased()
+        let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+
+        if let trailerChecksum, name == trailerChecksum.headerName {
+            let computed = trailerChecksum.finalizeBase64()
+            guard computed == value else {
+                throw S3Error(
+                    status: .badRequest, code: "BadDigest",
+                    message: "The \(name) you specified did not match the calculated checksum.")
+            }
+            trailerChecksumVerified = true
+            let algorithm = String(name.dropFirst("x-amz-checksum-".count))
+            validatedChecksum = ObjectChecksum(
+                algorithm: algorithm, value: value, type: .fullObject)
+        }
+        return false
+    }
+
+    /// After the trailer: a declared, computable checksum must actually have been checked.
+    private func finalizeTrailer() throws {
+        if trailerChecksum != nil && !trailerChecksumVerified {
+            throw S3Error(
+                status: .badRequest, code: "InvalidRequest",
+                message: "The declared checksum trailer was not sent with the request.")
+        }
     }
 }

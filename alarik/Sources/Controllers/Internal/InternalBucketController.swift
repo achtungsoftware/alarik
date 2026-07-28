@@ -744,7 +744,13 @@ struct InternalBucketController: RouteCollection {
                         req: req, bucketName: bucketName, prefix: sanitizedPrefix, delimiter: nil,
                         keyMarker: keyMarker, versionIdMarker: versionIdMarker, maxKeys: 1000)
                 for object in versions + deleteMarkers {
-                    let targetVersionId = object.versionId ?? "null"
+                    // Delete by the object's own versionId, exactly as the proven single-object
+                    // console delete does: nil for a truly non-versioned object (a plain-path
+                    // delete), the literal "null" for a suspended null version, or a real id for a
+                    // stored version. Coercing nil -> "null" here broke the cluster replica-delete
+                    // fan-out (a non-versioned object's replicas survived), while the single-object
+                    // path - which passes nil - worked; matching it fixes that.
+                    let targetVersionId = object.versionId
                     // A per-key delete can fail (a responsible peer being unreachable) - unlike
                     // the local-disk-only deletePrefix this replaced, whose only failure mode was
                     // a local IO error. Rather than silently reporting the whole folder deleted
@@ -756,7 +762,7 @@ struct InternalBucketController: RouteCollection {
                     } catch {
                         failedKeys += 1
                         req.logger.warning(
-                            "Folder delete: failed to delete '\(object.key)' (version \(targetVersionId)) under '\(sanitizedPrefix)': \(error)"
+                            "Folder delete: failed to delete '\(object.key)' (version \(targetVersionId ?? "null")) under '\(sanitizedPrefix)': \(error)"
                         )
                         continue
                     }

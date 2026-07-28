@@ -185,4 +185,154 @@ struct StreamingChunkDecoderTests {
             _ = try await decode(wire, pieceSize: 4096)
         }
     }
+
+    // MARK: - Unsigned + trailer forms (STREAMING-UNSIGNED-PAYLOAD-TRAILER etc.)
+
+    /// Builds an unsigned aws-chunked body: chunk size lines carry no `chunk-signature`, and an
+    /// optional trailer header follows the terminating zero chunk.
+    private func makeUnsignedWireBody(
+        chunks: [Data], trailer: (name: String, value: String)? = nil
+    ) -> (wire: Data, payload: Data) {
+        var wire = Data()
+        var payload = Data()
+        for chunk in chunks {
+            wire.append(Data("\(String(chunk.count, radix: 16))\r\n".utf8))
+            wire.append(chunk)
+            wire.append(Data("\r\n".utf8))
+            payload.append(chunk)
+        }
+        wire.append(Data("0\r\n".utf8))
+        if let trailer {
+            wire.append(Data("\(trailer.name):\(trailer.value)\r\n".utf8))
+        }
+        wire.append(Data("\r\n".utf8))
+        return (wire, payload)
+    }
+
+    /// Signed chunks (verified chain) plus a trailer + a (deliberately bogus, since we don't
+    /// verify it) trailer signature - the STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER form.
+    private func makeSignedTrailerWireBody(
+        chunks: [Data], trailer: (name: String, value: String)?
+    ) -> (wire: Data, payload: Data) {
+        var wire = Data()
+        var payload = Data()
+        var previous = seedSignature
+        for chunk in chunks {
+            let signature = chunkSignature(previous: previous, payload: chunk)
+            wire.append(
+                Data("\(String(chunk.count, radix: 16));chunk-signature=\(signature)\r\n".utf8))
+            wire.append(chunk)
+            wire.append(Data("\r\n".utf8))
+            payload.append(chunk)
+            previous = signature
+        }
+        let finalSignature = chunkSignature(previous: previous, payload: Data())
+        wire.append(Data("0;chunk-signature=\(finalSignature)\r\n".utf8))
+        if let trailer {
+            wire.append(Data("\(trailer.name):\(trailer.value)\r\n".utf8))
+        }
+        wire.append(Data("x-amz-trailer-signature:\(String(repeating: "0", count: 64))\r\n".utf8))
+        wire.append(Data("\r\n".utf8))
+        return (wire, payload)
+    }
+
+    private func crc32Base64(_ data: Data) -> String {
+        var checksum = TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32")!
+        checksum.update(ByteBuffer(data: data).readableBytesView)
+        return checksum.finalizeBase64()
+    }
+
+    /// Feeds `wire` to `decoder` in `pieceSize`-byte buffers, returning the decoded payload.
+    private func run(_ wire: Data, pieceSize: Int, decoder: StreamingChunkDecoder) async throws
+        -> Data
+    {
+        var decoded = Data()
+        var offset = 0
+        while offset < wire.count {
+            let end = Swift.min(offset + pieceSize, wire.count)
+            try await decoder.feed(ByteBuffer(data: wire.subdata(in: offset..<end))) {
+                decoded.append(contentsOf: $0)
+            }
+            offset = end
+        }
+        return decoded
+    }
+
+    @Test("unsigned trailer stream decodes and validates the CRC32 trailer at any split")
+    func unsignedTrailerValid() async throws {
+        let chunkA = Data((0..<5000).map { UInt8($0 % 251) })
+        let chunkB = Data((0..<321).map { UInt8(($0 * 5) % 256) })
+        let payloadWhole = chunkA + chunkB
+        let (wire, payload) = makeUnsignedWireBody(
+            chunks: [chunkA, chunkB],
+            trailer: ("x-amz-checksum-crc32", crc32Base64(payloadWhole)))
+
+        for pieceSize in [wire.count, 64, 3, 1] {
+            let decoder = StreamingChunkDecoder(
+                signatureValidator: nil, expectsTrailer: true,
+                trailerChecksum: TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32"))
+            let decoded = try await run(wire, pieceSize: pieceSize, decoder: decoder)
+            #expect(decoded == payload)
+            try decoder.verifyComplete(declaredDecodedLength: payload.count)
+        }
+    }
+
+    @Test("unsigned trailer with a wrong CRC32 is rejected")
+    func unsignedTrailerMismatch() async throws {
+        let chunk = Data(repeating: 0x7A, count: 1000)
+        let (wire, _) = makeUnsignedWireBody(
+            chunks: [chunk], trailer: ("x-amz-checksum-crc32", "AAAAAA=="))
+        await #expect(throws: (any Error).self) {
+            let decoder = StreamingChunkDecoder(
+                signatureValidator: nil, expectsTrailer: true,
+                trailerChecksum: TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32"))
+            _ = try await self.run(wire, pieceSize: 128, decoder: decoder)
+        }
+    }
+
+    @Test("a declared trailer checksum that never arrives is rejected")
+    func missingDeclaredTrailerRejected() async throws {
+        let chunk = Data(repeating: 0x09, count: 128)
+        let (wire, _) = makeUnsignedWireBody(chunks: [chunk], trailer: nil)
+        await #expect(throws: (any Error).self) {
+            let decoder = StreamingChunkDecoder(
+                signatureValidator: nil, expectsTrailer: true,
+                trailerChecksum: TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32"))
+            _ = try await self.run(wire, pieceSize: 32, decoder: decoder)
+            try decoder.verifyComplete(declaredDecodedLength: 128)
+        }
+    }
+
+    @Test("unsupported trailer algorithm is accepted without validation")
+    func unsupportedTrailerAccepted() async throws {
+        let chunk = Data(repeating: 0x05, count: 256)
+        // md5 is a valid S3 trailer algorithm we don't implement - decode, don't reject.
+        let (wire, payload) = makeUnsignedWireBody(
+            chunks: [chunk], trailer: ("x-amz-checksum-md5", "AAAAAAAAAAAAAAAAAAAAAA=="))
+        #expect(TrailerChecksum(trailerHeaderName: "x-amz-checksum-md5") == nil)
+        let decoder = StreamingChunkDecoder(
+            signatureValidator: nil, expectsTrailer: true, trailerChecksum: nil)
+        let decoded = try await run(wire, pieceSize: 16, decoder: decoder)
+        #expect(decoded == payload)
+        try decoder.verifyComplete(declaredDecodedLength: payload.count)
+    }
+
+    @Test("signed trailer stream verifies the chunk chain and the CRC32 trailer")
+    func signedTrailerValid() async throws {
+        let chunk = Data((0..<8192).map { UInt8($0 % 256) })
+        let (wire, payload) = makeSignedTrailerWireBody(
+            chunks: [chunk], trailer: ("x-amz-checksum-crc32", crc32Base64(chunk)))
+
+        for pieceSize in [wire.count, 100, 1] {
+            let decoder = StreamingChunkDecoder(
+                signatureValidator: ChunkSignatureValidator(
+                    signingKey: signingKey, fullDate: fullDate, credentialScope: scope,
+                    seedSignature: seedSignature),
+                expectsTrailer: true,
+                trailerChecksum: TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32"))
+            let decoded = try await run(wire, pieceSize: pieceSize, decoder: decoder)
+            #expect(decoded == payload)
+            try decoder.verifyComplete(declaredDecodedLength: payload.count)
+        }
+    }
 }

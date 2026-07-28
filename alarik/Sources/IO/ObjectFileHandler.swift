@@ -180,6 +180,43 @@ struct ObjectFileHandler {
         return md5.finalize().hexString()
     }
 
+    /// Streams a file region once and returns its base64 flexible checksum in `algorithm` (the
+    /// lowercase S3 suffix). Returns nil for an algorithm we don't implement. Used by CopyObject
+    /// to recompute the destination's full-object checksum from the copied bytes.
+    static func flexibleChecksumOfFileRegion(
+        path: String, offset: Int, size: Int, algorithm: String
+    ) throws -> String? {
+        guard var checksum = TrailerChecksum(trailerHeaderName: "x-amz-checksum-\(algorithm)") else {
+            return nil
+        }
+        let fd = POSIXFile.open(path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "FileError", code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
+        }
+        defer { _ = POSIXFile.close(fd) }
+        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
+
+        let windowSize = Constants.fileCopyWindowSize
+        var window = [UInt8](repeating: 0, count: windowSize)
+        var remaining = size
+        while remaining > 0 {
+            let toRead = Swift.min(windowSize, remaining)
+            let bytesRead = POSIXFile.read(fd, &window, toRead)
+            guard bytesRead > 0 else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "File region ended early"])
+            }
+            window.withUnsafeBytes { raw in
+                checksum.update(rawBufferPointer: UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
+            }
+            remaining -= bytesRead
+        }
+        return checksum.finalizeBase64()
+    }
+
     /// Reads an object file's metadata plus where its payload starts and how long it is -
     /// everything a streaming GET needs to serve the body straight off disk without ever
     /// buffering it.

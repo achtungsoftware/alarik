@@ -79,7 +79,9 @@ struct MultipartFileHandler {
         bucketName: String,
         key: String,
         contentType: String = "application/octet-stream",
-        metadata: [String: String] = [:]
+        metadata: [String: String] = [:],
+        checksumAlgorithm: String? = nil,
+        checksumType: String? = nil
     ) throws -> String {
         let uploadId = generateUploadId()
         let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
@@ -97,7 +99,9 @@ struct MultipartFileHandler {
             key: key,
             contentType: contentType,
             metadata: metadata,
-            initiated: Date()
+            initiated: Date(),
+            checksumAlgorithm: checksumAlgorithm,
+            checksumType: checksumType
         )
 
         let metaData = try jsonEncoder.encode(meta)
@@ -112,7 +116,8 @@ struct MultipartFileHandler {
         bucketName: String,
         uploadId: String,
         partNumber: Int,
-        data: Data
+        data: Data,
+        checksum: String? = nil
     ) throws -> String {
         // Validate part number (S3 allows 1-10000)
         guard partNumber >= 1 && partNumber <= 10000 else {
@@ -137,7 +142,7 @@ struct MultipartFileHandler {
 
         try writePartMeta(
             bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
-            etag: etag, size: data.count)
+            etag: etag, size: data.count, checksum: checksum)
 
         return etag
     }
@@ -152,7 +157,8 @@ struct MultipartFileHandler {
         partNumber: Int,
         spoolPath: String,
         etag: String,
-        size: Int
+        size: Int,
+        checksum: String? = nil
     ) throws -> String {
         guard partNumber >= 1 && partNumber <= 10000 else {
             throw NSError(
@@ -200,7 +206,7 @@ struct MultipartFileHandler {
 
         try writePartMeta(
             bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
-            etag: etag, size: size)
+            etag: etag, size: size, checksum: checksum)
 
         return etag
     }
@@ -272,13 +278,15 @@ struct MultipartFileHandler {
     }
 
     private static func writePartMeta(
-        bucketName: String, uploadId: String, partNumber: Int, etag: String, size: Int
+        bucketName: String, uploadId: String, partNumber: Int, etag: String, size: Int,
+        checksum: String? = nil
     ) throws {
         let partMeta = MultipartPartMeta(
             partNumber: partNumber,
             etag: etag,
             size: size,
-            lastModified: Date()
+            lastModified: Date(),
+            checksum: checksum
         )
         let partMetaData = try jsonEncoder.encode(partMeta)
         let partMetaPath = try partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
@@ -337,6 +345,9 @@ struct MultipartFileHandler {
         // process RAM.
         var payloadSources: [(path: String, offset: Int, size: Int)] = []
         var partEtags: [String] = []
+        // Per-part number/size/checksum, in part order - drives both the object checksum and the
+        // ObjectParts detail GetObjectAttributes reports.
+        var partDetails: [ObjectPart] = []
         var totalSize = 0
 
         for part in sortedParts {
@@ -355,6 +366,7 @@ struct MultipartFileHandler {
             let partMetaFilePath = try partMetaPath(
                 for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
             let partSize: Int
+            let partChecksum: String?
             if FileManager.default.fileExists(atPath: partMetaFilePath) {
                 let partMetaData = try Data(contentsOf: URL(fileURLWithPath: partMetaFilePath))
                 let partMeta = try jsonDecoder.decode(MultipartPartMeta.self, from: partMetaData)
@@ -369,13 +381,17 @@ struct MultipartFileHandler {
                         ])
                 }
                 partSize = partMeta.size
+                partChecksum = partMeta.checksum
             } else {
                 // No part meta (legacy upload dir): size straight from the file
                 let attrs = try FileManager.default.attributesOfItem(atPath: partFilePath)
                 partSize = (attrs[.size] as? Int) ?? 0
+                partChecksum = nil
             }
 
             payloadSources.append((path: partFilePath, offset: 0, size: partSize))
+            partDetails.append(
+                ObjectPart(partNumber: part.partNumber, size: partSize, checksum: partChecksum))
             totalSize += partSize
             partEtags.append(S3Service.normalizeETag(part.etag))
         }
@@ -400,7 +416,7 @@ struct MultipartFileHandler {
         let etagHash = S3Service.computeETag(binaryEtags)
         let finalEtag = "\(etagHash)-\(sortedParts.count)"
 
-        let objectMeta = ObjectMeta(
+        var objectMeta = ObjectMeta(
             bucketName: bucketName,
             key: uploadMeta.key,
             size: totalSize,
@@ -409,6 +425,28 @@ struct MultipartFileHandler {
             metadata: uploadMeta.metadata,
             updatedAt: Date()
         )
+
+        // Object checksum: only when the upload pinned an algorithm at Create and every part
+        // carried a checksum (a single missing one makes it unverifiable, so we store none rather
+        // than a wrong one). The type is constrained by the algorithm - CRC64NVME is full-object,
+        // SHA is composite, CRC32/CRC32C honor the client's requested type.
+        if let algorithm = uploadMeta.checksumAlgorithm,
+            partDetails.allSatisfy({ $0.checksum != nil })
+        {
+            let requestedType = uploadMeta.checksumType.flatMap(ObjectChecksum.ChecksumType.init)
+            let type = ObjectChecksum.multipartChecksumType(
+                algorithm: algorithm, requested: requestedType)
+            switch type {
+            case .fullObject:
+                objectMeta.checksum = ObjectChecksum.fullObject(
+                    algorithm: algorithm, parts: partDetails.map { ($0.checksum!, $0.size) })
+            case .composite:
+                objectMeta.checksum = ObjectChecksum.composite(
+                    algorithm: algorithm, partChecksumsBase64: partDetails.compactMap { $0.checksum })
+            }
+            // Retain per-part detail (for GetObjectAttributes) only for checksummed uploads.
+            objectMeta.parts = partDetails
+        }
 
         return CompletionPlan(
             key: uploadMeta.key, objectMeta: objectMeta, payloadSources: payloadSources,
@@ -422,7 +460,7 @@ struct MultipartFileHandler {
         uploadId: String,
         parts: [(partNumber: Int, etag: String)],
         versioningStatus: VersioningStatus
-    ) throws -> (etag: String, size: Int, versionId: String?) {
+    ) throws -> (etag: String, size: Int, versionId: String?, checksum: ObjectChecksum?) {
         let plan = try prepareCompletion(bucketName: bucketName, uploadId: uploadId, parts: parts)
 
         var versionId: String? = nil
@@ -441,7 +479,7 @@ struct MultipartFileHandler {
         }
 
         try abortUpload(bucketName: bucketName, uploadId: uploadId)
-        return (plan.etag, plan.totalSize, versionId)
+        return (plan.etag, plan.totalSize, versionId, plan.objectMeta.checksum)
     }
 
     /// Aborts (deletes) a multipart upload and all its parts
@@ -463,6 +501,16 @@ struct MultipartFileHandler {
         {
             try? FileManager.default.removeItem(atPath: bucketDir)
         }
+    }
+
+    /// The checksum algorithm pinned at CreateMultipartUpload (lowercase suffix), or nil. Used by
+    /// ListParts to name each part's `Checksum<ALGO>` element.
+    static func uploadChecksumAlgorithm(bucketName: String, uploadId: String) -> String? {
+        guard let metaPath = try? metadataPath(for: bucketName, uploadId: uploadId),
+            let data = try? Data(contentsOf: URL(fileURLWithPath: metaPath)),
+            let meta = try? jsonDecoder.decode(MultipartUploadMeta.self, from: data)
+        else { return nil }
+        return meta.checksumAlgorithm
     }
 
     /// Lists all parts for an upload

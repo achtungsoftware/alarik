@@ -16,6 +16,7 @@ limitations under the License.
 
 import Crypto
 import Foundation
+import NIOCore
 import Testing
 
 @testable import Alarik
@@ -175,6 +176,121 @@ struct MultipartFileHandlerTests {
         // Verify part data
         let storedData = try Data(contentsOf: URL(fileURLWithPath: partPath))
         #expect(storedData == partData)
+    }
+
+    private func crc32Base64(_ data: Data) -> String {
+        var checksum = TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32")!
+        checksum.update(ByteBuffer(data: data).readableBytesView)
+        return checksum.finalizeBase64()
+    }
+
+    @Test("prepareCompletion computes the COMPOSITE object checksum from the part checksums")
+    func compositeCompletion() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+
+        let bucket = "bucket"
+        let uploadId = try MultipartFileHandler.createUpload(
+            bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32")
+
+        let part1 = Data((0..<5000).map { UInt8($0 % 251) })
+        let part2 = Data((0..<3000).map { UInt8(($0 * 7) % 256) })
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
+            checksum: crc32Base64(part1))
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 2, data: part2,
+            checksum: crc32Base64(part2))
+
+        let plan = try MultipartFileHandler.prepareCompletion(
+            bucketName: bucket, uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+
+        let expected = ObjectChecksum.composite(
+            algorithm: "crc32", partChecksumsBase64: [crc32Base64(part1), crc32Base64(part2)])
+        #expect(plan.objectMeta.checksum == expected)
+        #expect(plan.objectMeta.checksum?.type == .composite)
+        #expect(plan.objectMeta.checksum?.value.hasSuffix("-2") == true)
+    }
+
+    @Test("prepareCompletion computes a FULL_OBJECT checksum for a CRC upload when requested")
+    func fullObjectCompletion() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+
+        let bucket = "bucket"
+        let uploadId = try MultipartFileHandler.createUpload(
+            bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32",
+            checksumType: "FULL_OBJECT")
+
+        let part1 = Data((0..<5000).map { UInt8($0 % 251) })
+        let part2 = Data((0..<3000).map { UInt8(($0 * 7) % 256) })
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
+            checksum: crc32Base64(part1))
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 2, data: part2,
+            checksum: crc32Base64(part2))
+
+        let plan = try MultipartFileHandler.prepareCompletion(
+            bucketName: bucket, uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+
+        // FULL_OBJECT must equal the CRC of the whole object, with no -N suffix.
+        let whole = part1 + part2
+        #expect(plan.objectMeta.checksum?.value == crc32Base64(whole))
+        #expect(plan.objectMeta.checksum?.type == .fullObject)
+        #expect(plan.objectMeta.checksum?.value.contains("-") == false)
+    }
+
+    @Test("prepareCompletion forces FULL_OBJECT for a CRC64NVME multipart upload")
+    func crc64nvmeAlwaysFullObject() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+
+        let bucket = "bucket"
+        // Request COMPOSITE, but CRC64NVME only supports full-object - the result must be FULL_OBJECT.
+        let uploadId = try MultipartFileHandler.createUpload(
+            bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc64nvme",
+            checksumType: "COMPOSITE")
+
+        func crc64(_ data: Data) -> String {
+            var c = TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc64nvme")!
+            c.update(ByteBuffer(data: data).readableBytesView)
+            return c.finalizeBase64()
+        }
+        let part1 = Data((0..<9000).map { UInt8($0 % 256) })
+        let part2 = Data((0..<4000).map { UInt8(($0 * 3) % 256) })
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
+            checksum: crc64(part1))
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 2, data: part2,
+            checksum: crc64(part2))
+
+        let plan = try MultipartFileHandler.prepareCompletion(
+            bucketName: bucket, uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+        #expect(plan.objectMeta.checksum?.type == .fullObject)
+        #expect(plan.objectMeta.checksum?.value == crc64(part1 + part2))
+    }
+
+    @Test("prepareCompletion stores no checksum when any part lacks one")
+    func compositeMissingPartChecksum() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+
+        let bucket = "bucket"
+        let uploadId = try MultipartFileHandler.createUpload(
+            bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32")
+        let part1 = Data("aaaa".utf8)
+        let part2 = Data("bbbb".utf8)
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
+            checksum: crc32Base64(part1))
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: bucket, uploadId: uploadId, partNumber: 2, data: part2)  // no checksum
+
+        let plan = try MultipartFileHandler.prepareCompletion(
+            bucketName: bucket, uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+        #expect(plan.objectMeta.checksum == nil)
     }
 
     @Test("writePart validates part number range")
@@ -436,7 +552,7 @@ struct MultipartFileHandlerTests {
         let etag2 = try MultipartFileHandler.writePart(
             bucketName: "test-bucket", uploadId: uploadId, partNumber: 2, data: part2Data)
 
-        let (finalEtag, size, _) = try MultipartFileHandler.completeUpload(
+        let (finalEtag, size, _, _) = try MultipartFileHandler.completeUpload(
             bucketName: "test-bucket",
             uploadId: uploadId,
             parts: [(1, etag1), (2, etag2)],

@@ -465,9 +465,13 @@ struct SigV4Validator {
         // Calculate signature using pre-derived signing key
         let calculatedSignatureData = try hmacSHA256(key: signingKey, data: Data(stringToSign.utf8))
 
-        // For streaming/chunked, this is the seed signature; validate chunks separately
-        let isStreaming = canonicalRequest.hasSuffix("\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-        if isStreaming {
+        // The signed streaming forms (with or without a trailer) sign this as the seed signature
+        // and carry a per-chunk `chunk-signature` chain that `validateChunked` verifies separately.
+        // The unsigned streaming form has no chain, so it takes the plain-signature path below.
+        let isSignedStreaming =
+            canonicalRequest.hasSuffix("\n" + S3PayloadHash.streamingSigned)
+            || canonicalRequest.hasSuffix("\n" + S3PayloadHash.streamingSignedTrailer)
+        if isSignedStreaming {
             // Use constant-time comparison to prevent timing attacks
             if calculatedSignatureData.constantTimeCompare(to: authInfo.signature) {
                 try validateChunked(request: request, authInfo: authInfo, signingKey: signingKey)
@@ -495,8 +499,10 @@ struct SigV4Validator {
                 status: .badRequest, code: "InvalidArgument",
                 message: "Missing required x-amz-content-sha256 header")
         }
-        guard payloadHash != "UNSIGNED-PAYLOAD",
-            payloadHash != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        // UNSIGNED-PAYLOAD and the streaming forms (whose bytes are verified per-chunk / deferred
+        // to the body consumer) put the sentinel itself into the canonical request, not a body hash.
+        guard payloadHash != S3PayloadHash.unsigned,
+            !S3PayloadHash.isStreaming(payloadHash)
         else { return payloadHash }
 
         if let bodyBuffer = request.body.data {
