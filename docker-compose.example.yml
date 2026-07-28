@@ -11,6 +11,8 @@ services:
       - ADMIN_PASSWORD=alarik
       - JWT=YOUR_SECURE_JWT_KEY
       - ALLOW_ACCOUNT_CREATION=false
+      # Optional: auto-create these buckets on first start, owned by the admin (comma-separated).
+      # - DEFAULT_BUCKETS=uploads,media,logs
     volumes:
       - alarik-storage:/app/Storage
 

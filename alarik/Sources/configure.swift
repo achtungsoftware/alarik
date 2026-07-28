@@ -153,6 +153,9 @@ public func configure(_ app: Application) async throws {
     // a single, statically-elected node in cluster mode - see `isDesignatedSeeder`'s doc comment.
     if isDesignatedSeeder(app: app) {
         try await CreateDefaultUser.run(app: app)
+        // Optional DEFAULT_BUCKETS seeding - must run after the admin exists, since the seeded
+        // buckets are owned by it. Idempotent, so safe on every boot.
+        try await CreateDefaultBuckets.run(app: app)
     }
 
     // The webhook dispatcher needs the app for db/client access; configured in every
