@@ -450,6 +450,59 @@ struct ObjectFileHandler {
         }
 
         try FileManager.default.removeItem(atPath: path)
+        pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
+    }
+
+    /// After an object's files are removed, remove any now-empty ancestor directories up to (but
+    /// never including) the bucket root. Because a key maps to a real nested path, a deleted folder
+    /// would otherwise linger as an empty directory and show up as a phantom folder in the
+    /// directory-scoped listing. `rmdir` only ever removes an *empty* directory (it fails with
+    /// ENOTEMPTY otherwise), so a concurrent write that repopulated the folder is never clobbered -
+    /// the walk simply stops. Best-effort: a dir that can't be removed just stays.
+    static func pruneEmptyParentDirectories(forKey key: String, bucketName: String) {
+        // Derive the bucket root the same way `storagePath` builds its base, so both are the same
+        // (relative) form - deriving it from a file URL instead yields an absolute path that would
+        // never prefix-match the relative `storagePath`, silently disabling all pruning.
+        let bucketRoot = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        var dir = (storagePath(for: bucketName, key: key) as NSString).deletingLastPathComponent
+        while dir.hasPrefix(bucketRoot + "/") {
+            if dir.withCString({ rmdir($0) }) != 0 {
+                // rmdir only fails on a non-empty directory. Retry once after clearing OS-metadata
+                // junk (e.g. macOS `.DS_Store`) that would otherwise leave a folder lingering as a
+                // phantom - but only when that junk is the folder's *sole* contents, so any real
+                // object artifact keeps the folder intact.
+                guard removeOSMetadataIfSoleContents(of: dir),
+                    dir.withCString({ rmdir($0) }) == 0
+                else { break }
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+    }
+
+    /// OS/desktop metadata files that can appear in a directory without being object data.
+    private static let ignorableDirectoryEntries: Set<String> = [
+        ".DS_Store", ".localized", "Thumbs.db", "desktop.ini",
+    ]
+
+    /// Removes the contents of `dir` and returns true **only** when every entry is a known-junk
+    /// *regular file* (macOS `.DS_Store`, AppleDouble `._*`, Windows `Thumbs.db`/`desktop.ini`).
+    /// A single real file - or any subdirectory - makes it a no-op returning false, so this can
+    /// never recursively delete real data.
+    private static func removeOSMetadataIfSoleContents(of dir: String) -> Bool {
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir),
+            !entries.isEmpty
+        else { return false }
+        for name in entries {
+            let path = "\(dir)/\(name)"
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+            let isJunk = ignorableDirectoryEntries.contains(name) || name.hasPrefix("._")
+            guard exists, !isDirectory.boolValue, isJunk else { return false }
+        }
+        for name in entries {
+            try? FileManager.default.removeItem(atPath: "\(dir)/\(name)")
+        }
+        return true
     }
 
     /// Lists all objects in a bucket with optional prefix filtering
@@ -467,6 +520,18 @@ struct ObjectFileHandler {
 
         guard FileManager.default.fileExists(atPath: bucketURL.path) else {
             return ([], [], false, nil)
+        }
+
+        // Fast path for a plain folder view: the prefix names a real directory (empty, or ends in
+        // "/"), the delimiter is "/", and there's no marker to page past - so a single directory
+        // level answers the request without walking the whole bucket. Arbitrary prefixes that
+        // don't land on a directory boundary, versions listings, and paginated continuations fall
+        // through to the recursive walk below, which stays exactly as it was.
+        if delimiter == "/", marker == nil, prefix.isEmpty || prefix.hasSuffix("/"),
+            !prefix.contains("..")
+        {
+            return listObjectsInDirectory(
+                bucketName: bucketName, prefix: prefix, maxKeys: maxKeys)
         }
 
         guard
@@ -615,62 +680,154 @@ struct ObjectFileHandler {
             latestByKey[key] = meta
         }
 
-        // Convert to array and sort
-        var allObjects: [(key: String, meta: ObjectMeta)] = latestByKey.map { ($0.key, $0.value) }
-        allObjects.sort { $0.key < $1.key }
+        return finalizeListing(
+            objectKeys: Array(latestByKey.keys), commonPrefixes: Array(commonPrefixesSet),
+            maxKeys: maxKeys, metaFor: { latestByKey[$0] })
+    }
 
-        // Sort common prefixes
-        let sortedCommonPrefixes = commonPrefixesSet.sorted()
+    /// Sorts the collected objects and common prefixes, merges them in lexicographic order, and
+    /// truncates to `maxKeys` (S3 counts objects + prefixes together toward the limit). Shared by
+    /// the recursive walk and the directory-scoped fast path so both produce byte-identical S3
+    /// listing semantics.
+    private static func finalizeListing(
+        objectKeys: [String], commonPrefixes: [String], maxKeys: Int,
+        metaFor: (String) -> ObjectMeta?
+    ) -> (
+        objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
+    ) {
+        let sortedKeys = objectKeys.sorted()
+        let sortedPrefixes = commonPrefixes.sorted()
 
-        // S3 behavior: maxKeys limits the TOTAL number of keys + common prefixes returned
         var finalObjects: [ObjectMeta] = []
         var finalCommonPrefixes: [String] = []
-        var isTruncated = false
         var nextMarker: String? = nil
 
-        var objectIndex = 0
+        var keyIndex = 0
         var prefixIndex = 0
         var totalCount = 0
 
         while totalCount < maxKeys
-            && (objectIndex < allObjects.count || prefixIndex < sortedCommonPrefixes.count)
+            && (keyIndex < sortedKeys.count || prefixIndex < sortedPrefixes.count)
         {
-            let nextObject = objectIndex < allObjects.count ? allObjects[objectIndex].key : nil
-            let nextPrefix =
-                prefixIndex < sortedCommonPrefixes.count ? sortedCommonPrefixes[prefixIndex] : nil
+            let nextKey = keyIndex < sortedKeys.count ? sortedKeys[keyIndex] : nil
+            let nextPrefix = prefixIndex < sortedPrefixes.count ? sortedPrefixes[prefixIndex] : nil
 
-            // Determine which comes first lexicographically
-            if let obj = nextObject, let pfx = nextPrefix {
-                if obj < pfx {
-                    finalObjects.append(allObjects[objectIndex].meta)
-                    nextMarker = obj
-                    objectIndex += 1
-                } else {
-                    finalCommonPrefixes.append(pfx)
-                    nextMarker = pfx
-                    prefixIndex += 1
-                }
-            } else if let obj = nextObject {
-                finalObjects.append(allObjects[objectIndex].meta)
-                nextMarker = obj
-                objectIndex += 1
-            } else if let pfx = nextPrefix {
-                finalCommonPrefixes.append(pfx)
-                nextMarker = pfx
+            // Object key or common prefix, whichever is lexicographically first.
+            if let key = nextKey, nextPrefix == nil || key < nextPrefix! {
+                // `metaFor` resolves the key's metadata only now that it's in the page - so the
+                // directory fast path reads a header per returned object, not per object present.
+                // A nil result (raced concurrent delete) is simply dropped from the page.
+                if let meta = metaFor(key) { finalObjects.append(meta) }
+                nextMarker = key
+                keyIndex += 1
+            } else if let prefix = nextPrefix {
+                finalCommonPrefixes.append(prefix)
+                nextMarker = prefix
                 prefixIndex += 1
             }
 
             totalCount += 1
         }
 
-        // Check if there are more items
-        if objectIndex < allObjects.count || prefixIndex < sortedCommonPrefixes.count {
-            isTruncated = true
-        } else {
-            nextMarker = nil
-        }
+        let isTruncated = keyIndex < sortedKeys.count || prefixIndex < sortedPrefixes.count
+        if !isTruncated { nextMarker = nil }
 
         return (finalObjects, finalCommonPrefixes, isTruncated, nextMarker)
+    }
+
+    /// Directory-scoped fast path for the folder view (`delimiter == "/"`, no marker, prefix empty
+    /// or ending in `/`). Because a key maps to a real nested path
+    /// (`folder/file.txt` -> `.../folder/file.txt.obj`), a single level of `folder/` is all that a
+    /// folder listing needs - `.obj` files are objects, `<name>.versions/` / `<name>.ecshards/`
+    /// are versioned / erasure-coded objects, and any other subdirectory is a common prefix. This
+    /// makes browsing a folder O(entries in that folder) instead of walking the whole bucket, and
+    /// it never descends into sibling folders. Object metadata (and the versioned/EC latest
+    /// resolution) is read only for the entries actually at this level. Same output contract as the
+    /// recursive walk, so the S3 listing tests cover both.
+    private static func listObjectsInDirectory(
+        bucketName: String, prefix: String, maxKeys: Int
+    ) -> (
+        objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
+    ) {
+        let bucketURL = BucketHandler.bucketURL(for: bucketName)
+        // prefix is empty or ends in "/", so it names a directory - drop the trailing slash.
+        let dirURL =
+            prefix.isEmpty ? bucketURL : bucketURL.appendingPathComponent(String(prefix.dropLast()))
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: dirURL, includingPropertiesForKeys: [.isDirectoryKey], options: [])
+        else {
+            return ([], [], false, nil)
+        }
+
+        // Plain `.obj` files: their key is the filename, and a plain object is never a delete
+        // marker (those only ever live under `.versions/`), so the header read is deferred - only
+        // the objects that survive sort+truncation into the returned page are read (see `metaFor`
+        // below). This keeps a folder with far more direct objects than `maxKeys` from reading
+        // every header just to discard most of them.
+        var objectPathByKey: [String: String] = [:]
+        // Versioned / EC objects need a read now (to find the latest and drop delete-marker
+        // latests). A key resolved here supersedes a plain `.obj` of the same key (EC > versioned
+        // > non-versioned), matching the recursive walk's precedence.
+        var resolvedByKey: [String: ObjectMeta] = [:]
+        var resolvedRankByKey: [String: Int] = [:]
+        var commonPrefixesSet: Set<String> = []
+
+        func resolve(_ key: String, _ meta: ObjectMeta, rank: Int) {
+            guard !meta.isDeleteMarker, rank >= (resolvedRankByKey[key] ?? -1) else { return }
+            resolvedByKey[key] = meta
+            resolvedRankByKey[key] = rank
+        }
+
+        for entry in entries {
+            let name = entry.lastPathComponent
+            let entryIsDir =
+                (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+
+            if !entryIsDir {
+                guard name.hasSuffix(".obj") else { continue }
+                objectPathByKey[prefix + String(name.dropLast(4))] = entry.path
+            } else if name.hasSuffix(".versions") {
+                let key = prefix + String(name.dropLast(".versions".count))
+                if let (meta, _) = try? readVersion(
+                    bucketName: bucketName, key: key, versionId: nil, loadData: false)
+                {
+                    resolve(key, meta, rank: 1)
+                }
+            } else if name.hasSuffix(".ecshards") {
+                let key = prefix + String(name.dropLast(".ecshards".count))
+                let shardZeroPath = entry.appendingPathComponent("0.ecshard").path
+                if let reader = try? ErasureCodedShardReader(path: shardZeroPath) {
+                    let header = reader.header
+                    reader.close()
+                    // Trust the header over the filename, exactly like `listLocalShardZeroEntries`.
+                    if header.shardIndex == 0, header.objectMeta.isLatest,
+                        header.objectMeta.bucketName == bucketName
+                    {
+                        resolve(key, header.objectMeta, rank: 2)
+                    }
+                }
+            } else {
+                commonPrefixesSet.insert(prefix + name + "/")
+            }
+        }
+
+        // A key resolved as versioned/EC wins over a plain `.obj` of the same key.
+        for key in resolvedByKey.keys { objectPathByKey[key] = nil }
+        let objectKeys = Array(objectPathByKey.keys) + Array(resolvedByKey.keys)
+
+        return finalizeListing(
+            objectKeys: objectKeys, commonPrefixes: Array(commonPrefixesSet), maxKeys: maxKeys
+        ) { key in
+            if let meta = resolvedByKey[key] { return meta }
+            guard let path = objectPathByKey[key],
+                let (meta, _) = try? read(from: path, loadData: false)
+            else { return nil }
+            return meta
+        }
     }
 
     /// Returns the base directory path for versioned objects
@@ -1245,6 +1402,7 @@ struct ObjectFileHandler {
                 let plainPath = storagePath(for: bucketName, key: key)
                 if FileManager.default.fileExists(atPath: plainPath) {
                     try FileManager.default.removeItem(atPath: plainPath)
+                    pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
                     return
                 }
             }
@@ -1264,8 +1422,10 @@ struct ObjectFileHandler {
             try updateLatestToMostRecent(bucketName: bucketName, key: key)
         }
 
-        // Clean up empty directories
+        // Clean up empty directories - the `.versions/` dir once its history is gone, then any
+        // now-empty parent folders so the object's folder doesn't linger as a phantom.
         try cleanupEmptyVersionsDirectory(bucketName: bucketName, key: key)
+        pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
     }
 
     /// Creates a delete marker (soft delete for versioned buckets)

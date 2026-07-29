@@ -816,6 +816,76 @@ struct ObjectFileHandlerTests {
         #expect(nextMarker == objects.last?.key)
     }
 
+    @Test("Deleting the last object in a folder prunes it even past a macOS .DS_Store")
+    func pruneFolderWithOSJunk() throws {
+        let bucketName = try createTestBucket()
+        defer { cleanupBucket(name: bucketName) }
+
+        try createTestObject(bucketName: bucketName, key: "folder/file.txt")
+        try createTestObject(bucketName: bucketName, key: "root.txt")
+
+        // Simulate Finder dropping a .DS_Store into the folder.
+        let folderDir = (ObjectFileHandler.storagePath(for: bucketName, key: "folder/x")
+            as NSString).deletingLastPathComponent
+        try Data("junk".utf8).write(to: URL(fileURLWithPath: "\(folderDir)/.DS_Store"))
+
+        try ObjectFileHandler.delete(bucketName: bucketName, key: "folder/file.txt")
+
+        let (objects, prefixes, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: bucketName, delimiter: "/")
+        #expect(prefixes.isEmpty)  // no phantom "folder/"
+        #expect(objects.map { $0.key } == ["root.txt"])
+        #expect(!FileManager.default.fileExists(atPath: folderDir))
+    }
+
+    @Test("Pruning never removes junk (or the folder) while a real object remains")
+    func pruneKeepsFolderWithRealContent() throws {
+        let bucketName = try createTestBucket()
+        defer { cleanupBucket(name: bucketName) }
+
+        try createTestObject(bucketName: bucketName, key: "folder/a.txt")
+        try createTestObject(bucketName: bucketName, key: "folder/b.txt")
+
+        let folderDir = (ObjectFileHandler.storagePath(for: bucketName, key: "folder/x")
+            as NSString).deletingLastPathComponent
+        let dsStore = "\(folderDir)/.DS_Store"
+        try Data("junk".utf8).write(to: URL(fileURLWithPath: dsStore))
+
+        // b.txt still lives here, so the folder and its junk must both be left untouched.
+        try ObjectFileHandler.delete(bucketName: bucketName, key: "folder/a.txt")
+
+        let (_, prefixes, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: bucketName, delimiter: "/")
+        #expect(prefixes == ["folder/"])
+        #expect(FileManager.default.fileExists(atPath: dsStore))
+    }
+
+    @Test("Folder view with maxKeys returns the correct page with real metadata (deferred read)")
+    func listObjectsFolderViewMaxKeys() throws {
+        let bucketName = try createTestBucket()
+        defer { cleanupBucket(name: bucketName) }
+
+        // 20 direct objects at the root - the fast path (delimiter "/") defers header reads to
+        // only the page that survives truncation, so the returned page must still be the correct
+        // lexicographically-first slice with fully-populated metadata.
+        for i in 1...20 {
+            try createTestObject(
+                bucketName: bucketName, key: String(format: "obj-%02d.txt", i),
+                content: "content-\(i)")
+        }
+
+        let (objects, prefixes, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+            bucketName: bucketName, delimiter: "/", maxKeys: 5)
+
+        #expect(prefixes.isEmpty)
+        #expect(objects.count == 5)
+        #expect(isTruncated == true)
+        #expect(objects.map { $0.key } == ["obj-01.txt", "obj-02.txt", "obj-03.txt", "obj-04.txt", "obj-05.txt"])
+        // Metadata was actually read for the returned page (not left blank by the deferred path).
+        #expect(objects.allSatisfy { $0.size > 0 && !$0.etag.isEmpty })
+        #expect(nextMarker == "obj-05.txt")
+    }
+
     @Test("List objects pagination with marker")
     func listObjectsWithMarker() throws {
         let bucketName = try createTestBucket()

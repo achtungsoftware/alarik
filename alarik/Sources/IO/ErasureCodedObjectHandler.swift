@@ -251,6 +251,9 @@ enum ErasureCodedObjectHandler {
         {
             try? FileManager.default.removeItem(atPath: basePath)
         }
+        // Prune now-empty parent folders so a deleted EC object's folder doesn't linger as a
+        // phantom in the directory-scoped listing (stops at the first non-empty ancestor).
+        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
     }
 
     /// Commits an already fully-formed `.ecshard` file (header + every stripe already written)
