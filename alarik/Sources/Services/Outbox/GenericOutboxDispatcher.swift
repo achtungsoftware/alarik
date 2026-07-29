@@ -17,13 +17,16 @@ limitations under the License.
 import Foundation
 import Vapor
 
-/// Outcome of one delivery attempt. `.skip` means "leave the row untouched" - e.g. a `.put`
-/// row this node doesn't physically have the object for; it stays pending and gets picked up
-/// again, possibly by whichever node actually does.
+/// Outcome of one delivery attempt. `.drop` means "this row is permanently undeliverable, remove
+/// it" - e.g. a `.put` row whose owner no longer physically holds the object (reclaimed by a
+/// rebalance because this node isn't a responsible replica). Since each row is owned by exactly
+/// one node, no other node will ever pick it up, so leaving it pending would clog the outbox (and
+/// the console's pending-replication view) forever; the object's replica count is kept correct by
+/// the responsible holders and the rebalance/scrub reconciliation independently of this row.
 enum OutboxDeliveryOutcome {
     case success
     case failure(any Error)
-    case skip
+    case drop
 }
 
 /// Same-key-in-flight tracking for one drain pass. `@unchecked Sendable`: only ever touched
@@ -222,8 +225,15 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
         describeFailure: @Sendable (Row) -> String
     ) async -> Bool {
         switch await attemptDelivery(row, app) {
-        case .skip:
-            return true
+        case .drop:
+            // Permanently undeliverable - remove it rather than leave it pending forever. This
+            // counts as progress (returns false below) so the drain keeps flowing.
+            do {
+                try await remove(row, app)
+            } catch {
+                app.logger.error(
+                    "\(logContext) dispatcher failed to delete undeliverable outbox row: \(error)")
+            }
         case .success:
             do {
                 try await remove(row, app)

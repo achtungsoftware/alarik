@@ -37,19 +37,18 @@ enum ClusterReplicationDispatcher {
         },
         dedupKey: { row in "\(row.bucketName)\u{0}\(row.key)\u{0}\(row.targetNodeId)" },
         attemptDelivery: { row, app in
-            // The local copy this node had at enqueue time may since have been reclaimed (a
-            // later rebalance pass, or this node losing responsibility for the key) - skip
-            // rather than burning an attempt on a guaranteed failure; if the copy is genuinely
-            // gone, nothing else will ever retry this exact row (ownership means only this node
-            // ever sees it), so it will skip harmlessly forever, same as the old shared-table
-            // design already tolerated for this exact scenario.
+            // The local copy this node had at enqueue time may since have been reclaimed (a later
+            // rebalance pass, or this node losing responsibility for the key). The row is owned by
+            // exactly this node, so nobody else will ever retry it, and the object's replica count
+            // is maintained by the responsible holders + rebalance independently - so drop the row
+            // rather than leaving it pending forever (which would clog the console's pending view).
             if row.operation == .put {
                 let hasLocalCopy =
                     (try? await app.threadPool.runIfActive {
                         try ObjectFileHandler.resolvePath(
                             bucketName: row.bucketName, key: row.key, versionId: row.versionId)
                     }) != nil
-                guard hasLocalCopy else { return .skip }
+                guard hasLocalCopy else { return .drop }
             }
 
             do {

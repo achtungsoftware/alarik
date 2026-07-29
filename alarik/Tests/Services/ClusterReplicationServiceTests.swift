@@ -103,13 +103,15 @@ struct ClusterReplicationServiceTests {
     }
 
     @Test(
-        "ClusterReplicationDispatcher skips a .put task it can't fulfill locally, without counting a failed attempt"
+        "ClusterReplicationDispatcher drops a .put task it can't fulfill locally instead of leaving it pending forever"
     )
-    func dispatcherSkipsUndeliverablePutWithoutBurningAttempts() async throws {
+    func dispatcherDropsUndeliverablePut() async throws {
         try await withApp { app in
             // This node owns the task (it enqueued it) but the object it references was never
             // actually written locally - simulates a straggler task whose local copy has since
-            // vanished (e.g. reclaimed) by the time the dispatcher drains it.
+            // vanished (e.g. reclaimed by a rebalance). The row is owned by exactly this node, so
+            // nobody else will ever retry it; the dispatcher must drop it rather than leave it
+            // pending forever (which is what showed up as never-finishing "pending replication").
             let task = ClusterReplicationTask(
                 bucketName: "no-local-copy-bucket", key: "missing.txt", versionId: nil,
                 operation: .put, targetNodeId: UUID(), reason: .write,
@@ -118,14 +120,11 @@ struct ClusterReplicationServiceTests {
 
             await ClusterReplicationDispatcher.shared.drain()
 
-            let reloaded = try #require(
-                OutboxMailbox.allOwnedTasks(
-                    ClusterReplicationTask.self, app: app,
-                    collection: OutboxCollections.clusterReplicationTasks
-                ).first(where: { $0.id == task.id }))
-            #expect(reloaded.state == .pending)
-            #expect(reloaded.attempts == 0)
-            #expect(reloaded.lastError == nil)
+            let remaining = OutboxMailbox.allOwnedTasks(
+                ClusterReplicationTask.self, app: app,
+                collection: OutboxCollections.clusterReplicationTasks
+            ).contains(where: { $0.id == task.id })
+            #expect(remaining == false)  // dropped, not left pending
         }
     }
 }
