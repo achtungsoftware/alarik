@@ -42,6 +42,8 @@ const openBucketPolicyModal = ref(false);
 const selectedBucketForPolicy = ref<Bucket | null>(null);
 const openBucketTagsModal = ref(false);
 const selectedBucketForTags = ref<Bucket | null>(null);
+const openBucketSettingsModal = ref(false);
+const selectedBucketForSettings = ref<Bucket | null>(null);
 const openShareModal = ref(false);
 const shareObject = ref<BrowserItem | null>(null);
 
@@ -394,6 +396,18 @@ const columns: TableColumn<BrowserItem>[] = [
                         },
                     }),
                     h(resolveComponent("UButton"), {
+                        label: "Settings",
+                        variant: "subtle",
+                        color: "neutral",
+                        size: "sm",
+                        icon: "i-lucide-settings",
+                        onClick: (e: Event) => {
+                            e.stopPropagation();
+                            selectedBucketForSettings.value = bucket;
+                            openBucketSettingsModal.value = true;
+                        },
+                    }),
+                    h(resolveComponent("UButton"), {
                         label: "Webhooks",
                         variant: "subtle",
                         color: "neutral",
@@ -658,6 +672,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
     <ObjectDetailModal v-model:open="openDetailModal" :item="selectedObject" :bucketName="currentBucket" @versionDeleted="refresh" @saved="refresh" />
     <BucketPolicyModal v-if="selectedBucketForPolicy && openBucketPolicyModal" v-model:open="openBucketPolicyModal" :bucket="selectedBucketForPolicy" @saved="refreshBuckets" />
     <BucketTagsModal v-if="selectedBucketForTags && openBucketTagsModal" v-model:open="openBucketTagsModal" :bucket="selectedBucketForTags" @saved="refreshBuckets" />
+    <BucketSettingsModal v-if="selectedBucketForSettings && openBucketSettingsModal" v-model:open="openBucketSettingsModal" :bucket="selectedBucketForSettings" @saved="refreshBuckets" />
     <ShareFileModal v-if="shareObject && openShareModal" v-model:open="openShareModal" :bucket="currentBucket" :item="shareObject" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
     <UploadProgressSlideover />
