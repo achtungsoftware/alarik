@@ -19,5 +19,8 @@
   },
   "devDependencies": {
     "vue-tsc": "^3.3.6"
+  },
+  "overrides": {
+    "svgo": "^4.0.2"
   }
 }
