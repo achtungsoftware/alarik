@@ -32,10 +32,11 @@ const { confirm } = useConfirmDialog();
 const authHeaders = computed(() => ({ Authorization: `Bearer ${jwtCookie.value}` }));
 const apiBase = computed(() => useRuntimeConfig().public.apiBaseUrl);
 
-// A fixed palette cycled by each node's position in `nodes` (stable - sorted by joinedAt server-
-// side) - gives every node a consistent color across the storage chart, its legend, and anywhere
-// else a node needs a swatch, without needing to persist a color assignment anywhere.
-const nodeColorPalette = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ef4444", "#06b6d4", "#ec4899", "#84cc16"];
+// Identity palette
+const nodeColorPalette = [
+    "#5e99d4", "#1d1dcd", "#8beeee", "#cd1d67", "#4646a4", "#46a4a4", "#4c66e6", "#8bc5ee",
+    "#a44695", "#4c8ce6", "#4831b9", "#70a0c2", "#1dcdcd", "#d45e8f", "#4c4ce6", "#3175b9",
+];
 
 function formatAge(iso: string): string {
     const seconds = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
@@ -190,9 +191,19 @@ const degradedDescription = computed(() => {
     return parts.join(" · ");
 });
 
+// FNV-1a - a tiny, well-spread string hash. Deterministic and dependency-free.
+function hashString(input: string): number {
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+}
+
+// Color keyed off the node id (not its list position)
 function nodeColor(nodeId: string): string {
-    const idx = nodes.value.findIndex((n) => n.id === nodeId);
-    return nodeColorPalette[(idx >= 0 ? idx : 0) % nodeColorPalette.length]!;
+    return nodeColorPalette[hashString(nodeId) % nodeColorPalette.length]!;
 }
 
 function nodeAddress(id: string): string {
