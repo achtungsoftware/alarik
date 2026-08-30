@@ -408,6 +408,28 @@ struct UserControllerTests {
         }
     }
 
+    @Test("Create key stores and returns its description")
+    func testCreateAccessKeyWithDescription() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            let createDTO = AccessKey.Create(
+                accessKey: "described-key", secretKey: "test-secret",
+                description: "  Backup server  ")
+
+            try await app.test(
+                .POST, "/api/v1/users/accessKeys",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res throws in
+                    #expect(res.status == .ok)
+                    let key = try res.content.decode(AccessKey.ResponseDTO.self)
+                    #expect(key.description == "Backup server")
+                })
+        }
+    }
+
     @Test("Edit user with valid data")
     func editUserSuccess() async throws {
         try await withApp { app in
