@@ -59,6 +59,7 @@ watch(open, (val) => {
 const state = reactive({
     accessKey: accessKeyGeneratorResponse?.value.accessKeyId ?? "",
     secretKey: accessKeyGeneratorResponse?.value.secretAccessKey ?? "",
+    description: "",
 });
 
 async function submitForm(event: FormSubmitEvent<any>) {
@@ -101,6 +102,9 @@ async function submitForm(event: FormSubmitEvent<any>) {
 
                 <UFormField required label="Secret Key" name="secretKey">
                     <UInput placeholder="Secret Key" v-model="state.secretKey" class="w-full" size="lg" variant="subtle" />
+                </UFormField>
+                <UFormField label="Description" name="description" help="Optional note to help identify what this key is used for.">
+                    <UTextarea placeholder="e.g. Backup server" v-model="state.description" :maxlength="500" class="w-full" size="lg" variant="subtle" />
                 </UFormField>
                 <UFormField label="Expiration Date" name="expirationDate" help="The Access Key will be deleted automatically if you set a date.">
                     <UInputDate ref="inputDateRef" v-model="expirationDate" variant="subtle" size="lg" class="w-full">
