@@ -119,6 +119,10 @@ See the [documentation](https://alarik.io/docs) for the full API reference.
 
 Please see [Documentation](https://alarik.io/docs/installation)
 
+## One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Alarik/)
+
 ## Future of Alarik
 
 We are the ones behind the German Accounting-Software [belegFuchs](https://belegfuchs.de), and although we currently run MinIO in production, we are planning to migrate to Alarik in the future. This isn’t a marketing slogan - it’s a commitment that directly shapes our roadmap.
