@@ -52,8 +52,7 @@ enum CORSAllowedOrigins {
 
     private static func isOrigin(_ value: String) -> Bool {
         guard let components = URLComponents(string: value),
-            let scheme = components.scheme?.lowercased(), scheme == "http" || scheme == "https",
-            let host = components.host, !host.isEmpty, !host.contains("*")
+            let host = components.host, !host.isEmpty, !host.contains("*"), components.percentEncodedHost == host
         else {
             return false
         }
