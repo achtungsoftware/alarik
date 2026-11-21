@@ -23,12 +23,15 @@ struct OIDCDiscoveryDocument: Content {
     let authorizationEndpoint: String
     let tokenEndpoint: String
     let jwksURI: String
+    /// Only consulted to word the error when the JWKS turns out empty (see `validateJWKS`).
+    let idTokenSigningAlgValuesSupported: [String]?
 
     enum CodingKeys: String, CodingKey {
         case issuer
         case authorizationEndpoint = "authorization_endpoint"
         case tokenEndpoint = "token_endpoint"
         case jwksURI = "jwks_uri"
+        case idTokenSigningAlgValuesSupported = "id_token_signing_alg_values_supported"
     }
 }
 
@@ -112,7 +115,9 @@ final actor OIDCDiscoveryCache {
         guard jwksResponse.status == .ok, let jwksBody = jwksResponse.body else {
             throw Abort(.badGateway, reason: "OIDC JWKS request failed.")
         }
-        let keyCollection = try await JWTKeyCollection().add(jwksJSON: String(buffer: jwksBody))
+        let jwksJSON = String(buffer: jwksBody)
+        try Self.validateJWKS(jwksJSON, discovery: discoveryDoc)
+        let keyCollection = try await JWTKeyCollection().add(jwksJSON: jwksJSON)
 
         entries[issuerURL] = Entry(discovery: discoveryDoc, keys: keyCollection, fetchedAt: Date())
 
@@ -135,6 +140,39 @@ final actor OIDCDiscoveryCache {
                 issuerURL: issuerURL, client: client, forceRefresh: true)
             return try await refreshedKeys.verify(token, as: OIDCIDToken.self)
         }
+    }
+
+    private struct JWKSEnvelope: Decodable {
+        struct Key: Decodable {}
+        let keys: [Key]?
+    }
+
+    /// Authentik serves a bare `{}` when the provider has no Signing Key (HS256 via client
+    /// secret); JWTKit then fails with the opaque "No such key 'keys' at path ''" (issue #30).
+    /// Alarik only verifies against asymmetric JWKS keys, so name the real cause instead.
+    static func validateJWKS(_ json: String, discovery: OIDCDiscoveryDocument) throws {
+        let envelope = try? JSONDecoder().decode(JWKSEnvelope.self, from: Data(json.utf8))
+        if let keys = envelope?.keys, !keys.isEmpty { return }
+
+        let algs = discovery.idTokenSigningAlgValuesSupported ?? []
+        let hmacOnly = !algs.isEmpty && algs.allSatisfy { $0.uppercased().hasPrefix("HS") }
+        let hint: String
+        if hmacOnly {
+            hint = """
+                The provider advertises only symmetric ID token signing \
+                (\(algs.joined(separator: ", "))), which Alarik does not support. Configure an \
+                asymmetric signing key on the provider (Authentik: select a Signing Key on the \
+                OAuth2/OIDC provider) so it signs with RS256/ES256 and publishes the public key.
+                """
+        } else {
+            hint = """
+                Alarik verifies ID tokens against the public keys published there, so the provider \
+                must be configured with an asymmetric signing key (RS256/ES256).
+                """
+        }
+        throw Abort(
+            .badGateway,
+            reason: "OIDC provider's JWKS at \(discovery.jwksURI) contains no keys. \(hint)")
     }
 
     /// Drops any cached discovery/keys for `issuerURL` - call this when an admin edits a

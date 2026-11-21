@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 import Testing
+import Vapor
 
 @testable import Alarik
 
@@ -128,5 +129,48 @@ struct OIDCDiscoveryCacheIssuerTests {
                 url == "https://authentik.example.com/application/o/alarik/.well-known/openid-configuration"
             )
         }
+    }
+}
+
+/// Regression coverage for issue #30: an Authentik provider with no Signing Key signs ID tokens
+/// with HS256 and serves a bare `{}` as its JWKS, which previously surfaced only as JWTKit's
+/// opaque "No such key 'keys' at path ''".
+@Suite("OIDCDiscoveryCache JWKS validation tests")
+struct OIDCDiscoveryCacheJWKSTests {
+    private func discovery(algs: [String]?) -> OIDCDiscoveryDocument {
+        OIDCDiscoveryDocument(
+            issuer: "https://authentik.example.com/application/o/alarik/",
+            authorizationEndpoint: "https://authentik.example.com/application/o/authorize/",
+            tokenEndpoint: "https://authentik.example.com/application/o/token/",
+            jwksURI: "https://authentik.example.com/application/o/alarik/jwks/",
+            idTokenSigningAlgValuesSupported: algs)
+    }
+
+    @Test("an Authentik HS256-only provider gets an error naming the missing signing key")
+    func emptyJWKSWithHMACOnlyProvider() {
+        let error = #expect(throws: Abort.self) {
+            try OIDCDiscoveryCache.validateJWKS("{}", discovery: discovery(algs: ["HS256"]))
+        }
+        let reason = error?.reason ?? ""
+        #expect(reason.contains("contains no keys"))
+        #expect(reason.contains("HS256"))
+        #expect(reason.contains("Signing Key"))
+    }
+
+    @Test("an empty keys array is rejected even when the alg list looks asymmetric")
+    func emptyKeysArray() {
+        let error = #expect(throws: Abort.self) {
+            try OIDCDiscoveryCache.validateJWKS(
+                #"{"keys": []}"#, discovery: discovery(algs: ["RS256"]))
+        }
+        #expect(error?.reason.contains("contains no keys") == true)
+        #expect(error?.reason.contains("does not support") == false)
+    }
+
+    @Test("a JWKS with at least one key passes (JWTKit does the real parsing)")
+    func nonEmptyKeysPass() throws {
+        try OIDCDiscoveryCache.validateJWKS(
+            #"{"keys": [{"kty": "RSA", "kid": "a", "n": "AQAB", "e": "AQAB"}]}"#,
+            discovery: discovery(algs: nil))
     }
 }

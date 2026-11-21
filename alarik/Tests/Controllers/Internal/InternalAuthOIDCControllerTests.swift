@@ -54,12 +54,15 @@ struct InternalAuthOIDCControllerTests {
             /// When set, the discovery document reports THIS as its `issuer` instead of the
             /// real `issuerURL` - used to test that a self-reported issuer mismatch is rejected.
             var discoveryIssuerOverride: String?
+            /// Mimics an Authentik provider with no Signing Key: JWKS is a bare `{}` and the
+            /// discovery document advertises only HS256 (issue #30).
+            var emptyJWKS = false
 
             func set(
                 issuerURL: String? = nil, sub: String? = nil, email: String?? = nil,
                 emailVerified: Bool?? = nil, name: String?? = nil, nonce: String?? = nil,
                 audience: String? = nil, expired: Bool? = nil, tokenStatus: HTTPStatus? = nil,
-                discoveryIssuerOverride: String?? = nil
+                discoveryIssuerOverride: String?? = nil, emptyJWKS: Bool? = nil
             ) {
                 if let issuerURL { self.issuerURL = issuerURL }
                 if let sub { self.sub = sub }
@@ -71,6 +74,7 @@ struct InternalAuthOIDCControllerTests {
                 if let expired { self.expired = expired }
                 if let tokenStatus { self.tokenStatus = tokenStatus }
                 if let discoveryIssuerOverride { self.discoveryIssuerOverride = discoveryIssuerOverride }
+                if let emptyJWKS { self.emptyJWKS = emptyJWKS }
             }
         }
 
@@ -116,7 +120,8 @@ struct InternalAuthOIDCControllerTests {
                         issuer: reportedIssuer,
                         authorizationEndpoint: "\(issuerURL)/authorize",
                         tokenEndpoint: "\(issuerURL)/token",
-                        jwksURI: "\(issuerURL)/jwks"
+                        jwksURI: "\(issuerURL)/jwks",
+                        idTokenSigningAlgValuesSupported: await state.emptyJWKS ? ["HS256"] : ["EdDSA"]
                     ))
                 return res
             }
@@ -124,7 +129,7 @@ struct InternalAuthOIDCControllerTests {
             app.get("jwks") { req -> Response in
                 Response(
                     status: .ok, headers: ["content-type": "application/json"],
-                    body: .init(string: jwksJSON))
+                    body: .init(string: await state.emptyJWKS ? "{}" : jwksJSON))
             }
 
             app.post("token") { req -> Response in
@@ -364,6 +369,26 @@ struct InternalAuthOIDCControllerTests {
                 .GET, "/api/v1/auth/oidc/login/\(id)",
                 afterResponse: { res async throws in
                     #expect(res.status == .badGateway)
+                })
+        }
+    }
+
+    @Test("login explains an empty JWKS (Authentik provider without a Signing Key) instead of a decode error")
+    func loginExplainsEmptyJWKS() async throws {
+        let provider = try await FakeOIDCProvider.start()
+        defer { Task { try? await provider.shutdown() } }
+        await provider.state.set(emptyJWKS: true)
+
+        try await withApp(oidc: provider) { app, providerId in
+            let id = try #require(providerId)
+            try await app.test(
+                .GET, "/api/v1/auth/oidc/login/\(id)",
+                afterResponse: { res async throws in
+                    #expect(res.status == .badGateway)
+                    let body = res.body.string
+                    #expect(body.contains("contains no keys"))
+                    #expect(body.contains("Signing Key"))
+                    #expect(!body.contains("No such key 'keys'"))
                 })
         }
     }
