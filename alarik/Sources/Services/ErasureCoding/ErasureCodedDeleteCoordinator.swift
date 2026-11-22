@@ -130,6 +130,8 @@ enum ErasureCodedDeleteCoordinator {
         try? FileManager.default.removeItem(
             atPath: ErasureCodedObjectHandler.shardBasePath(
                 bucketName: bucketName, key: key, versionId: versionId))
+        // Without this the key's folder lingers as a phantom on every shard holder (issue #25).
+        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
 
         let peers = responsible.filter { $0.id != selfNodeId }
         guard !peers.isEmpty else { return }

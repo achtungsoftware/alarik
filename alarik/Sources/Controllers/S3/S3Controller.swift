@@ -1923,6 +1923,12 @@ struct S3Controller: RouteCollection {
         let outcome = try await ClusterReplicationService.coordinateDelete(
             app: req.application, bucketName: bucketName, key: keyPath, versionId: versionId,
             versioningStatus: versioningStatus, peers: peers)
+        // `aws s3 rm s3://b/folder/` on a folder with no marker object is how clients remove an
+        // empty folder; S3 answers 204 either way, so also drop the lingering directory.
+        if keyPath.hasSuffix("/") {
+            await ClusterReplicationService.pruneEmptyPrefix(
+                app: req.application, bucketName: bucketName, prefix: keyPath)
+        }
 
         var headers = HTTPHeaders()
         if let resultVersionId = outcome.versionId {
@@ -1993,6 +1999,10 @@ struct S3Controller: RouteCollection {
                 let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                     req: req, bucketName: bucketName, key: object.key,
                     versionId: object.versionId, versioningStatus: versioningStatus)
+                if object.key.hasSuffix("/") {
+                    await ClusterReplicationService.pruneEmptyPrefix(
+                        app: req.application, bucketName: bucketName, prefix: object.key)
+                }
 
                 deleted.append(
                     DeletedEntry(

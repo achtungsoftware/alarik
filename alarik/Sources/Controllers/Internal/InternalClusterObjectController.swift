@@ -38,6 +38,7 @@ struct InternalClusterObjectController: RouteCollection {
             ClusterSecretMiddleware())
         cluster.on(.POST, "push", body: .stream, use: handlePush)
         cluster.delete(use: handleDelete)
+        cluster.delete("prune", use: handlePrune)
         cluster.get("fetch", use: handleFetch)
         cluster.get("exists", use: handleExists)
         cluster.get("latest-version", use: handleLatestVersion)
@@ -237,6 +238,23 @@ struct InternalClusterObjectController: RouteCollection {
         }
 
         _ = POSIXFile.unlink(spoolPath)
+        return .ok
+    }
+
+    /// Local half of `ClusterReplicationService.pruneEmptyPrefix`: drops this node's directory
+    /// for `prefix` if it holds no object data. Safe to call on any node, whether or not it ever
+    /// held a shard under the prefix.
+    @Sendable
+    func handlePrune(req: Request) async throws -> HTTPStatus {
+        guard
+            let bucketName = req.query[String.self, at: "bucket"],
+            let prefix = req.query[String.self, at: "prefix"]
+        else {
+            throw Abort(.badRequest, reason: "Missing bucket/prefix query parameters")
+        }
+        try await req.application.threadPool.runIfActive {
+            ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucketName, prefix: prefix)
+        }
         return .ok
     }
 

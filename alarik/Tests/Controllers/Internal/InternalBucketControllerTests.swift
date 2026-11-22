@@ -1611,6 +1611,50 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("Delete folder - A phantom (already empty) folder disappears from the listing")
+    func testDeletePhantomFolder() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "phantom-bucket")
+            try await putObject(
+                app, bucketName: "phantom-bucket", key: "ghost/file.txt", content: "boo")
+
+            // Remove the object's file behind the server's back, leaving the bare directory - the
+            // state an erasure-coded delete used to leave on every shard holder (issue #25).
+            try FileManager.default.removeItem(
+                atPath: ObjectFileHandler.storagePath(for: "phantom-bucket", key: "ghost/file.txt"))
+
+            func listedFolders() async throws -> [String] {
+                var folders: [String] = []
+                try await app.test(
+                    .GET, "/api/v1/objects?bucket=phantom-bucket&delimiter=/",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    },
+                    afterResponse: { res async throws in
+                        #expect(res.status == .ok)
+                        let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                        folders = page.items.filter { $0.isFolder }.map { $0.key }
+                    })
+                return folders
+            }
+
+            // The phantom is what the user sees - and could not get rid of.
+            #expect(try await listedFolders() == ["ghost/"])
+
+            try await app.test(
+                .DELETE, "/api/v1/objects?bucket=phantom-bucket&key=ghost/",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .noContent)
+                })
+
+            #expect(try await listedFolders().isEmpty)
+        }
+    }
+
     @Test("Delete folder - Path traversal in prefix fails")
     func testDeleteFolderPathTraversal() async throws {
         try await withApp { app in

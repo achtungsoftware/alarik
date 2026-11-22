@@ -162,6 +162,40 @@ enum ClusterReplicationService {
         return outcome
     }
 
+    /// Removes the on-disk directory behind a `folder/` prefix on every node once it holds no
+    /// object data. A key maps to a real nested path, so a folder whose last object was deleted
+    /// can linger as an empty directory - and the directory-scoped listing reports any
+    /// subdirectory as a folder, so it shows as a phantom that no delete could remove (issue
+    /// #25). Fans out to ALL active nodes, not just the prefix key's responsible set: shards of
+    /// the folder's former children lived wherever placement put them. Best-effort - a node
+    /// that's down keeps its directory until the next folder delete reaches it.
+    static func pruneEmptyPrefix(app: Application, bucketName: String, prefix: String) async {
+        guard prefix.hasSuffix("/") else { return }
+        _ = try? await offloadPrune(app: app, bucketName: bucketName, prefix: prefix)
+
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let peers = await ClusterNodeCache.shared.activeNodes().filter { $0.id != config.nodeId }
+        await withTaskGroup(of: Void.self) { group in
+            for peer in peers {
+                group.addTask {
+                    do {
+                        try await ClusterReplicationClient.pruneEmptyPrefix(
+                            app: app, to: peer, bucketName: bucketName, prefix: prefix)
+                    } catch {
+                        app.logger.warning(
+                            "Folder prune of '\(prefix)' in '\(bucketName)' failed on node \(peer.id): \(error)")
+                    }
+                }
+            }
+        }
+    }
+
+    private static func offloadPrune(app: Application, bucketName: String, prefix: String) async throws {
+        try await app.threadPool.runIfActive {
+            ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucketName, prefix: prefix)
+        }
+    }
+
     /// Pushes an object this node just wrote locally out to every node that's actually
     /// responsible for it, for the rare write path that can't determine its destination key (and
     /// therefore routing) until *after* the request body is already consumed - the admin

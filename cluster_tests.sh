@@ -1234,6 +1234,63 @@ else
     fail "Admin console folder delete left at least one key present on at least one node."
 fi
 
+# ── Test 26b: deleting EC objects leaves no phantom folder; empty folders are deletable ──
+# Issue #25: removing an erasure-coded object dropped its shard directory but kept the now-empty
+# parent folder on every shard holder, so the folder lived on as a phantom that neither the
+# console nor `aws s3 rm` could remove.
+echo ""
+echo "=== Test: EC object delete leaves no phantom folder, and an empty folder can be deleted ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-phantom-folder-test >/dev/null 2>&1
+echo "phantom" | aws --endpoint-url "${ENDPOINTS[1]}" s3 cp - "s3://cluster-phantom-folder-test/gone/file.txt" >/dev/null
+sleep 2
+aws --endpoint-url "${ENDPOINTS[2]}" s3 rm "s3://cluster-phantom-folder-test/gone/file.txt" >/dev/null
+sleep 2
+
+PHANTOM_SEEN=0
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    PREFIXES=$(aws --endpoint-url "${ENDPOINTS[$i]}" s3api list-objects-v2 --bucket cluster-phantom-folder-test --delimiter / \
+        | jq -r '.CommonPrefixes[]?.Prefix' 2>/dev/null)
+    if echo "$PREFIXES" | grep -q '^gone/$'; then
+        PHANTOM_SEEN=1
+        echo "  node $i still lists gone/ after its only object was deleted"
+    fi
+    if [ -d "${STATE_DIRS[$i]}/Storage/buckets/cluster-phantom-folder-test/gone" ]; then
+        PHANTOM_SEEN=1
+        echo "  node $i still has the gone/ directory on disk"
+    fi
+done
+if [ "$PHANTOM_SEEN" -eq 0 ]; then
+    pass "Deleting an erasure-coded object prunes its now-empty folder on every node."
+else
+    fail "Deleting an erasure-coded object left a phantom folder behind."
+fi
+
+# A folder that is already a bare directory on some nodes (the pre-fix leftover) must be
+# removable both through the console API and through a plain S3 DeleteObject of 'folder/'.
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    mkdir -p "${STATE_DIRS[$i]}/Storage/buckets/cluster-phantom-folder-test/stale-console/deep"
+    mkdir -p "${STATE_DIRS[$i]}/Storage/buckets/cluster-phantom-folder-test/stale-s3"
+done
+curl -s -o /dev/null -X DELETE "${ENDPOINTS[3]}/api/v1/objects?bucket=cluster-phantom-folder-test&key=stale-console/" \
+    -H "Authorization: Bearer $TOKEN"
+aws --endpoint-url "${ENDPOINTS[0]}" s3 rm "s3://cluster-phantom-folder-test/stale-s3/" >/dev/null
+sleep 2
+
+STALE_LEFT=0
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    for d in stale-console stale-s3; do
+        if [ -d "${STATE_DIRS[$i]}/Storage/buckets/cluster-phantom-folder-test/$d" ]; then
+            STALE_LEFT=1
+            echo "  node $i still has $d/ on disk"
+        fi
+    done
+done
+if [ "$STALE_LEFT" -eq 0 ]; then
+    pass "An empty folder is removed from every node via the console API and via S3 DeleteObject."
+else
+    fail "An empty folder survived deletion on at least one node."
+fi
+
 # ── Test 27: admin console version delete from a non-responsible node ──────────
 echo ""
 echo "=== Test: admin console version delete from a non-responsible node ==="

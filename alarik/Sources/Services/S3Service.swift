@@ -71,7 +71,11 @@ struct S3Service {
     }
 
     static func extractObjectKey(from req: Request) -> String {
-        let key = req.parameters.getCatchall().joined(separator: "/")
+        var key = req.parameters.getCatchall().joined(separator: "/")
+        // The catch-all drops a trailing empty component, turning the folder key `docs/` into
+        // the plain key `docs` - a folder marker would be stored (and later deleted) under the
+        // wrong name. The raw path still carries the slash (issue #25).
+        if !key.isEmpty, req.url.path.hasSuffix("/") { key += "/" }
         // URL-decode the key in case the client sent encoded characters
         return key.removingPercentEncoding ?? key
     }

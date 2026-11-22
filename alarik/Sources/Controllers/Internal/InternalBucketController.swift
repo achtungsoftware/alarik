@@ -791,6 +791,10 @@ struct InternalBucketController: RouteCollection {
                         "Failed to delete \(failedKeys) object(s) under the prefix; some may remain. Please retry."
                 )
             }
+            // The per-key deletes prune their own parents, but a folder that was already empty
+            // (a phantom directory) has no keys to delete - this is what actually removes it.
+            await ClusterReplicationService.pruneEmptyPrefix(
+                app: req.application, bucketName: bucketName, prefix: sanitizedPrefix)
         } else {
             let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                 req: req, bucketName: bucketName, key: key, versionId: nil,

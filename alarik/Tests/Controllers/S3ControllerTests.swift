@@ -1659,6 +1659,82 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("Put Object - a 'folder/' marker key keeps its trailing slash and lists as a folder")
+    func testFolderMarkerKeyKeepsTrailingSlash() async throws {
+        let bucketName = "test-folder-marker-key"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            // What `aws s3api put-object --key docs/` (and the AWS console) send for a folder.
+            try await putObject(app, bucketName: bucketName, key: "docs/", content: "")
+
+            let headSigned = signedHeaders(for: .HEAD, path: "/\(bucketName)/docs/")
+            try await app.test(
+                .HEAD, "/\(bucketName)/docs/",
+                beforeRequest: { req in req.headers.add(contentsOf: headSigned) },
+                afterResponse: { res in #expect(res.status == .ok) })
+
+            let listSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)", query: "list-type=2&delimiter=/")
+            try await app.test(
+                .GET, "/\(bucketName)?list-type=2&delimiter=/",
+                beforeRequest: { req in req.headers.add(contentsOf: listSigned) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Prefix>docs/</Prefix>"))
+                    #expect(!res.body.string.contains("<Key>docs</Key>"))
+                })
+
+            // Deleting the marker removes the folder entirely.
+            let deleteSigned = signedHeaders(for: .DELETE, path: "/\(bucketName)/docs/")
+            try await app.test(
+                .DELETE, "/\(bucketName)/docs/",
+                beforeRequest: { req in req.headers.add(contentsOf: deleteSigned) },
+                afterResponse: { res in #expect(res.status == .noContent) })
+            try await app.test(
+                .GET, "/\(bucketName)?list-type=2&delimiter=/",
+                beforeRequest: { req in req.headers.add(contentsOf: listSigned) },
+                afterResponse: { res in
+                    #expect(!res.body.string.contains("docs"))
+                })
+        }
+    }
+
+    @Test("Delete Object - DELETE of 'folder/' removes a phantom empty folder from the listing")
+    func testDeleteFolderKeyRemovesPhantomDirectory() async throws {
+        let bucketName = "test-delete-phantom-folder"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "ghost/file.txt", content: "boo")
+            // Leave the bare directory behind, as an erasure-coded delete used to (issue #25).
+            try FileManager.default.removeItem(
+                atPath: ObjectFileHandler.storagePath(for: bucketName, key: "ghost/file.txt"))
+
+            func listing() async throws -> String {
+                let signed = signedHeaders(
+                    for: .GET, path: "/\(bucketName)", query: "list-type=2&delimiter=/")
+                var body = ""
+                try await app.test(
+                    .GET, "/\(bucketName)?list-type=2&delimiter=/",
+                    beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        body = res.body.string
+                    })
+                return body
+            }
+            #expect(try await listing().contains("<Prefix>ghost/</Prefix>"))
+
+            // No `ghost/` marker object exists - S3 still answers 204, and the folder must go.
+            let signed = signedHeaders(for: .DELETE, path: "/\(bucketName)/ghost/")
+            try await app.test(
+                .DELETE, "/\(bucketName)/ghost/",
+                beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                afterResponse: { res in #expect(res.status == .noContent) })
+
+            #expect(!(try await listing().contains("<Prefix>ghost/</Prefix>")))
+        }
+    }
+
     @Test("Delete Object - versionId 'null' removes a never-versioned key's plain object")
     func testDeleteNullVersionRemovesPlainObject() async throws {
         let bucketName = "test-delete-null-version"

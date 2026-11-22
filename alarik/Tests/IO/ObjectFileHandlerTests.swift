@@ -1170,3 +1170,81 @@ struct ObjectFileHandlerTests {
         #expect(objects[1].key == "docs/file3.txt")
     }
 }
+
+/// Issue #25: a folder whose objects are gone can linger as an empty directory (and therefore a
+/// phantom folder in the listing). `removeEmptyPrefixDirectory` must remove exactly those, and
+/// never a directory that still holds object data in any form.
+@Suite("ObjectFileHandler empty-prefix removal", .serialized)
+struct ObjectFileHandlerEmptyPrefixTests {
+    private let bucket = "prefix-prune-bucket"
+    private var bucketRoot: String { "\(BucketHandler.rootPath)\(bucket)" }
+
+    private func reset() throws {
+        try? FileManager.default.removeItem(atPath: bucketRoot)
+        try FileManager.default.createDirectory(
+            atPath: bucketRoot, withIntermediateDirectories: true)
+    }
+
+    private func exists(_ relative: String) -> Bool {
+        FileManager.default.fileExists(atPath: "\(bucketRoot)/\(relative)")
+    }
+
+    @Test("nested empty directories are removed, up to but not including the bucket root")
+    func removesNestedEmptyDirectories() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: bucketRoot) }
+        try FileManager.default.createDirectory(
+            atPath: "\(bucketRoot)/a/b/c", withIntermediateDirectories: true)
+
+        #expect(ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: "a/b/"))
+        #expect(!exists("a"))
+        #expect(FileManager.default.fileExists(atPath: bucketRoot))
+    }
+
+    @Test("a directory holding any object artifact is left untouched")
+    func keepsDirectoriesWithObjectData() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: bucketRoot) }
+        for artifact in ["plain/x.obj", "versioned/k.versions/v1.obj", "ec/k.ecshards/0.ecshard"] {
+            let path = "\(bucketRoot)/\(artifact)"
+            try FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: URL(fileURLWithPath: path))
+        }
+        // Even an empty sibling subdirectory next to data must not pull the parent down.
+        try FileManager.default.createDirectory(
+            atPath: "\(bucketRoot)/plain/empty-sub", withIntermediateDirectories: true)
+
+        for prefix in ["plain/", "versioned/", "ec/"] {
+            #expect(
+                !ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: prefix),
+                "expected '\(prefix)' to be kept")
+        }
+        #expect(exists("plain/x.obj"))
+        #expect(exists("versioned/k.versions/v1.obj"))
+        #expect(exists("ec/k.ecshards/0.ecshard"))
+    }
+
+    @Test("OS junk alone does not keep a folder alive")
+    func junkOnlyDirectoryIsRemoved() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: bucketRoot) }
+        try FileManager.default.createDirectory(
+            atPath: "\(bucketRoot)/junk/sub", withIntermediateDirectories: true)
+        try Data().write(to: URL(fileURLWithPath: "\(bucketRoot)/junk/sub/.DS_Store"))
+
+        #expect(ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: "junk/"))
+        #expect(!exists("junk"))
+    }
+
+    @Test("rejects prefixes that are not folders or try to escape the bucket")
+    func rejectsBadPrefixes() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: bucketRoot) }
+        #expect(!ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: "file"))
+        #expect(!ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: "../"))
+        #expect(!ObjectFileHandler.removeEmptyPrefixDirectory(bucketName: bucket, prefix: "a/../"))
+        #expect(FileManager.default.fileExists(atPath: bucketRoot))
+    }
+}

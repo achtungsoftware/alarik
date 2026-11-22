@@ -683,6 +683,30 @@ enum ClusterReplicationClient {
         return tempPath
     }
 
+    /// Tells `node` to drop its directory for `prefix` if nothing under it is object data (see
+    /// `ObjectFileHandler.removeEmptyPrefixDirectory`).
+    static func pruneEmptyPrefix(
+        app: Application, to node: ClusterNodeInfo, bucketName: String, prefix: String
+    ) async throws {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        let allowed = CharacterSet.urlQueryAllowed
+        let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
+        let encodedPrefix = prefix.addingPercentEncoding(withAllowedCharacters: allowed) ?? prefix
+        var outbound = HTTPClientRequest(
+            url: "\(node.address)/internal/cluster/objects/prune?bucket=\(encodedBucket)&prefix=\(encodedPrefix)")
+        outbound.method = .DELETE
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard (200..<300).contains(response.status.code) else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+    }
+
     /// Tells `node` to delete whatever shard(s) it locally holds for (bucketName, key,
     /// versionId) - no `shardIndex` needed: a node only ever holds the one shard index it's
     /// currently responsible for, so "delete my shard for this version" is unambiguous. Used for

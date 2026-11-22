@@ -415,6 +415,8 @@ struct InternalClusterErasureCodedController: RouteCollection {
         try? FileManager.default.removeItem(
             atPath: ErasureCodedObjectHandler.shardBasePath(
                 bucketName: bucketName, key: key, versionId: versionId))
+        // Same as the coordinator's local removal: don't leave the folder behind as a phantom.
+        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
         return .ok
     }
 

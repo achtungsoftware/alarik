@@ -479,6 +479,50 @@ struct ObjectFileHandler {
         }
     }
 
+    /// Removes the directory a `folder/` prefix maps to when nothing under it is object data -
+    /// only (nested) empty directories and OS junk - then prunes its parents. Returns false and
+    /// touches nothing when any object artifact exists anywhere below. Bottom-up `rmdir` keeps
+    /// this race-safe against a concurrent write (issue #25: phantom folders after EC deletes).
+    @discardableResult
+    static func removeEmptyPrefixDirectory(bucketName: String, prefix: String) -> Bool {
+        guard prefix.hasSuffix("/"), !prefix.contains("..") else { return false }
+        let bucketRoot = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        let dir = bucketRoot + "/" + String(prefix.dropLast())
+        guard dir.hasPrefix(bucketRoot + "/"), removeDirectoryIfNoObjectData(dir) else {
+            return false
+        }
+        // Reuse the ancestor walk: a key named like the removed directory has exactly its parents.
+        pruneEmptyParentDirectories(forKey: String(prefix.dropLast()), bucketName: bucketName)
+        return true
+    }
+
+    private static func removeDirectoryIfNoObjectData(_ dir: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDirectory),
+            isDirectory.boolValue,
+            let entries = try? FileManager.default.contentsOfDirectory(atPath: dir)
+        else { return false }
+        for name in entries {
+            let path = "\(dir)/\(name)"
+            var entryIsDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &entryIsDirectory) else {
+                continue
+            }
+            if entryIsDirectory.boolValue {
+                // `.versions` / `.ecshards` hold object data even when their key has no plain file.
+                guard !name.hasSuffix(".versions"), !name.hasSuffix(".ecshards"),
+                    removeDirectoryIfNoObjectData(path)
+                else { return false }
+            } else {
+                guard ignorableDirectoryEntries.contains(name) || name.hasPrefix("._") else {
+                    return false
+                }
+            }
+        }
+        _ = removeOSMetadataIfSoleContents(of: dir)
+        return dir.withCString({ rmdir($0) }) == 0
+    }
+
     /// OS/desktop metadata files that can appear in a directory without being object data.
     private static let ignorableDirectoryEntries: Set<String> = [
         ".DS_Store", ".localized", "Thumbs.db", "desktop.ini",
