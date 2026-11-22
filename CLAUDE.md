@@ -62,7 +62,7 @@ There is no SQL/embedded DB. All control-plane metadata (users, buckets, access 
 
 `routes.swift` registers, in order: health probes (`/livez`, `/readyz`), `/api/v1/*` (console/internal API, mostly behind `InternalAuthenticator`), top-level node-to-node cluster controllers (behind the cluster-secret middleware), and finally `S3Controller`, which claims `:bucketName` + `**` catch-alls. Ordering matters — a bucket may not be named after a constant top-level path (`MetadataNamespace.reservedRootPaths`).
 
-Every S3 object handler follows the same shape: authenticate → extract bucket/key → `ObjectRoutingService.routingDecision` (before touching `req.body`, since `.forward` streams it onward untouched) → serve locally or proxy to a responsible node. Multipart operations use `multipartRoutingDecision` instead, which pins to rank-0, because in-flight part state exists on only one node.
+Every S3 object handler follows the same shape: authenticate → extract bucket/key → `ObjectRoutingService.routingDecision` (before touching `req.body`, since `.forward` streams it onward untouched) → serve locally or proxy to a responsible node. Multipart operations use `multipartRoutingDecision` instead, which pins to rank-0, because in-flight part state exists on only one node. The console's chunked upload (`/api/v1/objects/multipart*`, files ≥ 32 MiB) rides the same pinning and shares `S3Controller.completeMultipartUpload`.
 
 ### Clustering
 

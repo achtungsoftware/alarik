@@ -1291,6 +1291,48 @@ else
     fail "An empty folder survived deletion on at least one node."
 fi
 
+# ── Test 26c: console multipart upload converges on one node from wherever each call lands ──
+# Issue #21: the console splits large files into parts via /api/v1/objects/multipart. Every call
+# must pin to the key's rank-0 node exactly like the S3 multipart path, so a create / part /
+# complete sequence that reaches three different nodes still assembles one object.
+echo ""
+echo "=== Test: console multipart upload spread across nodes assembles one object ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-console-mp-test >/dev/null 2>&1
+MP_KEY="chunked/big.bin"
+MP_PART1="$LOG_DIR/mp-part1.bin"; MP_PART2="$LOG_DIR/mp-part2.bin"
+head -c $((6 * 1024 * 1024)) /dev/urandom > "$MP_PART1"
+head -c $((1024 * 1024)) /dev/urandom > "$MP_PART2"
+MP_UPLOAD_ID=$(curl -s -X POST "${ENDPOINTS[1]}/api/v1/objects/multipart?bucket=cluster-console-mp-test&key=$MP_KEY" \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.uploadId')
+MP_ETAG1=$(curl -s -X PUT "${ENDPOINTS[2]}/api/v1/objects/multipart/part?bucket=cluster-console-mp-test&key=$MP_KEY&uploadId=$MP_UPLOAD_ID&partNumber=1" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$MP_PART1" | jq -r '.etag')
+MP_ETAG2=$(curl -s -X PUT "${ENDPOINTS[3]}/api/v1/objects/multipart/part?bucket=cluster-console-mp-test&key=$MP_KEY&uploadId=$MP_UPLOAD_ID&partNumber=2" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$MP_PART2" | jq -r '.etag')
+MP_COMPLETE_STATUS=$(curl -s -o "$LOG_DIR/mp-complete.json" -w "%{http_code}" -X POST \
+    "${ENDPOINTS[0]}/api/v1/objects/multipart/complete?bucket=cluster-console-mp-test&key=$MP_KEY&uploadId=$MP_UPLOAD_ID" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"parts\":[{\"partNumber\":1,\"etag\":\"$MP_ETAG1\"},{\"partNumber\":2,\"etag\":\"$MP_ETAG2\"}]}")
+sleep 2
+
+cat "$MP_PART1" "$MP_PART2" > "$LOG_DIR/mp-expected.bin"
+MP_OK=1
+if [ "$MP_COMPLETE_STATUS" != "200" ] || [ -z "$MP_UPLOAD_ID" ] || [ "$MP_UPLOAD_ID" = "null" ]; then
+    MP_OK=0
+    echo "  create/complete failed (uploadId='$MP_UPLOAD_ID', complete status $MP_COMPLETE_STATUS): $(cat "$LOG_DIR/mp-complete.json")"
+fi
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    if ! aws --endpoint-url "${ENDPOINTS[$i]}" s3 cp "s3://cluster-console-mp-test/$MP_KEY" "$LOG_DIR/mp-got-$i.bin" >/dev/null 2>&1 \
+        || ! cmp -s "$LOG_DIR/mp-expected.bin" "$LOG_DIR/mp-got-$i.bin"; then
+        MP_OK=0
+        echo "  node $i does not serve the assembled object byte-for-byte"
+    fi
+done
+if [ "$MP_OK" -eq 1 ]; then
+    pass "Console multipart create/part/complete issued to three different nodes assembled one object readable from every node."
+else
+    fail "Console multipart upload spread across nodes did not produce a consistent object."
+fi
+
 # ── Test 27: admin console version delete from a non-responsible node ──────────
 echo ""
 echo "=== Test: admin console version delete from a non-responsible node ==="

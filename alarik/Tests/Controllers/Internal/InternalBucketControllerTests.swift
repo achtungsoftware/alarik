@@ -1330,6 +1330,149 @@ struct InternalBucketControllerTests {
         }
     }
 
+    // MARK: - Console multipart upload (issue #21)
+
+    private struct MultipartCreated: Content { let uploadId: String; let key: String }
+    private struct MultipartPart: Content { let partNumber: Int; let etag: String }
+    private struct MultipartCompleteBody: Content { let parts: [MultipartPart] }
+
+    private func createMultipart(_ app: Application, token: String, bucket: String, key: String)
+        async throws -> String
+    {
+        var uploadId = ""
+        try await app.test(
+            .POST, "/api/v1/objects/multipart?bucket=\(bucket)&key=\(key)&contentType=text/plain",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+            },
+            afterResponse: { res async throws in
+                #expect(res.status == .ok)
+                let created = try res.content.decode(MultipartCreated.self)
+                #expect(created.key == key)
+                uploadId = created.uploadId
+            })
+        return uploadId
+    }
+
+    private func uploadPart(
+        _ app: Application, token: String, bucket: String, key: String, uploadId: String,
+        partNumber: Int, body: String, expect status: HTTPStatus = .ok
+    ) async throws -> String? {
+        var etag: String?
+        try await app.test(
+            .PUT,
+            "/api/v1/objects/multipart/part?bucket=\(bucket)&key=\(key)&uploadId=\(uploadId)&partNumber=\(partNumber)",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                req.headers.contentType = .init(type: "application", subType: "octet-stream")
+                req.body = ByteBuffer(string: body)
+            },
+            afterResponse: { res async throws in
+                #expect(res.status == status)
+                if res.status == .ok {
+                    let part = try res.content.decode(MultipartPart.self)
+                    #expect(part.partNumber == partNumber)
+                    etag = part.etag
+                }
+            })
+        return etag
+    }
+
+    @Test("Console multipart - create, upload parts, complete yields the assembled object")
+    func testConsoleMultipartRoundTrip() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "mp-bucket")
+            let key = "videos/big.bin"
+            let uploadId = try await createMultipart(app, token: token, bucket: "mp-bucket", key: key)
+
+            let partOne = String(repeating: "a", count: 6 * 1024 * 1024)
+            let partTwo = "tail"
+            let etagOne = try #require(
+                try await uploadPart(
+                    app, token: token, bucket: "mp-bucket", key: key, uploadId: uploadId,
+                    partNumber: 1, body: partOne))
+            let etagTwo = try #require(
+                try await uploadPart(
+                    app, token: token, bucket: "mp-bucket", key: key, uploadId: uploadId,
+                    partNumber: 2, body: partTwo))
+
+            try await app.test(
+                .POST, "/api/v1/objects/multipart/complete?bucket=mp-bucket&key=\(key)&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    // Out of order on purpose - the server sorts by part number.
+                    try req.content.encode(
+                        MultipartCompleteBody(parts: [
+                            MultipartPart(partNumber: 2, etag: etagTwo),
+                            MultipartPart(partNumber: 1, etag: etagOne),
+                        ]))
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    let dto = try res.content.decode(ObjectMeta.ResponseDTO.self)
+                    #expect(dto.key == key)
+                    #expect(dto.size == partOne.utf8.count + partTwo.utf8.count)
+                    #expect(dto.contentType == "text/plain")
+                })
+
+            // The upload directory is gone and the object reads back byte-for-byte.
+            #expect(!MultipartFileHandler.uploadExists(bucketName: "mp-bucket", uploadId: uploadId))
+            let stored = try #require(
+                try ObjectFileHandler.readCurrentObject(bucketName: "mp-bucket", key: key, loadData: true))
+            let storedData = try #require(stored.data)
+            #expect(storedData.count == partOne.utf8.count + partTwo.utf8.count)
+            #expect(storedData.suffix(4) == Data("tail".utf8))
+        }
+    }
+
+    @Test("Console multipart - abort removes the upload, and bad requests are rejected")
+    func testConsoleMultipartAbortAndValidation() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "mp-bucket")
+            let uploadId = try await createMultipart(app, token: token, bucket: "mp-bucket", key: "a.bin")
+
+            // Part number out of range, empty body, and an uploadId used with a different key.
+            _ = try await uploadPart(
+                app, token: token, bucket: "mp-bucket", key: "a.bin", uploadId: uploadId,
+                partNumber: 0, body: "x", expect: .badRequest)
+            _ = try await uploadPart(
+                app, token: token, bucket: "mp-bucket", key: "a.bin", uploadId: uploadId,
+                partNumber: 1, body: "", expect: .badRequest)
+            _ = try await uploadPart(
+                app, token: token, bucket: "mp-bucket", key: "other.bin", uploadId: uploadId,
+                partNumber: 1, body: "x", expect: .notFound)
+
+            // Someone else's bucket is simply not found.
+            let otherToken = try await createUserAndLogin(app, username: "other@example.com")
+            try await app.test(
+                .POST, "/api/v1/objects/multipart?bucket=mp-bucket&key=a.bin",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                },
+                afterResponse: { res in #expect(res.status == .notFound) })
+
+            try await app.test(
+                .DELETE, "/api/v1/objects/multipart?bucket=mp-bucket&key=a.bin&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res in #expect(res.status == .noContent) })
+            #expect(!MultipartFileHandler.uploadExists(bucketName: "mp-bucket", uploadId: uploadId))
+
+            // Completing an aborted upload is a 404, not a 500.
+            try await app.test(
+                .POST, "/api/v1/objects/multipart/complete?bucket=mp-bucket&key=a.bin&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        MultipartCompleteBody(parts: [MultipartPart(partNumber: 1, etag: "x")]))
+                },
+                afterResponse: { res in #expect(res.status == .notFound) })
+        }
+    }
+
     @Test("Delete object - With prefix path")
     func testDeleteObjectWithPrefix() async throws {
         try await withApp { app in

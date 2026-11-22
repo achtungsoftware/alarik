@@ -983,7 +983,7 @@ struct S3Controller: RouteCollection {
             // Erasure-coded write: mint the version id the same way the plain versioned-write
             // path does (tags/listing behave identically either way), but encode+place shards
             // instead of writing a single `.obj` file.
-            let (versionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+            let (versionId, versionedMeta, priorLatestVersionId) = try Self.prepareErasureCodedVersionedWrite(
                 metadata: meta, bucketName: bucketName, key: keyPath,
                 versioningStatus: versioningStatus)
 
@@ -1094,7 +1094,7 @@ struct S3Controller: RouteCollection {
     /// `versionId` as true Swift `nil` for `.disabled` buckets instead of the `"null"`-string
     /// sentinel, since EC shard path selection keys off `versionId == nil`. `.suspended` is
     /// unaffected - it genuinely uses versioned storage under the literal name `"null"`.
-    private func prepareErasureCodedVersionedWrite(
+    static func prepareErasureCodedVersionedWrite(
         metadata: ObjectMeta, bucketName: String, key: String, versioningStatus: VersioningStatus
     ) throws -> (versionId: String?, versionedMeta: ObjectMeta, priorLatestVersionId: String?) {
         guard versioningStatus != .disabled else {
@@ -1521,7 +1521,7 @@ struct S3Controller: RouteCollection {
 
         let versionId: String?
         if let ecWriteFanOut {
-            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try Self.prepareErasureCodedVersionedWrite(
                 metadata: destinationMeta, bucketName: destinationBucket, key: destinationKey,
                 versioningStatus: versioningStatus)
 
@@ -2228,70 +2228,13 @@ struct S3Controller: RouteCollection {
 
         let parts = try S3Service.parseCompleteMultipartBody(bodyString, requestId: req.id)
 
-        // Get versioning status
-        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
-
-        // Complete the upload - streams every part into the final object and fsyncs before
-        // returning, real blocking file IO, so it's offloaded to the blocking-IO thread pool
-        // rather than tying up the async executor for a potentially multi-gigabyte assembly.
-        // Every request in this upload's lifecycle already landed on the identical (rank-0) node,
-        // so EC eligibility can be checked fresh here without any extra forwarding.
-        var usedEC = false
-        let etag: String
-        let versionId: String?
-        let finalSize: Int
-        var objectChecksum: ObjectChecksum?
+        let completion: MultipartCompletion
         do {
-            if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self],
-                case .local(let ecPeers) = try await ObjectRoutingService.erasureCodedRoutingDecision(
-                    req: req, bucketName: bucketName, key: key)
-            {
-                let plan = try await S3Service.offloadBlockingIO(req) {
-                    try MultipartFileHandler.prepareCompletion(
-                        bucketName: bucketName, uploadId: uploadId, parts: parts)
-                }
-                let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
-                    metadata: plan.objectMeta, bucketName: bucketName, key: key,
-                    versioningStatus: versioningStatus)
-                do {
-                    try await ErasureCodedWriteCoordinator.write(
-                        app: req.application, bucketName: bucketName, key: key,
-                        objectMeta: versionedMeta, payloadSources: plan.payloadSources,
-                        peers: ecPeers, ecConfig: (ecConfig.dataShards, ecConfig.parityShards),
-                        priorLatestVersionId: priorLatestVersionId)
-                } catch let error as ErasureCodedCoordinatorError {
-                    throw S3Error(
-                        status: .serviceUnavailable, code: "ServiceUnavailable",
-                        message: "\(error)", requestId: req.id)
-                }
-                if let mintedVersionId {
-                    try await S3Service.offloadBlockingIO(req) {
-                        try ObjectFileHandler.updateLatestPointer(
-                            bucketName: bucketName, key: key, versionId: mintedVersionId)
-                    }
-                }
-                versionId = mintedVersionId
-                try await S3Service.offloadBlockingIO(req) {
-                    try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
-                }
-                etag = plan.etag
-                finalSize = plan.totalSize
-                objectChecksum = plan.objectMeta.checksum
-                usedEC = true
-            } else {
-                let result = try await S3Service.offloadBlockingIO(req) {
-                    try MultipartFileHandler.completeUpload(
-                        bucketName: bucketName,
-                        uploadId: uploadId,
-                        parts: parts,
-                        versioningStatus: versioningStatus
-                    )
-                }
-                etag = result.etag
-                versionId = result.versionId
-                finalSize = result.size
-                objectChecksum = result.checksum
-            }
+            completion = try await Self.completeMultipartUpload(
+                req: req, bucketName: bucketName, key: key, uploadId: uploadId, parts: parts,
+                peers: peers)
+        } catch let error as S3Error {
+            throw error
         } catch let error as NSError {
             // Convert NSError to S3Error
             let code = error.domain == "InvalidPartOrder" ? "InvalidPartOrder" : "InvalidPart"
@@ -2299,18 +2242,9 @@ struct S3Controller: RouteCollection {
                 status: .badRequest, code: code,
                 message: error.localizedDescription, requestId: req.id)
         }
-
-        await NotificationService.emit(
-            event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
-            size: finalSize, etag: etag, versionId: versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
-        await ReplicationService.enqueuePut(
-            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
-        if !usedEC {
-            await ClusterReplicationService.replicateWrite(
-                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
-                operation: .put, peers: peers)
-        }
+        let etag = completion.etag
+        let versionId = completion.versionId
+        let objectChecksum = completion.checksum
 
         // Build response headers
         var headers = HTTPHeaders()
@@ -2345,6 +2279,102 @@ struct S3Controller: RouteCollection {
         return Response(status: .ok, headers: headers, body: .init(string: xml))
     }
 
+
+    struct MultipartCompletion {
+        let etag: String
+        let size: Int
+        let versionId: String?
+        let checksum: ObjectChecksum?
+    }
+
+    /// Assembles a multipart upload into the final object and runs every post-write side effect
+    /// (notification, bucket replication, cluster replication). Shared by the S3
+    /// CompleteMultipartUpload handler and the console's chunked upload
+    /// (`InternalBucketController.completeMultipartUpload`, issue #21) so both produce an
+    /// identical object. Must run on the upload's rank-0 node (see `multipartRoutingDecision`);
+    /// every request in the upload's lifecycle already landed there, so EC eligibility can be
+    /// checked fresh without extra forwarding. Part/order problems surface as the `NSError`s
+    /// `MultipartFileHandler` throws; EC unavailability as an `S3Error`.
+    static func completeMultipartUpload(
+        req: Request, bucketName: String, key: String, uploadId: String,
+        parts: [(partNumber: Int, etag: String)], peers: [ClusterNodeInfo]
+    ) async throws -> MultipartCompletion {
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(
+            app: req.application, bucket: bucketName)
+
+        // Streams every part into the final object and fsyncs before returning - real blocking
+        // file IO, offloaded to the blocking-IO thread pool rather than tying up the async
+        // executor for a potentially multi-gigabyte assembly.
+        var usedEC = false
+        let etag: String
+        let versionId: String?
+        let finalSize: Int
+        let objectChecksum: ObjectChecksum?
+        if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self],
+            case .local(let ecPeers) = try await ObjectRoutingService.erasureCodedRoutingDecision(
+                req: req, bucketName: bucketName, key: key)
+        {
+            let plan = try await S3Service.offloadBlockingIO(req) {
+                try MultipartFileHandler.prepareCompletion(
+                    bucketName: bucketName, uploadId: uploadId, parts: parts)
+            }
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
+                metadata: plan.objectMeta, bucketName: bucketName, key: key,
+                versioningStatus: versioningStatus)
+            do {
+                try await ErasureCodedWriteCoordinator.write(
+                    app: req.application, bucketName: bucketName, key: key,
+                    objectMeta: versionedMeta, payloadSources: plan.payloadSources,
+                    peers: ecPeers, ecConfig: (ecConfig.dataShards, ecConfig.parityShards),
+                    priorLatestVersionId: priorLatestVersionId)
+            } catch let error as ErasureCodedCoordinatorError {
+                throw S3Error(
+                    status: .serviceUnavailable, code: "ServiceUnavailable",
+                    message: "\(error)", requestId: req.id)
+            }
+            if let mintedVersionId {
+                try await S3Service.offloadBlockingIO(req) {
+                    try ObjectFileHandler.updateLatestPointer(
+                        bucketName: bucketName, key: key, versionId: mintedVersionId)
+                }
+            }
+            versionId = mintedVersionId
+            try await S3Service.offloadBlockingIO(req) {
+                try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
+            }
+            etag = plan.etag
+            finalSize = plan.totalSize
+            objectChecksum = plan.objectMeta.checksum
+            usedEC = true
+        } else {
+            let result = try await S3Service.offloadBlockingIO(req) {
+                try MultipartFileHandler.completeUpload(
+                    bucketName: bucketName,
+                    uploadId: uploadId,
+                    parts: parts,
+                    versioningStatus: versioningStatus
+                )
+            }
+            etag = result.etag
+            versionId = result.versionId
+            finalSize = result.size
+            objectChecksum = result.checksum
+        }
+
+        await NotificationService.emit(
+            event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
+            size: finalSize, etag: etag, versionId: versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
+        await ReplicationService.enqueuePut(
+            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
+        if !usedEC {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId,
+                operation: .put, peers: peers)
+        }
+        return MultipartCompletion(
+            etag: etag, size: finalSize, versionId: versionId, checksum: objectChecksum)
+    }
 
     /// UploadPart - handled in handleObjectPut when partNumber & uploadId are present
     @Sendable

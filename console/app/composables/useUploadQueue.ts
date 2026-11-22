@@ -35,6 +35,23 @@ const onCompleteCallbacks = ref<Set<() => void>>(new Set());
 const BATCH_SIZE = 50;
 const BATCH_DELAY = 10;
 
+// Files at or above this size go through the server's multipart endpoints as independent part
+// requests, so a reverse proxy's per-request body cap (Cloudflare: 100 MB) never sees the whole
+// file (issue #21). Part size well under any such cap, well above S3's 5 MiB minimum.
+export const MULTIPART_THRESHOLD = 32 * 1024 * 1024;
+export const MULTIPART_PART_SIZE = 16 * 1024 * 1024;
+const MULTIPART_PART_CONCURRENCY = 3;
+const MULTIPART_PART_RETRIES = 2;
+
+class UploadHttpError extends Error {
+    constructor(
+        message: string,
+        readonly status: number
+    ) {
+        super(message);
+    }
+}
+
 const ACTIVE_STATUSES: UploadStatus[] = ["pending", "uploading", "processing"];
 const FAILED_STATUSES: UploadStatus[] = ["error", "cancelled"];
 
@@ -131,6 +148,11 @@ export function useUploadQueue() {
         updateItem(item.id, { status: "uploading", abortController });
         activeUploads.value++;
 
+        if (item.file.size >= MULTIPART_THRESHOLD) {
+            uploadItemMultipart(item, abortController);
+            return;
+        }
+
         const formData = new FormData();
         formData.append("data", item.file, item.file.name);
 
@@ -183,6 +205,156 @@ export function useUploadQueue() {
         xhr.open("POST", url.toString());
         xhr.setRequestHeader("Authorization", `Bearer ${jwtCookie.value}`);
         xhr.send(formData);
+    }
+
+    /// One XHR with upload progress, resolved with the parsed JSON body. Rejects on any non-2xx
+    /// status, network error or abort, so callers can treat every failure the same way.
+    function sendXhr<T>(method: string, url: URL, body: XMLHttpRequestBodyInit | null, signal: AbortSignal, onProgress?: (loaded: number) => void): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            if (signal.aborted) return reject(new DOMException("Aborted", "AbortError"));
+            const xhr = new XMLHttpRequest();
+            if (onProgress) {
+                xhr.upload.onprogress = (event) => {
+                    if (event.lengthComputable) onProgress(event.loaded);
+                };
+            }
+            const onAbort = () => xhr.abort();
+            const settle = () => signal.removeEventListener("abort", onAbort);
+            xhr.onload = () => {
+                settle();
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        resolve(xhr.responseText ? JSON.parse(xhr.responseText) : (undefined as T));
+                    } catch {
+                        resolve(undefined as T);
+                    }
+                    return;
+                }
+                let message = `Upload failed (${xhr.status})`;
+                try {
+                    message = JSON.parse(xhr.responseText)?.reason || message;
+                } catch {
+                    // Keep default error message
+                }
+                reject(new UploadHttpError(message, xhr.status));
+            };
+            xhr.onerror = () => {
+                settle();
+                reject(new UploadHttpError("Network error", 0));
+            };
+            xhr.onabort = () => {
+                settle();
+                reject(new DOMException("Aborted", "AbortError"));
+            };
+            signal.addEventListener("abort", onAbort);
+            xhr.open(method, url.toString());
+            xhr.setRequestHeader("Authorization", `Bearer ${jwtCookie.value}`);
+            if (body !== null && !(body instanceof FormData) && !(body instanceof Blob)) {
+                xhr.setRequestHeader("Content-Type", "application/json");
+            }
+            xhr.send(body);
+        });
+    }
+
+    function multipartUrl(path: string, item: UploadItem, params: Record<string, string>): URL {
+        const url = new URL(`${apiBaseUrl}/api/v1/objects/multipart${path}`);
+        url.searchParams.set("bucket", item.bucket);
+        url.searchParams.set("key", `${item.prefix}${item.file.name}`);
+        for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value);
+        return url;
+    }
+
+    /// Create → parts (a few in flight, each retried on transient failure) → complete. Any
+    /// failure or cancellation aborts the upload server-side so no orphaned parts linger.
+    async function uploadItemMultipart(item: UploadItem, abortController: AbortController) {
+        // The user's cancel and a failed sibling part both stop every in-flight request through
+        // this one signal; `abortController.signal.aborted` afterwards tells the two apart.
+        const inner = new AbortController();
+        const { signal } = inner;
+        abortController.signal.addEventListener("abort", () => inner.abort(), { once: true });
+        const file = item.file;
+        const partCount = Math.ceil(file.size / MULTIPART_PART_SIZE);
+        const loadedPerPart = new Array<number>(partCount).fill(0);
+        let uploadId: string | undefined;
+
+        const reportProgress = () => {
+            const loaded = loadedPerPart.reduce((sum, n) => sum + n, 0);
+            updateItem(item.id, { progress: Math.min(99, Math.round((loaded / file.size) * 100)) });
+        };
+
+        const uploadPart = async (index: number): Promise<{ partNumber: number; etag: string }> => {
+            const partNumber = index + 1;
+            const blob = file.slice(index * MULTIPART_PART_SIZE, Math.min(file.size, (index + 1) * MULTIPART_PART_SIZE));
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    const url = multipartUrl("/part", item, { uploadId: uploadId!, partNumber: String(partNumber) });
+                    const result = await sendXhr<{ partNumber: number; etag: string }>("PUT", url, blob, signal, (loaded) => {
+                        loadedPerPart[index] = loaded;
+                        reportProgress();
+                    });
+                    if (typeof result?.etag !== "string") {
+                        throw new UploadHttpError("Part upload returned no ETag", 502);
+                    }
+                    loadedPerPart[index] = blob.size;
+                    reportProgress();
+                    return { partNumber, etag: result.etag };
+                } catch (error) {
+                    // Only transient failures (network, 5xx) are worth another attempt.
+                    const retryable = error instanceof UploadHttpError && (error.status === 0 || error.status >= 500);
+                    if (signal.aborted || !retryable || attempt >= MULTIPART_PART_RETRIES) throw error;
+                    loadedPerPart[index] = 0;
+                }
+            }
+        };
+
+        try {
+            const created = await sendXhr<{ uploadId: string }>(
+                "POST",
+                multipartUrl("", item, { contentType: file.type || "application/octet-stream" }),
+                null,
+                signal
+            );
+            if (typeof created?.uploadId !== "string" || created.uploadId.length === 0) {
+                throw new UploadHttpError("Server did not return an upload id", 502);
+            }
+            uploadId = created.uploadId;
+
+            // A small worker pool: each worker takes the next part index until none are left.
+            const parts: { partNumber: number; etag: string }[] = [];
+            let nextIndex = 0;
+            const worker = async () => {
+                while (nextIndex < partCount && !signal.aborted) {
+                    const index = nextIndex++;
+                    try {
+                        parts.push(await uploadPart(index));
+                    } catch (error) {
+                        inner.abort();
+                        throw error;
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(MULTIPART_PART_CONCURRENCY, partCount) }, worker));
+
+            updateItem(item.id, { status: "processing", progress: 100 });
+            parts.sort((a, b) => a.partNumber - b.partNumber);
+            await sendXhr("POST", multipartUrl("/complete", item, { uploadId }), JSON.stringify({ parts }), signal);
+            updateItem(item.id, { status: "completed", progress: 100 });
+        } catch (error) {
+            if (uploadId) {
+                // Best effort, never awaited against the user's cancel: clean up the server side.
+                $fetch(multipartUrl("", item, { uploadId }).toString(), {
+                    method: "DELETE",
+                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
+                }).catch(() => {});
+            }
+            if (abortController.signal.aborted) {
+                updateItem(item.id, { status: "cancelled", error: "Cancelled" });
+            } else {
+                updateItem(item.id, { status: "error", error: error instanceof Error ? error.message : "Upload failed" });
+            }
+        } finally {
+            onUploadFinished();
+        }
     }
 
     function onUploadFinished() {

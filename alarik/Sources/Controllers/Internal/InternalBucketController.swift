@@ -230,6 +230,21 @@ struct InternalBucketController: RouteCollection {
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
         routes.grouped("objects").on(.POST, body: .stream, use: self.uploadObject)
+        // Only the part route streams a file body; the others take the small subresource cap.
+        routes.grouped("objects", "multipart")
+            .on(
+                .POST, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.createMultipartUpload)
+        routes.grouped("objects", "multipart", "part")
+            .on(.PUT, body: .stream, use: self.uploadMultipartPart)
+        routes.grouped("objects", "multipart", "complete")
+            .on(
+                .POST, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.completeMultipartUpload)
+        routes.grouped("objects", "multipart")
+            .on(
+                .DELETE, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.abortMultipartUpload)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
@@ -676,6 +691,192 @@ struct InternalBucketController: RouteCollection {
             versionId: meta.versionId)
 
         return ObjectMeta.ResponseDTO(from: meta)
+    }
+
+    // MARK: - Console multipart upload (issue #21)
+    //
+    // The single-request upload above has to pass the whole file through one HTTP request, which
+    // reverse proxies routinely cap (Cloudflare: 100 MB). These four endpoints expose the same
+    // multipart lifecycle the S3 API offers, authenticated with the console's JWT instead of
+    // SigV4, so the browser can send a large file as independent parts. Unlike `uploadObject`,
+    // the key is known up front, so every call can be routed to the upload's rank-0 node
+    // *before* the body is touched - the same pinning the S3 handlers rely on, and the reason a
+    // create/part/complete sequence spread across different nodes still converges.
+
+    struct MultipartCreateResponse: Content {
+        let uploadId: String
+        let key: String
+    }
+
+    struct MultipartPartResponse: Content {
+        let partNumber: Int
+        let etag: String
+    }
+
+    struct MultipartCompleteRequest: Content {
+        struct Part: Content {
+            let partNumber: Int
+            let etag: String
+        }
+        let parts: [Part]
+    }
+
+    private struct MultipartTarget {
+        let bucketName: String
+        let key: String
+    }
+
+    /// Auth + ownership + rank-0 routing shared by the four multipart handlers. Returns the peers
+    /// to replicate to, or the forwarded response when another node owns this upload.
+    private func routeMultipart(req: Request) async throws
+        -> (target: MultipartTarget, routing: ObjectRoutingService.WriteRouting)
+    {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        guard let bucketName = req.query[String.self, at: "bucket"],
+            let key = req.query[String.self, at: "key"], !key.isEmpty, !key.hasSuffix("/")
+        else {
+            throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
+        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
+        let routing = try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: key, requirePrimary: true)
+        return (MultipartTarget(bucketName: bucketName, key: key), routing)
+    }
+
+    /// The upload must exist here AND have been created for this exact key - an uploadId is only
+    /// meaningful together with the key it was opened for.
+    private func requireUpload(req: Request, target: MultipartTarget) async throws -> (
+        uploadId: String, meta: MultipartUploadMeta
+    ) {
+        guard let uploadId = req.query[String.self, at: "uploadId"] else {
+            throw Abort(.badRequest, reason: "Missing 'uploadId' query parameter")
+        }
+        let bucketName = target.bucketName
+        let meta = try? await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.getUploadMeta(bucketName: bucketName, uploadId: uploadId)
+        }
+        guard let meta, meta.key == target.key else {
+            throw Abort(.notFound, reason: "The specified upload does not exist.")
+        }
+        return (uploadId, meta)
+    }
+
+    /// `MultipartFileHandler` reports part/order problems and a vanished upload as `NSError`
+    /// domains; everything else is a genuine server fault and must not masquerade as the
+    /// client's mistake (the console only retries 5xx).
+    private func abort(forCompletionError error: any Error) -> Abort {
+        if let error = error as? S3Error {
+            return Abort(error.status, reason: error.message)
+        }
+        let nsError = error as NSError
+        switch nsError.domain {
+        case "InvalidPart", "InvalidPartOrder", "InvalidPartNumber":
+            return Abort(.badRequest, reason: nsError.localizedDescription)
+        case "NoSuchUpload":
+            return Abort(.notFound, reason: "The specified upload does not exist.")
+        default:
+            return Abort(.internalServerError, reason: "Completing the upload failed: \(error)")
+        }
+    }
+
+    @Sendable
+    func createMultipartUpload(req: Request) async throws -> Response {
+        let (target, routing) = try await routeMultipart(req: req)
+        if case .forwarded(let response) = routing { return response }
+
+        let contentType = req.query[String.self, at: "contentType"] ?? "application/octet-stream"
+        let uploadId = try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.createUpload(
+                bucketName: target.bucketName, key: target.key, contentType: contentType)
+        }
+        let response = Response(status: .ok)
+        try response.content.encode(MultipartCreateResponse(uploadId: uploadId, key: target.key))
+        return response
+    }
+
+    @Sendable
+    func uploadMultipartPart(req: Request) async throws -> Response {
+        // Every early throw below fires before the body is read - see `withGuaranteedBodyDrain`.
+        try await StreamingBodySpooler.withGuaranteedBodyDrain(req: req) {
+            let (target, routing) = try await routeMultipart(req: req)
+            if case .forwarded(let response) = routing { return response }
+            let (uploadId, _) = try await requireUpload(req: req, target: target)
+            guard let partNumber = req.query[Int.self, at: "partNumber"], (1...10000).contains(partNumber)
+            else {
+                throw Abort(.badRequest, reason: "Part number must be between 1 and 10000.")
+            }
+
+            // Raw body, no SigV4 chunking: bounded memory, MD5 computed while spooling.
+            let spooled = try await StreamingBodySpooler.spool(req: req, authInfo: nil)
+            defer { spooled.cleanup() }
+            guard spooled.size > 0 else {
+                throw Abort(.badRequest, reason: "Request body is empty.")
+            }
+
+            let storage = spooled.storage
+            let etag: String = try await S3Service.offloadBlockingIO(req) {
+                switch storage {
+                case .memory(let data):
+                    return try MultipartFileHandler.writePart(
+                        bucketName: target.bucketName, uploadId: uploadId,
+                        partNumber: partNumber, data: data)
+                case .file(let spoolPath):
+                    return try MultipartFileHandler.writePartStreamed(
+                        bucketName: target.bucketName, uploadId: uploadId,
+                        partNumber: partNumber, spoolPath: spoolPath, etag: spooled.md5Hex,
+                        size: spooled.size)
+                }
+            }
+            let response = Response(status: .ok)
+            try response.content.encode(MultipartPartResponse(partNumber: partNumber, etag: etag))
+            return response
+        }
+    }
+
+    @Sendable
+    func completeMultipartUpload(req: Request) async throws -> Response {
+        let (target, routing) = try await routeMultipart(req: req)
+        let peers: [ClusterNodeInfo]
+        switch routing {
+        case .forwarded(let response): return response
+        case .local(let localPeers): peers = localPeers
+        }
+        let (uploadId, uploadMeta) = try await requireUpload(req: req, target: target)
+        let body = try req.content.decode(MultipartCompleteRequest.self)
+        guard !body.parts.isEmpty else {
+            throw Abort(.badRequest, reason: "At least one part is required.")
+        }
+
+        let completion: S3Controller.MultipartCompletion
+        do {
+            completion = try await S3Controller.completeMultipartUpload(
+                req: req, bucketName: target.bucketName, key: target.key, uploadId: uploadId,
+                parts: body.parts.map { (partNumber: $0.partNumber, etag: $0.etag) }, peers: peers)
+        } catch {
+            throw abort(forCompletionError: error)
+        }
+
+        var meta = ObjectMeta(
+            bucketName: target.bucketName, key: target.key, size: completion.size,
+            contentType: uploadMeta.contentType, etag: completion.etag, updatedAt: Date())
+        if let versionId = completion.versionId {
+            meta.versionId = versionId
+            meta.isLatest = true
+        }
+        let response = Response(status: .ok)
+        try response.content.encode(ObjectMeta.ResponseDTO(from: meta))
+        return response
+    }
+
+    @Sendable
+    func abortMultipartUpload(req: Request) async throws -> Response {
+        let (target, routing) = try await routeMultipart(req: req)
+        if case .forwarded(let response) = routing { return response }
+        let (uploadId, _) = try await requireUpload(req: req, target: target)
+        try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.abortUpload(bucketName: target.bucketName, uploadId: uploadId)
+        }
+        return Response(status: .noContent)
     }
 
     @Sendable
