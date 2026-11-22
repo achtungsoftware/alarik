@@ -21,7 +21,7 @@ BINARY="$PACKAGE_DIR/.build/debug/Alarik"
 NODE_COUNT=4
 BASE_PORT=8091
 CLUSTER_SECRET="test-cluster-secret"
-JWT_SECRET="test-secret"
+JWT_SECRET="test-secret-at-least-32-bytes-long!"
 # k=2/m=2 uses all 4 nodes with zero slack - matches this harness's node count exactly (the
 # app's own default, k=4/m=2, needs 6 nodes minimum and would hard-fail every write here via
 # admission control).

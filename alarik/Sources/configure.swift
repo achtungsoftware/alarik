@@ -112,6 +112,15 @@ public func configure(_ app: Application) async throws {
     app.middleware.use(S3ErrorMiddleware())
 
     if let jwt = Environment.sanitizedGet("JWT") {
+        // JWTKit 5.9+ requires an HMAC key at least as long as the digest (32 bytes for HS256);
+        // today that's a debug assertion, tomorrow a precondition. Refuse here with a usable
+        // message instead of letting the process trap at boot.
+        guard jwt.utf8.count >= 32 else {
+            throw ConfigurationError(
+                description:
+                    "JWT must be at least 32 bytes (got \(jwt.utf8.count)). Generate one with: openssl rand -base64 48"
+            )
+        }
         await app.jwt.keys.add(hmac: HMACKey(from: jwt), digestAlgorithm: .sha256)
     } else if app.environment == .production {
         // Refusing to boot, not warning and continuing: the fallback key below is a literal in a
@@ -126,7 +135,8 @@ public func configure(_ app: Application) async throws {
         app.logger.error(
             "No JWT key provided in environment variable 'JWT'. Falling back to an insecure default key. Please set a secure JWT key before deploying to production."
         )
-        await app.jwt.keys.add(hmac: "super-secret-key", digestAlgorithm: .sha256)
+        await app.jwt.keys.add(
+            hmac: "insecure-development-only-jwt-key-32b", digestAlgorithm: .sha256)
     }
 
     // Self-registers this node into the `cluster-nodes` metadata collection and starts its

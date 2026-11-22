@@ -9,6 +9,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=alarik
       - ADMIN_PASSWORD=alarik
+      # At least 32 bytes - generate one with: openssl rand -base64 48
       - JWT=YOUR_SECURE_JWT_KEY
       - ALLOW_ACCOUNT_CREATION=false
       # Optional: auto-create these buckets on first start, owned by the admin (comma-separated).

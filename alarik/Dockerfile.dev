@@ -1,7 +1,7 @@
 # ================================
 # Development image for Alarik
 # ================================
-FROM swift:6.2-noble
+FROM swift:6.4-noble
 
 # Install OS updates and development dependencies
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \

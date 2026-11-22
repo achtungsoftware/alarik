@@ -29,7 +29,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
-      - JWT=dev-cluster-jwt-secret
+      - JWT=dev-cluster-jwt-secret-at-least-32-bytes
       - CLUSTER_NODE_ADDRESS=http://alarik-1:8080
       - CLUSTER_SECRET=dev-cluster-secret
       # Erasure coding sized for this 4-node dev cluster: k=2 data + m=2 parity shards (one shard
@@ -70,7 +70,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
-      - JWT=dev-cluster-jwt-secret
+      - JWT=dev-cluster-jwt-secret-at-least-32-bytes
       - CLUSTER_NODE_ADDRESS=http://alarik-2:8080
       - CLUSTER_SECRET=dev-cluster-secret
       - CLUSTER_SEED_NODES=http://alarik-1:8080
@@ -113,7 +113,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
-      - JWT=dev-cluster-jwt-secret
+      - JWT=dev-cluster-jwt-secret-at-least-32-bytes
       - CLUSTER_NODE_ADDRESS=http://alarik-3:8080
       - CLUSTER_SECRET=dev-cluster-secret
       - CLUSTER_SEED_NODES=http://alarik-1:8080
@@ -156,7 +156,7 @@ services:
       - CONSOLE_BASE_URL=http://localhost:3000
       - ADMIN_USERNAME=${ADMIN_USERNAME:-alarik}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alarik}
-      - JWT=dev-cluster-jwt-secret
+      - JWT=dev-cluster-jwt-secret-at-least-32-bytes
       - CLUSTER_NODE_ADDRESS=http://alarik-4:8080
       - CLUSTER_SECRET=dev-cluster-secret
       - CLUSTER_SEED_NODES=http://alarik-1:8080

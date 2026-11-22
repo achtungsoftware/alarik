@@ -69,7 +69,7 @@ start_instance() {
     local name="$1" port="$2" region="$3"
     local state_dir
     state_dir=$(mktemp -d)
-    (cd "$state_dir" && JWT=test-secret ALARIK_REGION="$region" exec "$BINARY" serve --hostname 127.0.0.1 --port "$port") \
+    (cd "$state_dir" && JWT=test-secret-at-least-32-bytes-long! ALARIK_REGION="$region" exec "$BINARY" serve --hostname 127.0.0.1 --port "$port") \
         >"$LOG_DIR/$name.log" 2>&1 &
     local pid=$!
 

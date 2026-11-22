@@ -53,7 +53,7 @@ start_fresh_server() {
     stop_server
     local state_dir
     state_dir=$(mktemp -d)
-    (cd "$state_dir" && JWT=test-secret exec "$BINARY" serve --hostname 127.0.0.1 --port 8080) \
+    (cd "$state_dir" && JWT=test-secret-at-least-32-bytes-long! exec "$BINARY" serve --hostname 127.0.0.1 --port 8080) \
         > "$LOG_DIR/server-$1.log" 2>&1 &
     SERVER_PID=$!
 

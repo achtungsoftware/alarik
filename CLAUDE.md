@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two deployables plus a shell-script test battery at the root:
 
-- `alarik/` — the Swift (6.2, Vapor) server: S3 API, internal API, clustering. This is the SwiftPM package root.
+- `alarik/` — the Swift (6.4, Vapor) server: S3 API, internal API, clustering. This is the SwiftPM package root.
 - `console/` — Nuxt 4 SPA admin/object-browser console (`@nuxt/ui`), talks to the server's `/api/v1`.
 - `*_tests.sh` at repo root — end-to-end suites that drive real server processes with `aws`, `rclone`, `mc`, and raw `curl`.
 - `charts/alarik/` — Helm chart. `publish.sh` builds/pushes images and rewrites the version in `Sources/Global/Constants.swift`, `console/nuxt.config.ts`, and the chart's `appVersion` from `VERSION`.
@@ -39,7 +39,7 @@ bash aws_cli_tests.sh     # needs a server already running on :8080
 Running a server by hand:
 
 ```bash
-cd alarik && JWT=test-secret ./.build/debug/Alarik serve --hostname 127.0.0.1 --port 8080
+cd alarik && JWT=test-secret-at-least-32-bytes-long! ./.build/debug/Alarik serve --hostname 127.0.0.1 --port 8080
 ```
 
 The process resolves `Storage/` relative to its cwd — run it from a scratch directory to get clean state.
@@ -94,4 +94,4 @@ Opt-in: a node clusters only when both `CLUSTER_NODE_ADDRESS` and `CLUSTER_SECRE
 
 ## Environment variables
 
-`JWT` (required in production), `API_BASE_URL`, `CONSOLE_BASE_URL`, `ADMIN_USERNAME`/`ADMIN_PASSWORD`, `DEFAULT_ACCESS_KEY`/`DEFAULT_SECRET_KEY`, `DEFAULT_BUCKETS`, `ALLOW_ACCOUNT_CREATION`, `ALARIK_REGION`, `ALARIK_FSYNC`, `CLUSTER_NODE_ADDRESS`, `CLUSTER_SECRET`, `CLUSTER_SEED_NODES`, `CLUSTER_EC_DATA_SHARDS`, `CLUSTER_EC_PARITY_SHARDS`, `CLUSTER_EC_SCRUB_INTERVAL_HOURS`, `CLUSTER_MIN_FREE_PERCENT`, `CLUSTER_METADATA_REPLICA_COUNT`, `CLUSTER_METADATA_TOMBSTONE_GRACE_DAYS`.
+`JWT` (required in production, at least 32 bytes), `API_BASE_URL`, `CONSOLE_BASE_URL`, `ADMIN_USERNAME`/`ADMIN_PASSWORD`, `DEFAULT_ACCESS_KEY`/`DEFAULT_SECRET_KEY`, `DEFAULT_BUCKETS`, `ALLOW_ACCOUNT_CREATION`, `ALARIK_REGION`, `ALARIK_FSYNC`, `CLUSTER_NODE_ADDRESS`, `CLUSTER_SECRET`, `CLUSTER_SEED_NODES`, `CLUSTER_EC_DATA_SHARDS`, `CLUSTER_EC_PARITY_SHARDS`, `CLUSTER_EC_SCRUB_INTERVAL_HOURS`, `CLUSTER_MIN_FREE_PERCENT`, `CLUSTER_METADATA_REPLICA_COUNT`, `CLUSTER_METADATA_TOMBSTONE_GRACE_DAYS`.
