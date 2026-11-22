@@ -10,15 +10,15 @@
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
-    "@nuxt/ui": "^4.9.0",
-    "nuxt": "^4.5.1",
-    "nuxt-charts": "^2.1.4",
-    "typescript": "^5.9.3",
-    "vue": "^3.5.25",
-    "vue-router": "^4.6.3"
+    "@nuxt/ui": "^4.13.0",
+    "nuxt": "^4.6.4",
+    "nuxt-charts": "^3.3.0",
+    "typescript": "^6.0.3",
+    "vue": "^3.5.46",
+    "vue-router": "^5.5.1"
   },
   "devDependencies": {
-    "vue-tsc": "^3.3.6"
+    "vue-tsc": "3.3.13"
   },
   "overrides": {
     "svgo": "^4.0.2",

@@ -19,8 +19,10 @@ import * as locales from "@nuxt/ui/locale";
 
 useHead({
     htmlAttrs: { lang: "en" },
-    charset: "utf-8",
-    viewport: "width=device-width, initial-scale=1, maximum-scale=1",
+    meta: [
+        { charset: "utf-8" },
+        { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1" },
+    ],
     title: "Alarik",
     link: [
         { rel: "icon", type: "image/png", sizes: "96x96", href: "/favicon-96x96.png" },
