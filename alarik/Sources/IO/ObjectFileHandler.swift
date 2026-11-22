@@ -665,6 +665,10 @@ struct ObjectFileHandler {
 
         // Second pass: read the latest version for each key
         var latestByKey: [String: ObjectMeta] = [:]
+        // Keys whose latest version is a delete marker. A plain `.obj` written before versioning
+        // was enabled is left in place when the key is later deleted, so the marker must
+        // suppress it here or the deleted key keeps showing up in listings.
+        var tombstonedKeys: Set<String> = []
 
         // Process versioned keys - use the .latest pointer to find the latest version
         for key in versionedKeys {
@@ -679,6 +683,7 @@ struct ObjectFileHandler {
 
                 // Skip delete markers
                 if meta.isDeleteMarker {
+                    tombstonedKeys.insert(key)
                     continue
                 }
 
@@ -690,7 +695,9 @@ struct ObjectFileHandler {
         }
 
         // Plain keys not superseded by a versioned latest are listed, their header read lazily.
-        let plainKeys = nonVersionedKeys.filter { latestByKey[$0] == nil }
+        let plainKeys = nonVersionedKeys.filter {
+            latestByKey[$0] == nil && !tombstonedKeys.contains($0)
+        }
 
         // EC objects never appear in the `.obj` walk above - shard index 0's header already
         // carries the current `isLatest`/`isDeleteMarker` state directly (no separate pointer
@@ -832,6 +839,9 @@ struct ObjectFileHandler {
         // > non-versioned), matching the recursive walk's precedence.
         var resolvedByKey: [String: ObjectMeta] = [:]
         var resolvedRankByKey: [String: Int] = [:]
+        // Keys whose latest version is a delete marker - a legacy plain `.obj` of the same key
+        // must not be listed in its place (see `listObjects`' `tombstonedKeys`).
+        var tombstonedKeys: Set<String> = []
         var commonPrefixesSet: Set<String> = []
 
         func resolve(_ key: String, _ meta: ObjectMeta, rank: Int) {
@@ -863,6 +873,7 @@ struct ObjectFileHandler {
                 if let (meta, _) = try? readVersion(
                     bucketName: bucketName, key: key, versionId: nil, loadData: false)
                 {
+                    if meta.isDeleteMarker { tombstonedKeys.insert(key) }
                     resolve(key, meta, rank: 1)
                 }
             } else if name.hasSuffix(".ecshards") {
@@ -883,8 +894,10 @@ struct ObjectFileHandler {
             }
         }
 
-        // A key resolved as versioned/EC wins over a plain `.obj` of the same key.
+        // A key resolved as versioned/EC wins over a plain `.obj` of the same key, and so does a
+        // versioned delete marker.
         for key in resolvedByKey.keys { objectPathByKey[key] = nil }
+        for key in tombstonedKeys where resolvedByKey[key] == nil { objectPathByKey[key] = nil }
         let objectKeys = Array(objectPathByKey.keys) + Array(resolvedByKey.keys)
 
         return finalizeListing(
@@ -1075,11 +1088,12 @@ struct ObjectFileHandler {
     static func readCurrentObject(bucketName: String, key: String, loadData: Bool) throws -> (
         meta: ObjectMeta, data: Data?
     )? {
+        // A versioned latest - including a delete marker - is authoritative: a plain `.obj`
+        // from before versioning was enabled must not resurface once the key is deleted.
         if let (meta, data) = try? readVersion(
-            bucketName: bucketName, key: key, versionId: nil, loadData: loadData),
-            !meta.isDeleteMarker
+            bucketName: bucketName, key: key, versionId: nil, loadData: loadData)
         {
-            return (meta, data)
+            return meta.isDeleteMarker ? nil : (meta, data)
         }
 
         let path = storagePath(for: bucketName, key: key)

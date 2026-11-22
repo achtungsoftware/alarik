@@ -988,4 +988,33 @@ struct ObjectFileHandlerVersioningTests {
         #expect(finalMeta.size == metadata.size)
         #expect(finalData == data)
     }
+
+    @Test("Delete marker over a pre-versioning plain object hides it from listings and reads")
+    func testDeleteMarkerHidesLegacyPlainObject() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+
+        // Written before versioning was enabled: lives at the plain path, no .versions dir.
+        let path = ObjectFileHandler.storagePath(for: "test-bucket", key: "legacy.txt")
+        try ObjectFileHandler.write(
+            metadata: createTestMetadata(key: "legacy.txt"), data: createTestData("v0"), to: path)
+        try ObjectFileHandler.write(
+            metadata: createTestMetadata(key: "other.txt"), data: createTestData("x"),
+            to: ObjectFileHandler.storagePath(for: "test-bucket", key: "other.txt"))
+
+        // Versioning enabled afterwards, then the key is deleted -> delete marker is the latest.
+        _ = try ObjectFileHandler.createDeleteMarker(bucketName: "test-bucket", key: "legacy.txt")
+
+        #expect(
+            try ObjectFileHandler.readCurrentObject(
+                bucketName: "test-bucket", key: "legacy.txt", loadData: false) == nil)
+
+        let (folderView, _, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: "test-bucket", prefix: "", delimiter: "/")
+        #expect(folderView.map(\.key) == ["other.txt"])
+
+        let (recursive, _, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: "test-bucket", prefix: "", delimiter: nil)
+        #expect(recursive.map(\.key) == ["other.txt"])
+    }
 }
