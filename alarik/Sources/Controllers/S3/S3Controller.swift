@@ -131,7 +131,7 @@ struct S3Controller: RouteCollection {
         let delimiter = req.query[String.self, at: "delimiter"]
         let keyMarker = req.query[String.self, at: "key-marker"]
         let versionIdMarker = req.query[String.self, at: "version-id-marker"]
-        let maxKeys = req.query[Int.self, at: "max-keys"] ?? 1000
+        let maxKeys = S3Service.listLimit(from: req, name: "max-keys")
 
         let (
             versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker
@@ -2578,7 +2578,7 @@ struct S3Controller: RouteCollection {
                 message: "The specified upload does not exist.", requestId: req.id)
         }
 
-        let maxParts = req.query[Int.self, at: "max-parts"] ?? 1000
+        let maxParts = S3Service.listLimit(from: req, name: "max-parts")
         let partNumberMarker = req.query[Int.self, at: "part-number-marker"] ?? 0
 
         let (parts, isTruncated, nextPartNumberMarker) = try MultipartFileHandler.listParts(
@@ -2741,7 +2741,7 @@ struct S3Controller: RouteCollection {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let keyMarker = req.query[String.self, at: "key-marker"]
         let uploadIdMarker = req.query[String.self, at: "upload-id-marker"]
-        let maxUploads = req.query[Int.self, at: "max-uploads"] ?? 1000
+        let maxUploads = S3Service.listLimit(from: req, name: "max-uploads")
 
         let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
             try await ClusterListingService.listUploads(

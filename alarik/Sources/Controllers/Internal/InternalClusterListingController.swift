@@ -42,7 +42,7 @@ struct InternalClusterListingController: RouteCollection {
         }
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
-        let maxKeys = req.query[Int.self, at: "maxKeys"] ?? 1000
+        let maxKeys = S3Service.listLimit(from: req, name: "maxKeys")
         let marker = req.query[String.self, at: "marker"]
         let search = req.query[String.self, at: "search"]
 
@@ -63,7 +63,7 @@ struct InternalClusterListingController: RouteCollection {
         }
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
-        let maxKeys = req.query[Int.self, at: "maxKeys"] ?? 1000
+        let maxKeys = S3Service.listLimit(from: req, name: "maxKeys")
         let keyMarker = req.query[String.self, at: "keyMarker"]
         let versionIdMarker = req.query[String.self, at: "versionIdMarker"]
 
@@ -84,7 +84,7 @@ struct InternalClusterListingController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket query parameter")
         }
         let prefix = req.query[String.self, at: "prefix"] ?? ""
-        let maxUploads = req.query[Int.self, at: "maxUploads"] ?? 1000
+        let maxUploads = S3Service.listLimit(from: req, name: "maxUploads")
         let keyMarker = req.query[String.self, at: "keyMarker"]
         let uploadIdMarker = req.query[String.self, at: "uploadIdMarker"]
 

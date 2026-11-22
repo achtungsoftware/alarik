@@ -261,10 +261,18 @@ struct S3Service {
         return response
     }
 
+    /// Client-supplied page limits (`max-keys`, `max-parts`, `max-uploads`) clamped to S3's
+    /// 0...1000. They feed `Array.prefix`, which traps on a negative count - unclamped, a
+    /// single `?max-keys=-1` took the whole process down.
+    static func listLimit(from req: Request, name: String) -> Int {
+        let raw = req.query[Int.self, at: name] ?? 1000
+        return Swift.min(Swift.max(raw, 0), 1000)
+    }
+
     static func parseListObjectsParams(from req: Request, bucketName: String) -> ListObjectsParams {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
-        let maxKeys = req.query[Int.self, at: "max-keys"] ?? 1000
+        let maxKeys = listLimit(from: req, name: "max-keys")
         let listType = req.query[String.self, at: "list-type"]
         let isV2 = listType == "2"
         let startAfter = req.query[String.self, at: "start-after"]
