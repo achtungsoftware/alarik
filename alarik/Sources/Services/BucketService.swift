@@ -145,6 +145,8 @@ struct BucketService {
             collection: OutboxCollections.clusterReplicationTasks, bucketName: bucketName
         ) { $0.bucketName == bucketName }
 
+        await SharedLink.purge(app: req.application, bucketName: bucketName)
+
         try BucketHandler.delete(name: bucketName, force: force)
     }
 

@@ -62,4 +62,17 @@ extension SharedLink {
     static func find(app: Application, id: UUID) async throws -> SharedLink? {
         try await find(app: app, key: id.uuidString)
     }
+
+    /// Removes every link into `bucketName`. Called from bucket deletion: a link that outlives
+    /// its bucket would serve whatever a later owner of the same bucket name stores under the key.
+    static func purge(app: Application, bucketName: String) async {
+        for link in await all(app: app) where link.bucketName == bucketName {
+            do {
+                try await link.delete(app: app)
+            } catch {
+                app.logger.warning(
+                    "Could not delete shared link \(link.id) for deleted bucket \(bucketName): \(error)")
+            }
+        }
+    }
 }

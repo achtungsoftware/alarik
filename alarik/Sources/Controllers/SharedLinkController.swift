@@ -43,6 +43,15 @@ struct SharedLinkController: RouteCollection {
             throw Abort(.notFound)
         }
 
+        // The bucket must still belong to whoever created the link. Bucket paths are
+        // name-derived, so after a delete + re-create by another user the same bucket/key
+        // names a different owner's object - the stale link must not serve it.
+        guard let bucket = try await Bucket.find(app: req.application, name: link.bucketName),
+            bucket.userId == link.userId
+        else {
+            throw Abort(.notFound)
+        }
+
         let (isLocal, candidates, responsible) =
             await ObjectRoutingService.erasureCodedReadPlacement(
                 req: req, bucketName: link.bucketName, key: link.key)
