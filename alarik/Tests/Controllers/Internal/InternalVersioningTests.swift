@@ -638,7 +638,7 @@ struct InternalVersioningTests {
                 },
                 afterResponse: { res in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     let files = page.items.filter { !$0.isFolder }
                     #expect(files.count == 0)
                 })

@@ -48,6 +48,8 @@ struct BucketHandler {
     static func create(name: String) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: bucketURL(for: name), withIntermediateDirectories: true)
+        // A recreated bucket must not inherit the figures of its deleted namesake.
+        StorageStatsService.shared.noteChange(bucketName: name)
     }
 
     /// Deletes a bucket directory
@@ -67,6 +69,7 @@ struct BucketHandler {
         }
         // Remove the data directory
         try fm.removeItem(at: dataURL)
+        StorageStatsService.shared.noteChange(bucketName: name)
     }
 
     /// Force deletes a bucket directory including all its contents.
@@ -77,6 +80,7 @@ struct BucketHandler {
             return
         }
         try fm.removeItem(at: dataURL)
+        StorageStatsService.shared.noteChange(bucketName: name)
     }
 
     /// Lists all bucket names.

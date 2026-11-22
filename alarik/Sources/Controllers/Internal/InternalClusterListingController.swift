@@ -44,14 +44,16 @@ struct InternalClusterListingController: RouteCollection {
         let delimiter = req.query[String.self, at: "delimiter"]
         let maxKeys = req.query[Int.self, at: "maxKeys"] ?? 1000
         let marker = req.query[String.self, at: "marker"]
+        let search = req.query[String.self, at: "search"]
 
-        let (objects, commonPrefixes, isTruncated, _) = try ObjectFileHandler.listObjects(
+        let (objects, commonPrefixes, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
             bucketName: bucketName, prefix: prefix, delimiter: delimiter, maxKeys: maxKeys,
-            marker: marker)
+            marker: marker, keyFilter: search.map(ConsoleObjectListing.keyFilter(matching:)))
 
         return try jsonResponse(
             ClusterListingClient.ObjectsPageResponse(
-                objects: objects, commonPrefixes: commonPrefixes, isTruncated: isTruncated))
+                objects: objects, commonPrefixes: commonPrefixes, isTruncated: isTruncated,
+                nextMarker: nextMarker))
     }
 
     @Sendable
@@ -113,8 +115,8 @@ struct InternalClusterListingController: RouteCollection {
             throw Abort(.serviceUnavailable, reason: "This node is not part of a cluster.")
         }
         let active = await ClusterNodeCache.shared.activeNodes()
-        let stats = try ClusterListingService.ownedStats(
-            bucketName: bucketName, prefix: prefix, activeNodes: active,
+        let stats = try await ClusterListingService.ownedStats(
+            app: req.application, bucketName: bucketName, prefix: prefix, activeNodes: active,
             selfNodeId: config.nodeId)
 
         return try jsonResponse(

@@ -86,6 +86,7 @@ enum ErasureCodedWriteCoordinator {
         let scratchPath0 = scratchPaths[0]
         try await S3Service.offloadBlockingIO(app) {
             try copyIntoPlace(from: scratchPath0, to: localShardPath0)
+            StorageStatsService.shared.noteChange(bucketName: bucketName)
         }
 
         var delivered: Set<Int> = [0]

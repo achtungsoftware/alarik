@@ -57,29 +57,19 @@ const {
 });
 
 // Size/object-count aren't in the list response (a recursive directory walk per bucket on
-// every page load would make this list slow to scale) - instead fetched lazily, one small
-// request per bucket already visible on the current page.
-interface BucketStats {
-    sizeBytes: number;
-    objectCount: number;
-}
-const bucketStats = ref<Record<string, BucketStats | "loading" | "error">>({});
+// every page load would make this list slow to scale). Fetched lazily for the buckets on
+// screen, a few at a time (`useLazyStats`); the server caches the walks (issue #28).
+const { states: bucketStats, request: requestBucketStats } = useLazyStats<StorageStats>();
 
 watch(
     fetchResponse,
     (response) => {
         for (const bucket of response?.items ?? []) {
-            if (bucketStats.value[bucket.name]) continue;
-            bucketStats.value[bucket.name] = "loading";
-            $fetch<BucketStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets/${bucket.name}/stats`, {
-                headers: { Authorization: `Bearer ${jwtCookie.value}` },
-            })
-                .then((stats) => {
-                    bucketStats.value[bucket.name] = stats;
+            requestBucketStats(bucket.name, () =>
+                $fetch<StorageStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets/${bucket.name}/stats`, {
+                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
                 })
-                .catch(() => {
-                    bucketStats.value[bucket.name] = "error";
-                });
+            );
         }
     },
     { immediate: true }

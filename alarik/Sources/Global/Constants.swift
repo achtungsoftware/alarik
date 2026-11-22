@@ -39,6 +39,15 @@ public enum Constants {
     /// Chunk size for streaming GET response bodies off disk.
     public static let streamingReadChunkSize = 128 * 1024
 
+    /// How long a bucket/folder size figure is served from cache before its directory tree is
+    /// walked again (`StorageStatsService`). Dashboards poll and consoles re-render; a walk per
+    /// view is what saturated CPUs in issue #28.
+    public static let storageStatsCacheTTL: TimeInterval = 60
+
+    /// Directory walks for size figures that may run at once, process-wide. Two keeps a page
+    /// full of folder rows from monopolising the IO pool while still overlapping disk latency.
+    public static let storageStatsMaxConcurrentWalks = 2
+
     /// Window size for file-to-file payload copies (spool -> .obj assembly, multipart
     /// completion, CopyObject). Bounds memory per in-flight copy regardless of object size.
     public static let fileCopyWindowSize = 1 << 20

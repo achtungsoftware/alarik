@@ -25,6 +25,9 @@ import VaporTesting
 struct InternalAdminControllerTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
         let app = try await Application.make(.testing)
+        // The stats cache is process-wide; a figure from a previous test's identically named
+        // bucket must never be served here.
+        await StorageStatsService.shared.invalidateAll()
         do {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }

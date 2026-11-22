@@ -243,4 +243,18 @@ declare global {
             total: number;
         };
     }
+
+    // Marker-addressed page (server `CursorPage`): pass `nextMarker` back as `marker` to continue.
+    export interface CursorPage<T> {
+        items: T[];
+        nextMarker: string | null;
+        isTruncated: boolean;
+    }
+
+    // Size/object-count figure for a bucket or folder (server `StorageStatsService.Stats`).
+    export interface StorageStats {
+        sizeBytes: number;
+        objectCount: number;
+        computedAt: string;
+    }
 }

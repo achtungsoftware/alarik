@@ -61,6 +61,8 @@ struct InternalAdminController: RouteCollection {
     struct BucketStatsDTO: Content {
         let sizeBytes: Int64
         let objectCount: Int
+        /// When the underlying walk ran - figures are served from a short cache (issue #28).
+        let computedAt: Date
     }
 
     /// `listBuckets`'s response shape - deliberately NOT the raw `Bucket` model. Fluent's
@@ -208,8 +210,12 @@ struct InternalAdminController: RouteCollection {
         }
         _ = try await fetchAnyBucket(req: req, bucketName: bucketName)
 
-        let (sizeBytes, objectCount) = BucketHandler.calculateStats(bucketName: bucketName)
-        return BucketStatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
+        // Cluster-wide, cached and walk-limited - the same figure the owner sees in the object
+        // browser. This used to walk this node's disk only, under-reporting in a cluster.
+        let stats = try await ClusterListingService.calculateStats(
+            req: req, bucketName: bucketName, prefix: "")
+        return BucketStatsDTO(
+            sizeBytes: stats.sizeBytes, objectCount: stats.objectCount, computedAt: stats.computedAt)
     }
 
     @Sendable

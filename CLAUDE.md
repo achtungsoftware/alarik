@@ -80,6 +80,10 @@ Opt-in: a node clusters only when both `CLUSTER_NODE_ADDRESS` and `CLUSTER_SECRE
 - `AtomicObjectWriter` — temp file + rename + fsync of file *and* directory (skippable via `ALARIK_FSYNC=false`).
 - Payloads above `Constants.streamingThreshold` (4 MiB) stream through `Storage/spool/`; EC encode scratch is `Storage/ecscratch/`. Both live under `Storage/` so the finishing move is same-filesystem.
 
+### Listing and stats for the console
+
+`/api/v1/objects` is a cursor page (`CursorPage`: `items`, `nextMarker`, `isTruncated`) built by `ConsoleObjectListing` on the storage layer's own marker pagination — never an offset over a full listing, so a page costs what it returns regardless of bucket size (#27). Items are in S3 order; the console groups folders per page. Bucket/folder size figures go through `StorageStatsService`: cached for `Constants.storageStatsCacheTTL`, coalesced per key, and the directory walks run through a process-wide `AsyncSemaphore` on the blocking-IO pool (#28). Add any new "walk the tree for a number" there, not as a bare `BucketHandler.calculateStats` call.
+
 ### Caching
 
 `Sources/Cache/*` are process-wide singletons holding hot control-plane lookups (access key → secret/user/buckets, bucket policy, versioning, cluster nodes). Mutations broadcast through `CacheInvalidationService` over the inter-node protocol; a periodic full reload bounds staleness from a dropped broadcast. `CacheMissLedger` keeps bogus-key lookups from becoming cluster-wide reads.

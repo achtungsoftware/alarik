@@ -300,6 +300,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
     @Sendable
     func handlePush(req: Request) async throws -> HTTPStatus {
         let (path, bucketName, key) = try shardPath(req: req)
+        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
 
         let threadPool = req.application.threadPool
         let spoolPath = Constants.spoolDirectory + ".ecshard-push-" + UUID().uuidString
@@ -415,6 +416,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
         try? FileManager.default.removeItem(
             atPath: ErasureCodedObjectHandler.shardBasePath(
                 bucketName: bucketName, key: key, versionId: versionId))
+        StorageStatsService.shared.noteChange(bucketName: bucketName)
         // Same as the coordinator's local removal: don't leave the folder behind as a phantom.
         ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
         return .ok

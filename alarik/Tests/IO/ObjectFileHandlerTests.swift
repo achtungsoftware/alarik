@@ -1248,3 +1248,91 @@ struct ObjectFileHandlerEmptyPrefixTests {
         #expect(FileManager.default.fileExists(atPath: bucketRoot))
     }
 }
+
+/// Issue #27: listing pages must be cheap and exact - every page continues from the previous
+/// `nextMarker`, the union of all pages is the full listing with no gaps or duplicates, and a
+/// page that ends on a folder does not surface that folder again. Covers both the directory
+/// fast path (folder view) and the recursive walk (a prefix off a directory boundary).
+@Suite("ObjectFileHandler listing pagination", .serialized)
+struct ObjectFileHandlerPaginationTests {
+    private let bucket = "paging-bucket"
+
+    private func reset() throws {
+        let root = "\(BucketHandler.rootPath)\(bucket)"
+        try? FileManager.default.removeItem(atPath: root)
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+    }
+
+    private func put(_ key: String) throws {
+        let meta = ObjectMeta(
+            bucketName: bucket, key: key, size: 1, contentType: "text/plain", etag: "e",
+            updatedAt: Date())
+        try ObjectFileHandler.write(
+            metadata: meta, data: Data("x".utf8),
+            to: ObjectFileHandler.storagePath(for: bucket, key: key))
+    }
+
+    /// Pages through a listing with `maxKeys` per page, returning every listed name in order.
+    private func pageThrough(prefix: String, delimiter: String?, maxKeys: Int) throws -> [String] {
+        var names: [String] = []
+        var marker: String? = nil
+        var pages = 0
+        repeat {
+            let (objects, prefixes, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+                bucketName: bucket, prefix: prefix, delimiter: delimiter, maxKeys: maxKeys,
+                marker: marker)
+            #expect(objects.count + prefixes.count <= maxKeys)
+            names += ConsoleObjectListing.interleaved(objects: objects, commonPrefixes: prefixes).map(\.key)
+            marker = isTruncated ? nextMarker : nil
+            pages += 1
+            #expect(pages < 100, "runaway pagination")
+        } while marker != nil
+        return names
+    }
+
+    @Test("folder view pages through folders and files with no gaps or duplicates")
+    func folderViewPaging() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        for key in ["a.txt", "docs/1.txt", "docs/2.txt", "img/p.png", "m.txt", "z.txt", "zz/q.txt"] {
+            try put(key)
+        }
+        let expected = ["a.txt", "docs/", "img/", "m.txt", "z.txt", "zz/"]
+        for pageSize in [1, 2, 3, 10] {
+            #expect(try pageThrough(prefix: "", delimiter: "/", maxKeys: pageSize) == expected, "page size \(pageSize)")
+        }
+        #expect(try pageThrough(prefix: "docs/", delimiter: "/", maxKeys: 1) == ["docs/1.txt", "docs/2.txt"])
+    }
+
+    @Test("a page ending on a folder never lists that folder again on the next page")
+    func prefixBoundaryIsNotRepeated() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        for key in ["docs/a", "docs/b", "docs/c", "dog.txt", "dot.txt"] { try put(key) }
+
+        // Fast path: folder view.
+        #expect(try pageThrough(prefix: "", delimiter: "/", maxKeys: 1) == ["docs/", "dog.txt", "dot.txt"])
+        // Recursive walk: a prefix that is not a directory boundary.
+        #expect(try pageThrough(prefix: "do", delimiter: "/", maxKeys: 1) == ["docs/", "dog.txt", "dot.txt"])
+        // And a flat listing with no delimiter still pages key by key.
+        #expect(try pageThrough(prefix: "", delimiter: nil, maxKeys: 2) == ["docs/a", "docs/b", "docs/c", "dog.txt", "dot.txt"])
+    }
+
+    @Test("a marker inside a folder keeps the folder when keys remain after it (S3 start-after)")
+    func markerInsideFolder() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        for key in ["docs/a", "docs/b", "docs/c", "z.txt"] { try put(key) }
+
+        func listed(after marker: String) throws -> [String] {
+            let (objects, prefixes, _, _) = try ObjectFileHandler.listObjects(
+                bucketName: bucket, prefix: "", delimiter: "/", maxKeys: 100, marker: marker)
+            return ConsoleObjectListing.interleaved(objects: objects, commonPrefixes: prefixes).map(\.key)
+        }
+        // docs/c comes after docs/b, so the folder is still listed...
+        #expect(try listed(after: "docs/b") == ["docs/", "z.txt"])
+        // ...but not when nothing in it does, and never for the exact folder marker.
+        #expect(try listed(after: "docs/z") == ["z.txt"])
+        #expect(try listed(after: "docs/") == ["z.txt"])
+    }
+}

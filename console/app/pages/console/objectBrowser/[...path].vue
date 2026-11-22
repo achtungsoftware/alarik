@@ -28,8 +28,18 @@ useHead({
 const route = useRoute();
 
 const openBucketCreateModal = ref(false);
+// The bucket list at the root is small and offset-paginated; object listings are cursor-paged
+// (see `objectMarker` below), since their total is unknown and may be enormous (issue #27).
 const page = ref(1);
 const itemsPerPage = ref(100);
+// Marker of the object page on screen (null = first page) and the markers that led here, so
+// "Previous" can step back without the server having to count anything.
+const objectMarker = ref<string | null>(null);
+const objectMarkerHistory = ref<string[]>([]);
+function resetObjectPaging() {
+    objectMarker.value = null;
+    objectMarkerHistory.value = [];
+}
 const rowSelection = ref<Record<string, boolean>>({});
 const jwtCookie = useJWTCookie();
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -58,6 +68,7 @@ watch(searchInput, (val) => {
 });
 watch(searchQuery, () => {
     page.value = 1;
+    resetObjectPaging();
     rowSelection.value = {};
 });
 
@@ -88,9 +99,10 @@ const currentPrefix = computed(() => {
     return pathSegments.slice(1).join("/") + "/";
 });
 
-// Reset page and search when navigation changes
+// Reset paging and search when navigation changes
 watch([currentBucket, currentPrefix], () => {
     page.value = 1;
+    resetObjectPaging();
     rowSelection.value = {};
     searchInput.value = "";
     searchQuery.value = "";
@@ -170,29 +182,32 @@ const {
     default: () => ({ items: [], metadata: { page: 1, per: 100, total: 0 } }),
 });
 
-// Fetch objects when inside a bucket
+// Fetch objects when inside a bucket - one cursor page at a time
 const {
     data: objectsResponse,
     status: objectsStatus,
     refresh,
-} = await useFetch<Page<BrowserItem>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
+} = await useFetch<CursorPage<BrowserItem>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
     params: {
         bucket: currentBucket,
         prefix: currentPrefix,
         search: searchQuery,
-        page: page,
         per: itemsPerPage,
+        marker: objectMarker,
     },
     headers: {
         Authorization: `Bearer ${jwtCookie.value}`,
     },
     immediate: false,
-    default: () => ({ items: [], metadata: { page: 1, per: 100, total: 0 } }),
+    // The explicit watcher below is the single trigger; useFetch's own param watching would
+    // issue every listing twice.
+    watch: false,
+    default: () => ({ items: [], nextMarker: null, isTruncated: false }),
 });
 
-// Fetch objects when navigating into a bucket, or when the search query changes
+// Fetch objects when navigating into a bucket, paging, or when the search query changes
 watch(
-    [currentBucket, currentPrefix, page, searchQuery],
+    [currentBucket, currentPrefix, objectMarker, searchQuery],
     () => {
         if (currentBucket.value) {
             refresh();
@@ -200,6 +215,53 @@ watch(
     },
     { immediate: true }
 );
+
+// A search scans the bucket in bounded chunks, so a page can be empty yet truncated (nothing
+// matched in this chunk, more to scan). Keep following the cursor until something matches or
+// the scan ends, instead of showing "No Matches" with a Next button.
+const isScanningSearch = computed(() => !!searchQuery.value && objectsResponse.value?.items.length === 0 && objectsResponse.value?.isTruncated === true);
+watch([objectsResponse, objectsStatus], () => {
+    if (objectsStatus.value === "pending" || !isScanningSearch.value) return;
+    skipObjectPage();
+});
+
+const hasNextObjectPage = computed(() => objectsResponse.value?.isTruncated === true && !!objectsResponse.value?.nextMarker);
+const hasPreviousObjectPage = computed(() => objectMarkerHistory.value.length > 0);
+
+// The list is inside the dashboard panel's own scroll container, not the window, so a page
+// change scrolls the list's top edge into view rather than touching window.scrollTo.
+const listTop = useTemplateRef<HTMLElement>("listTop");
+function scrollListToTop() {
+    listTop.value?.scrollIntoView({ block: "start" });
+}
+
+function nextObjectPage() {
+    const next = objectsResponse.value?.nextMarker;
+    if (!next) return;
+    objectMarkerHistory.value.push(objectMarker.value ?? "");
+    objectMarker.value = next;
+    rowSelection.value = {};
+    scrollListToTop();
+}
+
+// Moves the cursor forward without recording the page left behind - for scan pages that showed
+// nothing, which "Previous" must never land on.
+function skipObjectPage() {
+    const next = objectsResponse.value?.nextMarker;
+    if (!next) return;
+    objectMarker.value = next;
+}
+
+function previousObjectPage() {
+    const previous = objectMarkerHistory.value.pop();
+    if (previous === undefined) return;
+    objectMarker.value = previous === "" ? null : previous;
+    rowSelection.value = {};
+    scrollListToTop();
+}
+
+// The bucket list pages by number; it gets the same scroll reset.
+watch(page, () => scrollListToTop());
 
 // Combined data: show buckets at root, or objects when inside a bucket
 const displayItems = computed<BrowserItem[]>(() => {
@@ -217,8 +279,10 @@ const displayItems = computed<BrowserItem[]>(() => {
             })) || []
         );
     } else {
-        // Show objects/folders inside bucket
-        return objectsResponse.value?.items || [];
+        // The server lists in S3 order (folders and files interleaved); group folders first
+        // within the page, which is what every S3 console does.
+        const items: BrowserItem[] = objectsResponse.value?.items ?? [];
+        return [...items.filter((item) => item.isFolder), ...items.filter((item) => !item.isFolder)];
     }
 });
 
@@ -227,52 +291,41 @@ const status = computed(() => {
 });
 
 // Bucket/folder sizes aren't in the list response (a recursive directory walk per row on
-// every page load would make listing slow to scale) - instead fetched lazily, one small
-// request per bucket/folder already visible on the current page. Keyed by item.key, which is
-// unique within a single listing (root = bucket names, inside a bucket = folder keys).
-interface EntryStats {
-    sizeBytes: number;
-    objectCount: number;
-}
-const entryStats = ref<Record<string, EntryStats | "loading" | "error">>({});
+// every page load would make listing slow to scale). They are fetched lazily for the rows on
+// screen, a few at a time (`useLazyStats`), and the server caches and rate-limits the walks
+// itself (issue #28). Keyed by item.key, which is unique within a single listing (root =
+// bucket names, inside a bucket = folder keys).
+const { states: entryStats, request: requestEntryStats, reset: resetEntryStats } = useLazyStats<StorageStats>();
 
 watch(
     displayItems,
     (items) => {
         for (const item of items) {
             if (!item.isFolder) continue;
-            if (entryStats.value[item.key]) continue;
-
-            entryStats.value[item.key] = "loading";
             const params = item.isBucket ? { bucket: item.key } : { bucket: currentBucket.value, prefix: item.key };
-            $fetch<EntryStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/stats`, {
-                headers: { Authorization: `Bearer ${jwtCookie.value}` },
-                params,
-            })
-                .then((stats) => {
-                    entryStats.value[item.key] = stats;
+            requestEntryStats(item.key, () =>
+                $fetch<StorageStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/stats`, {
+                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
+                    params,
                 })
-                .catch(() => {
-                    entryStats.value[item.key] = "error";
-                });
+            );
         }
     },
     { immediate: true }
 );
 
-// Cheap invalidation on navigation - stale folder stats from a different bucket/prefix must
-// never bleed into a fresh listing that happens to reuse the same folder name.
+// Stale folder stats from a different bucket/prefix must never bleed into a fresh listing that
+// happens to reuse the same folder name - and loads still in flight are discarded.
 watch([currentBucket, currentPrefix], () => {
-    entryStats.value = {};
+    resetEntryStats();
 });
 
-// Pagination metadata
-const paginationMetadata = computed(() => {
-    return !currentBucket.value ? bucketsResponse.value?.metadata : objectsResponse.value?.metadata;
+// Offset pagination applies to the bucket list at the root only.
+const showBucketPagination = computed(() => {
+    return !currentBucket.value && (bucketsResponse.value?.metadata.total || 0) > itemsPerPage.value;
 });
-
-const showPagination = computed(() => {
-    return (paginationMetadata.value?.total || 0) > itemsPerPage.value;
+const showObjectPaging = computed(() => {
+    return !!currentBucket.value && (hasNextObjectPage.value || hasPreviousObjectPage.value);
 });
 
 const columns: TableColumn<BrowserItem>[] = [
@@ -787,7 +840,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
         </template>
 
         <template #body>
-            <div class="flex flex-col relative" @dragenter.prevent="onDragEnter" @dragover.prevent @dragleave.prevent="onDragLeave" @drop.prevent="onDrop">
+            <div ref="listTop" class="flex flex-col relative" @dragenter.prevent="onDragEnter" @dragover.prevent @dragleave.prevent="onDragLeave" @drop.prevent="onDrop">
                 <div v-if="isDraggingOver" class="absolute inset-0 z-10 flex items-center justify-center bg-primary/10 border-2 border-dashed border-primary rounded-lg pointer-events-none m-2">
                     <div class="flex flex-col items-center gap-2 text-primary">
                         <UIcon name="i-lucide-upload-cloud" class="w-10 h-10" />
@@ -809,14 +862,30 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
                     }"
                 >
                     <template #empty>
-                        <UEmpty v-if="!currentBucket" title="No Buckets" description="There are no buckets yet." icon="i-lucide-cylinder" size="lg" variant="naked" />
+                        <div v-if="status === 'pending' || isScanningSearch" class="flex items-center justify-center gap-2 py-12 text-sm text-muted">
+                            <LoadingIndicator :size="16" />
+                            <span>{{ isScanningSearch ? "Searching…" : "Loading…" }}</span>
+                        </div>
+                        <UEmpty v-else-if="!currentBucket" title="No Buckets" description="There are no buckets yet." icon="i-lucide-cylinder" size="lg" variant="naked" />
+                        <UEmpty v-else-if="searchQuery" title="No Matches" description="Nothing under this folder matches your search." icon="i-lucide-search-x" size="lg" variant="naked" />
                         <UEmpty v-else title="No Objects" description="This folder is empty." icon="i-lucide-folder-open" size="lg" variant="naked" />
                     </template>
                 </UTable>
 
-                <!-- Pagination -->
-                <div v-if="showPagination" class="flex justify-end p-4 border-t border-default">
-                    <UPagination v-model:page="page" show-edges :items-per-page="itemsPerPage" :total="paginationMetadata?.total || 0" variant="ghost" active-variant="solid" active-color="primary" color="neutral" size="sm" />
+                <!-- Bucket list: offset pagination -->
+                <div v-if="showBucketPagination" class="flex justify-center sm:justify-end p-4 border-t border-default">
+                    <UPagination v-model:page="page" show-edges :items-per-page="itemsPerPage" :total="bucketsResponse?.metadata.total || 0" variant="ghost" active-variant="solid" active-color="primary" color="neutral" size="sm" />
+                </div>
+
+                <!-- Object list: cursor paging. Stacks on narrow screens, one row from `sm` up. -->
+                <div v-if="showObjectPaging" class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between p-4 border-t border-default">
+                    <span class="text-xs text-muted truncate">
+                        {{ displayItems.length }} item{{ displayItems.length !== 1 ? "s" : "" }}<template v-if="hasNextObjectPage"> · more available</template>
+                    </span>
+                    <div class="flex items-center justify-between sm:justify-end gap-2">
+                        <UButton icon="i-lucide-chevron-left" label="Previous" color="neutral" variant="subtle" size="sm" class="flex-1 sm:flex-none justify-center" :disabled="!hasPreviousObjectPage || status === 'pending'" @click="previousObjectPage" />
+                        <UButton trailing-icon="i-lucide-chevron-right" label="Next" color="neutral" variant="subtle" size="sm" class="flex-1 sm:flex-none justify-center" :disabled="!hasNextObjectPage || status === 'pending'" @click="nextObjectPage" />
+                    </div>
                 </div>
             </div>
         </template>

@@ -38,6 +38,7 @@ struct ObjectFileHandler {
     /// never see a partial object) and durably (fsync of both the file and its directory
     /// before acknowledging, unless `ALARIK_FSYNC=false`; see `AtomicObjectWriter`).
     static func write(metadata: ObjectMeta, data: Data, to path: String) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
         var writer = try AtomicObjectWriter(finalPath: path)
         do {
             try writeHeader(metadata: metadata, to: writer)
@@ -85,6 +86,7 @@ struct ObjectFileHandler {
         payloadSources: [(path: String, offset: Int, size: Int)],
         to path: String
     ) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
         var writer = try AtomicObjectWriter(finalPath: path)
         do {
             try writeHeader(metadata: metadata, to: writer)
@@ -441,6 +443,7 @@ struct ObjectFileHandler {
 
     /// Deletes an object from storage.
     static func delete(bucketName: String, key: String) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
         let path = storagePath(for: bucketName, key: key)
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -551,12 +554,18 @@ struct ObjectFileHandler {
 
     /// Lists all objects in a bucket with optional prefix filtering
     /// This method returns the LATEST version of each object (or the non-versioned object)
+    /// `keyFilter` turns the call into a bounded scan: `maxKeys` then counts every key examined
+    /// after `marker` (so the walk stays bounded) while only keys passing the filter are
+    /// returned with their metadata, and `nextMarker` is the last key *examined*. That is what
+    /// a substring search needs - headers are read for matches only, never for the keys skipped.
+    /// Only the recursive walk honours it (a search is always recursive, delimiter nil).
     static func listObjects(
         bucketName: String,
         prefix: String = "",
         delimiter: String? = nil,
         maxKeys: Int = 1000,
-        marker: String? = nil
+        marker: String? = nil,
+        keyFilter: (@Sendable (String) -> Bool)? = nil
     ) throws -> (
         objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
     ) {
@@ -567,20 +576,29 @@ struct ObjectFileHandler {
         }
 
         // Fast path for a plain folder view: the prefix names a real directory (empty, or ends in
-        // "/"), the delimiter is "/", and there's no marker to page past - so a single directory
-        // level answers the request without walking the whole bucket. Arbitrary prefixes that
-        // don't land on a directory boundary, versions listings, and paginated continuations fall
-        // through to the recursive walk below, which stays exactly as it was.
-        if delimiter == "/", marker == nil, prefix.isEmpty || prefix.hasSuffix("/"),
-            !prefix.contains("..")
+        // "/") and the delimiter is "/", so a single directory level answers the request - with
+        // or without a marker - without walking the whole bucket. Arbitrary prefixes that don't
+        // land on a directory boundary and versions listings fall through to the recursive walk
+        // below, which stays exactly as it was.
+        if delimiter == "/", keyFilter == nil, prefix.isEmpty || prefix.hasSuffix("/"),
+            !prefix.contains(".."), Self.markerIsAtThisLevel(marker, prefix: prefix)
         {
             return listObjectsInDirectory(
-                bucketName: bucketName, prefix: prefix, maxKeys: maxKeys)
+                bucketName: bucketName, prefix: prefix, maxKeys: maxKeys, marker: marker)
         }
 
-        guard
+        // Every key under `prefix` lives below the directory its folder part names, so the walk
+        // starts there rather than at the bucket root - a search scoped to `docs/rep` costs the
+        // `docs/` subtree, not the bucket.
+        let walkRoot: URL
+        if !prefix.contains(".."), let lastSlash = prefix.lastIndex(of: "/") {
+            walkRoot = bucketURL.appendingPathComponent(String(prefix[..<lastSlash]))
+        } else {
+            walkRoot = bucketURL
+        }
+        guard FileManager.default.fileExists(atPath: walkRoot.path),
             let enumerator = FileManager.default.enumerator(
-                at: bucketURL,
+                at: walkRoot,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 // No .skipsHiddenFiles: dot-prefixed keys (e.g. ".env") are real
                 // objects. Internal artifacts are excluded by the .obj filter below.
@@ -590,7 +608,9 @@ struct ObjectFileHandler {
             return ([], [], false, nil)
         }
 
-        // Track unique keys - we'll need to look up the latest version for each
+        // Track unique keys. Versioned keys need their `.latest` resolved now (the latest may be
+        // a delete marker, which must not be listed); plain keys are read lazily in `metaFor`,
+        // only once they made it into the returned page - a plain object is never a marker.
         var versionedKeys: Set<String> = []
         var nonVersionedKeys: Set<String> = []
         var commonPrefixesSet: Set<String> = []
@@ -626,24 +646,13 @@ struct ObjectFileHandler {
                 continue
             }
 
-            // Skip if before marker
-            if let marker = marker, key <= marker {
+            // Page on the key, then roll it up to its common prefix if the delimiter says so. A
+            // page whose last entry was the folder `docs/` continues with marker `docs/`, and
+            // `docs/a` (> `docs/`) must then not re-create that same folder on the next page.
+            if let marker, key <= marker { continue }
+            if let commonPrefix = Self.commonPrefix(of: key, prefix: prefix, delimiter: delimiter) {
+                if commonPrefix != marker { commonPrefixesSet.insert(commonPrefix) }
                 continue
-            }
-
-            // Handle delimiter (for directory-like listing)
-            if let delimiter = delimiter, !delimiter.isEmpty {
-                guard delimiter.count == 1, let delimChar = delimiter.first else {
-                    continue
-                }
-
-                let keyAfterPrefix = String(key.dropFirst(prefix.count))
-                if let delimiterIndex = keyAfterPrefix.firstIndex(of: delimChar) {
-                    let prefixSlice = String(keyAfterPrefix[..<delimiterIndex])
-                    let commonPrefix = prefix + prefixSlice + delimiter
-                    commonPrefixesSet.insert(commonPrefix)
-                    continue
-                }
             }
 
             // Track this key
@@ -680,26 +689,8 @@ struct ObjectFileHandler {
             }
         }
 
-        // Process non-versioned keys (only if not already covered by versioned)
-        for key in nonVersionedKeys {
-            if latestByKey[key] != nil {
-                continue  // Already have a versioned latest
-            }
-
-            let path = storagePath(for: bucketName, key: key)
-            do {
-                let (meta, _) = try read(from: path, loadData: false)
-
-                // Skip delete markers
-                if meta.isDeleteMarker {
-                    continue
-                }
-
-                latestByKey[key] = meta
-            } catch {
-                continue
-            }
-        }
+        // Plain keys not superseded by a versioned latest are listed, their header read lazily.
+        let plainKeys = nonVersionedKeys.filter { latestByKey[$0] == nil }
 
         // EC objects never appear in the `.obj` walk above - shard index 0's header already
         // carries the current `isLatest`/`isDeleteMarker` state directly (no separate pointer
@@ -710,23 +701,42 @@ struct ObjectFileHandler {
             let key = meta.key
             if !prefix.isEmpty && !key.hasPrefix(prefix) { continue }
             if let marker, key <= marker { continue }
-            if let delimiter, !delimiter.isEmpty {
-                guard delimiter.count == 1, let delimChar = delimiter.first else { continue }
-                let keyAfterPrefix = String(key.dropFirst(prefix.count))
-                if let delimiterIndex = keyAfterPrefix.firstIndex(of: delimChar) {
-                    let prefixSlice = String(keyAfterPrefix[..<delimiterIndex])
-                    let commonPrefix = prefix + prefixSlice + delimiter
-                    commonPrefixesSet.insert(commonPrefix)
-                    continue
-                }
+            if let commonPrefix = Self.commonPrefix(of: key, prefix: prefix, delimiter: delimiter) {
+                if commonPrefix != marker { commonPrefixesSet.insert(commonPrefix) }
+                continue
             }
             if meta.isDeleteMarker { continue }
             latestByKey[key] = meta
         }
 
         return finalizeListing(
-            objectKeys: Array(latestByKey.keys), commonPrefixes: Array(commonPrefixesSet),
-            maxKeys: maxKeys, metaFor: { latestByKey[$0] })
+            objectKeys: Array(latestByKey.keys) + plainKeys, commonPrefixes: Array(commonPrefixesSet),
+            maxKeys: maxKeys, keyFilter: keyFilter
+        ) { key in
+            if let meta = latestByKey[key] { return meta }
+            return try? read(from: storagePath(for: bucketName, key: key), loadData: false).0
+        }
+    }
+
+    /// The common prefix `key` rolls up to under a single-character `delimiter` (S3 semantics:
+    /// `prefix` + everything up to and including the first delimiter after it), or nil when the
+    /// key sits directly at this level or no delimiter applies.
+    static func commonPrefix(of key: String, prefix: String, delimiter: String?) -> String? {
+        guard let delimiter, delimiter.count == 1, let delimChar = delimiter.first else { return nil }
+        let keyAfterPrefix = key.dropFirst(prefix.count)
+        guard let delimiterIndex = keyAfterPrefix.firstIndex(of: delimChar) else { return nil }
+        return prefix + String(keyAfterPrefix[..<delimiterIndex]) + delimiter
+    }
+
+    /// True when `marker` names an entry directly at `prefix`'s level (a key there, or a folder
+    /// `prefix + name + "/"` - which is what every `nextMarker` this layer hands out is), or no
+    /// marker at all. A marker *inside* a subfolder (S3 start-after a key deep in `docs/`) still
+    /// has to show `docs/` when that folder holds keys after it - only the recursive walk, which
+    /// sees those keys, can decide that, so the directory fast path declines it.
+    static func markerIsAtThisLevel(_ marker: String?, prefix: String) -> Bool {
+        guard let marker else { return true }
+        guard marker.hasPrefix(prefix) else { return true }
+        return commonPrefix(of: marker, prefix: prefix, delimiter: "/").map { $0 == marker } ?? true
     }
 
     /// Sorts the collected objects and common prefixes, merges them in lexicographic order, and
@@ -735,6 +745,7 @@ struct ObjectFileHandler {
     /// listing semantics.
     private static func finalizeListing(
         objectKeys: [String], commonPrefixes: [String], maxKeys: Int,
+        keyFilter: (@Sendable (String) -> Bool)? = nil,
         metaFor: (String) -> ObjectMeta?
     ) -> (
         objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
@@ -758,10 +769,11 @@ struct ObjectFileHandler {
 
             // Object key or common prefix, whichever is lexicographically first.
             if let key = nextKey, nextPrefix == nil || key < nextPrefix! {
-                // `metaFor` resolves the key's metadata only now that it's in the page - so the
-                // directory fast path reads a header per returned object, not per object present.
-                // A nil result (raced concurrent delete) is simply dropped from the page.
-                if let meta = metaFor(key) { finalObjects.append(meta) }
+                // `metaFor` resolves the key's metadata only now that it's in the page - so a
+                // header is read per returned object, not per object present. A nil result
+                // (raced concurrent delete) is simply dropped from the page. A filtered-out key
+                // still counts toward the window and moves the marker (see `listObjects`).
+                if keyFilter?(key) ?? true, let meta = metaFor(key) { finalObjects.append(meta) }
                 nextMarker = key
                 keyIndex += 1
             } else if let prefix = nextPrefix {
@@ -779,17 +791,19 @@ struct ObjectFileHandler {
         return (finalObjects, finalCommonPrefixes, isTruncated, nextMarker)
     }
 
-    /// Directory-scoped fast path for the folder view (`delimiter == "/"`, no marker, prefix empty
-    /// or ending in `/`). Because a key maps to a real nested path
+    /// Directory-scoped fast path for the folder view (`delimiter == "/"`, prefix empty or ending
+    /// in `/`, any marker). Because a key maps to a real nested path
     /// (`folder/file.txt` -> `.../folder/file.txt.obj`), a single level of `folder/` is all that a
     /// folder listing needs - `.obj` files are objects, `<name>.versions/` / `<name>.ecshards/`
     /// are versioned / erasure-coded objects, and any other subdirectory is a common prefix. This
     /// makes browsing a folder O(entries in that folder) instead of walking the whole bucket, and
     /// it never descends into sibling folders. Object metadata (and the versioned/EC latest
-    /// resolution) is read only for the entries actually at this level. Same output contract as the
-    /// recursive walk, so the S3 listing tests cover both.
+    /// resolution) is read only for the entries actually at this level and after `marker`, so
+    /// paging through a huge folder costs one header read per returned object, not per object
+    /// present (issue #27). Same output contract as the recursive walk, so the S3 listing tests
+    /// cover both.
     private static func listObjectsInDirectory(
-        bucketName: String, prefix: String, maxKeys: Int
+        bucketName: String, prefix: String, maxKeys: Int, marker: String?
     ) -> (
         objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
     ) {
@@ -826,23 +840,33 @@ struct ObjectFileHandler {
             resolvedRankByKey[key] = rank
         }
 
+        // Everything an entry can list as, derived from its name alone - cheap enough to decide
+        // "is this past the marker" before paying for any header read.
+        func listedName(_ name: String, isDirectory: Bool) -> String? {
+            if !isDirectory { return name.hasSuffix(".obj") ? prefix + String(name.dropLast(4)) : nil }
+            if name.hasSuffix(".versions") { return prefix + String(name.dropLast(".versions".count)) }
+            if name.hasSuffix(".ecshards") { return prefix + String(name.dropLast(".ecshards".count)) }
+            return prefix + name + "/"
+        }
+
         for entry in entries {
             let name = entry.lastPathComponent
             let entryIsDir =
                 (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard let listed = listedName(name, isDirectory: entryIsDir) else { continue }
+            if let marker, listed <= marker { continue }
 
             if !entryIsDir {
-                guard name.hasSuffix(".obj") else { continue }
-                objectPathByKey[prefix + String(name.dropLast(4))] = entry.path
+                objectPathByKey[listed] = entry.path
             } else if name.hasSuffix(".versions") {
-                let key = prefix + String(name.dropLast(".versions".count))
+                let key = listed
                 if let (meta, _) = try? readVersion(
                     bucketName: bucketName, key: key, versionId: nil, loadData: false)
                 {
                     resolve(key, meta, rank: 1)
                 }
             } else if name.hasSuffix(".ecshards") {
-                let key = prefix + String(name.dropLast(".ecshards".count))
+                let key = listed
                 let shardZeroPath = entry.appendingPathComponent("0.ecshard").path
                 if let reader = try? ErasureCodedShardReader(path: shardZeroPath) {
                     let header = reader.header
@@ -855,7 +879,7 @@ struct ObjectFileHandler {
                     }
                 }
             } else {
-                commonPrefixesSet.insert(prefix + name + "/")
+                commonPrefixesSet.insert(listed)
             }
         }
 
@@ -1433,6 +1457,7 @@ struct ObjectFileHandler {
 
     /// Deletes a specific version of an object
     static func deleteVersion(bucketName: String, key: String, versionId: String) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
         let path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
         guard FileManager.default.fileExists(atPath: path) else {

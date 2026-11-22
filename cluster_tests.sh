@@ -1333,6 +1333,38 @@ else
     fail "Console multipart upload spread across nodes did not produce a consistent object."
 fi
 
+# ── Test 26d: console object listing pages by marker across nodes with no gaps or duplicates ──
+# Issue #27: the console listing is a cursor over the per-node pages merged by the coordinator.
+# Paging with a tiny page size through objects spread over every node must yield exactly the
+# full key set, once each, in order - and the folder on a page boundary must not repeat.
+echo ""
+echo "=== Test: console cursor listing pages across nodes without gaps or duplicates ==="
+aws --endpoint-url "${ENDPOINTS[0]}" s3api create-bucket --bucket cluster-paging-test >/dev/null 2>&1
+PAGING_KEYS=(a.txt b.txt docs/1.txt docs/2.txt docs/3.txt m.txt n.txt sub/x.txt z.txt)
+for idx in "${!PAGING_KEYS[@]}"; do
+    echo "k $idx" | aws --endpoint-url "${ENDPOINTS[$((idx % NODE_COUNT))]}" s3 cp - "s3://cluster-paging-test/${PAGING_KEYS[$idx]}" >/dev/null
+done
+sleep 2
+
+PAGING_SEEN=""
+PAGING_MARKER=""
+PAGING_PAGES=0
+while :; do
+    PAGING_PAGES=$((PAGING_PAGES + 1))
+    PAGE_JSON=$(curl -s "${ENDPOINTS[$((PAGING_PAGES % NODE_COUNT))]}/api/v1/objects?bucket=cluster-paging-test&per=2&marker=$PAGING_MARKER" \
+        -H "Authorization: Bearer $TOKEN")
+    PAGING_SEEN="$PAGING_SEEN$(echo "$PAGE_JSON" | jq -r '.items[].key')"$'\n'
+    if [ "$(echo "$PAGE_JSON" | jq -r '.isTruncated')" != "true" ] || [ "$PAGING_PAGES" -gt 20 ]; then break; fi
+    PAGING_MARKER=$(echo "$PAGE_JSON" | jq -r '.nextMarker | @uri')
+done
+PAGING_GOT=$(printf '%s' "$PAGING_SEEN" | sed '/^$/d')
+PAGING_EXPECTED=$'a.txt\nb.txt\ndocs/\nm.txt\nn.txt\nsub/\nz.txt'
+if [ "$PAGING_GOT" = "$PAGING_EXPECTED" ] && [ "$PAGING_PAGES" -eq 4 ]; then
+    pass "Console cursor listing paged $PAGING_PAGES pages across nodes with exactly the expected entries, once each."
+else
+    fail "Console cursor listing across nodes mismatched (pages=$PAGING_PAGES). Got: $(echo "$PAGING_GOT" | tr '\n' ' ')"
+fi
+
 # ── Test 27: admin console version delete from a non-responsible node ──────────
 echo ""
 echo "=== Test: admin console version delete from a non-responsible node ==="

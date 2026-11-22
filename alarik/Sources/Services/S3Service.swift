@@ -1007,6 +1007,7 @@ struct S3Service {
         let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
         if FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(atPath: path)
+            StorageStatsService.shared.noteChange(bucketName: bucketName)
             // Prune the now-empty folder so it doesn't linger as a phantom in the listing.
             ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
         }

@@ -26,6 +26,9 @@ import ZIPFoundation
 struct InternalBucketControllerTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
         let app = try await Application.make(.testing)
+        // The stats cache is process-wide; a figure from a previous test's identically named
+        // bucket must never be served here.
+        await StorageStatsService.shared.invalidateAll()
         do {
             try StorageHelper.cleanStorage()
             defer { try? StorageHelper.cleanStorage() }
@@ -529,9 +532,10 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 0)
-                    #expect(page.metadata.total == 0)
+                    #expect(!page.isTruncated)
+                    #expect(page.nextMarker == nil)
                 })
         }
     }
@@ -558,9 +562,9 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 3)
-                    #expect(page.metadata.total == 3)
+                    #expect(!page.isTruncated)
 
                     let keys = page.items.map { $0.key }
                     #expect(keys.contains("file1.txt"))
@@ -599,7 +603,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     let keys = Set(page.items.map(\.key))
                     // Matches at every depth, including deeply nested
                     #expect(keys == ["report-2024.pdf", "archive/report-2023.pdf", "archive/deep/report-final.pdf"])
@@ -624,7 +628,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.map(\.key) == ["Invoice.PDF"])
                 })
 
@@ -634,7 +638,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.isEmpty)
                 })
         }
@@ -662,6 +666,41 @@ struct InternalBucketControllerTests {
                     #expect(dto.objectCount == 2)
                     #expect(dto.sizeBytes >= 15)
                 })
+        }
+    }
+
+    @Test("Get object stats - Figures are cached, yet reflect a write made right after")
+    func testGetObjectStatsFreshAfterWrite() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "fresh-stats-bucket")
+            try await putObject(app, bucketName: "fresh-stats-bucket", key: "a.txt", content: "1")
+
+            func objectCount() async throws -> Int {
+                var count = -1
+                try await app.test(
+                    .GET, "/api/v1/objects/stats?bucket=fresh-stats-bucket",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    },
+                    afterResponse: { res async throws in
+                        #expect(res.status == .ok)
+                        count = try res.content.decode(InternalBucketController.StatsDTO.self).objectCount
+                    })
+                return count
+            }
+            #expect(try await objectCount() == 1)
+            // Served from cache now - and a write must still show up on the very next read.
+            #expect(try await objectCount() == 1)
+            try await putObject(app, bucketName: "fresh-stats-bucket", key: "b.txt", content: "2")
+            #expect(try await objectCount() == 2)
+            try await app.test(
+                .DELETE, "/api/v1/objects?bucket=fresh-stats-bucket&key=a.txt",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                },
+                afterResponse: { res in #expect(res.status == .noContent) })
+            #expect(try await objectCount() == 1)
         }
     }
 
@@ -759,7 +798,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
 
                     // Should have: root.txt (file), docs/ (folder), images/ (folder)
                     #expect(page.items.count == 3)
@@ -802,7 +841,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
 
                     // Should have: docs/api/ (folder), docs/guides/ (folder)
                     #expect(page.items.count == 2)
@@ -817,7 +856,7 @@ struct InternalBucketControllerTests {
         }
     }
 
-    @Test("List objects - Folders sorted before files")
+    @Test("List objects - S3 order: folders and files interleaved lexicographically")
     func testListObjectsSorting() async throws {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
@@ -836,63 +875,100 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
-                    #expect(page.items.count == 3)
-
-                    // First item should be the folder
-                    #expect(page.items[0].isFolder == true)
-                    #expect(page.items[0].key == "folder/")
-
-                    // Then files sorted alphabetically
-                    #expect(page.items[1].isFolder == false)
-                    #expect(page.items[1].key == "apple.txt")
-
-                    #expect(page.items[2].isFolder == false)
-                    #expect(page.items[2].key == "zebra.txt")
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
+                    // The wire order is S3's (lexicographic over keys and folders alike), so a
+                    // cursor can continue from any entry; the console groups folders per page.
+                    #expect(page.items.map(\.key) == ["apple.txt", "folder/", "zebra.txt"])
+                    #expect(page.items.map(\.isFolder) == [false, true, false])
                 })
         }
     }
 
-    @Test("List objects - With pagination")
+    @Test("List objects - Cursor pagination walks every entry once, in order, with no total")
     func testListObjectsPagination() async throws {
         try await withApp { app in
             let token = try await createUserAndLogin(app)
             try await createBucket(app, token: token, name: "test-bucket")
 
-            // Create 5 files
             for i in 1...5 {
                 try await putObject(
                     app, bucketName: "test-bucket", key: "file\(i).txt", content: "content\(i)")
             }
+            try await putObject(app, bucketName: "test-bucket", key: "dir/x.txt", content: "x")
 
-            // Page 1
+            var seen: [String] = []
+            var marker: String? = nil
+            var pages = 0
+            repeat {
+                let query = "bucket=test-bucket&per=2" + (marker.map { "&marker=\($0)" } ?? "")
+                try await app.test(
+                    .GET, "/api/v1/objects?\(query)",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    },
+                    afterResponse: { res async throws in
+                        #expect(res.status == .ok)
+                        let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
+                        #expect(page.items.count <= 2)
+                        seen += page.items.map(\.key)
+                        marker = page.isTruncated ? page.nextMarker : nil
+                        if page.isTruncated { #expect(page.nextMarker != nil) }
+                    })
+                pages += 1
+            } while marker != nil && pages < 10
+
+            #expect(pages == 3)
+            #expect(seen == ["dir/", "file1.txt", "file2.txt", "file3.txt", "file4.txt", "file5.txt"])
+
+            // `per` is clamped, never trusted: an absurd value still yields a bounded page.
             try await app.test(
-                .GET, "/api/v1/objects?bucket=test-bucket&page=1&per=2",
+                .GET, "/api/v1/objects?bucket=test-bucket&per=999999",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .ok)
-
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
-                    #expect(page.items.count == 2)
-                    #expect(page.metadata.total == 5)
-                    #expect(page.metadata.page == 1)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
+                    #expect(page.items.count == 6)
                 })
+        }
+    }
 
-            // Page 2
-            try await app.test(
-                .GET, "/api/v1/objects?bucket=test-bucket&page=2&per=2",
-                beforeRequest: { req in
-                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                },
-                afterResponse: { res async throws in
-                    #expect(res.status == .ok)
+    @Test("List objects - Search pages through the scan with a budget and resumes from the marker")
+    func testSearchPagesWithScanBudget() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "scan-bucket")
+            // Six objects, three of which match; a budget of two keys per request means the
+            // scan needs several requests and must resume exactly where it stopped.
+            for key in ["a-log.txt", "b.txt", "c-log.txt", "d.txt", "e.txt", "f-log.txt"] {
+                try await putObject(app, bucketName: "scan-bucket", key: key, content: "x")
+            }
+            let req = Request(application: app, on: app.eventLoopGroup.next())
+            var matches: [String] = []
+            var marker: String? = nil
+            var requests = 0
+            repeat {
+                let page = try await ConsoleObjectListing.searchPage(
+                    req: req, bucketName: "scan-bucket", prefix: "", term: "LOG", per: 10,
+                    marker: marker, scanBudget: 2)
+                matches += page.items.map(\.key)
+                marker = page.isTruncated ? page.nextMarker : nil
+                requests += 1
+            } while marker != nil && requests < 10
+            #expect(matches == ["a-log.txt", "c-log.txt", "f-log.txt"])
+            #expect(requests == 3)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
-                    #expect(page.items.count == 2)
-                    #expect(page.metadata.page == 2)
-                })
+            // A full page of matches stops early and resumes right after the last match.
+            let first = try await ConsoleObjectListing.searchPage(
+                req: req, bucketName: "scan-bucket", prefix: "", term: "log", per: 2, marker: nil)
+            #expect(first.items.map(\.key) == ["a-log.txt", "c-log.txt"])
+            #expect(first.isTruncated && first.nextMarker == "c-log.txt")
+            let second = try await ConsoleObjectListing.searchPage(
+                req: req, bucketName: "scan-bucket", prefix: "", term: "log", per: 2,
+                marker: first.nextMarker)
+            #expect(second.items.map(\.key) == ["f-log.txt"])
+            #expect(!second.isTruncated)
+            _ = token
         }
     }
 
@@ -1230,7 +1306,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == fileName)
                     #expect(page.items.first?.size == fileContent.utf8.count)
@@ -1324,7 +1400,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 0)
                 })
         }
@@ -1503,7 +1579,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 0)
                 })
         }
@@ -1642,7 +1718,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "private.txt")
                 })
@@ -1680,7 +1756,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "safe-file.txt")
                 })
@@ -1715,7 +1791,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                 })
         }
@@ -1748,7 +1824,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                 })
         }
@@ -1776,7 +1852,7 @@ struct InternalBucketControllerTests {
                     },
                     afterResponse: { res async throws in
                         #expect(res.status == .ok)
-                        let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                        let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                         folders = page.items.filter { $0.isFolder }.map { $0.key }
                     })
                 return folders
@@ -1830,7 +1906,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     // Should have at least 1 item (the folder or files)
                     #expect(page.items.count >= 1)
 
@@ -1877,7 +1953,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "other.txt")
                 })
@@ -1919,7 +1995,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "keep.txt")
                 })
@@ -1972,7 +2048,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     // May be 1 item (a/ folder) or 1 item (a/file3.txt) depending on delimiter
                     #expect(page.items.count >= 1)
 
@@ -2018,7 +2094,7 @@ struct InternalBucketControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
 
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 0)
                 })
         }
@@ -3100,7 +3176,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "keep.txt")
                 })
@@ -3233,7 +3309,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.key == "test.txt")
                 })
@@ -4360,7 +4436,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let page = try res.content.decode(Page<ObjectMeta.ResponseDTO>.self)
+                    let page = try res.content.decode(CursorPage<ObjectMeta.ResponseDTO>.self)
                     #expect(page.items.count == 1)
                     #expect(page.items.first?.size == "unchanged-data".utf8.count)
                 })

@@ -79,6 +79,77 @@ enum ClusterListingService {
         return mergeObjectsPages(pages, maxKeys: maxKeys)
     }
 
+    // MARK: - Search (console)
+
+    struct SearchPage {
+        let matches: [ObjectMeta]
+        let isTruncated: Bool
+        /// Last key examined (not matched) - the position to resume the scan from.
+        let nextMarker: String?
+    }
+
+    /// One bounded scan step of a substring search: every node examines at most `scanLimit`
+    /// keys after `marker` and returns only the matches, merged so that the result never skips
+    /// a key on any node (see `mergeSearchPages`).
+    static func searchObjects(
+        req: Request, bucketName: String, prefix: String, term: String, scanLimit: Int,
+        marker: String?
+    ) async throws -> SearchPage {
+        let filter = ConsoleObjectListing.keyFilter(matching: term)
+        let local = { @Sendable () throws -> SearchPage in
+            let (objects, _, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+                bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: scanLimit,
+                marker: marker, keyFilter: filter)
+            return SearchPage(matches: objects, isTruncated: isTruncated, nextMarker: nextMarker)
+        }
+        guard let config = req.application.storage[ClusterConfigurationKey.self] else {
+            return try local()
+        }
+        let peers = await activePeers(config: config)
+        guard !peers.isEmpty else { return try local() }
+
+        var pages = [try local()]
+        await withTaskGroup(of: SearchPage?.self) { group in
+            for node in peers {
+                group.addTask {
+                    do {
+                        let r = try await ClusterListingClient.fetchObjectsPage(
+                            app: req.application, from: node, bucketName: bucketName,
+                            prefix: prefix, delimiter: nil, maxKeys: scanLimit, marker: marker,
+                            search: term)
+                        return SearchPage(
+                            matches: r.objects, isTruncated: r.isTruncated, nextMarker: r.nextMarker)
+                    } catch {
+                        req.logger.warning(
+                            "Cluster search: peer \(node.id) unreachable for '\(bucketName)', proceeding best-effort: \(error)"
+                        )
+                        return nil
+                    }
+                }
+            }
+            for await page in group { if let page { pages.append(page) } }
+        }
+        return mergeSearchPages(pages)
+    }
+
+    /// Merges per-node scan steps. Nodes stop at different keys, so the merged position is the
+    /// *earliest* stop among the nodes that still have more; matches past it are dropped and
+    /// re-found by the next step, which resumes every node from that same position. Pure, so
+    /// it's unit-tested directly.
+    static func mergeSearchPages(_ pages: [SearchPage]) -> SearchPage {
+        let bound = pages.compactMap { $0.isTruncated ? $0.nextMarker : nil }.min()
+        var seen = Set<String>()
+        var matches: [ObjectMeta] = []
+        for page in pages {
+            for match in page.matches where seen.insert(match.key).inserted {
+                if let bound, match.key > bound { continue }
+                matches.append(match)
+            }
+        }
+        matches.sort { $0.key < $1.key }
+        return SearchPage(matches: matches, isTruncated: bound != nil, nextMarker: bound)
+    }
+
     // MARK: - Versions (ListObjectVersions)
 
     static func listAllVersions(
@@ -211,22 +282,49 @@ enum ClusterListingService {
 
     // MARK: - Stats (admin console)
 
+    /// Cluster-wide size and object count under `prefix` - cached, coalesced and walk-limited
+    /// through `StorageStatsService` (issue #28), so a page of folder rows or a polling
+    /// dashboard never turns into a storm of directory walks.
     static func calculateStats(
         req: Request, bucketName: String, prefix: String
-    ) async throws -> (sizeBytes: Int64, objectCount: Int) {
-        guard let config = req.application.storage[ClusterConfigurationKey.self] else {
-            return BucketHandler.calculateStats(bucketName: bucketName, prefix: prefix)
+    ) async throws -> StorageStatsService.Stats {
+        let app = req.application
+        let active = app.storage[ClusterConfigurationKey.self] == nil
+            ? [] : await ClusterNodeCache.shared.activeNodes()
+        let key = StorageStatsService.Key(
+            scope: .clusterTotal, bucketName: bucketName, prefix: prefix, activeNodes: active)
+        // With peers, the total is a sum of shares each node caches and invalidates for itself;
+        // caching the sum here would hide their changes. Alone, it IS this node's own figure.
+        let aggregatesPeers = active.contains { $0.id != app.storage[ClusterConfigurationKey.self]?.nodeId }
+        return try await StorageStatsService.shared.stats(
+            for: key, policy: aggregatesPeers ? .coalesceOnly : .cache
+        ) {
+            try await uncachedClusterStats(
+                app: app, bucketName: bucketName, prefix: prefix, activeNodes: active)
         }
-        let active = await ClusterNodeCache.shared.activeNodes()
+    }
+
+    private static func uncachedClusterStats(
+        app: Application, bucketName: String, prefix: String, activeNodes active: [ClusterNodeInfo]
+    ) async throws -> StorageStatsService.Computation {
+        let local = { @Sendable in
+            let (sizeBytes, objectCount) = BucketHandler.calculateStats(bucketName: bucketName, prefix: prefix)
+            return StorageStatsService.Computation(sizeBytes: sizeBytes, objectCount: objectCount)
+        }
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            return try await StorageStatsService.shared.localWalk(app: app, local)
+        }
         let peers = active.filter { $0.id != config.nodeId }
         guard !peers.isEmpty else {
-            return BucketHandler.calculateStats(bucketName: bucketName, prefix: prefix)
+            return try await StorageStatsService.shared.localWalk(app: app, local)
         }
 
         var totalSize: Int64 = 0
         var totalCount = 0
-        let own = try ownedStats(
-            bucketName: bucketName, prefix: prefix, activeNodes: active, selfNodeId: config.nodeId)
+        var everyPeerAnswered = true
+        let own = try await ownedStats(
+            app: app, bucketName: bucketName, prefix: prefix, activeNodes: active,
+            selfNodeId: config.nodeId)
         totalSize += own.sizeBytes
         totalCount += own.objectCount
 
@@ -235,10 +333,10 @@ enum ClusterListingService {
                 group.addTask {
                     do {
                         return try await ClusterListingClient.fetchOwnedStats(
-                            app: req.application, from: node, bucketName: bucketName,
+                            app: app, from: node, bucketName: bucketName,
                             prefix: prefix)
                     } catch {
-                        req.logger.warning(
+                        app.logger.warning(
                             "Cluster stats: peer \(node.id) unreachable for '\(bucketName)', proceeding best-effort: \(error)"
                         )
                         return nil
@@ -249,11 +347,15 @@ enum ClusterListingService {
                 if let result {
                     totalSize += result.sizeBytes
                     totalCount += result.objectCount
+                } else {
+                    everyPeerAnswered = false
                 }
             }
         }
 
-        return (totalSize, totalCount)
+        // A total missing a peer's share is a lower bound - served, but not cached.
+        return StorageStatsService.Computation(
+            sizeBytes: totalSize, objectCount: totalCount, complete: everyPeerAnswered)
     }
 
     /// Per-node storage breakdown across the *whole cluster* (every bucket), for the admin
@@ -313,17 +415,39 @@ enum ClusterListingService {
     static func ownedStatsAllBuckets(
         app: Application, activeNodes: [ClusterNodeInfo], selfNodeId: UUID
     ) async throws -> (sizeBytes: Int64, objectCount: Int) {
-        let buckets = await Bucket.all(app: app)
-        var sizeBytes: Int64 = 0
-        var objectCount = 0
-        for bucket in buckets {
-            let stats = try ownedStats(
-                bucketName: bucket.name, prefix: "", activeNodes: activeNodes,
-                selfNodeId: selfNodeId)
-            sizeBytes += stats.sizeBytes
-            objectCount += stats.objectCount
-        }
-        return (sizeBytes, objectCount)
+        let key = StorageStatsService.Key(
+            scope: .ownedShareAllBuckets, bucketName: "", prefix: "", activeNodes: activeNodes)
+        return try await StorageStatsService.shared.stats(for: key) {
+            let buckets = await Bucket.all(app: app)
+            var sizeBytes: Int64 = 0
+            var objectCount = 0
+            for bucket in buckets {
+                let stats = try await ownedStats(
+                    app: app, bucketName: bucket.name, prefix: "", activeNodes: activeNodes,
+                    selfNodeId: selfNodeId)
+                sizeBytes += stats.sizeBytes
+                objectCount += stats.objectCount
+            }
+            return StorageStatsService.Computation(sizeBytes: sizeBytes, objectCount: objectCount)
+        }.summary
+    }
+
+    /// `ownedStats` as every caller should run it: cached per (bucket, prefix) and walk-limited.
+    /// The raw walker below stays available for the cache to call.
+    static func ownedStats(
+        app: Application, bucketName: String, prefix: String, activeNodes: [ClusterNodeInfo],
+        selfNodeId: UUID
+    ) async throws -> (sizeBytes: Int64, objectCount: Int) {
+        let key = StorageStatsService.Key(
+            scope: .ownedShare, bucketName: bucketName, prefix: prefix, activeNodes: activeNodes)
+        return try await StorageStatsService.shared.stats(for: key) {
+            try await StorageStatsService.shared.localWalk(app: app) {
+                let (sizeBytes, objectCount) = try ownedStats(
+                    bucketName: bucketName, prefix: prefix, activeNodes: activeNodes,
+                    selfNodeId: selfNodeId)
+                return StorageStatsService.Computation(sizeBytes: sizeBytes, objectCount: objectCount)
+            }
+        }.summary
     }
 
     /// Each historical version and delete marker is counted toward exactly one node's local

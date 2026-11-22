@@ -241,6 +241,7 @@ enum ErasureCodedObjectHandler {
     /// its freshly delivered new-rank shard and its not-yet-reclaimed old-rank shard in the same
     /// directory, so reclaiming the stale one must never take the live one with it.
     static func removeLocalShard(bucketName: String, key: String, versionId: String?, shardIndex: Int) {
+        StorageStatsService.shared.noteChange(bucketName: bucketName)
         try? FileManager.default.removeItem(
             atPath: shardPath(
                 bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex))
@@ -264,6 +265,7 @@ enum ErasureCodedObjectHandler {
     static func commitShardFile(
         sourcePath: String, finalPath: String, bucketName: String, key: String
     ) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
         let incomingMeta = try? ErasureCodedShardReader(path: sourcePath).header.objectMeta
         // Demoting any prior local latest must happen BEFORE the new file lands - mirrors
         // handlePush's exact ordering (never demote the file we're about to write).

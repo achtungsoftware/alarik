@@ -40,6 +40,9 @@ enum ClusterListingClient {
         let objects: [ObjectMeta]
         let commonPrefixes: [String]
         let isTruncated: Bool
+        /// Where this node's scan stopped - needed by a filtered (search) merge, where the last
+        /// returned key is not the last key examined. Absent from older peers.
+        var nextMarker: String? = nil
     }
 
     struct VersionsPageResponse: Codable {
@@ -65,11 +68,12 @@ enum ClusterListingClient {
 
     static func fetchObjectsPage(
         app: Application, from node: ClusterNodeInfo, bucketName: String, prefix: String,
-        delimiter: String?, maxKeys: Int, marker: String?
+        delimiter: String?, maxKeys: Int, marker: String?, search: String? = nil
     ) async throws -> ObjectsPageResponse {
         var query = [("bucket", bucketName), ("prefix", prefix), ("maxKeys", String(maxKeys))]
         if let delimiter { query.append(("delimiter", delimiter)) }
         if let marker { query.append(("marker", marker)) }
+        if let search { query.append(("search", search)) }
         return try await get(
             app: app, node: node, path: "/internal/cluster/listing/objects", query: query)
     }

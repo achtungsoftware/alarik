@@ -222,3 +222,41 @@ struct ClusterListingServiceTests {
         #expect(result.nextUploadIdMarker == "u2")
     }
 }
+
+/// Search steps merge differently from listings: each node reports where its scan *stopped*,
+/// and the merged position must be the earliest of those so no node's keys are ever skipped.
+@Suite("ClusterListingService search merge tests")
+struct ClusterListingSearchMergeTests {
+    private func meta(_ key: String) -> ObjectMeta {
+        ObjectMeta(bucketName: "b", key: key, size: 1, contentType: "x", etag: "e", updatedAt: Date())
+    }
+    private func page(_ keys: [String], stoppedAt: String?) -> ClusterListingService.SearchPage {
+        .init(matches: keys.map(meta), isTruncated: stoppedAt != nil, nextMarker: stoppedAt)
+    }
+
+    @Test("the merged scan position is the earliest stop, and matches past it are deferred")
+    func earliestStopWins() {
+        let merged = ClusterListingService.mergeSearchPages([
+            page(["a-log", "m-log"], stoppedAt: "p"),
+            page(["c-log", "z-log"], stoppedAt: "k"),
+        ])
+        #expect(merged.matches.map(\.key) == ["a-log", "c-log"])
+        #expect(merged.isTruncated && merged.nextMarker == "k")
+    }
+
+    @Test("a node that finished contributes everything; the scan ends only when every node did")
+    func exhaustedNodes() {
+        let partial = ClusterListingService.mergeSearchPages([
+            page(["a-log", "z-log"], stoppedAt: nil),
+            page(["b-log"], stoppedAt: "q"),
+        ])
+        #expect(partial.matches.map(\.key) == ["a-log", "b-log"])
+        #expect(partial.isTruncated && partial.nextMarker == "q")
+
+        let done = ClusterListingService.mergeSearchPages([
+            page(["a-log"], stoppedAt: nil), page(["a-log", "b-log"], stoppedAt: nil),
+        ])
+        #expect(done.matches.map(\.key) == ["a-log", "b-log"])
+        #expect(!done.isTruncated && done.nextMarker == nil)
+    }
+}

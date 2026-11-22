@@ -40,6 +40,14 @@ struct InternalBucketController: RouteCollection {
     struct StatsDTO: Content {
         let sizeBytes: Int64
         let objectCount: Int
+        /// When the underlying walk ran - figures are served from a short cache (issue #28).
+        let computedAt: Date
+
+        init(_ stats: StorageStatsService.Stats) {
+            self.sizeBytes = stats.sizeBytes
+            self.objectCount = stats.objectCount
+            self.computedAt = stats.computedAt
+        }
     }
 
     struct NotificationConfigDTO: Content {
@@ -353,76 +361,33 @@ struct InternalBucketController: RouteCollection {
         return .noContent
     }
 
+    /// The object browser's listing: one cursor page of the folder `prefix` (or of search
+    /// matches anywhere under it). `marker` continues from a previous page's `nextMarker`;
+    /// `per` is clamped to `ConsoleObjectListing.maxPageSize`. See `ConsoleObjectListing` for
+    /// why this is a cursor and not an offset (issue #27).
     @Sendable
-    func listObjects(req: Request) async throws -> Page<ObjectMeta.ResponseDTO> {
+    func listObjects(req: Request) async throws -> CursorPage<ObjectMeta.ResponseDTO> {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         guard let bucketName = req.query[String.self, at: "bucket"] else {
             throw Abort(.badRequest, reason: "Missing 'bucket' query parameter")
         }
-
-        // Verify bucket exists and belongs to user
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
         let prefix = req.query[String.self, at: "prefix"] ?? ""
-        let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces)
+        let per = ConsoleObjectListing.clampedPageSize(req.query[Int.self, at: "per"])
+        let marker = req.query[String.self, at: "marker"].flatMap { $0.isEmpty ? nil : $0 }
+        let search = req.query[String.self, at: "search"]?.trimmingCharacters(in: .whitespaces) ?? ""
 
-        // A search term means "find this anywhere under the current folder", so listing goes
-        // recursive (no delimiter, hence no folder/commonPrefix grouping) instead of the normal
-        // single-level folder view.
-        let isSearching = search?.isEmpty == false
-        let delimiter = isSearching ? "" : (req.query[String.self, at: "delimiter"] ?? "/")
-
-        let (objects, commonPrefixes, _, _) = try await ClusterListingService.listObjects(
-            req: req,
-            bucketName: bucketName,
-            prefix: prefix,
-            delimiter: delimiter,
-            maxKeys: 10000,
-            marker: nil
-        )
-
-        // Convert objects to DTOs
-        var items: [ObjectMeta.ResponseDTO] = []
-
-        // Add folders (common prefixes) - none when searching, since listing is recursive
-        for commonPrefix in commonPrefixes {
-            items.append(ObjectMeta.ResponseDTO(folderKey: commonPrefix))
+        if search.isEmpty {
+            // An explicitly empty delimiter asks for a flat, recursive listing.
+            let delimiter = req.query[String.self, at: "delimiter"].map { $0.isEmpty ? nil : $0 } ?? "/"
+            return try await ConsoleObjectListing.page(
+                req: req, bucketName: bucketName, prefix: prefix, delimiter: delimiter, per: per,
+                marker: marker)
         }
-
-        // Add files
-        for object in objects {
-            items.append(ObjectMeta.ResponseDTO(from: object))
-        }
-
-        if let search, isSearching {
-            items = items.filter { $0.key.localizedCaseInsensitiveContains(search) }
-        }
-
-        // Sort: folders first, then by name
-        items.sort { a, b in
-            if a.isFolder != b.isFolder {
-                return a.isFolder
-            }
-            return a.key < b.key
-        }
-
-        // Simple pagination for now
-        let page = req.query[Int.self, at: "page"] ?? 1
-        let per = req.query[Int.self, at: "per"] ?? 100
-        let startIndex = (page - 1) * per
-        let endIndex = min(startIndex + per, items.count)
-
-        let paginatedItems = startIndex < items.count ? Array(items[startIndex..<endIndex]) : []
-
-        return Page(
-            items: paginatedItems,
-            metadata: PageMetadata(
-                page: page,
-                per: per,
-                total: items.count
-            )
-        )
+        return try await ConsoleObjectListing.searchPage(
+            req: req, bucketName: bucketName, prefix: prefix, term: search, per: per, marker: marker)
     }
 
     /// Disk usage and object count for a bucket you own, optionally scoped to a folder
@@ -430,8 +395,8 @@ struct InternalBucketController: RouteCollection {
     /// admin bucket list use (`BucketHandler.calculateStats`), just ownership-gated instead of
     /// admin-gated. Deliberately its own on-demand endpoint rather than a field embedded in
     /// `listObjects` - a recursive directory walk per row on every page load would make listing
-    /// slow to scale; the console fetches this lazily, one call per bucket/folder row already
-    /// on screen.
+    /// slow to scale; the console fetches this lazily, a few rows at a time, and the figure is
+    /// cached and rate-limited server-side by `StorageStatsService` (issue #28).
     @Sendable
     func getObjectStats(req: Request) async throws -> StatsDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
@@ -443,9 +408,9 @@ struct InternalBucketController: RouteCollection {
 
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
 
-        let (sizeBytes, objectCount) = try await ClusterListingService.calculateStats(
-            req: req, bucketName: bucketName, prefix: prefix)
-        return StatsDTO(sizeBytes: sizeBytes, objectCount: objectCount)
+        return StatsDTO(
+            try await ClusterListingService.calculateStats(
+                req: req, bucketName: bucketName, prefix: prefix))
     }
 
     /// Cap on how long a shared link can stay valid. Kept at the same 7 days as a S3
