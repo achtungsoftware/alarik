@@ -88,6 +88,9 @@ public func configure(_ app: Application) async throws {
     // Spool files are per-request transients; anything still here is an orphan from an
     // unclean shutdown mid-upload.
     StreamingBodySpooler.cleanupOrphans()
+    // Same for staged EC shards: a stage survives only when its coordinator can no longer
+    // commit it here (see `ErasureCodedObjectHandler.cleanupStagingOrphans`).
+    ErasureCodedObjectHandler.cleanupStagingOrphans()
 
     let cors: CORSMiddleware = CORSMiddleware(
         configuration: .init(

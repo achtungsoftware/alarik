@@ -247,4 +247,81 @@ struct ErasureCodedObjectHandlerTests {
 
         #expect(!FileManager.default.fileExists(atPath: path))
     }
+
+    // MARK: - Staged non-versioned writes
+
+    private func write(_ text: String, to path: String) throws {
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: URL(fileURLWithPath: path))
+    }
+
+    private func read(_ path: String) -> String? {
+        FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    @Test("commitStagedShards replaces the previous generation and removes the stage")
+    func commitStagedReplacesPreviousGeneration() throws {
+        let bucket = "stage-bucket"
+        defer {
+            try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket))
+            ErasureCodedObjectHandler.cleanupStagingOrphans()
+        }
+        let live0 = ErasureCodedObjectHandler.shardPath(bucketName: bucket, key: "k", shardIndex: 0)
+        let live1 = ErasureCodedObjectHandler.shardPath(bucketName: bucket, key: "k", shardIndex: 1)
+        try write("old-0", to: live0)
+        try write("old-1", to: live1)
+
+        let token = UUID().uuidString
+        try write("new-0", to: ErasureCodedObjectHandler.stagingShardPath(token: token, shardIndex: 0))
+        try write("new-1", to: ErasureCodedObjectHandler.stagingShardPath(token: token, shardIndex: 1))
+
+        // Until the commit the live object is untouched.
+        #expect(read(live0) == "old-0")
+
+        try ErasureCodedObjectHandler.commitStagedShards(token: token, bucketName: bucket, key: "k")
+        #expect(read(live0) == "new-0")
+        #expect(read(live1) == "new-1")
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: ErasureCodedObjectHandler.stagingBasePath(token: token)))
+    }
+
+    @Test("discardStagedShards drops only the stage; an empty stage cannot be committed")
+    func discardAndEmptyStage() throws {
+        let bucket = "stage-bucket"
+        defer {
+            try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket))
+            ErasureCodedObjectHandler.cleanupStagingOrphans()
+        }
+        let live0 = ErasureCodedObjectHandler.shardPath(bucketName: bucket, key: "k", shardIndex: 0)
+        try write("old-0", to: live0)
+        let token = UUID().uuidString
+        try write("new-0", to: ErasureCodedObjectHandler.stagingShardPath(token: token, shardIndex: 0))
+
+        ErasureCodedObjectHandler.discardStagedShards(token: token)
+        #expect(read(live0) == "old-0")
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: ErasureCodedObjectHandler.stagingBasePath(token: token)))
+        #expect(throws: (any Error).self) {
+            try ErasureCodedObjectHandler.commitStagedShards(
+                token: token, bucketName: bucket, key: "k")
+        }
+    }
+
+    @Test("staging tokens cannot escape the staging directory")
+    func stagingTokenIsSanitized() {
+        let path = ErasureCodedObjectHandler.stagingShardPath(token: "../../etc/x", shardIndex: 0)
+        #expect(path.hasPrefix(ErasureCodedObjectHandler.stagingDirectory))
+        #expect(!path.contains(".."))
+        #expect(!path.contains("/etc/"))
+    }
+
+    @Test("cleanupStagingOrphans empties the staging area")
+    func cleanupStaging() throws {
+        try write("x", to: ErasureCodedObjectHandler.stagingShardPath(token: "abc", shardIndex: 3))
+        ErasureCodedObjectHandler.cleanupStagingOrphans()
+        #expect(!FileManager.default.fileExists(atPath: ErasureCodedObjectHandler.stagingDirectory))
+    }
 }

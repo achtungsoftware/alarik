@@ -83,10 +83,18 @@ enum ErasureCodedWriteCoordinator {
                 shardPath: { "\(scratchDir)\($0).ecshard" })
         }
 
+        // A versioned write lands in a fresh per-version directory, so nothing pre-existing is
+        // at risk and shards can go straight into place. A non-versioned write reuses the one
+        // directory the previous generation lives in: its shards are staged everywhere (locally
+        // the scratch files already are the stage) and only moved into place after quorum -
+        // see `ErasureCodedObjectHandler.stagingDirectory`.
+        let stagingToken: String? = versionId == nil ? UUID().uuidString : nil
         let scratchPath0 = scratchPaths[0]
-        try await S3Service.offloadBlockingIO(app) {
-            try copyIntoPlace(from: scratchPath0, to: localShardPath0)
-            StorageStatsService.shared.noteChange(bucketName: bucketName)
+        if stagingToken == nil {
+            try await S3Service.offloadBlockingIO(app) {
+                try copyIntoPlace(from: scratchPath0, to: localShardPath0)
+                StorageStatsService.shared.noteChange(bucketName: bucketName)
+            }
         }
 
         var delivered: Set<Int> = [0]
@@ -107,7 +115,8 @@ enum ErasureCodedWriteCoordinator {
                     group.addTask {
                         let ok = await attemptImmediateShardPush(
                             app: app, node: peer, sourcePath: sourcePath, bucketName: bucketName,
-                            key: key, versionId: versionId, shardIndex: shardIndex)
+                            key: key, versionId: versionId, shardIndex: shardIndex,
+                            stagingToken: stagingToken)
                         return (shardIndex, ok)
                     }
                 }
@@ -125,12 +134,35 @@ enum ErasureCodedWriteCoordinator {
         guard delivered.count >= quorum else {
             await rollback(
                 app: app, bucketName: bucketName, key: key, versionId: versionId, peers: peers,
-                delivered: delivered, priorLatestVersionId: priorLatestVersionId)
+                delivered: delivered, priorLatestVersionId: priorLatestVersionId,
+                stagingToken: stagingToken)
             throw ErasureCodedCoordinatorError.quorumNotReached(
                 required: quorum, achieved: delivered.count)
         }
 
-        let undeliveredShardIndices = (1..<totalShards).filter { !delivered.contains($0) }
+        var committed = delivered
+        if let stagingToken {
+            do {
+                try await S3Service.offloadBlockingIO(app) {
+                    try copyIntoPlace(from: scratchPath0, to: localShardPath0)
+                    StorageStatsService.shared.noteChange(bucketName: bucketName)
+                }
+            } catch {
+                // Nothing has replaced the old generation anywhere yet - drop the stages.
+                await rollback(
+                    app: app, bucketName: bucketName, key: key, versionId: versionId, peers: peers,
+                    delivered: delivered, priorLatestVersionId: priorLatestVersionId,
+                    stagingToken: stagingToken)
+                throw error
+            }
+            // A peer whose commit fails is treated as undelivered: the outbox reconstructs its
+            // shard from the committed majority, exactly as for a push that never arrived.
+            committed = await commitStaged(
+                app: app, token: stagingToken, bucketName: bucketName, key: key, peers: peers,
+                delivered: delivered)
+        }
+
+        let undeliveredShardIndices = (1..<totalShards).filter { !committed.contains($0) }
         if !undeliveredShardIndices.isEmpty {
             await enqueueOutbox(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
@@ -146,8 +178,22 @@ enum ErasureCodedWriteCoordinator {
     /// (idempotent) and applied locally; a nil `versionId` skips it (non-versioned write).
     private static func rollback(
         app: Application, bucketName: String, key: String, versionId: String?,
-        peers: [ClusterNodeInfo], delivered: Set<Int>, priorLatestVersionId: String?
+        peers: [ClusterNodeInfo], delivered: Set<Int>, priorLatestVersionId: String?,
+        stagingToken: String? = nil
     ) async {
+        if let stagingToken {
+            // Staged write: nothing is in place anywhere, so the previous generation is intact.
+            // Only the stages on peers that received a shard need dropping.
+            await withTaskGroup(of: Void.self) { group in
+                for (offset, peer) in peers.enumerated() where delivered.contains(offset + 1) {
+                    group.addTask {
+                        await ClusterReplicationClient.discardStagedShards(
+                            app: app, to: peer, token: stagingToken)
+                    }
+                }
+            }
+            return
+        }
         if delivered.contains(0) {
             try? FileManager.default.removeItem(
                 atPath: ErasureCodedObjectHandler.shardBasePath(
@@ -209,15 +255,51 @@ enum ErasureCodedWriteCoordinator {
         }
     }
 
+    /// Commits the stages on every peer that received its shard, in parallel. Returns the
+    /// shard indices now in place (local shard 0 included); a failed commit also drops that
+    /// peer's stage so it can't be mistaken for live data later.
+    private static func commitStaged(
+        app: Application, token: String, bucketName: String, key: String,
+        peers: [ClusterNodeInfo], delivered: Set<Int>
+    ) async -> Set<Int> {
+        var committed: Set<Int> = [0]
+        await withTaskGroup(of: (shardIndex: Int, ok: Bool).self) { group in
+            for (offset, peer) in peers.enumerated() where delivered.contains(offset + 1) {
+                group.addTask {
+                    do {
+                        try await ClusterReplicationService.withTimeout(
+                            ClusterReplicationService.synchronousTimeout
+                        ) {
+                            try await ClusterReplicationClient.commitStagedShards(
+                                app: app, to: peer, token: token, bucketName: bucketName, key: key)
+                        }
+                        return (offset + 1, true)
+                    } catch {
+                        app.logger.warning(
+                            "Committing staged EC shard \(offset + 1) of '\(key)' on node \(peer.id) failed - falling back to async repair: \(error)"
+                        )
+                        await ClusterReplicationClient.discardStagedShards(
+                            app: app, to: peer, token: token)
+                        return (offset + 1, false)
+                    }
+                }
+            }
+            for await outcome in group where outcome.ok {
+                committed.insert(outcome.shardIndex)
+            }
+        }
+        return committed
+    }
+
     private static func attemptImmediateShardPush(
         app: Application, node: ClusterNodeInfo, sourcePath: String, bucketName: String,
-        key: String, versionId: String?, shardIndex: Int
+        key: String, versionId: String?, shardIndex: Int, stagingToken: String?
     ) async -> Bool {
         do {
             try await ClusterReplicationService.withTimeout(ClusterReplicationService.synchronousTimeout) {
                 try await ClusterReplicationClient.pushShard(
                     app: app, to: node, sourcePath: sourcePath, bucketName: bucketName, key: key,
-                    versionId: versionId, shardIndex: shardIndex)
+                    versionId: versionId, shardIndex: shardIndex, stagingToken: stagingToken)
             }
             return true
         } catch {

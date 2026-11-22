@@ -35,6 +35,8 @@ struct InternalClusterErasureCodedController: RouteCollection {
         let cluster = routes.grouped("internal", "cluster", "ecshards").grouped(
             ClusterSecretMiddleware())
         cluster.on(.POST, "push", body: .stream, use: handlePush)
+        cluster.on(.POST, "commit-staged", use: handleCommitStaged)
+        cluster.on(.DELETE, "staged", use: handleDiscardStaged)
         cluster.get("fetch", use: handleFetch)
         cluster.get("exists", use: handleExists)
         cluster.get("held", use: handleHeld)
@@ -221,6 +223,14 @@ struct InternalClusterErasureCodedController: RouteCollection {
     }
 
     private func shardPath(req: Request) throws -> (path: String, bucketName: String, key: String) {
+        try shardPathWithStaging(req: req).shard
+    }
+
+    /// `staging=<token>` on a push lands the shard in the staging area instead of its final
+    /// path - see `ErasureCodedObjectHandler.stagingDirectory`.
+    private func shardPathWithStaging(req: Request) throws -> (
+        shard: (path: String, bucketName: String, key: String), isStaged: Bool
+    ) {
         guard
             let bucketName = req.query[String.self, at: "bucket"],
             let key = req.query[String.self, at: "key"],
@@ -228,10 +238,39 @@ struct InternalClusterErasureCodedController: RouteCollection {
         else {
             throw Abort(.badRequest, reason: "Missing bucket/key/shardIndex query parameters")
         }
+        if let token = req.query[String.self, at: "staging"] {
+            return (
+                (ErasureCodedObjectHandler.stagingShardPath(token: token, shardIndex: shardIndex),
+                 bucketName, key), true
+            )
+        }
         let versionId = req.query[String.self, at: "versionId"]
         let path = ErasureCodedObjectHandler.shardPath(
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
-        return (path, bucketName, key)
+        return ((path, bucketName, key), false)
+    }
+
+    /// Moves a staged write into place once the coordinator has quorum.
+    @Sendable
+    func handleCommitStaged(req: Request) async throws -> HTTPStatus {
+        let (bucketName, key, _) = try bucketKey(req: req)
+        guard let token = req.query[String.self, at: "staging"] else {
+            throw Abort(.badRequest, reason: "Missing staging query parameter")
+        }
+        try await req.application.threadPool.runIfActive {
+            try ErasureCodedObjectHandler.commitStagedShards(
+                token: token, bucketName: bucketName, key: key)
+        }
+        return .ok
+    }
+
+    @Sendable
+    func handleDiscardStaged(req: Request) async throws -> HTTPStatus {
+        guard let token = req.query[String.self, at: "staging"] else {
+            throw Abort(.badRequest, reason: "Missing staging query parameter")
+        }
+        ErasureCodedObjectHandler.discardStagedShards(token: token)
+        return .ok
     }
 
     /// Header-only existence probe - the shard counterpart of `handleExists`.
@@ -299,7 +338,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
     /// blocking call, same as the existing `.obj` push path.
     @Sendable
     func handlePush(req: Request) async throws -> HTTPStatus {
-        let (path, bucketName, key) = try shardPath(req: req)
+        let ((path, bucketName, key), isStaged) = try shardPathWithStaging(req: req)
         defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
 
         let threadPool = req.application.threadPool
@@ -345,10 +384,12 @@ struct InternalClusterErasureCodedController: RouteCollection {
         // is a new "latest" version before committing it - demoting any prior local latest must
         // happen BEFORE the new file lands, mirroring InternalClusterObjectController.handlePush's
         // exact ordering for `.obj` (never demote the file we're about to write).
+        // A staged shard isn't live yet: demotion and the pointer update happen at commit, so a
+        // write that misses quorum leaves the previous generation exactly as it was.
         let incomingMeta = try? await threadPool.runIfActive {
             try ErasureCodedShardReader(path: spoolPath).header.objectMeta
         }
-        if incomingMeta?.isLatest == true {
+        if !isStaged, incomingMeta?.isLatest == true {
             try? await threadPool.runIfActive {
                 ErasureCodedObjectHandler.markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
             }
@@ -392,7 +433,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
 
         _ = POSIXFile.unlink(spoolPath)
 
-        if let incomingMeta, incomingMeta.isLatest, let versionId = incomingMeta.versionId {
+        if !isStaged, let incomingMeta, incomingMeta.isLatest, let versionId = incomingMeta.versionId {
             try? await threadPool.runIfActive {
                 try ObjectFileHandler.updateLatestPointer(
                     bucketName: bucketName, key: key, versionId: versionId)

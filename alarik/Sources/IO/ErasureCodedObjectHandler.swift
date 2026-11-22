@@ -96,6 +96,70 @@ enum ErasureCodedObjectHandler {
         "\(versionedShardBasePath(bucketName: bucketName, key: key, versionId: versionId))\(shardIndex).ecshard"
     }
 
+    /// Staging area for non-versioned EC writes. A non-versioned object reuses one shard
+    /// directory across generations, so writing the new shards in place meant a write that
+    /// then missed quorum had already overwritten the previous object's shards - and its
+    /// rollback deleted them. Shards now land here on every node and are only moved into
+    /// `shardBasePath` once the coordinator has quorum. Under `Storage/` so the commit is a
+    /// same-filesystem rename.
+    static let stagingDirectory = "Storage/ecstaging/"
+
+    private static func sanitizedToken(_ token: String) -> String {
+        String(token.filter { $0.isLetter || $0.isNumber || $0 == "-" })
+    }
+
+    static func stagingBasePath(token: String) -> String {
+        "\(stagingDirectory)\(sanitizedToken(token))/"
+    }
+
+    static func stagingShardPath(token: String, shardIndex: Int) -> String {
+        "\(stagingBasePath(token: token))\(shardIndex).ecshard"
+    }
+
+    /// Moves every shard staged under `token` into the non-versioned shard directory of
+    /// (bucketName, key), replacing the previous generation's shard of the same index
+    /// atomically. Runs the same isLatest demotion a direct push does, so a staged write ends
+    /// in exactly the state an in-place one used to.
+    static func commitStagedShards(token: String, bucketName: String, key: String) throws {
+        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
+        let stagingDir = stagingBasePath(token: token)
+        let staged = try FileManager.default.contentsOfDirectory(atPath: stagingDir)
+            .filter { $0.hasSuffix(".ecshard") }
+        guard let first = staged.first else {
+            throw ErasureCodedObjectHandlerError.openFailed(path: stagingDir, errno: ENOENT)
+        }
+        if (try? ErasureCodedShardReader(path: stagingDir + first).header.objectMeta.isLatest) == true {
+            markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
+        }
+
+        let baseDir = shardBasePath(bucketName: bucketName, key: key)
+        try FileManager.default.createDirectory(atPath: baseDir, withIntermediateDirectories: true)
+        for name in staged {
+            let source = stagingDir + name
+            let destination = baseDir + name
+            if POSIXFile.rename(source, destination) != 0 {
+                // Different filesystem (Storage/ split across mounts): copy, then drop the stage.
+                try commitShardFile(
+                    sourcePath: source, finalPath: destination, bucketName: bucketName, key: key)
+                _ = POSIXFile.unlink(source)
+            }
+        }
+        try? FileManager.default.removeItem(atPath: stagingDir)
+    }
+
+    /// Drops a staged write that will never be committed (quorum missed, or the coordinator's
+    /// commit failed and the outbox will repair this shard instead).
+    static func discardStagedShards(token: String) {
+        try? FileManager.default.removeItem(atPath: stagingBasePath(token: token))
+    }
+
+    /// Boot cleanup. A stage left behind belongs to a write whose coordinator cannot commit it
+    /// here any more: the coordinator restarted, or its commit found this node down and fell
+    /// back to the outbox. Either way the bytes are garbage.
+    static func cleanupStagingOrphans() {
+        try? FileManager.default.removeItem(atPath: stagingDirectory)
+    }
+
     /// Version-aware convenience overloads: a `nil` `versionId` selects the non-versioned path,
     /// a non-`nil` one the versioned path. Collapses the `versionId != nil ? versioned : plain`
     /// ternary that otherwise recurs at every shard call site into one place.

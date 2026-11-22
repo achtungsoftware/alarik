@@ -372,7 +372,7 @@ enum ClusterReplicationClient {
     /// copy - no repacking needed, unlike `pushObject`'s JSON-meta-header dance.
     static func pushShard(
         app: Application, to node: ClusterNodeInfo, sourcePath: String, bucketName: String,
-        key: String, versionId: String?, shardIndex: Int
+        key: String, versionId: String?, shardIndex: Int, stagingToken: String? = nil
     ) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
             throw ClusterConfigurationError(description: "This node is not part of a cluster.")
@@ -386,8 +386,9 @@ enum ClusterReplicationClient {
         }
         let fileSize = Int(statInfo.st_size)
         
-        let suffix = shardQuerySuffix(
+        var suffix = shardQuerySuffix(
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
+        if let stagingToken { suffix += "&staging=" + stagingQueryValue(stagingToken) }
         var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/push" + suffix)
         outbound.method = .POST
         outbound.headers.replaceOrAdd(
@@ -781,6 +782,45 @@ enum ClusterReplicationClient {
             suffix += "&versionId=\(encodedVersionId)"
         }
         return suffix
+    }
+
+    private static func stagingQueryValue(_ token: String) -> String {
+        token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+    }
+
+    /// Tells `node` to move the shards it staged under `token` into place for (bucketName, key)
+    /// - the second half of a non-versioned EC write, sent once the coordinator has quorum.
+    static func commitStagedShards(
+        app: Application, to node: ClusterNodeInfo, token: String, bucketName: String, key: String
+    ) async throws {
+        guard let config = app.storage[ClusterConfigurationKey.self] else {
+            throw ClusterConfigurationError(description: "This node is not part of a cluster.")
+        }
+        let suffix =
+            shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: nil)
+            + "&staging=" + stagingQueryValue(token)
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/ecshards/commit-staged" + suffix)
+        outbound.method = .POST
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        let response = try await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
+        guard (200..<300).contains(response.status.code) else {
+            throw ClusterProxyError.pushFailed(status: Int(response.status.code))
+        }
+    }
+
+    /// Best-effort: drops a stage that will not be committed on `node`.
+    static func discardStagedShards(app: Application, to node: ClusterNodeInfo, token: String) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        var outbound = HTTPClientRequest(
+            url: node.address + "/internal/cluster/ecshards/staged?staging=" + stagingQueryValue(token))
+        outbound.method = .DELETE
+        outbound.headers.replaceOrAdd(
+            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        _ = try? await app.http.client.shared.execute(
+            outbound, timeout: requestTimeout, logger: app.logger)
     }
 
     /// Same as `shardQuerySuffix` without a `shardIndex` - for endpoints scoped to a whole
