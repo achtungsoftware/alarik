@@ -3432,4 +3432,54 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("List Objects - negative or oversized max-keys is clamped instead of trapping the process")
+    func testListLimitsClamped() async throws {
+        let bucketName = "list-limit-clamp-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "a.txt", content: "a")
+
+            for query in ["max-keys=-1", "list-type=2&max-keys=-5", "max-keys=99999"] {
+                let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
+                try await app.test(
+                    .GET, "/\(bucketName)?\(query)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .ok, "\(query)")
+                    })
+            }
+        }
+    }
+
+    @Test("Object key with a literal percent sequence is stored verbatim, not decoded twice")
+    func testPercentEncodedKeyNotDoubleDecoded() async throws {
+        let bucketName = "percent-key-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            // What a client sends for the key `report%20final.pdf`: the `%` itself is encoded.
+            try await putObject(
+                app, bucketName: bucketName, key: "report%2520final.pdf", content: "x")
+
+            #expect(
+                FileManager.default.fileExists(
+                    atPath: ObjectFileHandler.storagePath(
+                        for: bucketName, key: "report%20final.pdf")))
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: ObjectFileHandler.storagePath(for: bucketName, key: "report final.pdf")))
+
+            let signed = signedHeaders(for: .HEAD, path: "/\(bucketName)/report%2520final.pdf")
+            try await app.test(
+                .HEAD, "/\(bucketName)/report%2520final.pdf",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
 }

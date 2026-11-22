@@ -52,6 +52,12 @@ struct SharedLinkControllerTests {
         return user.id
     }
 
+    /// `serve` only answers for a bucket still owned by the link's creator, so every test
+    /// needs the bucket row the link points at.
+    private func createBucket(_ app: Application, name: String, userId: UUID) async throws {
+        try await Bucket(name: name, userId: userId).save(app: app)
+    }
+
     private func writeObject(bucketName: String, key: String, content: String) throws {
         let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
         let data = Data(content.utf8)
@@ -70,6 +76,7 @@ struct SharedLinkControllerTests {
     func testServeValidToken() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-bucket", userId: userId)
             try writeObject(bucketName: "shared-bucket", key: "file.txt", content: "hello world")
 
             let link = SharedLink(
@@ -93,6 +100,7 @@ struct SharedLinkControllerTests {
     func testServeContentDispositionUsesLastPathSegment() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-bucket", userId: userId)
             try writeObject(
                 bucketName: "shared-bucket", key: "folder/sub/report.pdf", content: "%PDF-1.4")
 
@@ -116,6 +124,7 @@ struct SharedLinkControllerTests {
     func testServeNonExpiringLink() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-bucket", userId: userId)
             try writeObject(bucketName: "shared-bucket", key: "forever.txt", content: "no expiry")
 
             let link = SharedLink(
@@ -145,6 +154,7 @@ struct SharedLinkControllerTests {
     func testServeExpiredLink() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-bucket", userId: userId)
             try writeObject(bucketName: "shared-bucket", key: "file.txt", content: "hello world")
 
             let link = SharedLink(
@@ -186,6 +196,7 @@ struct SharedLinkControllerTests {
     func testServeObjectDeletedAfterLinkCreated() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-bucket", userId: userId)
             try writeObject(bucketName: "shared-bucket", key: "file.txt", content: "hello world")
 
             let link = SharedLink(
@@ -209,6 +220,7 @@ struct SharedLinkControllerTests {
     func testServeDeleteMarkerFails() async throws {
         try await withApp { app in
             let userId = try await createUser(app)
+            try await createBucket(app, name: "shared-versioned-bucket", userId: userId)
             let data = Data("versioned content".utf8)
             let meta = ObjectMeta(
                 bucketName: "shared-versioned-bucket", key: "file.txt", size: data.count,
@@ -233,6 +245,60 @@ struct SharedLinkControllerTests {
                 afterResponse: { res async in
                     #expect(res.status == .notFound)
                 })
+        }
+    }
+
+    @Test("Serve - Link whose bucket name is now owned by another user fails")
+    func testServeBucketReownedFails() async throws {
+        try await withApp { app in
+            let linkOwner = try await createUser(app)
+            let newOwner = try await createUser(app)
+            // The link's bucket was deleted and re-created under the same name by someone else.
+            try await createBucket(app, name: "shared-bucket", userId: newOwner)
+            try writeObject(bucketName: "shared-bucket", key: "file.txt", content: "not yours")
+
+            let link = SharedLink(
+                userId: linkOwner, bucketName: "shared-bucket", key: "file.txt", expiresAt: nil)
+            try await link.save(app: app)
+
+            try await app.test(
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Serve - Link whose bucket no longer exists fails")
+    func testServeBucketGoneFails() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+            try writeObject(bucketName: "shared-bucket", key: "file.txt", content: "orphan")
+            let link = SharedLink(
+                userId: userId, bucketName: "shared-bucket", key: "file.txt", expiresAt: nil)
+            try await link.save(app: app)
+
+            try await app.test(
+                .GET, "/api/v1/shared/\(link.id.uuidString)",
+                afterResponse: { res async in
+                    #expect(res.status == .notFound)
+                })
+        }
+    }
+
+    @Test("Purge - removes only the links into the deleted bucket")
+    func testPurgeByBucket() async throws {
+        try await withApp { app in
+            let userId = try await createUser(app)
+            let doomed = SharedLink(userId: userId, bucketName: "gone", key: "a", expiresAt: nil)
+            let doomed2 = SharedLink(userId: userId, bucketName: "gone", key: "b", expiresAt: nil)
+            let kept = SharedLink(userId: userId, bucketName: "stays", key: "a", expiresAt: nil)
+            for link in [doomed, doomed2, kept] { try await link.save(app: app) }
+
+            await SharedLink.purge(app: app, bucketName: "gone")
+
+            let remaining = await SharedLink.all(app: app)
+            #expect(remaining.map(\.id) == [kept.id])
         }
     }
 }

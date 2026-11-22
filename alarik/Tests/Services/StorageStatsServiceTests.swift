@@ -227,4 +227,22 @@ struct StorageStatsServiceTests {
         // Every permit came back: two more can still run concurrently.
         try await semaphore.withPermit { try await semaphore.withPermit {} }
     }
+
+    @Test("the local storage tree figure is cached, and invalidated by a write to any bucket")
+    func localTreeFollowsGlobalGeneration() async throws {
+        let service = StorageStatsService(ttl: 60, maxConcurrentWalks: 1)
+        let computations = Counter()
+        let treeKey = StorageStatsService.Key(scope: .localStorageTree, bucketName: "", prefix: "")
+        let compute: @Sendable () async throws -> StorageStatsService.Computation = {
+            await computations.increment()
+            return StorageStatsService.Computation(sizeBytes: 1, objectCount: 0)
+        }
+        _ = try await service.stats(for: treeKey, compute: compute)
+        _ = try await service.stats(for: treeKey, compute: compute)
+        #expect(await computations.value == 1)
+
+        service.noteChange(bucketName: "some-bucket")
+        _ = try await service.stats(for: treeKey, compute: compute)
+        #expect(await computations.value == 2)
+    }
 }

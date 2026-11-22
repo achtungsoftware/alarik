@@ -672,4 +672,37 @@ struct S3BucketPolicyTests {
                 })
         }
     }
+
+    @Test("PutBucketPolicy - Statements with a Condition (or any unsupported element) are rejected, not silently widened")
+    func testPutBucketPolicyConditionRejected() async throws {
+        let bucketName = "test-policy-condition-rejected"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            for element in [
+                """
+                "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}
+                """,
+                """
+                "NotAction": "s3:DeleteObject"
+                """,
+            ] {
+                let policyJSON = """
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:GetObject",
+                            "Resource": "arn:aws:s3:::\(bucketName)/*",
+                            \(element)
+                        }]
+                    }
+                    """
+                let response = try await putPolicy(app, bucketName: bucketName, policyJSON: policyJSON)
+                #expect(response.status == .badRequest)
+                #expect(response.body.string.contains("<Code>MalformedPolicy</Code>"))
+                #expect(response.body.string.contains("Unsupported Statement element"))
+            }
+        }
+    }
 }
