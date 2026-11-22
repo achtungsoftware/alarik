@@ -57,8 +57,21 @@ struct InternalUserController: RouteCollection {
         try User.Edit.validate(content: req)
 
         let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireSession()
 
         let editUser: User.Edit = try req.content.decode(User.Edit.self)
+
+        // A rename is how a local account gets bound to someone else's SSO identity (OIDC
+        // first-login links by username == email), so it needs the current password - checked
+        // before any password change below replaces the hash.
+        if editUser.username != auth.user.username {
+            guard let currentPassword = editUser.currentPassword, !currentPassword.isEmpty,
+                try auth.user.verify(password: currentPassword)
+            else {
+                throw Abort(
+                    .unauthorized, reason: "Changing the username requires the current password.")
+            }
+        }
 
         // Handle password change if requested
         if let currentPassword = editUser.currentPassword,
@@ -88,6 +101,7 @@ struct InternalUserController: RouteCollection {
     @Sendable
     func createAccessKey(req: Request) async throws -> AccessKey.ResponseDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireSession()
 
         try AccessKey.Create.validate(content: req)
 
@@ -141,6 +155,7 @@ struct InternalUserController: RouteCollection {
     @Sendable
     func updateAccessKey(req: Request) async throws -> AccessKey.ResponseDTO {
         let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireSession()
 
         guard let accessKeyId = req.parameters.get("accessKeyId", as: UUID.self) else {
             throw Abort(.badRequest, reason: "Invalid access key ID.")
@@ -174,6 +189,7 @@ struct InternalUserController: RouteCollection {
     @Sendable
     func deleteAccessKey(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireSession()
 
         guard let accessKeyId = req.parameters.get("accessKeyId", as: UUID.self) else {
             throw Abort(.badRequest, reason: "Invalid access key ID.")
@@ -246,6 +262,7 @@ struct InternalUserController: RouteCollection {
     @Sendable
     func deleteUser(req: Request) async throws -> HTTPStatus {
         let auth = try req.auth.require(AuthenticatedUser.self)
+        try auth.requireSession()
 
         // Force-delete every bucket the user owns through BucketService, not a raw local-disk
         // removal - see InternalAdminController.deleteUser for why a raw `forceDelete` leaves

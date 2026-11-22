@@ -970,7 +970,7 @@ struct UserControllerTests {
         }
     }
 
-    @Test("Edit user with access key - should pass")
+    @Test("Edit user with access key - forbidden, account changes need a session")
     func testEditUserWithAccessKey() async throws {
         try await withApp { app in
 
@@ -988,14 +988,14 @@ struct UserControllerTests {
                     try req.content.encode(editDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .ok)
-                    let user = try res.content.decode(User.ResponseDTO.self)
-                    #expect(user.name == "Updated Admin Name")
+                    #expect(res.status == .forbidden)
                 })
+            let admin = try await User.findByUsername(app: app, username: "alarik")
+            #expect(admin?.name != "Updated Admin Name")
         }
     }
 
-    @Test("Create access key with access key auth - should pass")
+    @Test("Create access key with access key auth - forbidden, a leaked key must not mint keys")
     func testCreateAccessKeyWithAccessKey() async throws {
         try await withApp { app in
 
