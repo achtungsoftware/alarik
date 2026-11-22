@@ -16,7 +16,7 @@ limitations under the License.
 */
 
 import { h, resolveComponent } from "vue";
-import type { TableColumn, TableRow } from "@nuxt/ui";
+import type { DropdownMenuItem, TableColumn, TableRow } from "@nuxt/ui";
 
 definePageMeta({
     layout: "dashboard",
@@ -30,6 +30,10 @@ const page = ref(1);
 const itemsPerPage = ref(10);
 const UCheckbox = resolveComponent("UCheckbox");
 const UBadge = resolveComponent("UBadge");
+const UDropdownMenu = resolveComponent("UDropdownMenu");
+const UButton = resolveComponent("UButton");
+const selectedKeyForEdit = ref<AccessKey | null>(null);
+const openKeyEditModal = ref(false);
 const rowSelection = ref<Record<string, boolean>>({});
 const jwtCookie = useJWTCookie();
 const openAccessKeyCreateModal = ref(false);
@@ -78,7 +82,13 @@ const columns: TableColumn<AccessKey>[] = [
     {
         accessorKey: "description",
         header: "Description",
-        cell: ({ row }) => row.original.description || "—",
+        // Capped and truncated: a 500-character note must not stretch the row; the full text is
+        // in the tooltip and in the edit dialog.
+        cell: ({ row }) => {
+            const description = row.original.description;
+            if (!description) return h("span", { class: "text-muted" }, "—");
+            return h("span", { class: "block max-w-xs truncate", title: description }, description);
+        },
     },
     {
         accessorKey: "expirationDate",
@@ -92,6 +102,42 @@ const columns: TableColumn<AccessKey>[] = [
         header: "Created at",
         cell: ({ row }) => {
             return new Date(row.original.createdAt).toLocaleString();
+        },
+    },
+    {
+        id: "actions",
+        cell: ({ row }) => {
+            return h(
+                "div",
+                { class: "text-right" },
+                h(
+                    UDropdownMenu,
+                    {
+                        content: { align: "end" },
+                        items: [
+                            [
+                                {
+                                    label: "Edit Description",
+                                    icon: "i-lucide-square-pen",
+                                    onSelect() {
+                                        selectedKeyForEdit.value = row.original;
+                                        openKeyEditModal.value = true;
+                                    },
+                                },
+                            ],
+                        ] as DropdownMenuItem[][],
+                        "aria-label": "Action Menu",
+                    },
+                    () =>
+                        h(UButton, {
+                            icon: "i-lucide-ellipsis-vertical",
+                            color: "neutral",
+                            variant: "ghost",
+                            class: "ml-auto",
+                            "aria-label": "Action Menu",
+                        })
+                )
+            );
         },
     },
 ];
@@ -174,6 +220,8 @@ async function deleteMany() {
 }
 </script>
 <template>
+    <EditAccessKeyModal v-if="selectedKeyForEdit && openKeyEditModal" v-model:open="openKeyEditModal" :access-key="selectedKeyForEdit" @saved="refresh" />
+
     <UDashboardPanel
         :ui="{
             body: '!p-0',

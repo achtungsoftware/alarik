@@ -408,6 +408,25 @@ struct UserControllerTests {
         }
     }
 
+    /// The listed descriptions, keyed by access key - read back through the store, not from the
+    /// in-memory object the create response is built from.
+    private func listedDescriptions(_ app: Application, token: String) async throws
+        -> [String: String?]
+    {
+        var result: [String: String?] = [:]
+        try await app.test(
+            .GET, "/api/v1/users/accessKeys",
+            beforeRequest: { req in
+                req.headers.bearerAuthorization = BearerAuthorization(token: token)
+            },
+            afterResponse: { res async throws in
+                #expect(res.status == .ok)
+                let page = try res.content.decode(Page<AccessKey.ResponseDTO>.self)
+                for item in page.items { result[item.accessKey ?? ""] = item.description }
+            })
+        return result
+    }
+
     @Test("Create key stores and returns its description")
     func testCreateAccessKeyWithDescription() async throws {
         try await withApp { app in
@@ -427,6 +446,133 @@ struct UserControllerTests {
                     let key = try res.content.decode(AccessKey.ResponseDTO.self)
                     #expect(key.description == "Backup server")
                 })
+
+            // Persisted, not just echoed: the listing reads the record back from the store.
+            let listed = try await listedDescriptions(app, token: token)
+            #expect(listed["described-key"] == "Backup server")
+        }
+    }
+
+    @Test("Create key - whitespace-only description is stored as no description")
+    func testCreateAccessKeyBlankDescription() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            let createDTO = AccessKey.Create(
+                accessKey: "blank-key", secretKey: "test-secret", description: "   \n ")
+            try await app.test(
+                .POST, "/api/v1/users/accessKeys",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res throws in
+                    #expect(res.status == .ok)
+                    #expect(try res.content.decode(AccessKey.ResponseDTO.self).description == nil)
+                })
+        }
+    }
+
+    @Test("Create key - description over 500 characters is rejected by validation")
+    func testCreateAccessKeyDescriptionTooLong() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            let createDTO = AccessKey.Create(
+                accessKey: "long-key", secretKey: "test-secret",
+                description: String(repeating: "x", count: 501))
+            try await app.test(
+                .POST, "/api/v1/users/accessKeys",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(createDTO)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                })
+            #expect(try await listedDescriptions(app, token: token).isEmpty)
+        }
+    }
+
+    @Test("Update key - edits, clears, and validates the description")
+    func testUpdateAccessKeyDescription() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            var keyId: UUID?
+            try await app.test(
+                .POST, "/api/v1/users/accessKeys",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        AccessKey.Create(
+                            accessKey: "edit-key", secretKey: "test-secret",
+                            description: "Backup sever"))
+                },
+                afterResponse: { res throws in
+                    keyId = try res.content.decode(AccessKey.ResponseDTO.self).id
+                })
+            let id = try #require(keyId)
+
+            try await app.test(
+                .PATCH, "/api/v1/users/accessKeys/\(id)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(AccessKey.Update(description: " Backup server "))
+                },
+                afterResponse: { res throws in
+                    #expect(res.status == .ok)
+                    #expect(
+                        try res.content.decode(AccessKey.ResponseDTO.self).description
+                            == "Backup server")
+                })
+            #expect(try await listedDescriptions(app, token: token)["edit-key"] == "Backup server")
+
+            // An empty description clears it.
+            try await app.test(
+                .PATCH, "/api/v1/users/accessKeys/\(id)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(AccessKey.Update(description: ""))
+                },
+                afterResponse: { res in #expect(res.status == .ok) })
+            #expect(try await listedDescriptions(app, token: token)["edit-key"] == .some(nil))
+
+            // Same length rule as create.
+            try await app.test(
+                .PATCH, "/api/v1/users/accessKeys/\(id)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(
+                        AccessKey.Update(description: String(repeating: "x", count: 501)))
+                },
+                afterResponse: { res in #expect(res.status == .badRequest) })
+        }
+    }
+
+    @Test("Update key - another user's key is not found")
+    func testUpdateAccessKeyOfOtherUser() async throws {
+        try await withApp { app in
+            let ownerToken = try await createUserAndLogin(app)
+            var keyId: UUID?
+            try await app.test(
+                .POST, "/api/v1/users/accessKeys",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: ownerToken)
+                    try req.content.encode(
+                        AccessKey.Create(accessKey: "owned-key", secretKey: "test-secret"))
+                },
+                afterResponse: { res throws in
+                    keyId = try res.content.decode(AccessKey.ResponseDTO.self).id
+                })
+            let id = try #require(keyId)
+
+            let otherToken = try await createUserAndLogin(app, username: "other@example.com")
+            try await app.test(
+                .PATCH, "/api/v1/users/accessKeys/\(id)",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
+                    try req.content.encode(AccessKey.Update(description: "hijacked"))
+                },
+                afterResponse: { res in #expect(res.status == .notFound) })
+            #expect(try await listedDescriptions(app, token: ownerToken)["owned-key"] == .some(nil))
         }
     }
 

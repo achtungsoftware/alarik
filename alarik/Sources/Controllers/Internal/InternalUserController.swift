@@ -43,6 +43,10 @@ struct InternalUserController: RouteCollection {
             .grouped(InternalAuthenticator())
             .delete(use: deleteAccessKey)
 
+        routes.grouped("users").grouped("accessKeys").grouped(":accessKeyId")
+            .grouped(InternalAuthenticator())
+            .patch(use: updateAccessKey)
+
         routes.grouped("users")
             .grouped(InternalAuthenticator())
             .delete(use: deleteUser)
@@ -88,13 +92,9 @@ struct InternalUserController: RouteCollection {
         try AccessKey.Create.validate(content: req)
 
         let create: AccessKey.Create = try req.content.decode(AccessKey.Create.self)
-        let description = create.description?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard description?.count ?? 0 <= 500 else {
-            throw Abort(.badRequest, reason: "Description must not exceed 500 characters.")
-        }
         let accessKey: AccessKey = AccessKey(
             userId: auth.userId, accessKey: create.accessKey, secretKey: create.secretKey,
-            description: description?.isEmpty == false ? description : nil,
+            description: AccessKey.normalizedDescription(create.description),
             expirationDate: create.expirationDate
         )
 
@@ -134,6 +134,41 @@ struct InternalUserController: RouteCollection {
             app: req.application, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
 
         return accessKey.toResponseDTO()
+    }
+
+    /// Edits a key's description in place. Nothing else about a key is mutable, and no cache
+    /// holds the description, so a plain store overwrite is enough - no invalidation broadcast.
+    @Sendable
+    func updateAccessKey(req: Request) async throws -> AccessKey.ResponseDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let accessKeyId = req.parameters.get("accessKeyId", as: UUID.self) else {
+            throw Abort(.badRequest, reason: "Invalid access key ID.")
+        }
+        try AccessKey.Update.validate(content: req)
+        let update = try req.content.decode(AccessKey.Update.self)
+
+        guard let accessKey = try await Self.findOwnedAccessKey(
+            app: req.application, id: accessKeyId, userId: auth.userId)
+        else {
+            throw Abort(.notFound, reason: "Access key not found.")
+        }
+
+        accessKey.description = AccessKey.normalizedDescription(update.description)
+        try await accessKey.save(app: req.application)
+        return accessKey.toResponseDTO()
+    }
+
+    /// By-id lookup scoped to `userId`: the pointer first (a single store read), then the
+    /// listing for keys that predate the pointer - the same two steps `deleteAccessKey` takes.
+    private static func findOwnedAccessKey(app: Application, id: UUID, userId: UUID) async throws
+        -> AccessKey?
+    {
+        if let pointer = try await AccessKey.findIdPointer(app: app, id: id) {
+            guard pointer.userId == userId else { return nil }
+            return try await AccessKey.find(app: app, accessKey: pointer.accessKey)
+        }
+        return try await AccessKey.findAll(app: app, userId: userId).first { $0.id == id }
     }
 
     @Sendable

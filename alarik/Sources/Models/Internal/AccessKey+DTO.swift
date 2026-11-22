@@ -124,11 +124,24 @@ extension AccessKey {
 }
 
 extension AccessKey {
+    static let descriptionMaxLength = 500
+
+    /// Trims and maps an empty description to nil, so "no description" is stored one way only.
+    static func normalizedDescription(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     struct Create: Content {
         var accessKey: String
         var secretKey: String
         var description: String? = nil
         var expirationDate: Date?
+    }
+
+    /// Only the description is editable - the key pair and expiry are fixed at creation.
+    struct Update: Content {
+        var description: String?
     }
 
     struct ResponseDTO: Content {
@@ -154,5 +167,16 @@ extension AccessKey.Create: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("accessKey", as: String.self, is: !.empty)
         validations.add("secretKey", as: String.self, is: !.empty)
+        validations.add(
+            "description", as: String?.self,
+            is: .nil || .count(...AccessKey.descriptionMaxLength), required: false)
+    }
+}
+
+extension AccessKey.Update: Validatable {
+    static func validations(_ validations: inout Validations) {
+        validations.add(
+            "description", as: String?.self,
+            is: .nil || .count(...AccessKey.descriptionMaxLength), required: false)
     }
 }

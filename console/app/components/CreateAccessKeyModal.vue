@@ -72,6 +72,7 @@ async function submitForm(event: FormSubmitEvent<any>) {
             method: "POST",
             body: JSON.stringify({
                 ...state,
+                description: state.description.trim(),
                 expirationDate: expirationDate.value ? expirationDate.value.toDate("UTC").toISOString() : null,
             }),
             headers: {
