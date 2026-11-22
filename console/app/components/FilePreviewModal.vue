@@ -196,6 +196,12 @@ async function loadPreview() {
 
         if (previewType.value === "text") {
             textContent.value = await blob.text();
+        } else if (previewType.value === "pdf") {
+            // Force the type. The blob otherwise carries the stored Content-Type, so a key named
+            // *.pdf uploaded as text/html rendered as HTML inside the console's own origin
+            // (blob: URLs are same-origin) with access to the session cookie. A sandboxed
+            // iframe is not an option: Chrome's PDF viewer refuses to run in one.
+            previewUrl.value = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
         } else {
             previewUrl.value = URL.createObjectURL(blob);
         }
