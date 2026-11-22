@@ -134,6 +134,7 @@ declare global {
     export interface AccessKey {
         id: string;
         accessKey: string;
+        description?: string;
         createdAt: string;
         expirationDate?: string;
     }

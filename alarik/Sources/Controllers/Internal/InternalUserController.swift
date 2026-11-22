@@ -88,8 +88,13 @@ struct InternalUserController: RouteCollection {
         try AccessKey.Create.validate(content: req)
 
         let create: AccessKey.Create = try req.content.decode(AccessKey.Create.self)
+        let description = create.description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard description?.count ?? 0 <= 500 else {
+            throw Abort(.badRequest, reason: "Description must not exceed 500 characters.")
+        }
         let accessKey: AccessKey = AccessKey(
             userId: auth.userId, accessKey: create.accessKey, secretKey: create.secretKey,
+            description: description?.isEmpty == false ? description : nil,
             expirationDate: create.expirationDate
         )
 

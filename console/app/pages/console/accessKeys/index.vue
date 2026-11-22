@@ -76,6 +76,11 @@ const columns: TableColumn<AccessKey>[] = [
         },
     },
     {
+        accessorKey: "description",
+        header: "Description",
+        cell: ({ row }) => row.original.description || "—",
+    },
+    {
         accessorKey: "expirationDate",
         header: "Expiration Date",
         cell: ({ row }) => {

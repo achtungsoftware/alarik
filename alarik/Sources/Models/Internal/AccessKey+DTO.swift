@@ -28,6 +28,7 @@ final class AccessKey: @unchecked Sendable, MetadataRecord {
     var userId: UUID
     var accessKey: String
     var secretKey: String
+    var description: String?
     var createdAt: Date
     var expirationDate: Date?
 
@@ -36,6 +37,7 @@ final class AccessKey: @unchecked Sendable, MetadataRecord {
         userId: UUID,
         accessKey: String,
         secretKey: String,
+        description: String? = nil,
         createdAt: Date = Date(),
         expirationDate: Date? = nil
     ) {
@@ -43,6 +45,7 @@ final class AccessKey: @unchecked Sendable, MetadataRecord {
         self.userId = userId
         self.accessKey = accessKey
         self.secretKey = secretKey
+        self.description = description
         self.createdAt = createdAt
         self.expirationDate = expirationDate
     }
@@ -124,12 +127,14 @@ extension AccessKey {
     struct Create: Content {
         var accessKey: String
         var secretKey: String
+        var description: String? = nil
         var expirationDate: Date?
     }
 
     struct ResponseDTO: Content {
         var id: UUID?
         var accessKey: String?
+        var description: String?
         var createdAt: Date?
         var expirationDate: Date??
     }
@@ -138,6 +143,7 @@ extension AccessKey {
         .init(
             id: self.id,
             accessKey: self.accessKey,
+            description: self.description,
             createdAt: self.createdAt,
             expirationDate: self.expirationDate
         )
