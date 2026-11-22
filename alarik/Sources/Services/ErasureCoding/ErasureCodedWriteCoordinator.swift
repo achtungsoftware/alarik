@@ -122,12 +122,16 @@ enum ErasureCodedWriteCoordinator {
                 }
                 for await outcome in group {
                     if outcome.ok { delivered.insert(outcome.shardIndex) }
-                    if delivered.count >= quorum { break }
+                    // A staged write must hear every outcome: a push that lands after quorum
+                    // still has to be committed, or that peer keeps the previous generation.
+                    // The group awaits the stragglers either way, so this costs no latency.
+                    if stagingToken == nil, delivered.count >= quorum { break }
                 }
-                // Stragglers keep running in the background (structured concurrency awaits them
-                // even though this loop stopped listening) - same reasoning as
-                // ClusterReplicationService.replicateWrite; their eventual success is harmless
-                // (the receiver just re-writes the identical shard) even after rollback below.
+                // In-place writes: stragglers keep running in the background (structured
+                // concurrency awaits them even though this loop stopped listening) - same
+                // reasoning as ClusterReplicationService.replicateWrite; their eventual success
+                // is harmless (the receiver just re-writes the identical shard) even after
+                // rollback below.
             }
         }
 
@@ -264,6 +268,14 @@ enum ErasureCodedWriteCoordinator {
     ) async -> Set<Int> {
         var committed: Set<Int> = [0]
         await withTaskGroup(of: (shardIndex: Int, ok: Bool).self) { group in
+            // A push that timed out on our side may still have landed: drop that stage so the
+            // outbox repair below is the only thing that ever updates this peer.
+            for (offset, peer) in peers.enumerated() where !delivered.contains(offset + 1) {
+                group.addTask {
+                    await ClusterReplicationClient.discardStagedShards(app: app, to: peer, token: token)
+                    return (offset + 1, false)
+                }
+            }
             for (offset, peer) in peers.enumerated() where delivered.contains(offset + 1) {
                 group.addTask {
                     do {
