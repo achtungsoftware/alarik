@@ -266,16 +266,16 @@ enum ErasureCodedWriteCoordinator {
         app: Application, token: String, bucketName: String, key: String,
         peers: [ClusterNodeInfo], delivered: Set<Int>
     ) async -> Set<Int> {
+        // A push that timed out on our side may still have landed: drop that stage so the outbox
+        // repair is the only thing that ever updates this peer. Detached, never awaited - the
+        // peer is most likely down, and a request to a down host waits out the HTTP client's
+        // connection backoff (seconds), which must not be added to the write's latency.
+        for (offset, peer) in peers.enumerated() where !delivered.contains(offset + 1) {
+            Task { await ClusterReplicationClient.discardStagedShards(app: app, to: peer, token: token) }
+        }
+
         var committed: Set<Int> = [0]
         await withTaskGroup(of: (shardIndex: Int, ok: Bool).self) { group in
-            // A push that timed out on our side may still have landed: drop that stage so the
-            // outbox repair below is the only thing that ever updates this peer.
-            for (offset, peer) in peers.enumerated() where !delivered.contains(offset + 1) {
-                group.addTask {
-                    await ClusterReplicationClient.discardStagedShards(app: app, to: peer, token: token)
-                    return (offset + 1, false)
-                }
-            }
             for (offset, peer) in peers.enumerated() where delivered.contains(offset + 1) {
                 group.addTask {
                     do {
