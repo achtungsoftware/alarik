@@ -1144,7 +1144,8 @@ struct S3Controller: RouteCollection {
         // Metadata-only rewrite - the payload is window-copied from the file to itself, never
         // buffered, so this doesn't cost a full read+rewrite of a potentially huge object.
         let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path, transform: transform)
+            try ObjectFileHandler.rewriteMetadata(
+                bucketName: bucketName, key: key, at: path, transform: transform)
         }
 
         // Cluster peers physically hold the exact same version file, so a change must be pushed

@@ -1336,3 +1336,51 @@ struct ObjectFileHandlerPaginationTests {
         #expect(try listed(after: "docs/") == ["z.txt"])
     }
 }
+
+extension ObjectFileHandlerTests {
+    @Test("rewriteMetadata keeps the payload and updates only the header")
+    func rewriteMetadataPreservesPayload() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        try ObjectFileHandler.write(metadata: createTestMetadata(), data: createTestData(), to: path)
+
+        let updated = try ObjectFileHandler.rewriteMetadata(
+            bucketName: "test-bucket", key: "test-key.txt", at: path
+        ) { $0.tags = ["a": "b"] }
+        #expect(updated.tags == ["a": "b"])
+
+        let (meta, data) = try ObjectFileHandler.read(from: path)
+        #expect(meta.tags == ["a": "b"])
+        #expect(data == createTestData())
+    }
+
+    @Test("concurrent overwrites and metadata rewrites of one key never corrupt the object")
+    func concurrentRewriteAndOverwrite() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        let base = createTestMetadata()
+        let payloads = (0..<8).map { Data(repeating: UInt8($0 + 1), count: 100_000 + $0 * 7_000) }
+        var first = base
+        first.size = payloads[0].count
+        try ObjectFileHandler.write(metadata: first, data: payloads[0], to: path)
+
+        DispatchQueue.concurrentPerform(iterations: 64) { i in
+            if i % 2 == 0 {
+                let payload = payloads[(i / 2) % payloads.count]
+                var meta = base
+                meta.size = payload.count
+                try? ObjectFileHandler.write(metadata: meta, data: payload, to: path)
+            } else {
+                _ = try? ObjectFileHandler.rewriteMetadata(
+                    bucketName: "test-bucket", key: "test-key.txt", at: path
+                ) { $0.tags = ["i": "\(i)"] }
+            }
+        }
+
+        // Whatever won, header and payload must describe the same write.
+        let (meta, data) = try ObjectFileHandler.read(from: path)
+        let payload = try #require(data)
+        #expect(payload.count == meta.size)
+        #expect(payloads.contains(payload))
+    }
+}

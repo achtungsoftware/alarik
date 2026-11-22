@@ -2211,7 +2211,9 @@ struct InternalBucketController: RouteCollection {
         }
 
         let updatedMeta = try await S3Service.offloadBlockingIO(req) {
-            try ObjectFileHandler.rewriteMetadata(at: path) { $0.tags = nil }
+            try ObjectFileHandler.rewriteMetadata(bucketName: bucketName, key: key, at: path) {
+                $0.tags = nil
+            }
         }
 
         // See S3Controller.handleObjectTaggingPut - an in-place metadata edit has no outbox

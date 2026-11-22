@@ -38,15 +38,17 @@ struct ObjectFileHandler {
     /// never see a partial object) and durably (fsync of both the file and its directory
     /// before acknowledging, unless `ALARIK_FSYNC=false`; see `AtomicObjectWriter`).
     static func write(metadata: ObjectMeta, data: Data, to path: String) throws {
-        defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
-        var writer = try AtomicObjectWriter(finalPath: path)
-        do {
-            try writeHeader(metadata: metadata, to: writer)
-            try writer.write(data)
-            try writer.finish()
-        } catch {
-            writer.abort()
-            throw error
+        try ObjectKeyLock.withLock(bucketName: metadata.bucketName, key: metadata.key) { () throws -> Void in
+            defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
+            var writer = try AtomicObjectWriter(finalPath: path)
+            do {
+                try writeHeader(metadata: metadata, to: writer)
+                try writer.write(data)
+                try writer.finish()
+            } catch {
+                writer.abort()
+                throw error
+            }
         }
     }
 
@@ -86,45 +88,74 @@ struct ObjectFileHandler {
         payloadSources: [(path: String, offset: Int, size: Int)],
         to path: String
     ) throws {
+        try ObjectKeyLock.withLock(bucketName: metadata.bucketName, key: metadata.key) { () throws -> Void in
+            defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
+            var writer = try AtomicObjectWriter(finalPath: path)
+            do {
+                try writeHeader(metadata: metadata, to: writer)
+
+                var window = [UInt8](repeating: 0, count: Constants.fileCopyWindowSize)
+
+                for source in payloadSources {
+                    let sourceFd = POSIXFile.open(source.path, O_RDONLY)
+                    guard sourceFd >= 0 else {
+                        throw NSError(
+                            domain: "FileError", code: Int(errno),
+                            userInfo: [NSLocalizedDescriptionKey: "Could not open payload source"])
+                    }
+                    defer { _ = POSIXFile.close(sourceFd) }
+                    try copyRegion(
+                        fd: sourceFd, offset: source.offset, size: source.size, into: writer,
+                        window: &window)
+                }
+
+                try writer.finish()
+            } catch {
+                writer.abort()
+                throw error
+            }
+        }
+    }
+
+    /// Payload from an already-open descriptor (`openPayloadSnapshot`), so a metadata-only
+    /// rewrite copies the exact inode its header came from. Reopening by path raced a
+    /// concurrent overwrite: the new file was read at the old header's offset and renamed back
+    /// over the fresh PUT with stale metadata and a shifted payload.
+    static func writeStreamed(
+        metadata: ObjectMeta, payloadFd fd: Int32, payloadOffset: Int, payloadSize: Int,
+        to path: String
+    ) throws {
         defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
         var writer = try AtomicObjectWriter(finalPath: path)
         do {
             try writeHeader(metadata: metadata, to: writer)
-
-            let windowSize = Constants.fileCopyWindowSize
-            var window = [UInt8](repeating: 0, count: windowSize)
-
-            for source in payloadSources {
-                let sourceFd = POSIXFile.open(source.path, O_RDONLY)
-                guard sourceFd >= 0 else {
-                    throw NSError(
-                        domain: "FileError", code: Int(errno),
-                        userInfo: [NSLocalizedDescriptionKey: "Could not open payload source"])
-                }
-                defer { _ = POSIXFile.close(sourceFd) }
-                _ = POSIXFile.lseek(sourceFd, off_t(source.offset), SEEK_SET)
-
-                var remaining = source.size
-                while remaining > 0 {
-                    let toRead = Swift.min(windowSize, remaining)
-                    let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
-                    guard bytesRead > 0 else {
-                        throw NSError(
-                            domain: "InvalidFile", code: 0,
-                            userInfo: [NSLocalizedDescriptionKey: "Payload source ended early"])
-                    }
-                    try window.withUnsafeBytes { raw in
-                        try writer.writeRaw(
-                            UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-                    }
-                    remaining -= bytesRead
-                }
-            }
-
+            var window = [UInt8](repeating: 0, count: Constants.fileCopyWindowSize)
+            try copyRegion(fd: fd, offset: payloadOffset, size: payloadSize, into: writer, window: &window)
             try writer.finish()
         } catch {
             writer.abort()
             throw error
+        }
+    }
+
+    /// Copies `size` bytes from `offset` of `fd` into `writer`, one window at a time.
+    private static func copyRegion(
+        fd: Int32, offset: Int, size: Int, into writer: AtomicObjectWriter, window: inout [UInt8]
+    ) throws {
+        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
+        var remaining = size
+        while remaining > 0 {
+            let toRead = Swift.min(window.count, remaining)
+            let bytesRead = POSIXFile.read(fd, &window, toRead)
+            guard bytesRead > 0 else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Payload source ended early"])
+            }
+            try window.withUnsafeBytes { raw in
+                try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
+            }
+            remaining -= bytesRead
         }
     }
 
@@ -135,18 +166,19 @@ struct ObjectFileHandler {
     /// (safe: `AtomicObjectWriter` writes to a distinct temp file and only renames over the
     /// original once the copy is fully done - same reasoning as `markAllVersionsNotLatest`).
     static func rewriteMetadata(
-        at path: String, transform: (inout ObjectMeta) -> Void
+        bucketName: String, key: String, at path: String, transform: (inout ObjectMeta) -> Void
     ) throws -> ObjectMeta {
-        let location = try payloadLocation(path: path)
-        var updatedMeta = location.meta
-        transform(&updatedMeta)
-        try writeStreamed(
-            metadata: updatedMeta,
-            payloadFile: path,
-            payloadOffset: location.payloadOffset,
-            payloadSize: location.payloadSize,
-            to: path)
-        return updatedMeta
+        try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> ObjectMeta in
+            let snapshot = try openPayloadSnapshot(path: path)
+            defer { _ = POSIXFile.close(snapshot.fd) }
+            var updatedMeta = snapshot.meta
+            transform(&updatedMeta)
+            try writeStreamed(
+                metadata: updatedMeta, payloadFd: snapshot.fd,
+                payloadOffset: snapshot.payloadOffset, payloadSize: snapshot.payloadSize,
+                to: path)
+            return updatedMeta
+        }
     }
 
     /// MD5 of a file region, computed in fixed-size windows (bounded memory). Used by
@@ -443,17 +475,19 @@ struct ObjectFileHandler {
 
     /// Deletes an object from storage.
     static func delete(bucketName: String, key: String) throws {
-        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
-        let path = storagePath(for: bucketName, key: key)
+        try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> Void in
+            defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
+            let path = storagePath(for: bucketName, key: key)
 
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw NSError(
-                domain: "ObjectNotFound", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "Object does not exist"])
+            guard FileManager.default.fileExists(atPath: path) else {
+                throw NSError(
+                    domain: "ObjectNotFound", code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "Object does not exist"])
+            }
+
+            try FileManager.default.removeItem(atPath: path)
+            pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
         }
-
-        try FileManager.default.removeItem(atPath: path)
-        pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
     }
 
     /// After an object's files are removed, remove any now-empty ancestor directories up to (but
@@ -968,17 +1002,19 @@ struct ObjectFileHandler {
         key: String,
         versioningStatus: VersioningStatus
     ) throws -> String {
-        let (versionId, path, versionedMeta) = try prepareVersionedWrite(
-            metadata: metadata, bucketName: bucketName, key: key,
-            versioningStatus: versioningStatus)
+        return try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> String in
+            let (versionId, path, versionedMeta) = try prepareVersionedWrite(
+                metadata: metadata, bucketName: bucketName, key: key,
+                versioningStatus: versioningStatus)
 
-        try write(metadata: versionedMeta, data: data, to: path)
+            try write(metadata: versionedMeta, data: data, to: path)
 
-        if versioningStatus != .disabled {
-            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+            if versioningStatus != .disabled {
+                try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+            }
+
+            return versionId
         }
-
-        return versionId
     }
 
     /// `writeVersioned` with the payload coming from files on disk instead of memory (spool
@@ -991,17 +1027,19 @@ struct ObjectFileHandler {
         key: String,
         versioningStatus: VersioningStatus
     ) throws -> String {
-        let (versionId, path, versionedMeta) = try prepareVersionedWrite(
-            metadata: metadata, bucketName: bucketName, key: key,
-            versioningStatus: versioningStatus)
+        return try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> String in
+            let (versionId, path, versionedMeta) = try prepareVersionedWrite(
+                metadata: metadata, bucketName: bucketName, key: key,
+                versioningStatus: versioningStatus)
 
-        try writeStreamed(metadata: versionedMeta, payloadSources: payloadSources, to: path)
+            try writeStreamed(metadata: versionedMeta, payloadSources: payloadSources, to: path)
 
-        if versioningStatus != .disabled {
-            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+            if versioningStatus != .disabled {
+                try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+            }
+
+            return versionId
         }
-
-        return versionId
     }
 
     /// Shared setup for both versioned-write flavors: picks the version ID and target path
@@ -1016,40 +1054,42 @@ struct ObjectFileHandler {
         key: String,
         versioningStatus: VersioningStatus
     ) throws -> (versionId: String, path: String, meta: ObjectMeta) {
-        let versionId: String
-        let path: String
+        return try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> (versionId: String, path: String, meta: ObjectMeta) in
+            let versionId: String
+            let path: String
 
-        switch versioningStatus {
-        case .enabled:
-            // Generate a new version ID and store in versioned directory
-            versionId = ObjectMeta.generateVersionId()
-            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+            switch versioningStatus {
+            case .enabled:
+                // Generate a new version ID and store in versioned directory
+                versionId = ObjectMeta.generateVersionId()
+                path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-            // Mark all existing versions as not latest
-            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+                // Mark all existing versions as not latest
+                try markAllVersionsNotLatest(bucketName: bucketName, key: key)
 
-        case .suspended:
-            // Use "null" as version ID, overwrite any existing null version
-            versionId = "null"
-            path = versionedPath(for: bucketName, key: key, versionId: versionId)
+            case .suspended:
+                // Use "null" as version ID, overwrite any existing null version
+                versionId = "null"
+                path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-            // Mark all existing versions as not latest
-            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+                // Mark all existing versions as not latest
+                try markAllVersionsNotLatest(bucketName: bucketName, key: key)
 
-        case .disabled:
-            // No versioning - use the old single-file path
-            // If there are existing versions, this is an error state
-            // For simplicity, we just write to the non-versioned path
-            versionId = "null"
-            path = storagePath(for: bucketName, key: key)
+            case .disabled:
+                // No versioning - use the old single-file path
+                // If there are existing versions, this is an error state
+                // For simplicity, we just write to the non-versioned path
+                versionId = "null"
+                path = storagePath(for: bucketName, key: key)
+            }
+
+            var versionedMeta = metadata
+            versionedMeta.versionId = versionId
+            versionedMeta.isLatest = true
+            versionedMeta.isDeleteMarker = false
+
+            return (versionId, path, versionedMeta)
         }
-
-        var versionedMeta = metadata
-        versionedMeta.versionId = versionId
-        versionedMeta.isLatest = true
-        versionedMeta.isDeleteMarker = false
-
-        return (versionId, path, versionedMeta)
     }
 
     /// Reads a specific version of an object, or the latest if versionId is nil
@@ -1185,16 +1225,15 @@ struct ObjectFileHandler {
 
         for fileURL in contents where fileURL.pathExtension == "obj" {
             do {
-                let location = try payloadLocation(path: fileURL.path)
-                guard location.meta.isLatest else { continue }
+                let snapshot = try openPayloadSnapshot(path: fileURL.path)
+                defer { _ = POSIXFile.close(snapshot.fd) }
+                guard snapshot.meta.isLatest else { continue }
 
-                var updatedMeta = location.meta
+                var updatedMeta = snapshot.meta
                 updatedMeta.isLatest = false
                 try writeStreamed(
-                    metadata: updatedMeta,
-                    payloadFile: fileURL.path,
-                    payloadOffset: location.payloadOffset,
-                    payloadSize: location.payloadSize,
+                    metadata: updatedMeta, payloadFd: snapshot.fd,
+                    payloadOffset: snapshot.payloadOffset, payloadSize: snapshot.payloadSize,
                     to: fileURL.path)
             } catch {
                 // Skip files we can't read
@@ -1471,74 +1510,78 @@ struct ObjectFileHandler {
 
     /// Deletes a specific version of an object
     static func deleteVersion(bucketName: String, key: String, versionId: String) throws {
-        defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
-        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+        try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> Void in
+            defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
+            let path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-        guard FileManager.default.fileExists(atPath: path) else {
-            // The "null" version of a key that was never written under versioning lives at
-            // the plain non-versioned path, not in the .versions directory - but listings
-            // still (correctly, matching S3) report it as VersionId "null", and clients
-            // like mc echo that id back in versioned deletes. Deleting versionId "null" must
-            // therefore remove the plain file too, or `mc rb --force` style flows leave the
-            // object behind while believing the delete succeeded.
-            if versionId == "null" {
-                let plainPath = storagePath(for: bucketName, key: key)
-                if FileManager.default.fileExists(atPath: plainPath) {
-                    try FileManager.default.removeItem(atPath: plainPath)
-                    pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
-                    return
+            guard FileManager.default.fileExists(atPath: path) else {
+                // The "null" version of a key that was never written under versioning lives at
+                // the plain non-versioned path, not in the .versions directory - but listings
+                // still (correctly, matching S3) report it as VersionId "null", and clients
+                // like mc echo that id back in versioned deletes. Deleting versionId "null" must
+                // therefore remove the plain file too, or `mc rb --force` style flows leave the
+                // object behind while believing the delete succeeded.
+                if versionId == "null" {
+                    let plainPath = storagePath(for: bucketName, key: key)
+                    if FileManager.default.fileExists(atPath: plainPath) {
+                        try FileManager.default.removeItem(atPath: plainPath)
+                        pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
+                        return
+                    }
                 }
+                throw NSError(
+                    domain: "ObjectNotFound", code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "Version does not exist"])
             }
-            throw NSError(
-                domain: "ObjectNotFound", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "Version does not exist"])
+
+            // Check if this is the latest version
+            let isLatest = try getLatestVersionId(bucketName: bucketName, key: key) == versionId
+
+            // Delete the version file
+            try FileManager.default.removeItem(atPath: path)
+
+            // If we deleted the latest version, update the pointer to the next most recent
+            if isLatest {
+                try updateLatestToMostRecent(bucketName: bucketName, key: key)
+            }
+
+            // Clean up empty directories - the `.versions/` dir once its history is gone, then any
+            // now-empty parent folders so the object's folder doesn't linger as a phantom.
+            try cleanupEmptyVersionsDirectory(bucketName: bucketName, key: key)
+            pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
         }
-
-        // Check if this is the latest version
-        let isLatest = try getLatestVersionId(bucketName: bucketName, key: key) == versionId
-
-        // Delete the version file
-        try FileManager.default.removeItem(atPath: path)
-
-        // If we deleted the latest version, update the pointer to the next most recent
-        if isLatest {
-            try updateLatestToMostRecent(bucketName: bucketName, key: key)
-        }
-
-        // Clean up empty directories - the `.versions/` dir once its history is gone, then any
-        // now-empty parent folders so the object's folder doesn't linger as a phantom.
-        try cleanupEmptyVersionsDirectory(bucketName: bucketName, key: key)
-        pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
     }
 
     /// Creates a delete marker (soft delete for versioned buckets)
     static func createDeleteMarker(bucketName: String, key: String) throws -> ObjectMeta {
-        let versionId = ObjectMeta.generateVersionId()
-        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+        return try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> ObjectMeta in
+            let versionId = ObjectMeta.generateVersionId()
+            let path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-        // Mark all existing versions as not latest
-        try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+            // Mark all existing versions as not latest
+            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
 
-        // Create delete marker metadata
-        let meta = ObjectMeta(
-            bucketName: bucketName,
-            key: key,
-            size: 0,
-            contentType: "",
-            etag: "",
-            updatedAt: Date(),
-            versionId: versionId,
-            isLatest: true,
-            isDeleteMarker: true
-        )
+            // Create delete marker metadata
+            let meta = ObjectMeta(
+                bucketName: bucketName,
+                key: key,
+                size: 0,
+                contentType: "",
+                etag: "",
+                updatedAt: Date(),
+                versionId: versionId,
+                isLatest: true,
+                isDeleteMarker: true
+            )
 
-        // Write empty data with delete marker metadata
-        try write(metadata: meta, data: Data(), to: path)
+            // Write empty data with delete marker metadata
+            try write(metadata: meta, data: Data(), to: path)
 
-        // Update latest pointer
-        try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+            // Update latest pointer
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
 
-        return meta
+            return meta
+        }
     }
 
     /// Creates a delete marker for a *suspended*-versioning bucket - distinct from
@@ -1548,38 +1591,40 @@ struct ObjectFileHandler {
     /// untouched and retrievable by its real version ID. Using `createDeleteMarker` here would be
     /// wrong: it mints a fresh random version ID instead of the "null" S3 expects.
     static func createNullVersionDeleteMarker(bucketName: String, key: String) throws -> ObjectMeta {
-        // The existing "null" version may currently live at the plain non-versioned path (an
-        // object written before versioning was ever enabled on this bucket) rather than inside
-        // .versions/ - deleteVersion(versionId: "null") already knows this, so the marker write
-        // below doesn't silently leave that plain file behind as an orphaned duplicate.
-        let plainPath = storagePath(for: bucketName, key: key)
-        if FileManager.default.fileExists(atPath: plainPath) {
-            try FileManager.default.removeItem(atPath: plainPath)
+        return try ObjectKeyLock.withLock(bucketName: bucketName, key: key) { () throws -> ObjectMeta in
+            // The existing "null" version may currently live at the plain non-versioned path (an
+            // object written before versioning was ever enabled on this bucket) rather than inside
+            // .versions/ - deleteVersion(versionId: "null") already knows this, so the marker write
+            // below doesn't silently leave that plain file behind as an orphaned duplicate.
+            let plainPath = storagePath(for: bucketName, key: key)
+            if FileManager.default.fileExists(atPath: plainPath) {
+                try FileManager.default.removeItem(atPath: plainPath)
+            }
+
+            let versionId = "null"
+            let path = versionedPath(for: bucketName, key: key, versionId: versionId)
+
+            // Demotes prior real versions to not-latest - never deletes them, matching
+            // prepareVersionedWrite's .suspended case exactly.
+            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
+
+            let meta = ObjectMeta(
+                bucketName: bucketName,
+                key: key,
+                size: 0,
+                contentType: "",
+                etag: "",
+                updatedAt: Date(),
+                versionId: versionId,
+                isLatest: true,
+                isDeleteMarker: true
+            )
+
+            try write(metadata: meta, data: Data(), to: path)
+            try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
+
+            return meta
         }
-
-        let versionId = "null"
-        let path = versionedPath(for: bucketName, key: key, versionId: versionId)
-
-        // Demotes prior real versions to not-latest - never deletes them, matching
-        // prepareVersionedWrite's .suspended case exactly.
-        try markAllVersionsNotLatest(bucketName: bucketName, key: key)
-
-        let meta = ObjectMeta(
-            bucketName: bucketName,
-            key: key,
-            size: 0,
-            contentType: "",
-            etag: "",
-            updatedAt: Date(),
-            versionId: versionId,
-            isLatest: true,
-            isDeleteMarker: true
-        )
-
-        try write(metadata: meta, data: Data(), to: path)
-        try updateLatestPointer(bucketName: bucketName, key: key, versionId: versionId)
-
-        return meta
     }
 
     /// Updates the .latest pointer to the most recent non-deleted version
@@ -1594,14 +1639,13 @@ struct ObjectFileHandler {
             // (see markAllVersionsNotLatest) rather than buffering the whole payload just to
             // flip one boolean.
             let path = versionedPath(for: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
-            if let location = try? payloadLocation(path: path) {
-                var updatedMeta = location.meta
+            if let snapshot = try? openPayloadSnapshot(path: path) {
+                defer { _ = POSIXFile.close(snapshot.fd) }
+                var updatedMeta = snapshot.meta
                 updatedMeta.isLatest = true
                 try writeStreamed(
-                    metadata: updatedMeta,
-                    payloadFile: path,
-                    payloadOffset: location.payloadOffset,
-                    payloadSize: location.payloadSize,
+                    metadata: updatedMeta, payloadFd: snapshot.fd,
+                    payloadOffset: snapshot.payloadOffset, payloadSize: snapshot.payloadSize,
                     to: path)
             }
         } else {
