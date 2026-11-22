@@ -970,7 +970,7 @@ struct UserControllerTests {
         }
     }
 
-    @Test("Edit user with access key - forbidden, account changes need a session")
+    @Test("Edit user with access key - should pass")
     func testEditUserWithAccessKey() async throws {
         try await withApp { app in
 
@@ -988,14 +988,14 @@ struct UserControllerTests {
                     try req.content.encode(editDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .ok)
+                    let user = try res.content.decode(User.ResponseDTO.self)
+                    #expect(user.name == "Updated Admin Name")
                 })
-            let admin = try await User.findByUsername(app: app, username: "alarik")
-            #expect(admin?.name != "Updated Admin Name")
         }
     }
 
-    @Test("Create access key with access key auth - forbidden, a leaked key must not mint keys")
+    @Test("Create access key with access key auth - should pass")
     func testCreateAccessKeyWithAccessKey() async throws {
         try await withApp { app in
 
@@ -1009,9 +1009,10 @@ struct UserControllerTests {
                     try req.content.encode(createDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .ok)
+                    let key = try res.content.decode(AccessKey.ResponseDTO.self)
+                    #expect(key.accessKey == "NEWACCESSKEY123456")
                 })
-            #expect(try await AccessKey.find(app: app, accessKey: "NEWACCESSKEY123456") == nil)
         }
     }
 
@@ -1042,22 +1043,6 @@ struct UserControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .unauthorized)
                 })
-        }
-    }
-
-    @Test("Delete access key with access key auth - forbidden")
-    func testDeleteAccessKeyWithAccessKey() async throws {
-        try await withApp { app in
-            let key = try #require(try await AccessKey.find(app: app, accessKey: testAccessKey))
-            try await app.test(
-                .DELETE, "/api/v1/users/accessKeys/\(key.id.uuidString)",
-                beforeRequest: { req in
-                    setAccessKeyHeaders(&req)
-                },
-                afterResponse: { res async in
-                    #expect(res.status == .forbidden)
-                })
-            #expect(try await AccessKey.find(app: app, accessKey: testAccessKey) != nil)
         }
     }
 

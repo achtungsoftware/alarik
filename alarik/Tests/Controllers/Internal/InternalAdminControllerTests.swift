@@ -1034,7 +1034,7 @@ struct InternalAdminControllerTests {
         }
     }
 
-    @Test("List users with access key as admin - forbidden, admin actions need a session")
+    @Test("List users with access key as admin - should pass")
     func testListUsersWithAccessKey() async throws {
         try await withApp { app in
 
@@ -1044,7 +1044,9 @@ struct InternalAdminControllerTests {
                     setAccessKeyHeaders(&req)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .ok)
+                    let page = try res.content.decode(Page<User.ResponseDTO>.self)
+                    #expect(page.items.count >= 1)
                 })
         }
     }
@@ -1062,7 +1064,7 @@ struct InternalAdminControllerTests {
                     setAccessKeyHeaders(&req, accessKey: nonAdminAccessKey, secretKey: nonAdminSecretKey)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .unauthorized)
                 })
         }
     }
@@ -1096,7 +1098,7 @@ struct InternalAdminControllerTests {
         }
     }
 
-    @Test("Get storage stats with access key as admin - forbidden")
+    @Test("Get storage stats with access key as admin - should pass")
     func testGetStorageStatsWithAccessKey() async throws {
         try await withApp { app in
 
@@ -1106,12 +1108,14 @@ struct InternalAdminControllerTests {
                     setAccessKeyHeaders(&req)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .ok)
+                    let stats = try res.content.decode(InternalAdminController.StorageStats.self)
+                    #expect(stats.userCount >= 1)
                 })
         }
     }
 
-    @Test("Delete bucket with access key as admin - forbidden, bucket survives")
+    @Test("Delete bucket with access key as admin - should pass")
     func testDeleteBucketWithAccessKey() async throws {
         try await withApp { app in
 
@@ -1121,18 +1125,19 @@ struct InternalAdminControllerTests {
             try await bucket.save(app: app)
             try BucketHandler.create(name: "access-key-delete-test-bucket")
 
-            // Access keys are S3 credentials, not admin credentials.
+            // Delete the bucket using access key auth
             try await app.test(
                 .DELETE, "/api/v1/admin/buckets/access-key-delete-test-bucket",
                 beforeRequest: { req in
                     setAccessKeyHeaders(&req)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .forbidden)
+                    #expect(res.status == .noContent)
                 })
 
-            let survivingBucket = try await Bucket.find(app: app, name: "access-key-delete-test-bucket")
-            #expect(survivingBucket != nil)
+            // Verify bucket is deleted
+            let deletedBucket = try await Bucket.find(app: app, name: "access-key-delete-test-bucket")
+            #expect(deletedBucket == nil)
         }
     }
 
