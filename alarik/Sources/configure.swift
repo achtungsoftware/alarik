@@ -37,6 +37,8 @@ public func configure(_ app: Application) async throws {
     app.http.server.configuration.shutdownTimeout = .seconds(30)
 
     let consoleBaseUrl = ConsoleBaseURL.resolve()
+    // Parsed first so a typo fails boot before anything touches `Storage/`.
+    let corsAllowedOrigins = try CORSAllowedOrigins.resolve()
 
     #if DEBUG
     #else
@@ -92,7 +94,8 @@ public func configure(_ app: Application) async throws {
     let cors: CORSMiddleware = CORSMiddleware(
         configuration: .init(
             allowedOrigin: .any(
-                [consoleBaseUrl] + additionalCorsOrigins(consoleBaseUrl: consoleBaseUrl)),
+                [consoleBaseUrl] + additionalCorsOrigins(consoleBaseUrl: consoleBaseUrl)
+                    + corsAllowedOrigins),
             allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
             allowedHeaders: [
                 .accept,
