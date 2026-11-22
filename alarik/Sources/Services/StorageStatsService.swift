@@ -56,6 +56,8 @@ actor StorageStatsService {
             case clusterTotal
             case ownedShare
             case ownedShareAllBuckets
+            /// Raw bytes under this node's whole `Storage/buckets` tree (admin dashboard).
+            case localStorageTree
         }
         let scope: Scope
         let bucketName: String
@@ -158,7 +160,8 @@ actor StorageStatsService {
 
     private nonisolated func changeGeneration(for key: Key) -> UInt64 {
         // The all-buckets share spans every bucket, so it follows the global generation.
-        let bucket = key.scope == .ownedShareAllBuckets ? "" : key.bucketName
+        let bucket =
+            key.scope == .ownedShareAllBuckets || key.scope == .localStorageTree ? "" : key.bucketName
         return generations.withLock { $0[bucket] ?? 0 }
     }
 

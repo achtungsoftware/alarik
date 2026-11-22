@@ -384,8 +384,18 @@ struct InternalAdminController: RouteCollection {
 
         let usedBytes = totalBytes - availableBytes
 
-        // Calculate storage used by alarik (size of Storage/buckets directory)
-        let alarikUsedBytes = Self.calculateDirectorySize(at: storageURL)
+        // Size of the Storage/buckets tree. Cached, coalesced and walked on the IO pool via
+        // StorageStatsService - the dashboard polls this, and an inline walk per poll is the
+        // CPU saturation from issue #28 all over again.
+        let app = req.application
+        let alarikUsedBytes = try await StorageStatsService.shared.stats(
+            for: .init(scope: .localStorageTree, bucketName: "", prefix: "")
+        ) {
+            let size = try await StorageStatsService.shared.localWalk(app: app) {
+                Self.calculateDirectorySize(at: storageURL)
+            }
+            return .init(sizeBytes: size, objectCount: 0)
+        }.sizeBytes
 
         // Count buckets and objects
         let bucketCount = await MetadataListingService.count(
