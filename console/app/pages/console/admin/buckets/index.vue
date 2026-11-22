@@ -191,11 +191,9 @@ const columns: TableColumn<Bucket>[] = [
     },
 ];
 
+// Keyed by `name` (see `getRowId`), not row index, so a refresh cannot move the selection.
 const selectedItems = computed(() => {
-    return Object.entries(rowSelection.value)
-        .filter(([_, selected]) => selected)
-        .map(([index]) => fetchResponse.value?.items?.[Number(index)])
-        .filter((item): item is Bucket => item !== undefined);
+    return (fetchResponse.value?.items ?? []).filter((item: Bucket) => rowSelection.value[item.name]);
 });
 
 function onSelect(e: Event, row: TableRow<Bucket>) {
@@ -310,6 +308,7 @@ async function deleteMany() {
             <div class="flex flex-col">
                 <UTable
                     v-model:row-selection="rowSelection"
+                    :get-row-id="(row: Bucket) => row.name"
                     @select="onSelect"
                     :data="fetchResponse?.items"
                     :columns="columns"

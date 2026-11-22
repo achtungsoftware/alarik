@@ -142,11 +142,9 @@ const columns: TableColumn<AccessKey>[] = [
     },
 ];
 
+// Keyed by `id` (see `getRowId`), not row index, so a refresh cannot move the selection.
 const selectedItems = computed(() => {
-    return Object.entries(rowSelection.value)
-        .filter(([_, selected]) => selected)
-        .map(([index]) => fetchResponse.value?.items?.[Number(index)])
-        .filter((item): item is AccessKey => item !== undefined);
+    return (fetchResponse.value?.items ?? []).filter((item: AccessKey) => rowSelection.value[item.id]);
 });
 
 function onSelect(e: Event, row: TableRow<AccessKey>) {
@@ -247,6 +245,7 @@ async function deleteMany() {
             <div class="flex flex-col">
                 <UTable
                     v-model:row-selection="rowSelection"
+                    :get-row-id="(row: AccessKey) => row.id"
                     @select="onSelect"
                     :data="fetchResponse?.items"
                     :columns="columns"

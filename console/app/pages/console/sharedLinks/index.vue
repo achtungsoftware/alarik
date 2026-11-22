@@ -154,11 +154,9 @@ const columns: TableColumn<SharedLink>[] = [
     },
 ];
 
+// Keyed by `id` (see `getRowId`), not row index, so a refresh cannot move the selection.
 const selectedItems = computed(() => {
-    return Object.entries(rowSelection.value)
-        .filter(([_, selected]) => selected)
-        .map(([index]) => fetchResponse.value?.items?.[Number(index)])
-        .filter((item): item is SharedLink => item !== undefined);
+    return (fetchResponse.value?.items ?? []).filter((item: SharedLink) => rowSelection.value[item.id]);
 });
 
 async function deleteMany() {
@@ -246,6 +244,7 @@ async function deleteMany() {
             <div class="flex flex-col">
                 <UTable
                     v-model:row-selection="rowSelection"
+                    :get-row-id="(row: SharedLink) => row.id"
                     :data="fetchResponse?.items"
                     :columns="columns"
                     :loading="status === 'pending'"

@@ -108,8 +108,24 @@ watch([currentBucket, currentPrefix], () => {
     searchQuery.value = "";
 });
 
+// Selection is keyed by item key (see `getRowId` on the table), never by row index: a
+// background refresh that inserts an earlier-sorting key must not shift the selection onto
+// different objects before a delete.
 const selectedItems = computed(() => {
-    return displayItems.value.filter((_, index) => rowSelection.value[index]);
+    return displayItems.value.filter((item) => rowSelection.value[item.key]);
+});
+
+// Drop selections for rows that are no longer listed, so counts and bulk actions only ever
+// cover what is on screen.
+watch(displayItems, (items) => {
+    const listed = new Set(items.map((item) => item.key));
+    const kept: Record<string, boolean> = {};
+    for (const [key, selected] of Object.entries(rowSelection.value)) {
+        if (selected && listed.has(key)) kept[key] = true;
+    }
+    if (Object.keys(kept).length !== Object.keys(rowSelection.value).length) {
+        rowSelection.value = kept;
+    }
 });
 
 // Count files, folders, and buckets for deletion dialog
@@ -851,6 +867,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
                 <!-- File browser table -->
                 <UTable
                     v-model:row-selection="rowSelection"
+                    :get-row-id="(row: BrowserItem) => row.key"
                     @select="onSelect"
                     :data="displayItems"
                     :columns="columns"

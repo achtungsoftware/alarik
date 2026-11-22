@@ -144,11 +144,9 @@ const columns: TableColumn<User>[] = [
     },
 ];
 
+// Keyed by `id` (see `getRowId`), not row index, so a refresh cannot move the selection.
 const selectedItems = computed(() => {
-    return Object.entries(rowSelection.value)
-        .filter(([_, selected]) => selected)
-        .map(([index]) => fetchResponse.value?.items?.[Number(index)])
-        .filter((item): item is User => item !== undefined);
+    return (fetchResponse.value?.items ?? []).filter((item: User) => rowSelection.value[item.id]);
 });
 
 function onSelect(e: Event, row: TableRow<User>) {}
@@ -287,6 +285,7 @@ async function deleteSingleUser(user: User) {
             <div class="flex flex-col">
                 <UTable
                     v-model:row-selection="rowSelection"
+                    :get-row-id="(row: User) => row.id"
                     @select="onSelect"
                     :data="fetchResponse?.items"
                     :columns="columns"
