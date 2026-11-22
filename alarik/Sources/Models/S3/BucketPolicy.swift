@@ -115,7 +115,7 @@ struct PolicyStatement: Decodable {
     let actions: [String]
     let resources: [ResourceMatcher]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case sid = "Sid"
         case effect = "Effect"
         case principal = "Principal"
@@ -123,7 +123,26 @@ struct PolicyStatement: Decodable {
         case resources = "Resource"
     }
 
+    /// A statement element outside the supported subset (`Condition`, `NotAction`, ...).
+    /// Surfaced as its own error so `parseAndValidate` can name the element: `JSONDecoder`
+    /// ignores unknown keys, which silently turned a conditional Allow into an unconditional one.
+    struct UnsupportedElementError: Error {
+        let elements: [String]
+    }
+
+    private struct AnyKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
     init(from decoder: any Decoder) throws {
+        let supported = Set(CodingKeys.allCases.map(\.rawValue))
+        let present = try decoder.container(keyedBy: AnyKey.self).allKeys.map(\.stringValue)
+        let unsupported = present.filter { !supported.contains($0) }.sorted()
+        guard unsupported.isEmpty else { throw UnsupportedElementError(elements: unsupported) }
+
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sid = try container.decodeIfPresent(String.self, forKey: .sid)
         effect = try container.decode(PolicyEffect.self, forKey: .effect)
@@ -189,6 +208,12 @@ struct BucketPolicy: Equatable {
         let document: PolicyDocument
         do {
             document = try JSONDecoder().decode(PolicyDocument.self, from: data)
+        } catch let error as PolicyStatement.UnsupportedElementError {
+            throw S3Error(
+                status: .badRequest, code: "MalformedPolicy",
+                message:
+                    "Unsupported Statement element(s): \(error.elements.joined(separator: ", ")). Supported: Sid, Effect, Principal, Action, Resource.",
+                requestId: requestId)
         } catch {
             throw S3Error(
                 status: .badRequest, code: "MalformedPolicy",
