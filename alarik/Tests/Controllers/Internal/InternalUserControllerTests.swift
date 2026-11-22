@@ -584,7 +584,7 @@ struct UserControllerTests {
             let editDTO = User.Edit(
                 name: "Updated Name",
                 username: "updated@example.com",
-                currentPassword: nil,
+                currentPassword: "TestPass123!",
                 newPassword: nil
             )
 
@@ -649,7 +649,7 @@ struct UserControllerTests {
             let editDTO = User.Edit(
                 name: "First User",
                 username: "second@example.com",
-                currentPassword: nil,
+                currentPassword: "TestPass123!",
                 newPassword: nil
             )
 
@@ -1009,10 +1009,9 @@ struct UserControllerTests {
                     try req.content.encode(createDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .ok)
-                    let key = try res.content.decode(AccessKey.ResponseDTO.self)
-                    #expect(key.accessKey == "NEWACCESSKEY123456")
+                    #expect(res.status == .forbidden)
                 })
+            #expect(try await AccessKey.find(app: app, accessKey: "NEWACCESSKEY123456") == nil)
         }
     }
 
@@ -1043,6 +1042,77 @@ struct UserControllerTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .unauthorized)
                 })
+        }
+    }
+
+    @Test("Delete access key with access key auth - forbidden")
+    func testDeleteAccessKeyWithAccessKey() async throws {
+        try await withApp { app in
+            let key = try #require(try await AccessKey.find(app: app, accessKey: testAccessKey))
+            try await app.test(
+                .DELETE, "/api/v1/users/accessKeys/\(key.id.uuidString)",
+                beforeRequest: { req in
+                    setAccessKeyHeaders(&req)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .forbidden)
+                })
+            #expect(try await AccessKey.find(app: app, accessKey: testAccessKey) != nil)
+        }
+    }
+
+    @Test("Changing the username requires the current password")
+    func renameRequiresCurrentPassword() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app, username: "rename@example.com")
+
+            for (password, expected) in [(nil, HTTPStatus.unauthorized), ("wrong", .unauthorized)] {
+                let editDTO = User.Edit(
+                    name: "Test User", username: "victim@example.com",
+                    currentPassword: password, newPassword: nil)
+                try await app.test(
+                    .PUT, "/api/v1/users",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                        try req.content.encode(editDTO)
+                    },
+                    afterResponse: { res async in
+                        #expect(res.status == expected)
+                    })
+            }
+            #expect(try await User.findByUsername(app: app, username: "victim@example.com") == nil)
+
+            // Name-only edits still work without a password.
+            let nameOnly = User.Edit(
+                name: "Renamed Display", username: "rename@example.com",
+                currentPassword: nil, newPassword: nil)
+            try await app.test(
+                .PUT, "/api/v1/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(nameOnly)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                })
+        }
+    }
+
+    @Test("Usernames with path or control characters are rejected")
+    func usernameCharsetEnforced() async throws {
+        try await withApp { app in
+            for username in ["evil/../admin", "a b", "x\ny"] {
+                let createDTO = User.Create(
+                    name: "Bad", username: username, password: "SecurePass123!", isAdmin: false)
+                try await app.test(
+                    .POST, "/api/v1/users",
+                    beforeRequest: { req in
+                        try req.content.encode(createDTO)
+                    },
+                    afterResponse: { res async in
+                        #expect(res.status == .badRequest, "\(username.debugDescription)")
+                    })
+            }
         }
     }
 }

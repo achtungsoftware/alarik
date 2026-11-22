@@ -203,7 +203,7 @@ extension User {
 extension User.Create: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: !.empty)
+        validations.add("username", as: String.self, is: .username)
         validations.add("password", as: String.self, is: !.empty)
     }
 }
@@ -211,7 +211,7 @@ extension User.Create: Validatable {
 extension User.FormCreate: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: !.empty)
+        validations.add("username", as: String.self, is: .username)
         validations.add("password", as: String.self, is: !.empty)
     }
 }
@@ -220,7 +220,7 @@ extension User.EditAdmin: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("id", as: UUID.self)
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: !.empty)
+        validations.add("username", as: String.self, is: .username)
         validations.add("isAdmin", as: Bool.self)
     }
 }
@@ -228,6 +228,6 @@ extension User.EditAdmin: Validatable {
 extension User.Edit: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: !.empty)
+        validations.add("username", as: String.self, is: .username)
     }
 }

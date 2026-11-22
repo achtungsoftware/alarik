@@ -247,6 +247,10 @@ struct InternalAuthOIDCController: RouteCollection {
             if let existingByUsername = try await User.findByUsername(
                 app: req.application, username: email)
             {
+                // Never rebind an account that already belongs to another SSO identity.
+                guard existingByUsername.oidcProviderId == nil else {
+                    return errorRedirect("account_already_linked")
+                }
                 existingByUsername.oidcProviderId = providerId
                 existingByUsername.oidcSubject = idToken.sub.value
                 try await existingByUsername.save(app: req.application)
