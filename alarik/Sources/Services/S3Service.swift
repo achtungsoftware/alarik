@@ -76,8 +76,9 @@ struct S3Service {
         // the plain key `docs` - a folder marker would be stored (and later deleted) under the
         // wrong name. The raw path still carries the slash (issue #25).
         if !key.isEmpty, req.url.path.hasSuffix("/") { key += "/" }
-        // URL-decode the key in case the client sent encoded characters
-        return key.removingPercentEncoding ?? key
+        // Already percent-decoded: RoutingKit decodes catch-all components when it matches
+        // them. Decoding again turned a literal `%20` in a key into a space.
+        return key
     }
 
     /// Existence comes from the `buckets` projection (cache, then store), NOT from the
