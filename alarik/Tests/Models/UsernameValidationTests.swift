@@ -25,17 +25,17 @@ struct UsernameValidationTests {
         !Validator<String>.username.validate(value).isFailure
     }
 
-    @Test("accepts emails and plain handles")
+    @Test("accepts emails, handles, spaces and non-ASCII letters")
     func accepts() {
-        for value in ["alice", "alice@example.com", "first.last+tag@corp.io", "a_b-c", "0x1"] {
+        for value in ["alice", "alice@example.com", "first.last+tag@corp.io", "a_b-c", "Jürgen Müller", "0x1"] {
             #expect(isValid(value), "\(value)")
         }
         #expect(isValid(String(repeating: "a", count: 128)))
     }
 
-    @Test("rejects path separators, whitespace, control characters, empty and overlong values")
+    @Test("rejects path separators, control characters, dot-prefixed, blank and overlong values")
     func rejects() {
-        let bad = ["", "a/b", "../admin", "a b", "a\nb", "a\0b", ".lead", "@lead", "ümlaut",
+        let bad = ["", "   ", "a/b", "a\\b", "../admin", ".lead", "a\nb", "a\0b", "a\tb",
                    String(repeating: "a", count: 129)]
         for value in bad {
             #expect(!isValid(value), "\(value.debugDescription)")

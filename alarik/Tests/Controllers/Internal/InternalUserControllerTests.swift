@@ -1086,7 +1086,7 @@ struct UserControllerTests {
     @Test("Usernames with path or control characters are rejected")
     func usernameCharsetEnforced() async throws {
         try await withApp { app in
-            for username in ["evil/../admin", "a b", "x\ny"] {
+            for username in ["evil/../admin", ".hidden", "x\ny"] {
                 let createDTO = User.Create(
                     name: "Bad", username: username, password: "SecurePass123!", isAdmin: false)
                 try await app.test(
@@ -1098,6 +1098,54 @@ struct UserControllerTests {
                         #expect(res.status == .badRequest, "\(username.debugDescription)")
                     })
             }
+        }
+    }
+
+    @Test("An existing username outside the rule can still edit other fields; renaming to a bad one cannot")
+    func legacyUsernameCanStillEdit() async throws {
+        try await withApp { app in
+            // Created directly, bypassing validation - an account from before the rule existed.
+            let username = "legacy user/with slash"
+            let legacy = User(
+                name: "Legacy", username: username,
+                passwordHash: try Bcrypt.hash("TestPass123!"), isAdmin: false)
+            try await legacy.create(app: app)
+
+            var token = ""
+            try await app.test(
+                .POST, "/api/v1/users/login",
+                beforeRequest: { req in
+                    try req.content.encode(["username": username, "password": "TestPass123!"])
+                },
+                afterResponse: { res async throws in
+                    #expect(res.status == .ok)
+                    token = try res.content.decode(ClientTokenResponse.self).token
+                })
+
+            let nameOnly = User.Edit(
+                name: "Still Legacy", username: username, currentPassword: nil, newPassword: nil)
+            try await app.test(
+                .PUT, "/api/v1/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(nameOnly)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .ok)
+                })
+
+            let badRename = User.Edit(
+                name: "Still Legacy", username: "other/name",
+                currentPassword: "TestPass123!", newPassword: nil)
+            try await app.test(
+                .PUT, "/api/v1/users",
+                beforeRequest: { req in
+                    req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    try req.content.encode(badRename)
+                },
+                afterResponse: { res async in
+                    #expect(res.status == .badRequest)
+                })
         }
     }
 }

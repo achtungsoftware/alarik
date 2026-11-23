@@ -32,24 +32,26 @@ extension ValidatorResults.Username: ValidatorResult {
     }
 
     public var failureDescription: String? {
-        "must be 1-128 characters: letters, digits, or @ . _ + - (starting with a letter or digit)"
+        "must be 1-128 characters with no slashes or control characters, and not start with a dot"
     }
 }
 
-private let usernameRegex: String = "^[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}$"
-
 extension Validator where T == String {
-    /// Usernames double as metadata-store ids and on-disk path segments, so the charset is a
-    /// whitelist: no `/`, whitespace or control characters, bounded length.
+    /// Usernames double as metadata-store ids and on-disk path segments. This is the minimum
+    /// that keeps them safe there, not a style rule: bounded length, no path separators, no
+    /// control characters, not dot-prefixed (hidden on disk), not blank.
     public static var username: Validator<T> {
         .init { input in
-            guard let range = input.range(of: usernameRegex, options: .regularExpression),
-                range.lowerBound == input.startIndex,
-                range.upperBound == input.endIndex
-            else {
-                return ValidatorResults.Username(isValidUsername: false)
+            let hasForbiddenCharacter = input.contains { character in
+                character == "/" || character == "\\"
+                    || character.unicodeScalars.contains {
+                        $0.properties.generalCategory == .control
+                    }
             }
-            return ValidatorResults.Username(isValidUsername: true)
+            let isValid =
+                !input.isEmpty && input.count <= 128 && !input.hasPrefix(".")
+                && !input.allSatisfy(\.isWhitespace) && !hasForbiddenCharacter
+            return ValidatorResults.Username(isValidUsername: isValid)
         }
     }
 }

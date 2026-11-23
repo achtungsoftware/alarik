@@ -59,6 +59,7 @@ struct InternalUserController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
 
         let editUser: User.Edit = try req.content.decode(User.Edit.self)
+        try User.validateUsernameChange(from: auth.user.username, to: editUser.username)
 
         // A rename is how a local account gets bound to someone else's SSO identity (OIDC
         // first-login links by username == email), so it needs the current password - checked

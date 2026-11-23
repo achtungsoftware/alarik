@@ -292,6 +292,7 @@ struct InternalAdminController: RouteCollection {
         guard let existingUser = try await User.find(app: req.application, id: editUser.id) else {
             throw Abort(.notFound, reason: "User not found")
         }
+        try User.validateUsernameChange(from: existingUser.username, to: editUser.username)
 
         // Every admin endpoint (including this one) requires an authenticated admin, so
         // stripping the last admin's status would permanently lock every admin-only action -

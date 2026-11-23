@@ -244,6 +244,11 @@ struct InternalAuthOIDCController: RouteCollection {
             guard idToken.emailVerified == true else {
                 return errorRedirect("email_not_verified")
             }
+            // The email becomes the username (and so a metadata id and path segment), so it has
+            // to pass the same rule as a username typed into the signup form.
+            guard !Validator<String>.username.validate(email).isFailure else {
+                return errorRedirect("invalid_username")
+            }
             if let existingByUsername = try await User.findByUsername(
                 app: req.application, username: email)
             {

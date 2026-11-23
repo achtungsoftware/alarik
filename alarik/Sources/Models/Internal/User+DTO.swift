@@ -59,6 +59,16 @@ final class User: @unchecked Sendable, MetadataRecord, Authenticatable {
     func verify(password: String) throws -> Bool {
         try Bcrypt.verify(password, created: self.passwordHash)
     }
+
+    /// The username rule, applied only when the name actually changes - an account created
+    /// under older, looser rules must still be able to edit its other fields.
+    static func validateUsernameChange(from current: String, to proposed: String) throws {
+        guard proposed != current else { return }
+        let result = Validator<String>.username.validate(proposed)
+        if result.isFailure {
+            throw Abort(.badRequest, reason: "username \(result.failureDescription ?? "is invalid")")
+        }
+    }
 }
 
 // MARK: - MetadataStore access
@@ -220,7 +230,7 @@ extension User.EditAdmin: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("id", as: UUID.self)
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: .username)
+        validations.add("username", as: String.self, is: !.empty)
         validations.add("isAdmin", as: Bool.self)
     }
 }
@@ -228,6 +238,6 @@ extension User.EditAdmin: Validatable {
 extension User.Edit: Validatable {
     static func validations(_ validations: inout Validations) {
         validations.add("name", as: String.self, is: !.empty)
-        validations.add("username", as: String.self, is: .username)
+        validations.add("username", as: String.self, is: !.empty)
     }
 }
