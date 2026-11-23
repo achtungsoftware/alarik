@@ -3533,4 +3533,55 @@ struct S3ControllerTests {
             #expect(!second.contains("<Key>b.txt</Key>"))
         }
     }
+
+    @Test("Conditional GET - dates compare at second precision and If-Match overrides If-Unmodified-Since")
+    func testConditionalReadHeaders() async throws {
+        let bucketName = "conditional-read-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "c.txt", content: "payload")
+
+            var lastModified = ""
+            var etag = ""
+            let head = signedHeaders(for: .HEAD, path: "/\(bucketName)/c.txt")
+            try await app.test(
+                .HEAD, "/\(bucketName)/c.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: head)
+                },
+                afterResponse: { res in
+                    lastModified = res.headers.first(name: "Last-Modified") ?? ""
+                    etag = res.headers.first(name: "ETag") ?? ""
+                })
+            #expect(!lastModified.isEmpty && !etag.isEmpty)
+
+            func get(_ conditions: [String: String]) async throws -> HTTPStatus {
+                let signed = signedHeaders(
+                    for: .GET, path: "/\(bucketName)/c.txt", additionalHeaders: conditions)
+                var status = HTTPStatus.internalServerError
+                try await app.test(
+                    .GET, "/\(bucketName)/c.txt",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        status = res.status
+                    })
+                return status
+            }
+
+            let longAgo = "Mon, 01 Jan 2001 00:00:00 GMT"
+            // Echoing Last-Modified back is the common cache-validation case: 304, not a miss
+            // on the sub-second part the header could not carry.
+            #expect(try await get(["If-Modified-Since": lastModified]) == .notModified)
+            #expect(try await get(["If-Unmodified-Since": lastModified]) == .ok)
+            #expect(try await get(["If-Modified-Since": longAgo]) == .ok)
+            #expect(try await get(["If-Unmodified-Since": longAgo]) == .preconditionFailed)
+            // If-Match true wins over a failing If-Unmodified-Since.
+            #expect(try await get(["If-Match": etag, "If-Unmodified-Since": longAgo]) == .ok)
+            // If-None-Match matching wins over a passing If-Modified-Since.
+            #expect(try await get(["If-None-Match": etag, "If-Modified-Since": longAgo]) == .notModified)
+            #expect(try await get(["If-None-Match": "\"other\""]) == .ok)
+        }
+    }
 }

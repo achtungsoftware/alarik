@@ -433,63 +433,60 @@ struct S3Service {
         return CopySource(bucketName: bucketName, key: key, versionId: versionId)
     }
 
-    /// Validates conditional copy headers against source object metadata
+    /// Validates conditional copy headers against source object metadata - the copy-source
+    /// variants of the GetObject conditions, with the same evaluation rules (see
+    /// `evaluateReadConditions`), except that every failure is `412 PreconditionFailed`.
     static func validateCopyConditions(req: Request, sourceMeta: ObjectMeta) throws {
-        let headers = req.headers
+        switch evaluateReadConditions(
+            headers: req.headers, meta: sourceMeta, headerPrefix: "x-amz-copy-source-")
+        {
+        case .proceed:
+            return
+        case .preconditionFailed, .notModified:
+            throw S3Error(
+                status: .preconditionFailed, code: "PreconditionFailed",
+                message: "At least one of the pre-conditions you specified did not hold",
+                requestId: req.id)
+        }
+    }
 
-        // x-amz-copy-source-if-match: Copy only if source ETag matches
-        if let ifMatch = headers.first(name: "x-amz-copy-source-if-match") {
-            let matches = matchesETag(ifMatch, etag: sourceMeta.etag)
-            if !matches {
-                throw S3Error(
-                    status: .preconditionFailed,
-                    code: "PreconditionFailed",
-                    message: "At least one of the pre-conditions you specified did not hold",
-                    requestId: req.id
-                )
-            }
+    enum ReadConditionOutcome {
+        case proceed
+        case preconditionFailed
+        case notModified
+    }
+
+    /// Evaluates `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` (or their
+    /// `x-amz-copy-source-` prefixed forms) the way the GetObject API reference specifies:
+    /// `If-Match` true overrides a false `If-Unmodified-Since` (200), and `If-None-Match` false
+    /// (ETag matches) yields 304 even when `If-Modified-Since` is true. Dates are compared at
+    /// whole-second precision: `Last-Modified` is served truncated to seconds, so a client
+    /// echoing it back must get 304, not a spurious miss on the sub-second remainder.
+    static func evaluateReadConditions(
+        headers: HTTPHeaders, meta: ObjectMeta, headerPrefix: String = ""
+    ) -> ReadConditionOutcome {
+        let modifiedSeconds = meta.updatedAt.timeIntervalSince1970.rounded(.down)
+        func date(_ name: String) -> Date? {
+            headers.first(name: headerPrefix + name).flatMap(Date.fromHTTPDateString)
         }
 
-        // x-amz-copy-source-if-none-match: Copy only if source ETag doesn't match
-        if let ifNoneMatch = headers.first(name: "x-amz-copy-source-if-none-match") {
-            let matches = matchesETag(ifNoneMatch, etag: sourceMeta.etag)
-            if matches {
-                throw S3Error(
-                    status: .preconditionFailed,
-                    code: "PreconditionFailed",
-                    message: "At least one of the pre-conditions you specified did not hold",
-                    requestId: req.id
-                )
-            }
+        if let ifMatch = headers.first(name: headerPrefix + "If-Match") {
+            if !matchesETag(ifMatch, etag: meta.etag) { return .preconditionFailed }
+        } else if let since = date("If-Unmodified-Since"),
+            modifiedSeconds > since.timeIntervalSince1970
+        {
+            return .preconditionFailed
         }
 
-        // x-amz-copy-source-if-modified-since: Copy only if source modified after date
-        if let ifModifiedSince = headers.first(name: "x-amz-copy-source-if-modified-since") {
-            if let sinceDate = Date.fromHTTPDateString(ifModifiedSince) {
-                if sourceMeta.updatedAt.timeIntervalSince1970 <= sinceDate.timeIntervalSince1970 {
-                    throw S3Error(
-                        status: .preconditionFailed,
-                        code: "PreconditionFailed",
-                        message: "At least one of the pre-conditions you specified did not hold",
-                        requestId: req.id
-                    )
-                }
-            }
+        if let ifNoneMatch = headers.first(name: headerPrefix + "If-None-Match") {
+            if matchesETag(ifNoneMatch, etag: meta.etag) { return .notModified }
+        } else if let since = date("If-Modified-Since"),
+            modifiedSeconds <= since.timeIntervalSince1970
+        {
+            return .notModified
         }
 
-        // x-amz-copy-source-if-unmodified-since: Copy only if source not modified after date
-        if let ifUnmodifiedSince = headers.first(name: "x-amz-copy-source-if-unmodified-since") {
-            if let sinceDate = Date.fromHTTPDateString(ifUnmodifiedSince) {
-                if sourceMeta.updatedAt.timeIntervalSince1970 > sinceDate.timeIntervalSince1970 {
-                    throw S3Error(
-                        status: .preconditionFailed,
-                        code: "PreconditionFailed",
-                        message: "At least one of the pre-conditions you specified did not hold",
-                        requestId: req.id
-                    )
-                }
-            }
-        }
+        return .proceed
     }
 
     /// Determines whether to replace or copy metadata
@@ -509,65 +506,21 @@ struct S3Service {
         return normalizeETag(trimmed) == normalizeETag(etag)
     }
 
-    /// Validates conditional request headers against object metadata
-    /// Returns true if the request should proceed, throws S3Error if precondition fails
+    /// Validates conditional request headers against object metadata for reads - throws
+    /// `412 PreconditionFailed` or `304 Not Modified`, see `evaluateReadConditions`.
     static func validateConditionalHeaders(req: Request, meta: ObjectMeta) throws {
-        let headers = req.headers
-
-        // If-Match: Return object only if ETag matches
-        if let ifMatch = headers.first(name: "If-Match") {
-            let matches = Self.matchesETag(ifMatch, etag: meta.etag)
-            if !matches {
-                throw S3Error(
-                    status: .preconditionFailed,
-                    code: "PreconditionFailed",
-                    message: "At least one of the pre-conditions you specified did not hold",
-                    requestId: req.id
-                )
-            }
-        }
-
-        // If-None-Match: Return object only if ETag doesn't match
-        if let ifNoneMatch = headers.first(name: "If-None-Match") {
-            let matches = Self.matchesETag(ifNoneMatch, etag: meta.etag)
-            if matches {
-                throw S3Error(
-                    status: .notModified,
-                    code: "NotModified",
-                    message: "Not Modified",
-                    requestId: req.id
-                )
-            }
-        }
-
-        // If-Modified-Since: Return object only if modified after this date
-        if let ifModifiedSince = headers.first(name: "If-Modified-Since") {
-            if let sinceDate = Date.fromHTTPDateString(ifModifiedSince) {
-                // S3 uses truncated seconds comparison
-                if meta.updatedAt.timeIntervalSince1970 <= sinceDate.timeIntervalSince1970 {
-                    throw S3Error(
-                        status: .notModified,
-                        code: "NotModified",
-                        message: "Not Modified",
-                        requestId: req.id
-                    )
-                }
-            }
-        }
-
-        // If-Unmodified-Since: Return object only if not modified after this date
-        if let ifUnmodifiedSince = headers.first(name: "If-Unmodified-Since") {
-            if let sinceDate = Date.fromHTTPDateString(ifUnmodifiedSince) {
-                // S3 uses truncated seconds comparison
-                if meta.updatedAt.timeIntervalSince1970 > sinceDate.timeIntervalSince1970 {
-                    throw S3Error(
-                        status: .preconditionFailed,
-                        code: "PreconditionFailed",
-                        message: "At least one of the pre-conditions you specified did not hold",
-                        requestId: req.id
-                    )
-                }
-            }
+        switch evaluateReadConditions(headers: req.headers, meta: meta) {
+        case .proceed:
+            return
+        case .preconditionFailed:
+            throw S3Error(
+                status: .preconditionFailed, code: "PreconditionFailed",
+                message: "At least one of the pre-conditions you specified did not hold",
+                requestId: req.id)
+        case .notModified:
+            throw S3Error(
+                status: .notModified, code: "NotModified", message: "Not Modified",
+                requestId: req.id)
         }
     }
 
@@ -970,8 +923,6 @@ struct S3Service {
         else {
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         }
-
-        return nil
     }
 
     static func authenticateWithDB(
