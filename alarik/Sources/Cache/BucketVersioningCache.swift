@@ -73,6 +73,8 @@ final actor BucketVersioningCache: StoreBackedCache {
 
     func loadFromStore(app: Application, key: String) async throws -> VersioningStatus? {
         guard let stored = try await Bucket.find(app: app, name: key) else { return nil }
+        // One gather warms every bucket cache - see `LoadCacheLifecycle.seedBucketCaches`.
+        await LoadCacheLifecycle.seedBucketCaches(from: stored, logger: app.logger)
         return VersioningStatus(rawValue: stored.versioningStatus) ?? .disabled
     }
 

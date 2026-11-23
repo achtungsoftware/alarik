@@ -148,6 +148,7 @@ final actor BucketPolicyCache: StoreBackedCache {
 
     func loadFromStore(app: Application, key: String) async throws -> Authorization? {
         guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        await LoadCacheLifecycle.seedBucketCaches(from: bucket, logger: app.logger)
         return Authorization(
             policy: LoadCacheLifecycle.parsedPolicy(for: bucket, logger: app.logger),
             publicAccessBlock: LoadCacheLifecycle.publicAccessBlockIfNonDefault(for: bucket))

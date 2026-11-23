@@ -127,6 +127,7 @@ final actor AccessKeyBucketMapCache: StoreBackedCache {
                 app: app, accessKey: key.accessKey)
         else { return nil }
         guard let bucket = try await Bucket.find(app: app, name: key.bucket) else { return nil }
+        await LoadCacheLifecycle.seedBucketCaches(from: bucket, logger: app.logger)
         return bucket.userId == ownerId ? true : nil
     }
 }

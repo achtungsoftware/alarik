@@ -238,7 +238,9 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     /// `gossipFanout` requests regardless of cluster size.
     @discardableResult
     private func gossipMembership(app: Application, config: ClusterConfiguration) async -> Bool {
-        let peerAddresses = await ClusterNodeCache.shared.all()
+        // `reachablePeers`, not `all`: a decommissioned node never answers, and a sample slot
+        // spent on it is a timeout per round for nothing.
+        let peerAddresses = await ClusterNodeCache.shared.reachablePeers()
             .filter { $0.id != config.nodeId }
             .map(\.address)
 

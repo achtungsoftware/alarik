@@ -67,6 +67,7 @@ final actor ReplicationConfigCache: StoreBackedCache {
 
     func loadFromStore(app: Application, key: String) async throws -> ReplicationConfiguration? {
         guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        await LoadCacheLifecycle.seedBucketCaches(from: bucket, logger: app.logger)
         return LoadCacheLifecycle.replicationConfig(for: bucket)
     }
 

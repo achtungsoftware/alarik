@@ -429,8 +429,8 @@ enum ClusterReplicationClient {
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
         do {
-            let response = try await app.http.client.shared.execute(
-                outbound, timeout: requestTimeout, logger: app.logger)
+            let response = try await LightweightClusterControlClient.shared.execute(
+                outbound, timeout: probeTimeout, logger: app.logger)
             return response.status == .ok
         } catch {
             return false

@@ -66,6 +66,7 @@ final actor NotificationConfigCache: StoreBackedCache {
 
     func loadFromStore(app: Application, key: String) async throws -> NotificationConfiguration? {
         guard let bucket = try await Bucket.find(app: app, name: key) else { return nil }
+        await LoadCacheLifecycle.seedBucketCaches(from: bucket, logger: app.logger)
         return LoadCacheLifecycle.notificationConfig(for: bucket)
     }
 

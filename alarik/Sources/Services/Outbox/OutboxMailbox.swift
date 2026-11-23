@@ -253,7 +253,7 @@ enum OutboxMailbox {
     static func enqueue<Row: OutboxMailboxRow>(app: Application, collection: String, row: Row) async {
         let selfId = selfNodeId(app: app)
         if row.ownerNodeId == selfId {
-            try? update(row, collection: collection)
+            try? store(row, collection: collection)
             return
         }
         guard let config = app.storage[ClusterConfigurationKey.self],
@@ -299,7 +299,7 @@ enum OutboxMailbox {
             }
 
             if row.ownerNodeId == selfId {
-                try? update(row, collection: collection)
+                try? store(row, collection: collection)
                 OutboxMailboxFileHandler.remove(path: spoolPath)
                 continue
             }
@@ -338,6 +338,25 @@ enum OutboxMailbox {
     /// mailbox directory. Trusts the caller's placement decision unconditionally, the same trust
     /// model every other internal cluster RPC uses (secured by `ClusterSecretMiddleware`).
     static func receiveEnqueue<Row: OutboxMailboxRow>(_ row: Row, collection: String) throws {
+        try store(row, collection: collection)
+    }
+
+    /// Files a newly enqueued row. A row whose id is derived from its identity
+    /// (`ErasureCodedReplicationTask`) may already be here: a pending one is left as it is, a
+    /// dead-lettered one is revived in place, so re-requesting the same work never stacks
+    /// duplicates and needs no look around the cluster first.
+    static func store<Row: OutboxMailboxRow>(_ row: Row, collection: String) throws {
+        if let existing = readOwned(
+            Row.self, collection: collection, ownerNodeId: row.ownerNodeId, taskId: row.id)
+        {
+            guard existing.state == .failed else { return }
+            existing.state = .pending
+            existing.attempts = 0
+            existing.nextAttemptAt = Date()
+            existing.lastError = nil
+            try update(existing, collection: collection)
+            return
+        }
         try update(row, collection: collection)
     }
 

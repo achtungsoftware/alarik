@@ -584,62 +584,21 @@ enum ErasureCodedRebalanceService {
         }
     }
 
-    /// Enqueues one `.put`/reconstruct outbox row per `(shardIndex, targetNodeId)` candidate,
-    /// deduped against rows already pending for this key (across all versions - `versionId` is part
-    /// of the identity), and clearing any dead-lettered rows so a repair can be retried. Shared by
-    /// the rank-0 gap sweep and read-repair.
+    /// Enqueues one `.put`/reconstruct outbox row per `(shardIndex, targetNodeId)` candidate.
+    /// Shared by the rank-0 gap sweep and read-repair. A row's id is its identity, so the owning
+    /// mailbox itself keeps a repeat from stacking up and revives a dead-lettered one
+    /// (`OutboxMailbox.store`) - this used to list every node's mailbox per key to find that out.
     private static func enqueueReconstructTasks(
         app: Application, bucketName: String, key: String, versionId: String?,
         candidates: [(shardIndex: Int, targetNodeId: UUID)],
         reason: ErasureCodedReplicationTask.Reason
     ) async throws {
         guard !candidates.isEmpty else { return }
-
-        // A candidate's target is whichever node ranks that shard index - could be any node in
-        // the cluster, not just this one, so "already outstanding" needs the cluster-wide fan-out
-        // (`OutboxMailbox` mailboxes are per-owner-node; a target's own pending/failed row for
-        // this repair lives on *that* node's disk, not necessarily this one's).
-        let existingTasks = await OutboxMailbox.listAllAcrossCluster(
-            ErasureCodedReplicationTask.self, app: app,
-            collection: OutboxCollections.erasureCodedReplicationTasks
-        ).filter {
-            $0.bucketName == bucketName && $0.key == key
-                && $0.operation == .put
-        }
-
-        // Dedup key includes versionId: without it, a pending task for one version of this key
-        // would suppress enqueueing the same (shardIndex, target) pair for a *different* version,
-        // silently leaving that other version's gap unfilled. `existingTasks` fetches every
-        // version's tasks for the key, so the version must be part of the identity.
-        func pairKey(_ versionId: String?, _ shardIndex: Int, _ targetNodeId: UUID) -> String {
-            "\(versionId ?? "")\u{0}\(shardIndex)\u{0}\(targetNodeId)"
-        }
-        var coveredPairs: Set<String> = []
-        for task in existingTasks {
-            let pair = pairKey(task.versionId, task.shardIndex, task.targetNodeId)
-            if task.state == .pending {
-                coveredPairs.insert(pair)
-            } else if task.state == .failed {
-                // Dead-lettered - reset it in place on its owning node via the cross-node retry
-                // RPC (rather than deleting and recreating, which would require reaching directly
-                // into a peer's mailbox directory) so a stalled repair actually gets retried.
-                let retried = await OutboxMailbox.retryAcrossCluster(
-                    ErasureCodedReplicationTask.self, app: app,
-                    collection: OutboxCollections.erasureCodedReplicationTasks, taskId: task.id)
-                if retried { coveredPairs.insert(pair) }
-            }
-        }
-
-        let newTasks = candidates
-            .filter { !coveredPairs.contains(pairKey(versionId, $0.shardIndex, $0.targetNodeId)) }
-            .map { candidate in
-                ErasureCodedReplicationTask(
-                    bucketName: bucketName, key: key, versionId: versionId,
-                    shardIndex: candidate.shardIndex, operation: .put,
-                    targetNodeId: candidate.targetNodeId, reason: reason)
-            }
-        guard !newTasks.isEmpty else { return }
-        for task in newTasks {
+        for candidate in candidates {
+            let task = ErasureCodedReplicationTask(
+                bucketName: bucketName, key: key, versionId: versionId,
+                shardIndex: candidate.shardIndex, operation: .put,
+                targetNodeId: candidate.targetNodeId, reason: reason)
             await OutboxMailbox.enqueue(
                 app: app, collection: OutboxCollections.erasureCodedReplicationTasks, row: task)
         }

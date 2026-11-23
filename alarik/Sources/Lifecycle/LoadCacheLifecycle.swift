@@ -182,43 +182,9 @@ final class LoadCacheLifecycle: LifecycleHandler {
             await AccessKeyBucketMapCache.shared.add(accessKey: accessKey, bucketName: bucketName)
         }
 
-        // Bucket versioning status - upsert only, see the doc comment above.
+        // Every bucket cache from each record - upsert only, see the doc comment above.
         for bucket in allBuckets {
-            let status = VersioningStatus(rawValue: bucket.versioningStatus) ?? .disabled
-            await BucketVersioningCache.shared.addBucket(bucket.name, versioningStatus: status)
-        }
-
-        // Bucket policy and public access block, in one pass over the buckets (each is parsed
-        // once, and buckets with neither are recorded as such so the anonymous request path can
-        // answer "nothing set" from cache rather than paying a store read per bucket to
-        // rediscover it after every restart). A policy that fails to re-validate is skipped, not
-        // crashed on, since it should always have been valid when it was saved.
-        for bucket in allBuckets {
-            let policy = parsedPolicy(for: bucket, logger: app.logger)
-            let publicAccessBlock = publicAccessBlockIfNonDefault(for: bucket)
-
-            if let policy {
-                await BucketPolicyCache.shared.setPolicy(for: bucket.name, policy: policy)
-            }
-            if let publicAccessBlock {
-                await BucketPolicyCache.shared.setPublicAccessBlock(
-                    for: bucket.name, configuration: publicAccessBlock)
-            }
-            if policy == nil, publicAccessBlock == nil {
-                await BucketPolicyCache.shared.markWithoutAuthorization(bucket.name)
-            }
-        }
-
-        // Notification (webhook) configuration
-        for bucket in allBuckets {
-            guard let config = notificationConfig(for: bucket) else { continue }
-            await NotificationConfigCache.shared.setConfig(for: bucket.name, config: config)
-        }
-
-        // Replication configuration
-        for bucket in allBuckets {
-            guard let config = replicationConfig(for: bucket) else { continue }
-            await ReplicationConfigCache.shared.setConfig(for: bucket.name, config: config)
+            await seedBucketCaches(from: bucket, logger: app.logger)
         }
 
         // Removal reconciliation - the upsert-only loads above can never DROP an entry, which
@@ -283,6 +249,38 @@ final class LoadCacheLifecycle: LifecycleHandler {
     }
 
     // MARK: - Per-bucket mappers
+
+    /// Fills every bucket cache from one record. Also what a cache miss uses: whichever bucket
+    /// cache missed first has paid for the cluster-wide read, so its siblings take the same
+    /// record instead of each paying again on the next request - a cold bucket used to cost one
+    /// gather per cache (versioning, policy, notifications, replication) before any of them
+    /// warmed. Buckets with neither policy nor public-access block are recorded as such, so the
+    /// anonymous request path answers "nothing set" from cache. A policy that fails to
+    /// re-validate is skipped, not crashed on, since it was valid when it was saved.
+    static func seedBucketCaches(from bucket: Bucket, logger: Logger) async {
+        await BucketVersioningCache.shared.setStatus(
+            for: bucket.name, status: VersioningStatus(rawValue: bucket.versioningStatus) ?? .disabled)
+
+        let policy = parsedPolicy(for: bucket, logger: logger)
+        let publicAccessBlock = publicAccessBlockIfNonDefault(for: bucket)
+        if let policy {
+            await BucketPolicyCache.shared.setPolicy(for: bucket.name, policy: policy)
+        }
+        if let publicAccessBlock {
+            await BucketPolicyCache.shared.setPublicAccessBlock(
+                for: bucket.name, configuration: publicAccessBlock)
+        }
+        if policy == nil, publicAccessBlock == nil {
+            await BucketPolicyCache.shared.markWithoutAuthorization(bucket.name)
+        }
+
+        if let config = notificationConfig(for: bucket) {
+            await NotificationConfigCache.shared.setConfig(for: bucket.name, config: config)
+        }
+        if let config = replicationConfig(for: bucket) {
+            await ReplicationConfigCache.shared.setConfig(for: bucket.name, config: config)
+        }
+    }
 
     /// Shared by the bulk load above and `CacheReloadDispatch`'s single-item reload, so the two
     /// paths can never drift apart on what a stored JSON policy actually decodes to. Returns
