@@ -171,6 +171,11 @@ public func configure(_ app: Application) async throws {
         connect: .seconds(5), read: .seconds(10))
     
     app.http.client.configuration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 256
+    // A refused connection is final: the client's default re-dials a dead peer with backoff
+    // (about 5.6s before the first error surfaces), which put every write with a down replica
+    // within a hair of the 10s synchronous forward timeout. Failing at once lets the outbox
+    // take over immediately.
+    app.http.client.configuration.connectionPool.retryConnectionEstablishment = false
 
     // Idempotent (see DefaultUserSeed.swift's doc comment) - safe to run on every boot, not
     // just the first one, now that there's no migration-tracking table to gate it on. Gated to

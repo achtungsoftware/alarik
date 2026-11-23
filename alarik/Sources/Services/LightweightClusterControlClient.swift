@@ -31,6 +31,8 @@ enum LightweightClusterControlClient {
         configuration.timeout = .init(connect: .milliseconds(500), read: .seconds(2))
         configuration.connectionPool = .init(
             idleTimeout: .seconds(30), concurrentHTTP1ConnectionsPerHostSoftLimit: 64)
+        // Control-plane probes must learn "down" in milliseconds, not after a dial-retry loop.
+        configuration.connectionPool.retryConnectionEstablishment = false
         return HTTPClient(
             eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
             configuration: configuration)
