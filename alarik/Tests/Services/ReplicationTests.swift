@@ -150,11 +150,11 @@ struct ReplicationTests {
             .PUT, "/api/v1/buckets/\(bucketName)/replication/targets",
             beforeRequest: { req in
                 req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                try req.content.encode(InternalBucketController.ReplicationTargetsDTO(targets: targets))
+                try req.content.encode(InternalBucketReplicationController.ReplicationTargetsDTO(targets: targets))
             },
             afterResponse: { res async throws in
                 #expect(res.status == .ok)
-                saved = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                saved = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     .targets
             })
         return saved
@@ -169,12 +169,12 @@ struct ReplicationTests {
             .PUT, "/api/v1/buckets/\(bucketName)/replication/rules",
             beforeRequest: { req in
                 req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                try req.content.encode(InternalBucketController.ReplicationRulesDTO(rules: rules))
+                try req.content.encode(InternalBucketReplicationController.ReplicationRulesDTO(rules: rules))
             },
             afterResponse: { res async throws in
                 #expect(res.status == expectedStatus)
                 if expectedStatus == .ok {
-                    saved = try res.content.decode(InternalBucketController.ReplicationRulesDTO.self)
+                    saved = try res.content.decode(InternalBucketReplicationController.ReplicationRulesDTO.self)
                         .rules
                 }
             })
@@ -552,7 +552,7 @@ struct ReplicationTests {
                 .PUT, "/api/v1/buckets/user-repl-bucket/replication/targets",
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
-                    try req.content.encode(InternalBucketController.ReplicationTargetsDTO(targets: [target]))
+                    try req.content.encode(InternalBucketReplicationController.ReplicationTargetsDTO(targets: [target]))
                 },
                 afterResponse: { res async in
                     #expect(res.status == .forbidden)
@@ -601,7 +601,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     #expect(dto.targets.isEmpty)
                 })
 
@@ -612,7 +612,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationRulesDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationRulesDTO.self)
                     #expect(dto.rules.isEmpty)
                 })
 
@@ -627,7 +627,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     #expect(dto.targets.map(\.id) == [target.id])
                     #expect(dto.targets.first?.endpoint == baseURL)
                 })
@@ -639,7 +639,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationRulesDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationRulesDTO.self)
                     #expect(dto.rules.map(\.id) == [rule.id])
                 })
         }
@@ -664,7 +664,7 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: [target]))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: [target]))
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
@@ -672,7 +672,7 @@ struct ReplicationTests {
                     // must not contain the real secret either.
                     let bodyString = String(buffer: res.body)
                     #expect(!bodyString.contains("super-secret-value"))
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     savedId = dto.targets.first?.id
                     #expect(dto.targets.first?.secretAccessKey != "super-secret-value")
                     #expect(dto.targets.first?.secretAccessKey.isEmpty == false)
@@ -690,7 +690,7 @@ struct ReplicationTests {
                     #expect(res.status == .ok)
                     let bodyString = String(buffer: res.body)
                     #expect(!bodyString.contains("super-secret-value"))
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     maskedSecret = dto.targets.first?.secretAccessKey
                 })
 
@@ -707,11 +707,11 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: [editedTarget]))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: [editedTarget]))
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTargetsDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTargetsDTO.self)
                     #expect(dto.targets.first?.enabled == false)
                 })
 
@@ -740,7 +740,7 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: targets))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: targets))
                 },
                 afterResponse: { res async in #expect(res.status == .badRequest) })
         }
@@ -787,7 +787,7 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: [badTarget]))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: [badTarget]))
                 },
                 afterResponse: { res async in #expect(res.status == .badRequest) })
 
@@ -800,7 +800,7 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: [badTarget]))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: [badTarget]))
                 },
                 afterResponse: { res async in #expect(res.status == .badRequest) })
 
@@ -813,7 +813,7 @@ struct ReplicationTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ReplicationTargetsDTO(targets: [badTarget]))
+                        InternalBucketReplicationController.ReplicationTargetsDTO(targets: [badTarget]))
                 },
                 afterResponse: { res async in #expect(res.status == .badRequest) })
         }
@@ -893,7 +893,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTasksDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTasksDTO.self)
                     let task = try #require(dto.tasks.first)
                     #expect(task.state == "pending")
                     #expect(task.key == "a.txt")
@@ -950,7 +950,7 @@ struct ReplicationTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ReplicationTaskDTO.self)
+                    let dto = try res.content.decode(InternalBucketReplicationController.ReplicationTaskDTO.self)
                     #expect(dto.state == "pending")
                     #expect(dto.attempts == 0)
                 })

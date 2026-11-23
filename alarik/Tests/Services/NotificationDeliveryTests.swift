@@ -361,7 +361,7 @@ struct NotificationDeliveryTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.NotificationConfigDTO.self)
                     #expect(dto.rules.count == 1)
                     // Server assigned a real id
                     #expect(dto.rules[0].id != NotificationRule.zeroUUID)
@@ -374,7 +374,7 @@ struct NotificationDeliveryTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.NotificationConfigDTO.self)
                     #expect(dto.rules.count == 1)
                     #expect(dto.rules[0].url == "https://example.com/h")
                 })
@@ -410,7 +410,7 @@ struct NotificationDeliveryTests {
                     // body, not just that GET is sanitized.
                     let bodyString = String(buffer: res.body)
                     #expect(!bodyString.contains("super-secret-value"))
-                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.NotificationConfigDTO.self)
                     ruleId = dto.rules.first?.id
                     #expect(dto.rules.first?.secret != nil)
                     #expect(dto.rules.first?.secret != "super-secret-value")
@@ -427,7 +427,7 @@ struct NotificationDeliveryTests {
                     #expect(res.status == .ok)
                     let bodyString = String(buffer: res.body)
                     #expect(!bodyString.contains("super-secret-value"))
-                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.NotificationConfigDTO.self)
                     #expect(dto.rules.first?.secret != nil)
                 })
 
@@ -447,7 +447,7 @@ struct NotificationDeliveryTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.NotificationConfigDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.NotificationConfigDTO.self)
                     #expect(dto.rules.first?.enabled == false)
                 })
 
@@ -598,7 +598,7 @@ struct NotificationDeliveryTests {
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
                     let dto = try res.content.decode(
-                        InternalBucketController.DeliveriesDTO.self)
+                        InternalBucketNotificationController.DeliveriesDTO.self)
                     let delivery = try #require(dto.deliveries.first)
                     #expect(delivery.state == "pending")
                     #expect(delivery.attempts >= 1)
@@ -656,7 +656,7 @@ struct NotificationDeliveryTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.DeliveryDTO.self)
+                    let dto = try res.content.decode(InternalBucketNotificationController.DeliveryDTO.self)
                     #expect(dto.state == "pending")
                     #expect(dto.attempts == 0)
                 })

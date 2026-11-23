@@ -32,6 +32,12 @@ func routes(_ app: Application) throws {
     try apiV1.grouped(InternalAuthenticator()).register(
         collection: InternalAdminOIDCProviderController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBucketController())
+    try apiV1.grouped(InternalAuthenticator()).register(collection: InternalObjectController())
+    try apiV1.grouped(InternalAuthenticator()).register(collection: InternalSharedLinkController())
+    try apiV1.grouped(InternalAuthenticator()).register(
+        collection: InternalBucketNotificationController())
+    try apiV1.grouped(InternalAuthenticator()).register(
+        collection: InternalBucketReplicationController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalClusterController())
 
     // Public, unauthenticated shared-file links - kept under /api/v1 (ungrouped, so no

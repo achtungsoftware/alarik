@@ -662,7 +662,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.StatsDTO.self)
+                    let dto = try res.content.decode(InternalObjectController.StatsDTO.self)
                     #expect(dto.objectCount == 2)
                     #expect(dto.sizeBytes >= 15)
                 })
@@ -685,7 +685,7 @@ struct InternalBucketControllerTests {
                     },
                     afterResponse: { res async throws in
                         #expect(res.status == .ok)
-                        count = try res.content.decode(InternalBucketController.StatsDTO.self).objectCount
+                        count = try res.content.decode(InternalObjectController.StatsDTO.self).objectCount
                     })
                 return count
             }
@@ -722,7 +722,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.StatsDTO.self)
+                    let dto = try res.content.decode(InternalObjectController.StatsDTO.self)
                     #expect(dto.objectCount == 2)
                 })
         }
@@ -4044,13 +4044,13 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-bucket", key: "file.txt", expiresInSeconds: 3600))
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
                     let dto = try res.content.decode(
-                        InternalBucketController.ShareResponseDTO.self)
+                        InternalSharedLinkController.ShareResponseDTO.self)
                     #expect(dto.url.contains("/api/v1/shared/"))
                     // No credential of any kind should appear in the link
                     #expect(!dto.url.contains("share-bucket"))
@@ -4096,7 +4096,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-versioned-bucket", key: "file.txt",
                             expiresInSeconds: 3600))
                 },
@@ -4120,13 +4120,13 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-bucket", key: "file.txt", expiresInSeconds: nil))
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
                     let dto = try res.content.decode(
-                        InternalBucketController.ShareResponseDTO.self)
+                        InternalSharedLinkController.ShareResponseDTO.self)
                     #expect(dto.expiresAt == nil)
                     shareURL = dto.url
                 })
@@ -4166,7 +4166,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-bucket", key: "file.txt", expiresInSeconds: 604_801))
                 },
                 afterResponse: { res async in
@@ -4186,7 +4186,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-bucket", key: "does-not-exist.txt",
                             expiresInSeconds: 3600))
                 },
@@ -4213,7 +4213,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: otherToken)
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-owner-bucket", key: "file.txt", expiresInSeconds: 3600)
                     )
                 },
@@ -4230,7 +4230,7 @@ struct InternalBucketControllerTests {
                 .POST, "/api/v1/objects/share",
                 beforeRequest: { req in
                     try req.content.encode(
-                        InternalBucketController.ShareRequestDTO(
+                        InternalSharedLinkController.ShareRequestDTO(
                             bucket: "share-bucket", key: "file.txt", expiresInSeconds: 3600))
                 },
                 afterResponse: { res async in
@@ -4241,19 +4241,19 @@ struct InternalBucketControllerTests {
 
     private func createSharedLink(
         _ app: Application, token: String, bucket: String, key: String
-    ) async throws -> InternalBucketController.ShareResponseDTO {
-        var dto: InternalBucketController.ShareResponseDTO?
+    ) async throws -> InternalSharedLinkController.ShareResponseDTO {
+        var dto: InternalSharedLinkController.ShareResponseDTO?
         try await app.test(
             .POST, "/api/v1/objects/share",
             beforeRequest: { req in
                 req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 try req.content.encode(
-                    InternalBucketController.ShareRequestDTO(
+                    InternalSharedLinkController.ShareRequestDTO(
                         bucket: bucket, key: key, expiresInSeconds: 3600))
             },
             afterResponse: { res async throws in
                 #expect(res.status == .ok)
-                dto = try res.content.decode(InternalBucketController.ShareResponseDTO.self)
+                dto = try res.content.decode(InternalSharedLinkController.ShareResponseDTO.self)
             })
         return dto!
     }
@@ -4407,7 +4407,7 @@ struct InternalBucketControllerTests {
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    let dto = try res.content.decode(InternalObjectController.ObjectMetadataDTO.self)
                     #expect(dto.contentType == "text/plain")
                     #expect(dto.metadata.isEmpty)
                 })
@@ -4427,12 +4427,12 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ObjectMetadataDTO(
+                        InternalObjectController.ObjectMetadataDTO(
                             contentType: "application/json", metadata: ["Author": "julian"]))
                 },
                 afterResponse: { res async throws in
                     #expect(res.status == .ok)
-                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    let dto = try res.content.decode(InternalObjectController.ObjectMetadataDTO.self)
                     #expect(dto.contentType == "application/json")
                     // Keys are lowercased, matching x-amz-meta-* normalization on the S3 path
                     #expect(dto.metadata == ["author": "julian"])
@@ -4444,7 +4444,7 @@ struct InternalBucketControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    let dto = try res.content.decode(InternalBucketController.ObjectMetadataDTO.self)
+                    let dto = try res.content.decode(InternalObjectController.ObjectMetadataDTO.self)
                     #expect(dto.contentType == "application/json")
                     #expect(dto.metadata == ["author": "julian"])
                 })
@@ -4476,7 +4476,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ObjectMetadataDTO(contentType: "  ", metadata: [:]))
+                        InternalObjectController.ObjectMetadataDTO(contentType: "  ", metadata: [:]))
                 },
                 afterResponse: { res async in
                     #expect(res.status == .badRequest)
@@ -4495,7 +4495,7 @@ struct InternalBucketControllerTests {
                 beforeRequest: { req in
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                     try req.content.encode(
-                        InternalBucketController.ObjectMetadataDTO(
+                        InternalObjectController.ObjectMetadataDTO(
                             contentType: "text/plain", metadata: [:]))
                 },
                 afterResponse: { res async in
@@ -4517,7 +4517,7 @@ struct InternalBucketControllerTests {
                 .PUT, "/api/v1/objects/metadata?bucket=meta-bucket&key=file.txt",
                 beforeRequest: { req in
                     try req.content.encode(
-                        InternalBucketController.ObjectMetadataDTO(
+                        InternalObjectController.ObjectMetadataDTO(
                             contentType: "text/plain", metadata: [:]))
                 },
                 afterResponse: { res async in

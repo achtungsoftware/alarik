@@ -1150,7 +1150,7 @@ struct S3Controller: RouteCollection {
     }
 
     /// Shared in-place metadata rewrite for tagging PUT/DELETE and the admin console's metadata
-    /// editor (`InternalBucketController.setObjectMetadata`): EC-aware first (checked directly
+    /// editor (`InternalObjectController.setObjectMetadata`): EC-aware first (checked directly
     /// against local disk, like GET/DELETE's own EC detection), falling through to the plain
     /// `.obj` `ObjectFileHandler.rewriteMetadata` + best-effort peer push unchanged when the
     /// target isn't erasure-coded. `static`, not instance-private - `S3Controller` has no stored
@@ -2423,7 +2423,7 @@ struct S3Controller: RouteCollection {
     /// Assembles a multipart upload into the final object and runs every post-write side effect
     /// (notification, bucket replication, cluster replication). Shared by the S3
     /// CompleteMultipartUpload handler and the console's chunked upload
-    /// (`InternalBucketController.completeMultipartUpload`, issue #21) so both produce an
+    /// (`InternalObjectController.completeMultipartUpload`, issue #21) so both produce an
     /// identical object. Must run on the upload's rank-0 node (see `multipartRoutingDecision`);
     /// every request in the upload's lifecycle already landed there, so EC eligibility can be
     /// checked fresh without extra forwarding. Part/order problems surface as the `NSError`s
