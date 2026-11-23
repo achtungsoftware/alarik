@@ -21,7 +21,10 @@ import Vapor
 /// scheduled task closure in configure.swift) so tests can trigger a sweep directly instead of
 /// waiting for the real once-an-hour interval.
 struct LifecycleService {
-    static func runSweep(app: Application) async throws {
+    /// `pageSize` is how many keys each listing step examines; the sweeps page through the
+    /// whole bucket regardless (a single 10 000-key page used to leave everything past it
+    /// unexpired forever). Parameterised for tests.
+    static func runSweep(app: Application, pageSize: Int = 1000) async throws {
         let buckets = await Bucket.all(app: app)
 
         for bucket in buckets {
@@ -30,23 +33,30 @@ struct LifecycleService {
 
             let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: app, bucket: bucket.name)
 
-            for rule in enabledRules {
-                if let expirationDays = rule.expirationDays {
-                    try await expireCurrentObjects(
-                        bucketName: bucket.name, prefix: rule.prefix, days: expirationDays,
-                        versioningStatus: versioningStatus, app: app)
-                }
+            // One bucket's failure (a peer down mid-delete, a corrupt header) must not stop the
+            // sweep for every bucket after it.
+            do {
+                for rule in enabledRules {
+                    if let expirationDays = rule.expirationDays {
+                        try await expireCurrentObjects(
+                            bucketName: bucket.name, prefix: rule.prefix, days: expirationDays,
+                            versioningStatus: versioningStatus, pageSize: pageSize, app: app)
+                    }
 
-                if let noncurrentDays = rule.noncurrentVersionExpirationDays {
-                    try await expireNoncurrentVersions(
-                        bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays,
-                        app: app)
-                }
+                    if let noncurrentDays = rule.noncurrentVersionExpirationDays {
+                        try await expireNoncurrentVersions(
+                            bucketName: bucket.name, prefix: rule.prefix, days: noncurrentDays,
+                            pageSize: pageSize, app: app)
+                    }
 
-                if let abortDays = rule.abortIncompleteMultipartUploadDays {
-                    try await abortStaleMultipartUploads(
-                        bucketName: bucket.name, prefix: rule.prefix, days: abortDays, app: app)
+                    if let abortDays = rule.abortIncompleteMultipartUploadDays {
+                        try await abortStaleMultipartUploads(
+                            bucketName: bucket.name, prefix: rule.prefix, days: abortDays,
+                            pageSize: pageSize, app: app)
+                    }
                 }
+            } catch {
+                app.logger.error("Lifecycle sweep failed for bucket '\(bucket.name)': \(error)")
             }
         }
     }
@@ -56,38 +66,44 @@ struct LifecycleService {
     /// identical to a normal DELETE request, matching S3's lifecycle Expiration behavior.
     private static func expireCurrentObjects(
         bucketName: String, prefix: String, days: Int, versioningStatus: VersioningStatus,
-        app: Application
+        pageSize: Int, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
-        let (objects, _, _, _) = try ObjectFileHandler.listObjects(
-            bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
         // Membership is read once for the whole sweep, not per object - the active set doesn't
         // meaningfully change within a single pass, and re-reading it per key would both add
         // thousands of redundant actor hops and let placement decisions drift mid-sweep.
         let clusterContext = await clusterContext(app: app)
 
-        for object in objects where object.updatedAt <= cutoff {
-            // Every replica runs its own sweep independently and would otherwise all race to
-            // expire the same object - gating on "am I the primary (rank-0) responsible node"
-            // means exactly one node acts. Being primary implies holding a local replica, so
-            // this node's own local listing above already covers every key it's primary for.
-            let (isPrimary, peers) = primaryAuthority(
-                context: clusterContext, bucketName: bucketName, key: object.key)
-            guard isPrimary else { continue }
+        var marker: String?
+        repeat {
+            let (objects, _, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+                bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: pageSize,
+                marker: marker)
+            marker = isTruncated ? nextMarker : nil
 
-            let outcome = try await ClusterReplicationService.coordinateDelete(
-                app: app, bucketName: bucketName, key: object.key, versionId: nil,
-                versioningStatus: versioningStatus, peers: peers)
+            for object in objects where object.updatedAt <= cutoff {
+                // Every replica runs its own sweep independently and would otherwise all race to
+                // expire the same object - gating on "am I the primary (rank-0) responsible node"
+                // means exactly one node acts. Being primary implies holding a local replica, so
+                // this node's own local listing above already covers every key it's primary for.
+                let (isPrimary, peers) = primaryAuthority(
+                    context: clusterContext, bucketName: bucketName, key: object.key)
+                guard isPrimary else { continue }
 
-            await NotificationService.emit(
-                event: outcome.isDeleteMarker
-                    ? .lifecycleExpirationDeleteMarkerCreated : .lifecycleExpirationDelete,
-                bucketName: bucketName, key: object.key, size: nil, etag: nil,
-                versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, app: app)
-            await ReplicationService.enqueueDelete(
-                app: app, bucketName: bucketName, key: object.key, versionId: outcome.versionId)
-        }
+                let outcome = try await ClusterReplicationService.coordinateDelete(
+                    app: app, bucketName: bucketName, key: object.key, versionId: nil,
+                    versioningStatus: versioningStatus, peers: peers)
+
+                await NotificationService.emit(
+                    event: outcome.isDeleteMarker
+                        ? .lifecycleExpirationDeleteMarkerCreated : .lifecycleExpirationDelete,
+                    bucketName: bucketName, key: object.key, size: nil, etag: nil,
+                    versionId: outcome.versionId, requestId: UUID().uuidString, sourceIP: nil, app: app)
+                await ReplicationService.enqueueDelete(
+                    app: app, bucketName: bucketName, key: object.key, versionId: outcome.versionId)
+            }
+        } while marker != nil
     }
 
     /// NoncurrentVersionExpiration - permanently deletes noncurrent versions that have been
@@ -96,13 +112,24 @@ struct LifecycleService {
     /// the chain (the version that superseded them) - the closest equivalent derivable from the
     /// existing storage format.
     private static func expireNoncurrentVersions(
-        bucketName: String, prefix: String, days: Int, app: Application
+        bucketName: String, prefix: String, days: Int, pageSize: Int, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
-        let (versions, deleteMarkers, _, _, _, _) = try ObjectFileHandler.listAllVersions(
-            bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: 10000)
 
-        let keys = Set(versions.map(\.key) + deleteMarkers.map(\.key))
+        // Every key with any version under the prefix, across all pages.
+        var keys = Set<String>()
+        var keyMarker: String?
+        var versionIdMarker: String?
+        repeat {
+            let (versions, deleteMarkers, _, isTruncated, nextKeyMarker, nextVersionIdMarker) =
+                try ObjectFileHandler.listAllVersions(
+                    bucketName: bucketName, prefix: prefix, delimiter: nil, keyMarker: keyMarker,
+                    versionIdMarker: versionIdMarker, maxKeys: pageSize)
+            keys.formUnion(versions.map(\.key))
+            keys.formUnion(deleteMarkers.map(\.key))
+            keyMarker = isTruncated ? nextKeyMarker : nil
+            versionIdMarker = isTruncated ? nextVersionIdMarker : nil
+        } while keyMarker != nil
 
         // Read membership once for the whole sweep - see expireCurrentObjects.
         let clusterContext = await clusterContext(app: app)
@@ -179,17 +206,26 @@ struct LifecycleService {
     /// replicate an abort to. An upload whose owning node is permanently lost never gets swept,
     /// the same tradeoff every other primary-pinned multipart operation already accepts.
     private static func abortStaleMultipartUploads(
-        bucketName: String, prefix: String, days: Int, app: Application
+        bucketName: String, prefix: String, days: Int, pageSize: Int, app: Application
     ) async throws {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
-        let (uploads, _, _, _) = try MultipartFileHandler.listUploads(
-            bucketName: bucketName, prefix: prefix, maxUploads: 10000)
 
-        for upload in uploads where upload.initiated <= cutoff {
-            try await S3Service.offloadBlockingIO(app) {
-                try MultipartFileHandler.abortUpload(
-                    bucketName: bucketName, uploadId: upload.uploadId)
+        var keyMarker: String?
+        var uploadIdMarker: String?
+        repeat {
+            let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
+                try MultipartFileHandler.listUploads(
+                    bucketName: bucketName, prefix: prefix, keyMarker: keyMarker,
+                    uploadIdMarker: uploadIdMarker, maxUploads: pageSize)
+            keyMarker = isTruncated ? nextKeyMarker : nil
+            uploadIdMarker = isTruncated ? nextUploadIdMarker : nil
+
+            for upload in uploads where upload.initiated <= cutoff {
+                try await S3Service.offloadBlockingIO(app) {
+                    try MultipartFileHandler.abortUpload(
+                        bucketName: bucketName, uploadId: upload.uploadId)
+                }
             }
-        }
+        } while keyMarker != nil
     }
 }

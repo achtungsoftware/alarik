@@ -365,4 +365,22 @@ struct LifecycleServiceTests {
                 bucketName: "lifecycle-mpu-fresh-bucket", uploadId: uploadId))
         }
     }
+
+    @Test("runSweep - Expiration pages through every key, not just the first listing page")
+    func testExpirationPagesThroughAllKeys() async throws {
+        try await withApp { app in
+            try await createBucketWithRules(
+                app, name: "lifecycle-paging",
+                rules: [LifecycleRule(id: "all", enabled: true, prefix: "", expirationDays: 1)])
+            for i in 0..<7 {
+                try writeObject(bucketName: "lifecycle-paging", key: "old-\(i).txt", daysOld: 3)
+            }
+            try writeObject(bucketName: "lifecycle-paging", key: "fresh.txt", daysOld: 0)
+
+            try await LifecycleService.runSweep(app: app, pageSize: 2)
+
+            let (remaining, _, _, _) = try ObjectFileHandler.listObjects(bucketName: "lifecycle-paging")
+            #expect(remaining.map(\.key) == ["fresh.txt"])
+        }
+    }
 }
