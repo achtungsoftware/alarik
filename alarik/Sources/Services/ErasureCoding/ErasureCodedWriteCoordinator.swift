@@ -187,12 +187,17 @@ enum ErasureCodedWriteCoordinator {
     ) async {
         if let stagingToken {
             // Staged write: nothing is in place anywhere, so the previous generation is intact.
-            // Only the stages on peers that received a shard need dropping.
+            // Stages on peers that acked are dropped synchronously; a peer that timed out may
+            // hold one too, but is probably down, so that discard is detached (see commitStaged).
             await withTaskGroup(of: Void.self) { group in
-                for (offset, peer) in peers.enumerated() where delivered.contains(offset + 1) {
-                    group.addTask {
-                        await ClusterReplicationClient.discardStagedShards(
-                            app: app, to: peer, token: stagingToken)
+                for (offset, peer) in peers.enumerated() {
+                    if delivered.contains(offset + 1) {
+                        group.addTask {
+                            await ClusterReplicationClient.discardStagedShards(
+                                app: app, to: peer, token: stagingToken)
+                        }
+                    } else {
+                        Task { await ClusterReplicationClient.discardStagedShards(app: app, to: peer, token: stagingToken) }
                     }
                 }
             }
