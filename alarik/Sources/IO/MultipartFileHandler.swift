@@ -80,7 +80,8 @@ struct MultipartFileHandler {
         metadata: [String: String] = [:],
         checksumAlgorithm: String? = nil,
         checksumType: String? = nil,
-        httpHeaders: [String: String]? = nil
+        httpHeaders: [String: String]? = nil,
+        replicationStatus: String? = nil
     ) throws -> String {
         let uploadId = generateUploadId()
         let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
@@ -101,7 +102,8 @@ struct MultipartFileHandler {
             initiated: Date(),
             checksumAlgorithm: checksumAlgorithm,
             checksumType: checksumType,
-            httpHeaders: httpHeaders
+            httpHeaders: httpHeaders,
+            replicationStatus: replicationStatus
         )
 
         try writeAtomically(
@@ -451,6 +453,7 @@ struct MultipartFileHandler {
         // serve one part's byte range, checksummed or not.
         objectMeta.parts = partDetails
         objectMeta.httpHeaders = uploadMeta.httpHeaders
+        objectMeta.replicationStatus = uploadMeta.replicationStatus
 
         // Object checksum: only when the upload pinned an algorithm at Create and every part
         // carried a checksum (a single missing one makes it unverifiable, so we store none rather

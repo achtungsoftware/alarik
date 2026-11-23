@@ -4232,4 +4232,47 @@ struct S3ControllerTests {
                 afterResponse: { res in #expect(res.status == .ok) })
         }
     }
+
+    @Test("a write that arrives through bucket replication is stored as a replica and reports it")
+    func testReplicationWriteIsMarkedReplica() async throws {
+        let bucketName = "replica-mark-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            func put(_ key: String, replicated: Bool) async throws {
+                let data = Data("x".utf8)
+                let extra = replicated ? [S3Service.replicationSourceHeader: "other-bucket"] : [:]
+                let signed = signedHeaders(
+                    for: .PUT, path: "/\(bucketName)/\(key)", body: data, additionalHeaders: extra)
+                try await app.test(
+                    .PUT, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                        for (name, value) in extra { req.headers.replaceOrAdd(name: name, value: value) }
+                        req.body = ByteBuffer(data: data)
+                    },
+                    afterResponse: { res in #expect(res.status == .ok) })
+            }
+            func head(_ key: String) async throws -> String? {
+                var status: String?
+                let signed = signedHeaders(for: .HEAD, path: "/\(bucketName)/\(key)")
+                try await app.test(
+                    .HEAD, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        status = res.headers.first(name: "x-amz-replication-status")
+                    })
+                return status
+            }
+
+            try await put("replica.txt", replicated: true)
+            try await put("original.txt", replicated: false)
+            #expect(try await head("replica.txt") == "REPLICA")
+            #expect(try await head("original.txt") == nil)
+            let stored = try #require(
+                try ObjectFileHandler.readCurrentObject(bucketName: bucketName, key: "replica.txt", loadData: false))
+            #expect(stored.meta.replicationStatus == "REPLICA")
+        }
+    }
 }

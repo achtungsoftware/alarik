@@ -74,6 +74,20 @@ struct S3Service {
         return bucketName
     }
 
+    /// Header a replicating Alarik sends with every request to its target (`ReplicationClient`),
+    /// carrying the source bucket's name.
+    static let replicationSourceHeader = "x-alarik-replication-source"
+    /// `ObjectMeta.replicationStatus` of a version that arrived through bucket replication.
+    static let replicaStatus = "REPLICA"
+
+    /// Whether this write or delete was issued by another Alarik's bucket replication. Such a
+    /// change is stored as a replica and never replicated onward: two buckets replicating to
+    /// each other would otherwise bounce every version back and forth forever. Any client may
+    /// set the header; all it can do is keep the caller's own write from being replicated.
+    static func isReplicationWrite(_ req: Request) -> Bool {
+        req.headers.first(name: replicationSourceHeader) != nil
+    }
+
     /// The object key of the request, checked against `ObjectKeyValidation` before any handler
     /// turns it into a path.
     static func extractObjectKey(from req: Request) throws -> String {
@@ -269,6 +283,9 @@ struct S3Service {
         }
         for (name, value) in meta.httpHeaders ?? [:] {
             response.headers.replaceOrAdd(name: name, value: value)
+        }
+        if let replicationStatus = meta.replicationStatus {
+            response.headers.add(name: "x-amz-replication-status", value: replicationStatus)
         }
 
         if let range = range {

@@ -75,7 +75,10 @@ struct ReplicationService {
                 bucketName: bucketName, prefix: rule.prefix ?? "", delimiter: nil, maxKeys: 1000,
                 marker: marker)
 
-            let tasks = objects.map { object in
+            // Replicas are never replicated onward (see `ObjectMeta.replicationStatus`): with two
+            // buckets replicating to each other, a resync would otherwise send every object it
+            // received straight back.
+            let tasks = objects.filter { $0.replicationStatus == nil }.map { object in
                 ReplicationTask(
                     bucketName: bucketName, ruleId: rule.id, target: target, key: object.key,
                     versionId: object.versionId, operation: .put, ownerNodeId: ownerNodeId)
@@ -197,7 +200,8 @@ struct ReplicationService {
                         app: app, target: target, bucketName: bucketName, key: key,
                         versionId: versionId)
                 case .delete:
-                    try await ReplicationClient.replicateDelete(target: target, key: key)
+                    try await ReplicationClient.replicateDelete(
+                        target: target, bucketName: bucketName, key: key)
                 }
             }
             return true

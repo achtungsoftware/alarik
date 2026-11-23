@@ -34,6 +34,8 @@ struct MultipartUploadMeta: Codable {
     /// Standard HTTP headers given at CreateMultipartUpload, stored with the completed object
     /// (see `ObjectMeta.httpHeaders`). Optional: older upload directories decode as nil.
     var httpHeaders: [String: String]? = nil
+    /// See `ObjectMeta.replicationStatus`; decided at CreateMultipartUpload from the request.
+    var replicationStatus: String? = nil
 }
 
 /// Metadata stored for each uploaded part

@@ -990,6 +990,7 @@ struct S3Controller: RouteCollection {
             }
         }
         meta.httpHeaders = S3Service.storedObjectHeaders(from: req.headers)
+        if S3Service.isReplicationWrite(req) { meta.replicationStatus = S3Service.replicaStatus }
 
         // x-amz-tagging sets tags inline at upload time - URL query-string encoded (verified
         // against the PutObject API reference)
@@ -1114,9 +1115,11 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedPut, bucketName: bucketName, key: keyPath,
             size: spooled.size, etag: etag, versionId: writtenVersionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
-        await ReplicationService.enqueuePut(
-            app: req.application, bucketName: bucketName, key: keyPath,
-            versionId: writtenVersionId)
+        if !S3Service.isReplicationWrite(req) {
+            await ReplicationService.enqueuePut(
+                app: req.application, bucketName: bucketName, key: keyPath,
+                versionId: writtenVersionId)
+        }
         if ecWriteFanOut == nil {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: bucketName, key: keyPath,
@@ -1638,9 +1641,11 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
             size: destinationMeta.size, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
-        await ReplicationService.enqueuePut(
-            app: req.application, bucketName: destinationBucket, key: destinationKey,
-            versionId: versionId)
+        if !S3Service.isReplicationWrite(req) {
+            await ReplicationService.enqueuePut(
+                app: req.application, bucketName: destinationBucket, key: destinationKey,
+                versionId: versionId)
+        }
         if ecWriteFanOut == nil {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: destinationBucket, key: destinationKey,
@@ -2040,8 +2045,9 @@ struct S3Controller: RouteCollection {
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
         // A client-specified versionId permanently prunes one historical version - there's no
         // matching version on the replication target to remove (see ReplicationClient.replicateDelete),
-        // so only replicate when this deleted the *current* object.
-        if versionId == nil {
+        // so only replicate when this deleted the *current* object - and never a delete that is
+        // itself replication arriving from another Alarik.
+        if versionId == nil, !S3Service.isReplicationWrite(req) {
             await ReplicationService.enqueueDelete(
                 app: req.application, bucketName: bucketName, key: keyPath,
                 versionId: outcome.versionId)
@@ -2111,7 +2117,7 @@ struct S3Controller: RouteCollection {
                     requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
                 // See the single-object DELETE handler: a client-specified versionId prunes one
                 // historical version, which has no replicable equivalent on the target.
-                if object.versionId == nil {
+                if object.versionId == nil, !S3Service.isReplicationWrite(req) {
                     await ReplicationService.enqueueDelete(
                         app: req.application, bucketName: bucketName, key: object.key,
                         versionId: outcome.versionId)
@@ -2307,6 +2313,7 @@ struct S3Controller: RouteCollection {
 
         let storedHeaders = S3Service.storedObjectHeaders(from: req.headers)
         let userMetadata = metadata
+        let isReplica = S3Service.isReplicationWrite(req)
         let uploadId = try await S3Service.offloadBlockingIO(req) {
             try MultipartFileHandler.createUpload(
                 bucketName: bucketName,
@@ -2315,7 +2322,8 @@ struct S3Controller: RouteCollection {
                 metadata: userMetadata,
                 checksumAlgorithm: checksumAlgorithm,
                 checksumType: checksumType,
-                httpHeaders: storedHeaders
+                httpHeaders: storedHeaders,
+                replicationStatus: isReplica ? S3Service.replicaStatus : nil
             )
         }
 
@@ -2506,8 +2514,10 @@ struct S3Controller: RouteCollection {
             event: .objectCreatedCompleteMultipartUpload, bucketName: bucketName, key: key,
             size: finalSize, etag: etag, versionId: versionId,
             requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
-        await ReplicationService.enqueuePut(
-            app: req.application, bucketName: bucketName, key: key, versionId: versionId)
+        if !S3Service.isReplicationWrite(req) {
+            await ReplicationService.enqueuePut(
+                app: req.application, bucketName: bucketName, key: key, versionId: versionId)
+        }
         if !usedEC {
             await ClusterReplicationService.replicateWrite(
                 app: req.application, bucketName: bucketName, key: key, versionId: versionId,

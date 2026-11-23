@@ -45,7 +45,8 @@ enum ReplicationDispatcher {
                         app: app, target: row, bucketName: row.bucketName, key: row.key,
                         versionId: row.versionId)
                 case .delete:
-                    try await ReplicationClient.replicateDelete(target: row, key: row.key)
+                    try await ReplicationClient.replicateDelete(
+                        target: row, bucketName: row.bucketName, key: row.key)
                 }
                 return .success
             } catch {

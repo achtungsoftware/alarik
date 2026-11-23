@@ -61,15 +61,21 @@ enum ReplicationClient {
     /// Builds a target-scoped AWSClient + S3 service client pair. Callers must `defer { try?
     /// await awsClient.shutdown() }` immediately after calling this (the `deinit` on
     /// `AWSClient` asserts it was shut down).
-    private static func makeClient(for target: any ReplicationTaskConnection) -> (
-        awsClient: AWSClient, s3: S3
-    ) {
+    /// Every request names its source bucket in `S3Service.replicationSourceHeader`, so an Alarik
+    /// target stores the result as a replica and does not replicate it onward (two buckets
+    /// replicating to each other would otherwise loop). Any other S3 target ignores the header.
+    private static func makeClient(
+        for target: any ReplicationTaskConnection, sourceBucket: String
+    ) -> (awsClient: AWSClient, s3: S3) {
         let awsClient = AWSClient(
             credentialProvider: .static(
                 accessKeyId: target.accessKeyId, secretAccessKey: target.secretAccessKey),
             httpClient: HTTPClient.shared
         )
         let s3 = S3(client: awsClient, region: .init(rawValue: target.region), endpoint: target.endpoint)
+            .with(
+                middleware: AWSEditHeadersMiddleware(
+                    .add(name: S3Service.replicationSourceHeader, value: sourceBucket)))
         return (awsClient, s3)
     }
 
@@ -100,7 +106,7 @@ enum ReplicationClient {
         let (meta, _) = try ObjectFileHandler.readVersion(
             bucketName: bucketName, key: key, versionId: versionId, loadData: false)
 
-        let (awsClient, s3) = makeClient(for: target)
+        let (awsClient, s3) = makeClient(for: target, sourceBucket: bucketName)
         do {
             if meta.size <= multipartThreshold {
                 try await putSmall(
@@ -165,7 +171,7 @@ enum ReplicationClient {
         let tempPath = try await S3Controller.drainToTempFile(stream: stream, app: app)
         defer { _ = POSIXFile.unlink(tempPath) }
 
-        let (awsClient, s3) = makeClient(for: target)
+        let (awsClient, s3) = makeClient(for: target, sourceBucket: bucketName)
         do {
             if meta.size <= multipartThreshold {
                 let data = try Data(contentsOf: URL(fileURLWithPath: tempPath))
@@ -343,9 +349,10 @@ enum ReplicationClient {
     /// which never enqueue a delete task for a client-specified historical-version delete.
     static func replicateDelete(
         target: any ReplicationTaskConnection,
+        bucketName: String,
         key: String
     ) async throws {
-        let (awsClient, s3) = makeClient(for: target)
+        let (awsClient, s3) = makeClient(for: target, sourceBucket: bucketName)
         do {
             _ = try await s3.deleteObject(.init(bucket: target.targetBucket, key: key))
         } catch {

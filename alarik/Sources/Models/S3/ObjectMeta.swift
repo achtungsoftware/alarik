@@ -51,6 +51,12 @@ struct ObjectMeta: Codable {
     /// lowercase header name. Optional for the same backward-compat reason as `tags`.
     var httpHeaders: [String: String]?
 
+    /// `REPLICA` for a version written by another Alarik's bucket replication (it sends
+    /// `x-alarik-replication-source`, see `S3Service.isReplicationWrite`). Replicas are never
+    /// replicated onward, which is what keeps two buckets that replicate to each other from
+    /// bouncing every version back and forth forever. Reported as `x-amz-replication-status`.
+    var replicationStatus: String?
+
     init(
         bucketName: String,
         key: String,
@@ -65,7 +71,8 @@ struct ObjectMeta: Codable {
         tags: [String: String]? = nil,
         checksum: ObjectChecksum? = nil,
         parts: [ObjectPart]? = nil,
-        httpHeaders: [String: String]? = nil
+        httpHeaders: [String: String]? = nil,
+        replicationStatus: String? = nil
     ) {
         self.bucketName = bucketName
         self.key = key
@@ -81,6 +88,7 @@ struct ObjectMeta: Codable {
         self.checksum = checksum
         self.parts = parts
         self.httpHeaders = httpHeaders
+        self.replicationStatus = replicationStatus
     }
 
     /// Generates a new version ID (UUID without dashes)

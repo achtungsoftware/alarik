@@ -256,6 +256,52 @@ struct ReplicationTests {
         }
     }
 
+    @Test("two buckets replicating to each other do not loop: replicas are never replicated onward")
+    func bidirectionalReplicationDoesNotLoop() async throws {
+        try await withApp { app, baseURL in
+            let token = try await loginDefaultAdminUser(app)
+            for bucket in ["repl-loop-a", "repl-loop-b"] {
+                try await createBucket(app, bucketName: bucket)
+                try await enableVersioning(app, bucketName: bucket)
+            }
+            _ = try await configureReplication(
+                app, token: token, sourceBucket: "repl-loop-a", endpoint: baseURL,
+                destBucket: "repl-loop-b", replicateDeletes: true)
+            _ = try await configureReplication(
+                app, token: token, sourceBucket: "repl-loop-b", endpoint: baseURL,
+                destBucket: "repl-loop-a", replicateDeletes: true)
+
+            let content = Data("ping".utf8)
+            _ = try await putObject(app, bucketName: "repl-loop-a", key: "k.txt", data: content)
+            #expect(try await waitUntil { readObject(bucketName: "repl-loop-b", key: "k.txt") == content })
+
+            // The copy on B is a replica, and nothing was queued to send it back to A.
+            await ReplicationDispatcher.shared.drain()
+            #expect(ownedTasks(app).isEmpty)
+            let copy = try ObjectFileHandler.readVersion(
+                bucketName: "repl-loop-b", key: "k.txt", versionId: nil, loadData: false).0
+            #expect(copy.replicationStatus == "REPLICA")
+            let original = try ObjectFileHandler.readVersion(
+                bucketName: "repl-loop-a", key: "k.txt", versionId: nil, loadData: false).0
+            #expect(original.replicationStatus == nil)
+            #expect(try ObjectFileHandler.listVersions(bucketName: "repl-loop-a", key: "k.txt").count == 1)
+            #expect(try ObjectFileHandler.listVersions(bucketName: "repl-loop-b", key: "k.txt").count == 1)
+
+            // A delete travels once as well: B gets its marker and does not send one back.
+            try await deleteObject(app, bucketName: "repl-loop-a", key: "k.txt")
+            #expect(
+                try await waitUntil {
+                    try ObjectFileHandler.readCurrentObject(
+                        bucketName: "repl-loop-b", key: "k.txt", loadData: false) == nil
+                })
+            await ReplicationDispatcher.shared.drain()
+            #expect(ownedTasks(app).isEmpty)
+            let markersOnA = try ObjectFileHandler.listVersions(bucketName: "repl-loop-a", key: "k.txt")
+                .filter(\.isDeleteMarker)
+            #expect(markersOnA.count == 1)
+        }
+    }
+
     @Test("a large object goes through the multipart path and is byte-identical")
     func largeObjectMultipartByteIdentical() async throws {
         try await withApp { app, baseURL in
