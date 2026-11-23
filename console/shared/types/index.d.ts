@@ -118,6 +118,13 @@ declare global {
     }
 
     // ObjectMeta.ResponseDTO
+    // `POST /api/v1/objects/download-ticket`: a signed, short-lived URL credential the browser
+    // redeems itself at `GET /api/v1/objects/download?ticket=...`.
+    export interface DownloadTicket {
+        ticket: string;
+        expiresAt: string;
+    }
+
     export interface BrowserItem {
         key: string;
         size: number;

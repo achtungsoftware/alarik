@@ -27,6 +27,8 @@ func routes(_ app: Application) throws {
     let apiV1: any RoutesBuilder = app.grouped("api", "v1")
     try apiV1.register(collection: InternalUserController())
     try apiV1.register(collection: InternalAuthOIDCController())
+    // Authenticated by the signed ticket in its query, not by the bearer token - see the type.
+    try apiV1.register(collection: DownloadTicketController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalBaseController())
     try apiV1.grouped(InternalAuthenticator()).register(collection: InternalAdminController())
     try apiV1.grouped(InternalAuthenticator()).register(

@@ -42,6 +42,20 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
     /// Same shape as a bucket's tag set.
     typealias TagsDTO = InternalBucketController.TagsDTO
 
+    struct DownloadTicketRequestDTO: Content {
+        let bucket: String
+        let keys: [String]
+        let versionId: String?
+        /// Ask for display rather than a download; honoured only for types safe to render.
+        let inline: Bool?
+        let downloadName: String?
+    }
+
+    struct DownloadTicketDTO: Content {
+        let ticket: String
+        let expiresAt: Date
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
@@ -63,6 +77,10 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
                 use: self.abortMultipartUpload)
         routes.grouped("objects").delete(use: self.deleteObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
+        routes.grouped("objects", "download-ticket")
+            .on(
+                .POST, body: .collect(maxSize: Self.subresourceBodySizeLimit),
+                use: self.issueDownloadTicket)
         routes.grouped("objects", "versions").get(use: self.listObjectVersions)
         routes.grouped("objects", "version").delete(use: self.deleteObjectVersion)
         routes.grouped("objects", "tags").get(use: self.getObjectTags)
@@ -565,27 +583,57 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
     func downloadObjects(req: Request) async throws -> Response {
         let auth = try req.auth.require(AuthenticatedUser.self)
         let input = try req.content.decode(DownloadRequestDTO.self)
+        return try await download(
+            req: req, userId: auth.userId, bucket: input.bucket, keys: input.keys,
+            versionId: input.versionId, inline: false, downloadName: nil)
+    }
 
+    /// Hands out a `DownloadTicket` for what the caller may download, so the browser can fetch
+    /// it directly (`DownloadTicketController`). Ownership is checked here and again when the
+    /// ticket is redeemed.
+    @Sendable
+    func issueDownloadTicket(req: Request) async throws -> DownloadTicketDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        let input = try req.content.decode(DownloadTicketRequestDTO.self)
         guard !input.keys.isEmpty else {
             throw Abort(.badRequest, reason: "No keys provided for download")
         }
+        try await requireOwnedBucketExists(req: req, bucketName: input.bucket, userId: auth.userId)
+        guard let key = req.application.storage[DownloadTicketSigner.Key.self] else {
+            throw Abort(.internalServerError, reason: "Download tickets are not configured")
+        }
+        let ticket = DownloadTicket(
+            bucket: input.bucket, keys: input.keys, versionId: input.versionId, userId: auth.userId,
+            inline: input.inline ?? false, downloadName: input.downloadName,
+            expiresAt: Date().addingTimeInterval(DownloadTicketSigner.lifetime))
+        return DownloadTicketDTO(
+            ticket: try DownloadTicketSigner.issue(ticket, key: key), expiresAt: ticket.expiresAt)
+    }
 
-        // Verify bucket exists and belongs to user
-        try await requireOwnedBucketExists(
-            req: req, bucketName: input.bucket, userId: auth.userId)
+    /// The download itself, for the bearer-authenticated POST and for a redeemed ticket alike.
+    func download(
+        req: Request, userId: UUID, bucket: String, keys: [String], versionId: String?,
+        inline: Bool, downloadName: String?
+    ) async throws -> Response {
+        guard !keys.isEmpty else {
+            throw Abort(.badRequest, reason: "No keys provided for download")
+        }
+        try await requireOwnedBucketExists(req: req, bucketName: bucket, userId: userId)
 
         // If single file, download directly
-        if input.keys.count == 1 && !input.keys[0].hasSuffix("/") {
+        if keys.count == 1 && !keys[0].hasSuffix("/") {
             return try await downloadSingleFile(
-                req: req, bucketName: input.bucket, key: input.keys[0], versionId: input.versionId)
+                req: req, bucketName: bucket, key: keys[0], versionId: versionId, inline: inline,
+                downloadName: downloadName)
         }
 
         // Multiple files or folders - create ZIP
-        return try await downloadAsZip(req: req, bucketName: input.bucket, keys: input.keys)
+        return try await downloadAsZip(req: req, bucketName: bucket, keys: keys)
     }
 
     private func downloadSingleFile(
-        req: Request, bucketName: String, key: String, versionId: String? = nil
+        req: Request, bucketName: String, key: String, versionId: String? = nil, inline: Bool = false,
+        downloadName: String? = nil
     ) async throws
         -> Response
     {
@@ -611,7 +659,7 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
                 }
                 let tempPath = try await S3Controller.drainToTempFile(
                     stream: body, app: req.application)
-                return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key)
+                return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key, inline: inline, downloadName: downloadName)
             }
 
             // Resolve to the on-disk file so large objects can stream straight from it - a
@@ -651,7 +699,7 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
                     response = S3Service.buildVersionedObjectMetadataResponse(
                         meta: freshMeta, includeBody: true, data: data)
                 }
-                return Self.attachDownloadHeaders(to: response, key: key)
+                return Self.attachDownloadHeaders(to: response, key: key, inline: inline, downloadName: downloadName)
             }
         }
 
@@ -679,7 +727,7 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
             _ = POSIXFile.unlink(tempPath)
             throw Abort(.notFound, reason: "Object not found")
         }
-        return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key)
+        return streamedResponse(req: req, rawTempFile: tempPath, meta: meta, key: key, inline: inline, downloadName: downloadName)
     }
 
     /// Streams a raw (header-less) temp file - the payload `ClusterReplicationClient
@@ -688,11 +736,12 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
     /// `S3Service.buildStreamingObjectResponse`, which streams an on-disk *Alarik object file*
     /// (metadata header + payload); this file is bare bytes with `meta` supplied separately.
     private func streamedResponse(
-        req: Request, rawTempFile tempPath: String, meta: ObjectMeta, key: String
+        req: Request, rawTempFile tempPath: String, meta: ObjectMeta, key: String, inline: Bool,
+        downloadName: String?
     ) -> Response {
         let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta, includeBody: false)
         Self.streamRawFile(req: req, path: tempPath, count: meta.size, into: response)
-        return Self.attachDownloadHeaders(to: response, key: key)
+        return Self.attachDownloadHeaders(to: response, key: key, inline: inline, downloadName: downloadName)
     }
 
     /// Attaches a windowed-read streaming body over a raw on-disk file to `response`, deleting
@@ -725,13 +774,38 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
             }, count: count)
     }
 
-    private static func attachDownloadHeaders(to response: Response, key: String) -> Response {
-        let fileName = String(key.split(separator: "/").last ?? "download")
+    /// `inline` is honoured only for types a browser renders natively without running anything;
+    /// an HTML or SVG body shown inline would run in the API's origin. A `.pdf` key is served as
+    /// a PDF whatever type it was uploaded with, so the viewer opens it and nothing else does.
+    private static func attachDownloadHeaders(
+        to response: Response, key: String, inline: Bool, downloadName: String?
+    ) -> Response {
+        let fileName = downloadName ?? String(key.split(separator: "/").last ?? "download")
+        var disposition = "attachment"
+        if inline {
+            if fileName.lowercased().hasSuffix(".pdf") {
+                response.headers.contentType = HTTPMediaType(type: "application", subType: "pdf")
+            }
+            if let type = response.headers.contentType, isInlineSafe(type) {
+                disposition = "inline"
+            }
+        }
         response.headers.replaceOrAdd(
             name: "Content-Disposition",
-            value: "attachment; filename=\"\(fileName.contentDispositionFilenameEscaped)\""
+            value: "\(disposition); filename=\"\(fileName.contentDispositionFilenameEscaped)\""
         )
+        response.headers.replaceOrAdd(name: "X-Content-Type-Options", value: "nosniff")
+        response.headers.replaceOrAdd(name: .cacheControl, value: "private, no-store")
         return response
+    }
+
+    private static func isInlineSafe(_ type: HTTPMediaType) -> Bool {
+        switch type.type.lowercased() {
+        case "image": return type.subType.lowercased() != "svg+xml"
+        case "video", "audio": return true
+        case "application": return type.subType.lowercased() == "pdf"
+        default: return false
+        }
     }
 
     private func downloadAsZip(req: Request, bucketName: String, keys: [String]) async throws

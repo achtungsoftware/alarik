@@ -136,6 +136,7 @@ public func configure(_ app: Application) async throws {
             )
         }
         await app.jwt.keys.add(hmac: HMACKey(from: jwt), digestAlgorithm: .sha256)
+        app.storage[DownloadTicketSigner.Key.self] = DownloadTicketSigner.key(fromSecret: jwt)
     } else if app.environment == .production {
         // Refusing to boot, not warning and continuing: the fallback key below is a literal in a
         // public repository, so anyone can mint a valid admin session token against a production
@@ -151,6 +152,8 @@ public func configure(_ app: Application) async throws {
         )
         await app.jwt.keys.add(
             hmac: "insecure-development-only-jwt-key-32b", digestAlgorithm: .sha256)
+        app.storage[DownloadTicketSigner.Key.self] = DownloadTicketSigner.key(
+            fromSecret: "insecure-development-only-jwt-key-32b")
     }
 
     // Self-registers this node into the `cluster-nodes` metadata collection and starts its

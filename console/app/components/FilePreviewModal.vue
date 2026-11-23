@@ -30,6 +30,13 @@ const emit = defineEmits(["update:open", "saved"]);
 const open = ref(props.open);
 const jwtCookie = useJWTCookie();
 const toast = useToast();
+const { downloadTicketUrl } = useObjectService();
+
+/// Text is the one preview that has to be read into the page; past this size it is a download.
+const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
+const tooLargeForText = computed(
+    () => previewType.value === "text" && (props.item?.size ?? 0) > MAX_TEXT_PREVIEW_BYTES
+);
 const loading = ref(false);
 const saving = ref(false);
 const error = ref<string | null>(null);
@@ -95,10 +102,7 @@ watch(open, (val) => {
 });
 
 function cleanup() {
-    if (previewUrl.value) {
-        URL.revokeObjectURL(previewUrl.value);
-        previewUrl.value = null;
-    }
+    previewUrl.value = null;
     textContent.value = null;
     editedContent.value = null;
     isEditing.value = false;
@@ -175,38 +179,29 @@ async function loadPreview() {
     error.value = null;
 
     try {
-        const response = await fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/download`, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                bucket: props.bucket,
-                keys: [props.item.key],
-                ...(props.item.versionId && { versionId: props.item.versionId }),
-            }),
+        // Images, video, audio and PDFs are shown straight from a ticket URL: the browser
+        // streams (and seeks) them itself, nothing is buffered here. Text has to be read.
+        const url = await downloadTicketUrl({
+            bucket: props.bucket,
+            keys: [props.item.key],
+            versionId: props.item.versionId,
+            inline: previewType.value !== "text",
         });
-
-        if (!response.ok) {
-            throw new Error(`Failed to load file: ${response.statusText}`);
-        }
-
-        const blob = await response.blob();
-
         if (previewType.value === "text") {
-            textContent.value = await blob.text();
-        } else if (previewType.value === "pdf") {
-            // Force the type. The blob otherwise carries the stored Content-Type, so a key named
-            // *.pdf uploaded as text/html rendered as HTML inside the console's own origin
-            // (blob: URLs are same-origin) with access to the session cookie. A sandboxed
-            // iframe is not an option: Chrome's PDF viewer refuses to run in one.
-            previewUrl.value = URL.createObjectURL(new Blob([blob], { type: "application/pdf" }));
+            if (tooLargeForText.value) {
+                error.value = `This file is ${formatBytes(props.item.size)}; text preview is limited to ${formatBytes(MAX_TEXT_PREVIEW_BYTES)}. Download it instead.`;
+                return;
+            }
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Failed to load file: ${response.statusText}`);
+            }
+            textContent.value = await response.text();
         } else {
-            previewUrl.value = URL.createObjectURL(blob);
+            previewUrl.value = url;
         }
-    } catch (err: any) {
-        error.value = err.message || "Failed to load preview";
+    } catch (err) {
+        error.value = errorMessage(err, "Failed to load preview");
     } finally {
         loading.value = false;
     }

@@ -106,198 +106,67 @@ export function useObjectService() {
         }
     }
 
-    /// Fetches `url` and reports live progress as bytes arrive, instead of the browser giving
-    /// no feedback at all until `response.blob()` resolves - which for a large object could be
-    /// minutes of the UI looking completely idle. `total` is null when the response has no
-    /// Content-Length (e.g. the ZIP multi-file download, whose size isn't known upfront).
-    async function fetchWithProgress(
-        url: string,
-        options: RequestInit,
-        onProgress: (loaded: number, total: number | null) => void
-    ): Promise<{ blob: Blob; response: Response }> {
-        const response = await fetch(url, options);
-        if (!response.ok) {
-            throw new Error(`Download failed: ${response.statusText}`);
-        }
-
-        const contentLength = response.headers.get("Content-Length");
-        const total = contentLength ? parseInt(contentLength, 10) : null;
-
-        if (!response.body) {
-            // Streaming reads aren't available in this environment - fall back to a single
-            // await with no progress reporting, rather than failing the download entirely.
-            const blob = await response.blob();
-            onProgress(blob.size, total);
-            return { blob, response };
-        }
-
-        const reader = response.body.getReader();
-        const chunks: BlobPart[] = [];
-        let loaded = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-                chunks.push(value as BlobPart);
-                loaded += value.length;
-                onProgress(loaded, total);
-            }
-        }
-
-        return { blob: new Blob(chunks), response };
+    /// Asks the API for a download ticket and returns the URL the browser can fetch on its own.
+    /// The browser streams the bytes itself - native progress, no copy of the object in memory,
+    /// previews that can seek - which a fetch-then-blob flow could not do.
+    async function downloadTicketUrl(request: {
+        bucket: string;
+        keys: string[];
+        versionId?: string;
+        inline?: boolean;
+        downloadName?: string;
+    }): Promise<string> {
+        const ticket = await $fetch<DownloadTicket>(`${apiBaseUrl}/api/v1/objects/download-ticket`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+            body: request,
+        });
+        return `${apiBaseUrl}/api/v1/objects/download?ticket=${encodeURIComponent(ticket.ticket)}`;
     }
 
-    /// One line of human-readable progress, shown live in the download toast - a percentage
-    /// when the total size is known, otherwise just the running byte count.
-    function formatProgress(loaded: number, total: number | null): string {
-        if (total && total > 0) {
-            const percent = Math.min(100, Math.round((loaded / total) * 100));
-            return `${percent}% • ${formatBytes(loaded)} / ${formatBytes(total)}`;
+    /// Hands a ticket URL to the browser as a download. The server's Content-Disposition names
+    /// the file, so this works across origins where the `download` attribute would be ignored.
+    function triggerBrowserDownload(url: string) {
+        const a = document.createElement("a");
+        a.href = url;
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }
+
+    async function startDownload(bucket: string, keys: string[], label: string): Promise<boolean> {
+        isDownloading.value = true;
+        try {
+            triggerBrowserDownload(await downloadTicketUrl({ bucket, keys }));
+            toast.add({
+                title: "Download Started",
+                description: `${label} - your browser shows the progress`,
+                icon: "i-lucide-download",
+                color: "success",
+            });
+            return true;
+        } catch (err) {
+            toast.add({
+                title: "Download Failed",
+                description: errorMessage(err),
+                icon: "i-lucide-circle-x",
+                color: "error",
+            });
+            return false;
+        } finally {
+            isDownloading.value = false;
         }
-        return `${formatBytes(loaded)} downloaded`;
     }
 
     async function downloadObjects(bucket: string, keys: string[]): Promise<boolean> {
         if (keys.length === 0) return false;
-
-        isDownloading.value = true;
-
         const label = keys.length === 1 ? (keys[0]?.split("/").pop() ?? keys[0]!) : `${keys.length} items`;
-        const toastId = toast.add({
-            title: `Downloading ${label}`,
-            description: "Starting…",
-            icon: "i-lucide-download",
-            color: "primary",
-            duration: 0,
-        }).id;
-        let lastUpdate = 0;
-
-        try {
-            const { blob, response } = await fetchWithProgress(
-                `${apiBaseUrl}/api/v1/objects/download`,
-                {
-                    method: "POST",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({ bucket, keys }),
-                },
-                (loaded, total) => {
-                    // Progress arrives in a tight loop on fast connections - updating the
-                    // toast on every chunk would just churn re-renders for no visible benefit.
-                    const now = Date.now();
-                    if (now - lastUpdate < 150 && loaded !== total) return;
-                    lastUpdate = now;
-                    toast.update(toastId, { description: formatProgress(loaded, total) });
-                }
-            );
-
-            const filename = extractFilename(response) || "download";
-            triggerBrowserDownload(blob, filename);
-
-            toast.update(toastId, {
-                title: "Download Complete",
-                description: `${keys.length} item${keys.length !== 1 ? "s" : ""} downloaded successfully`,
-                icon: "i-lucide-circle-check",
-                color: "success",
-                duration: undefined,
-            });
-
-            return true;
-        } catch (err: any) {
-            toast.update(toastId, {
-                title: "Download Failed",
-                description: err.data?.reason ?? err.message ?? "Unknown error",
-                icon: "i-lucide-circle-x",
-                color: "error",
-                duration: undefined,
-            });
-            return false;
-        } finally {
-            isDownloading.value = false;
-        }
+        return startDownload(bucket, keys, label);
     }
 
     async function downloadSingleObject(bucket: string, key: string): Promise<boolean> {
-        isDownloading.value = true;
-
-        const displayName = key.split("/").pop() || key;
-        const toastId = toast.add({
-            title: `Downloading ${displayName}`,
-            description: "Starting…",
-            icon: "i-lucide-download",
-            color: "primary",
-            duration: 0,
-        }).id;
-        let lastUpdate = 0;
-
-        try {
-            const { blob, response } = await fetchWithProgress(
-                `${apiBaseUrl}/api/v1/objects/download`,
-                {
-                    method: "POST",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({ bucket, keys: [key] }),
-                },
-                (loaded, total) => {
-                    const now = Date.now();
-                    if (now - lastUpdate < 150 && loaded !== total) return;
-                    lastUpdate = now;
-                    toast.update(toastId, { description: formatProgress(loaded, total) });
-                }
-            );
-
-            const filename = extractFilename(response) || displayName;
-            triggerBrowserDownload(blob, filename);
-
-            toast.update(toastId, {
-                title: "Download Complete",
-                description: filename,
-                icon: "i-lucide-circle-check",
-                color: "success",
-                duration: undefined,
-            });
-
-            return true;
-        } catch (err: any) {
-            toast.update(toastId, {
-                title: "Download Failed",
-                description: err.data?.reason ?? err.message ?? "Unknown error",
-                icon: "i-lucide-circle-x",
-                color: "error",
-                duration: undefined,
-            });
-            return false;
-        } finally {
-            isDownloading.value = false;
-        }
-    }
-
-    function extractFilename(response: Response): string | null {
-        const contentDisposition = response.headers.get("Content-Disposition");
-        if (contentDisposition) {
-            const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
-            if (filenameMatch && filenameMatch[1]) {
-                return filenameMatch[1];
-            }
-        }
-        return null;
-    }
-
-    function triggerBrowserDownload(blob: Blob, filename: string) {
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
+        return startDownload(bucket, [key], key.split("/").pop() || key);
     }
 
     return {
@@ -312,5 +181,7 @@ export function useObjectService() {
         // Download operations
         downloadObjects,
         downloadSingleObject,
+        downloadTicketUrl,
+        triggerBrowserDownload,
     };
 }

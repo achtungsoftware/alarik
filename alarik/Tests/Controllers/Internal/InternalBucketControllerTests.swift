@@ -2153,6 +2153,72 @@ struct InternalBucketControllerTests {
         }
     }
 
+    @Test("a download ticket lets the browser stream the object with no bearer token, inline only for safe types")
+    func testDownloadTicket() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "ticket-bucket")
+            try await putObject(app, bucketName: "ticket-bucket", key: "notes.txt", content: "ticketed bytes")
+            let png = ObjectMeta(
+                bucketName: "ticket-bucket", key: "pic.png", size: 3, contentType: "image/png", etag: "e",
+                updatedAt: Date())
+            try ObjectFileHandler.write(
+                metadata: png, data: Data([0x89, 0x50, 0x4E]),
+                to: ObjectFileHandler.storagePath(for: "ticket-bucket", key: "pic.png"))
+
+            func issue(_ keys: [String], inline: Bool, downloadName: String? = nil) async throws -> String {
+                var ticket = ""
+                try await app.test(
+                    .POST, "/api/v1/objects/download-ticket",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                        try req.content.encode(
+                            InternalObjectController.DownloadTicketRequestDTO(
+                                bucket: "ticket-bucket", keys: keys, versionId: nil, inline: inline,
+                                downloadName: downloadName))
+                    },
+                    afterResponse: { res async throws in
+                        #expect(res.status == .ok)
+                        ticket = try res.content.decode(InternalObjectController.DownloadTicketDTO.self).ticket
+                    })
+                return ticket
+            }
+
+            // No Authorization header at all: the ticket is the credential.
+            let plain = try await issue(["notes.txt"], inline: false, downloadName: "notes_v1.txt")
+            try await app.test(
+                .GET, "/api/v1/objects/download?ticket=\(plain)",
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "ticketed bytes")
+                    #expect(res.headers.first(name: "Content-Disposition") == "attachment; filename=\"notes_v1.txt\"")
+                    #expect(res.headers.first(name: "X-Content-Type-Options") == "nosniff")
+                })
+            // Inline is honoured for an image...
+            let image = try await issue(["pic.png"], inline: true)
+            try await app.test(
+                .GET, "/api/v1/objects/download?ticket=\(image)",
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.first(name: "Content-Disposition")?.hasPrefix("inline;") == true)
+                })
+            // ...but never for a type a browser would execute.
+            let text = try await issue(["notes.txt"], inline: true)
+            try await app.test(
+                .GET, "/api/v1/objects/download?ticket=\(text)",
+                afterResponse: { res in
+                    #expect(res.headers.first(name: "Content-Disposition")?.hasPrefix("attachment;") == true)
+                })
+            // A forged ticket and a missing one are refused.
+            try await app.test(
+                .GET, "/api/v1/objects/download?ticket=\(plain)x",
+                afterResponse: { res in #expect(res.status == .forbidden) })
+            try await app.test(
+                .GET, "/api/v1/objects/download",
+                afterResponse: { res in #expect(res.status == .unauthorized) })
+        }
+    }
+
     @Test("Download single file - Non-existent file fails")
     func testDownloadSingleFileNonExistent() async throws {
         try await withApp { app in

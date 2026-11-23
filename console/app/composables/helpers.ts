@@ -16,6 +16,18 @@ limitations under the License.
 
 export const MAX_CONCURRENT_UPLOADS = 3;
 
+/// The message to show for a failed request: the server's `reason` when it sent one, else the
+/// error's own message. Every catch block used to pick these fields off an `any`.
+export function errorMessage(error: unknown, fallback = "Unknown error"): string {
+    if (typeof error === "object" && error !== null) {
+        const data = (error as { data?: { reason?: unknown } }).data;
+        if (data && typeof data.reason === "string" && data.reason.length > 0) return data.reason;
+        const message = (error as { message?: unknown }).message;
+        if (typeof message === "string" && message.length > 0) return message;
+    }
+    return fallback;
+}
+
 export function formatBytes(bytes: number): string {
     if (bytes === 0) return "0 Bytes";
     const k = 1024;

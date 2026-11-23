@@ -30,6 +30,7 @@ const props = withDefaults(
 const emit = defineEmits(["update:open", "close", "versionDeleted", "saved"]);
 const open = ref(props.open);
 const jwtCookie = useJWTCookie();
+const { downloadTicketUrl, triggerBrowserDownload } = useObjectService();
 const toast = useToast();
 const versions = ref<BrowserItem[]>([]);
 const loadingVersions = ref(false);
@@ -285,24 +286,6 @@ async function downloadVersion(versionId: string) {
     if (!props.item || !props.bucketName) return;
 
     try {
-        const response = await fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/download`, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                bucket: props.bucketName,
-                keys: [props.item.key],
-                versionId: versionId,
-            }),
-        });
-
-        if (!response.ok) {
-            throw new Error(`Download failed: ${response.statusText}`);
-        }
-
-        const blob = await response.blob();
         const originalFilename = props.item.key.split("/").pop() || "download";
 
         // Build versioned filename: name_versionId.ext or name_versionId if no extension
@@ -316,14 +299,15 @@ async function downloadVersion(versionId: string) {
             downloadFilename = `${originalFilename}_${versionId.substring(0, 8)}`;
         }
 
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = downloadFilename;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
+        // The browser streams the version itself; the ticket carries the file name to save as.
+        triggerBrowserDownload(
+            await downloadTicketUrl({
+                bucket: props.bucketName,
+                keys: [props.item.key],
+                versionId,
+                downloadName: downloadFilename,
+            })
+        );
 
         toast.add({
             title: "Download Started",
