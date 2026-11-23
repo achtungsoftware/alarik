@@ -100,7 +100,7 @@ struct S3Controller: RouteCollection {
         _ = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName, action: .listBucket, key: nil)
 
-        let params = S3Service.parseListObjectsParams(from: req, bucketName: bucketName)
+        let params = try S3Service.parseListObjectsParams(from: req, bucketName: bucketName)
 
         let (objects, commonPrefixes, isTruncated, nextMarker) =
             try await ClusterListingService.listObjects(
@@ -131,7 +131,7 @@ struct S3Controller: RouteCollection {
         let delimiter = req.query[String.self, at: "delimiter"]
         let keyMarker = req.query[String.self, at: "key-marker"]
         let versionIdMarker = req.query[String.self, at: "version-id-marker"]
-        let maxKeys = S3Service.listLimit(from: req, name: "max-keys")
+        let maxKeys = try S3Service.listLimit(from: req, name: "max-keys")
 
         let (
             versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker
@@ -2579,7 +2579,7 @@ struct S3Controller: RouteCollection {
                 message: "The specified upload does not exist.", requestId: req.id)
         }
 
-        let maxParts = S3Service.listLimit(from: req, name: "max-parts")
+        let maxParts = try S3Service.listLimit(from: req, name: "max-parts")
         let partNumberMarker = req.query[Int.self, at: "part-number-marker"] ?? 0
 
         let (parts, isTruncated, nextPartNumberMarker) = try MultipartFileHandler.listParts(
@@ -2742,7 +2742,7 @@ struct S3Controller: RouteCollection {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let keyMarker = req.query[String.self, at: "key-marker"]
         let uploadIdMarker = req.query[String.self, at: "upload-id-marker"]
-        let maxUploads = S3Service.listLimit(from: req, name: "max-uploads")
+        let maxUploads = try S3Service.listLimit(from: req, name: "max-uploads")
 
         let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
             try await ClusterListingService.listUploads(

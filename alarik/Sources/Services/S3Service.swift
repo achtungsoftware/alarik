@@ -262,18 +262,25 @@ struct S3Service {
         return response
     }
 
-    /// Client-supplied page limits (`max-keys`, `max-parts`, `max-uploads`) clamped to S3's
-    /// 0...1000. They feed `Array.prefix`, which traps on a negative count - unclamped, a
-    /// single `?max-keys=-1` took the whole process down.
-    static func listLimit(from req: Request, name: String) -> Int {
+    /// Client-supplied page limits (`max-keys`, `max-parts`, `max-uploads`). A negative value
+    /// is `InvalidArgument`, anything above S3's page maximum is capped to 1000. They feed
+    /// `Array.prefix`, which traps on a negative count - unchecked, `?max-keys=-1` took the
+    /// whole process down.
+    static func listLimit(from req: Request, name: String) throws -> Int {
         let raw = req.query[Int.self, at: name] ?? 1000
-        return Swift.min(Swift.max(raw, 0), 1000)
+        guard raw >= 0 else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument",
+                message: "Argument \(name) must be an integer between 0 and 2147483647",
+                requestId: req.id)
+        }
+        return Swift.min(raw, 1000)
     }
 
-    static func parseListObjectsParams(from req: Request, bucketName: String) -> ListObjectsParams {
+    static func parseListObjectsParams(from req: Request, bucketName: String) throws -> ListObjectsParams {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
         let delimiter = req.query[String.self, at: "delimiter"]
-        let maxKeys = listLimit(from: req, name: "max-keys")
+        let maxKeys = try listLimit(from: req, name: "max-keys")
         let listType = req.query[String.self, at: "list-type"]
         let isV2 = listType == "2"
         let startAfter = req.query[String.self, at: "start-after"]

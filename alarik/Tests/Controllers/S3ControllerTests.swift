@@ -3433,14 +3433,14 @@ struct S3ControllerTests {
         }
     }
 
-    @Test("List Objects - negative or oversized max-keys is clamped instead of trapping the process")
-    func testListLimitsClamped() async throws {
+    @Test("List Objects - negative max-keys is InvalidArgument and oversized max-keys is capped, never a trap")
+    func testListLimitsValidated() async throws {
         let bucketName = "list-limit-clamp-bucket"
         try await withApp { app in
             try await createBucket(app, bucketName: bucketName)
             try await putObject(app, bucketName: bucketName, key: "a.txt", content: "a")
 
-            for query in ["max-keys=-1", "list-type=2&max-keys=-5", "max-keys=99999"] {
+            for query in ["max-keys=-1", "list-type=2&max-keys=-5", "versions&max-keys=-1"] {
                 let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
                 try await app.test(
                     .GET, "/\(bucketName)?\(query)",
@@ -3448,9 +3448,21 @@ struct S3ControllerTests {
                         req.headers.add(contentsOf: signed)
                     },
                     afterResponse: { res in
-                        #expect(res.status == .ok, "\(query)")
+                        #expect(res.status == .badRequest, "\(query)")
+                        #expect(res.body.string.contains("<Code>InvalidArgument</Code>"), "\(query)")
                     })
             }
+
+            let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: "max-keys=99999")
+            try await app.test(
+                .GET, "/\(bucketName)?max-keys=99999",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<MaxKeys>1000</MaxKeys>"))
+                })
         }
     }
 
