@@ -241,7 +241,9 @@ struct S3Controller: RouteCollection {
         req: Request, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo]
     ) async -> Bool {
-        localHeldShardPath(req: req, bucketName: bucketName, key: key, versionId: versionId) != nil
+        (try? await S3Service.offloadBlockingIO(req) {
+            localHeldShardPath(req: req, bucketName: bucketName, key: key, versionId: versionId) != nil
+        }) ?? false
     }
 
     /// Whether any responsible peer holds a shard for (bucketName, key, effectiveVersionId) -
@@ -280,52 +282,52 @@ struct S3Controller: RouteCollection {
         req: Request, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo]
     ) async throws -> ObjectMeta {
-        if let localShardPath = localHeldShardPath(
-            req: req, bucketName: bucketName, key: key, versionId: versionId)
-        {
-            return try await S3Service.offloadBlockingIO(req) {
-                try ErasureCodedShardReader(path: localShardPath).header.objectMeta
+        // Everything local - shard header, versioned `.obj`, plain `.obj` - is disk IO, so it
+        // runs on the IO pool as one step rather than on the request executor.
+        let localMeta: ObjectMeta? = try await S3Service.offloadBlockingIO(req) {
+            if let localShardPath = localHeldShardPath(
+                req: req, bucketName: bucketName, key: key, versionId: versionId)
+            {
+                return try ErasureCodedShardReader(path: localShardPath).header.objectMeta
             }
-        }
-
-        do {
-            let (meta, _) = try ObjectFileHandler.readVersion(
+            if let (meta, _) = try? ObjectFileHandler.readVersion(
                 bucketName: bucketName, key: key, versionId: versionId, loadData: false)
-            return meta
-        } catch {
-            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
-            guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else {
-                // Nothing local in either format - before concluding 404, ask responsible peers
-                // for a shard header (cheap, header-only). Covers the fresh-write straggler
-                // window: this node is responsible but hasn't received its shard yet, while peers
-                // already hold the object. Parallel, first hit wins.
-                if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
-                    req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
-                    let peerMeta = await withTaskGroup(
-                        of: ObjectMeta?.self, returning: ObjectMeta?.self, body: { group in
-                        for node in responsible where node.id != clusterConfig.nodeId {
-                            group.addTask {
-                                await ClusterReplicationClient.fetchShardMeta(
-                                    app: req.application, node: node, bucketName: bucketName,
-                                    key: key, versionId: versionId)
-                            }
-                        }
-                        for await meta in group where meta != nil {
-                            group.cancelAll()
-                            return meta
-                        }
-                        return nil
-                    })
-                {
-                    return peerMeta
-                }
-                throw S3Error(
-                    status: .notFound, code: "NoSuchKey",
-                    message: "The specified key does not exist.", requestId: req.id)
+            {
+                return meta
             }
-            let (meta, _) = try ObjectFileHandler.read(from: path, loadData: false)
-            return meta
+            let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
+            guard ObjectFileHandler.keyExists(for: bucketName, key: key, path: path) else { return nil }
+            return try ObjectFileHandler.read(from: path, loadData: false).0
         }
+        if let localMeta { return localMeta }
+
+        // Nothing local in either format - before concluding 404, ask responsible peers for a
+        // shard header (cheap, header-only). Covers the fresh-write straggler window: this node
+        // is responsible but hasn't received its shard yet, while peers already hold the object.
+        // Parallel, first hit wins.
+        if let clusterConfig = req.application.storage[ClusterConfigurationKey.self],
+            req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
+            let peerMeta = await withTaskGroup(
+                of: ObjectMeta?.self, returning: ObjectMeta?.self, body: { group in
+                for node in responsible where node.id != clusterConfig.nodeId {
+                    group.addTask {
+                        await ClusterReplicationClient.fetchShardMeta(
+                            app: req.application, node: node, bucketName: bucketName,
+                            key: key, versionId: versionId)
+                    }
+                }
+                for await meta in group where meta != nil {
+                    group.cancelAll()
+                    return meta
+                }
+                return nil
+            })
+        {
+            return peerMeta
+        }
+        throw S3Error(
+            status: .notFound, code: "NoSuchKey",
+            message: "The specified key does not exist.", requestId: req.id)
     }
 
     @Sendable
@@ -1155,11 +1157,14 @@ struct S3Controller: RouteCollection {
         req: Request, bucketName: String, key: String, versionId: String?,
         peers: [ClusterNodeInfo], transform: @escaping @Sendable (inout ObjectMeta) -> Void
     ) async throws -> ObjectMeta {
-        if let placement = await ErasureCodedDeleteCoordinator.ecPlacement(
-            app: req.application, bucketName: bucketName, key: key),
-            placement.responsible.contains(where: { $0.id == placement.selfNodeId }),
+        let holdsLocalShard = try await S3Service.offloadBlockingIO(req) {
             ErasureCodedObjectHandler.holdsAnyLocalShard(
                 bucketName: bucketName, key: key, versionId: versionId)
+        }
+        if holdsLocalShard,
+            let placement = await ErasureCodedDeleteCoordinator.ecPlacement(
+                app: req.application, bucketName: bucketName, key: key),
+            placement.responsible.contains(where: { $0.id == placement.selfNodeId })
         {
             return try await ErasureCodedWriteCoordinator.rewriteMetadata(
                 app: req.application, bucketName: bucketName, key: key, versionId: versionId,
@@ -1167,10 +1172,10 @@ struct S3Controller: RouteCollection {
                 transform: transform)
         }
 
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: versionId)
-        else {
+        let resolvedPath = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.resolvePath(bucketName: bucketName, key: key, versionId: versionId)
+        }
+        guard let path = resolvedPath else {
             throw S3Error(
                 status: .notFound, code: "NoSuchKey",
                 message: "The specified key does not exist.", requestId: req.id)
@@ -1316,14 +1321,15 @@ struct S3Controller: RouteCollection {
             let effectiveVersionId: String?
             if let versionId {
                 effectiveVersionId = versionId
-            } else if isLocal, ObjectFileHandler.isVersioned(bucketName: bucketName, key: key) {
-                effectiveVersionId = try ObjectFileHandler.getLatestVersionId(
-                    bucketName: bucketName, key: key)
-            } else if !isLocal {
+            } else if isLocal {
+                effectiveVersionId = try await S3Service.offloadBlockingIO(req) {
+                    ObjectFileHandler.isVersioned(bucketName: bucketName, key: key)
+                        ? try ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: key)
+                        : nil
+                }
+            } else {
                 effectiveVersionId = await ClusterReplicationClient.resolveLatestVersionId(
                     app: req.application, candidates: responsible, bucketName: bucketName, key: key)
-            } else {
-                effectiveVersionId = nil
             }
 
             if await isSourceErasureCoded(
@@ -1731,11 +1737,12 @@ struct S3Controller: RouteCollection {
         let effectiveVersionId: String?
         if let versionId {
             effectiveVersionId = versionId
-        } else if ObjectFileHandler.isVersioned(bucketName: bucketName, key: keyPath) {
-            effectiveVersionId = try ObjectFileHandler.getLatestVersionId(
-                bucketName: bucketName, key: keyPath)
         } else {
-            effectiveVersionId = nil
+            effectiveVersionId = try await S3Service.offloadBlockingIO(req) {
+                ObjectFileHandler.isVersioned(bucketName: bucketName, key: keyPath)
+                    ? try ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: keyPath)
+                    : nil
+            }
         }
 
         // Is this an erasure-coded object? Discover it location-independently: this node holds a
@@ -1748,18 +1755,22 @@ struct S3Controller: RouteCollection {
             req.application.storage[ClusterErasureCodingConfigKey.self] != nil,
             responsible.contains(where: { $0.id == clusterConfig.nodeId })
         {
-            let localHeld = ErasureCodedObjectHandler.locallyHeldShardIndices(
-                bucketName: bucketName, key: keyPath, versionId: effectiveVersionId)
-            var isErasureCoded = !localHeld.isEmpty
-            if !isErasureCoded {
-                let plainResolvesLocally =
-                    ((try? ObjectFileHandler.resolvePath(
+            let (holdsShard, plainResolvesLocally) = try await S3Service.offloadBlockingIO(req) {
+                let holds = !ErasureCodedObjectHandler.locallyHeldShardIndices(
+                    bucketName: bucketName, key: keyPath, versionId: effectiveVersionId
+                ).isEmpty
+                let plain =
+                    holds
+                    ? false
+                    : ((try? ObjectFileHandler.resolvePath(
                         bucketName: bucketName, key: keyPath, versionId: versionId)) ?? nil) != nil
-                if !plainResolvesLocally {
-                    isErasureCoded = await Self.anyPeerHoldsShard(
-                        req: req, responsible: responsible, selfNodeId: clusterConfig.nodeId,
-                        bucketName: bucketName, key: keyPath, versionId: effectiveVersionId)
-                }
+                return (holds, plain)
+            }
+            var isErasureCoded = holdsShard
+            if !isErasureCoded && !plainResolvesLocally {
+                isErasureCoded = await Self.anyPeerHoldsShard(
+                    req: req, responsible: responsible, selfNodeId: clusterConfig.nodeId,
+                    bucketName: bucketName, key: keyPath, versionId: effectiveVersionId)
             }
 
             if isErasureCoded {
@@ -1839,23 +1850,27 @@ struct S3Controller: RouteCollection {
         // Resolve to a single on-disk path up front - the meta, conditional checks, range
         // math, and body all come off that one file, and large payloads stream from it
         // directly instead of ever being buffered whole in memory.
-        var path = try ObjectFileHandler.resolvePath(
-            bucketName: bucketName, key: keyPath, versionId: versionId)
-        if path == nil, versionId == "null" {
-            // The "null" version of a never-versioned key lives at the plain path (mirrors
-            // the same fallback in deleteVersion - listings report it as VersionId "null")
-            let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
-            if ObjectFileHandler.keyExists(for: bucketName, key: keyPath, path: plainPath) {
-                path = plainPath
+        let resolved: (path: String, meta: ObjectMeta, payloadOffset: Int, payloadSize: Int)? =
+            try await S3Service.offloadBlockingIO(req) {
+                var path = try ObjectFileHandler.resolvePath(
+                    bucketName: bucketName, key: keyPath, versionId: versionId)
+                if path == nil, versionId == "null" {
+                    // The "null" version of a never-versioned key lives at the plain path (mirrors
+                    // the same fallback in deleteVersion - listings report it as VersionId "null")
+                    let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: keyPath)
+                    if ObjectFileHandler.keyExists(for: bucketName, key: keyPath, path: plainPath) {
+                        path = plainPath
+                    }
+                }
+                guard let path else { return nil }
+                let location = try ObjectFileHandler.payloadLocation(path: path)
+                return (path, location.meta, location.payloadOffset, location.payloadSize)
             }
-        }
-        guard let path else {
+        guard let (path, meta, payloadOffset, payloadSize) = resolved else {
             throw S3Error(
                 status: .notFound, code: "NoSuchKey",
                 message: "The specified key does not exist.", requestId: req.id)
         }
-
-        let (meta, payloadOffset, payloadSize) = try ObjectFileHandler.payloadLocation(path: path)
 
         // A latest-version delete marker means "deleted" (resolvePath already nils this for
         // versionId == nil - kept as a belt-and-suspenders check)
@@ -1897,9 +1912,11 @@ struct S3Controller: RouteCollection {
         // response is built from THIS read's metadata (not the earlier lookup's), so headers
         // and body always describe the same snapshot of the file even under a concurrent
         // overwrite - the streaming branch gets the same guarantee from its ETag check.
-        let (freshMeta, data) = try ObjectFileHandler.read(
-            from: path, loadData: true,
-            range: byteRange.map { ($0.start, $0.end) })
+        let (freshMeta, data) = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.read(
+                from: path, loadData: true,
+                range: byteRange.map { ($0.start, $0.end) })
+        }
         guard let data else {
             throw S3Error(
                 status: .internalServerError, code: "InternalError",
@@ -2244,7 +2261,7 @@ struct S3Controller: RouteCollection {
 
         // POST ?uploads → CreateMultipartUpload
         if S3Service.queryParameterNames(from: query).contains("uploads") {
-            return try handleCreateMultipartUpload(req: req, bucketName: bucketName, key: keyPath)
+            return try await handleCreateMultipartUpload(req: req, bucketName: bucketName, key: keyPath)
         }
 
         // POST ?uploadId=X → CompleteMultipartUpload
@@ -2264,7 +2281,7 @@ struct S3Controller: RouteCollection {
         req: Request,
         bucketName: String,
         key: String
-    ) throws -> Response {
+    ) async throws -> Response {
         guard !key.isEmpty else {
             throw S3Error(
                 status: .badRequest, code: "InvalidArgument",
@@ -2289,15 +2306,19 @@ struct S3Controller: RouteCollection {
         let checksumAlgorithm = S3Service.requestedChecksumAlgorithm(req)
         let checksumType = req.headers.first(name: "x-amz-checksum-type")?.uppercased()
 
-        let uploadId = try MultipartFileHandler.createUpload(
-            bucketName: bucketName,
-            key: key,
-            contentType: contentType,
-            metadata: metadata,
-            checksumAlgorithm: checksumAlgorithm,
-            checksumType: checksumType,
-            httpHeaders: S3Service.storedObjectHeaders(from: req.headers)
-        )
+        let storedHeaders = S3Service.storedObjectHeaders(from: req.headers)
+        let userMetadata = metadata
+        let uploadId = try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.createUpload(
+                bucketName: bucketName,
+                key: key,
+                contentType: contentType,
+                metadata: userMetadata,
+                checksumAlgorithm: checksumAlgorithm,
+                checksumType: checksumType,
+                httpHeaders: storedHeaders
+            )
+        }
 
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -2700,17 +2721,20 @@ struct S3Controller: RouteCollection {
         let maxParts = try S3Service.listLimit(from: req, name: "max-parts")
         let partNumberMarker = req.query[Int.self, at: "part-number-marker"] ?? 0
 
-        let (parts, isTruncated, nextPartNumberMarker) = try MultipartFileHandler.listParts(
-            bucketName: bucketName,
-            uploadId: uploadId,
-            maxParts: maxParts,
-            partNumberMarker: partNumberMarker
-        )
-
-        // When the upload pinned a checksum algorithm, ListParts reports the algorithm and each
-        // part's stored checksum (as a `Checksum<ALGO>` element).
-        let checksumAlgorithm = MultipartFileHandler.uploadChecksumAlgorithm(
-            bucketName: bucketName, uploadId: uploadId)
+        let (parts, isTruncated, nextPartNumberMarker, checksumAlgorithm) =
+            try await S3Service.offloadBlockingIO(req) {
+                let listed = try MultipartFileHandler.listParts(
+                    bucketName: bucketName,
+                    uploadId: uploadId,
+                    maxParts: maxParts,
+                    partNumberMarker: partNumberMarker
+                )
+                // When the upload pinned a checksum algorithm, ListParts reports the algorithm and
+                // each part's stored checksum (as a `Checksum<ALGO>` element).
+                let algorithm = MultipartFileHandler.uploadChecksumAlgorithm(
+                    bucketName: bucketName, uploadId: uploadId)
+                return (listed.parts, listed.isTruncated, listed.nextPartNumberMarker, algorithm)
+            }
         let checksumTag = checksumAlgorithm.map { "Checksum\($0.uppercased())" }
 
         // Build XML response

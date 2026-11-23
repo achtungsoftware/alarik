@@ -88,11 +88,16 @@ struct SharedLinkController: RouteCollection {
             // a shared link to a multi-GB object must not buffer it in memory per download.
             // resolvePath also nils delete markers (object deleted from a versioned bucket after
             // the link was created), matching every other GetObject-style read in this codebase.
-            if let path = try? ObjectFileHandler.resolvePath(
-                bucketName: link.bucketName, key: link.key, versionId: nil),
-                let (meta, payloadOffset, payloadSize) = try? ObjectFileHandler.payloadLocation(
-                    path: path)
-            {
+            let located: (path: String, meta: ObjectMeta, payloadOffset: Int, payloadSize: Int)? =
+                try? await S3Service.offloadBlockingIO(req) {
+                    guard
+                        let path = try ObjectFileHandler.resolvePath(
+                            bucketName: link.bucketName, key: link.key, versionId: nil)
+                    else { return nil }
+                    let location = try ObjectFileHandler.payloadLocation(path: path)
+                    return (path, location.meta, location.payloadOffset, location.payloadSize)
+                }
+            if let (path, meta, payloadOffset, payloadSize) = located ?? nil {
                 let response: Response
                 if payloadSize > Constants.streamingThreshold {
                     response = S3Service.buildStreamingObjectResponse(
@@ -101,7 +106,9 @@ struct SharedLinkController: RouteCollection {
                     // Headers and body from the same read, so they always describe one snapshot of
                     // the file (the streaming branch gets the same guarantee from its ETag check)
                     guard
-                        let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                        let (freshMeta, data) = try? await S3Service.offloadBlockingIO(req, {
+                            try ObjectFileHandler.read(from: path, loadData: true)
+                        }),
                         let data
                     else {
                         throw Abort(.notFound)

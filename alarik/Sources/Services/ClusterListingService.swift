@@ -37,18 +37,21 @@ enum ClusterListingService {
     ) async throws -> (
         objects: [ObjectMeta], commonPrefixes: [String], isTruncated: Bool, nextMarker: String?
     ) {
+        // Directory walks and header reads: IO-pool work, never the request executor.
         let local = {
-            try ObjectFileHandler.listObjects(
-                bucketName: bucketName, prefix: prefix, delimiter: delimiter, maxKeys: maxKeys,
-                marker: marker)
+            try await req.application.threadPool.runIfActive {
+                try ObjectFileHandler.listObjects(
+                    bucketName: bucketName, prefix: prefix, delimiter: delimiter, maxKeys: maxKeys,
+                    marker: marker)
+            }
         }
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
-            return try local()
+            return try await local()
         }
         let peers = await activePeers(config: config)
-        guard !peers.isEmpty else { return try local() }
+        guard !peers.isEmpty else { return try await local() }
 
-        let localResult = try local()
+        let localResult = try await local()
         var pages = [
             ObjectsPage(
                 objects: localResult.objects, commonPrefixes: localResult.commonPrefixes,
@@ -96,19 +99,21 @@ enum ClusterListingService {
         marker: String?
     ) async throws -> SearchPage {
         let filter = ConsoleObjectListing.keyFilter(matching: term)
-        let local = { @Sendable () throws -> SearchPage in
-            let (objects, _, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
-                bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: scanLimit,
-                marker: marker, keyFilter: filter)
-            return SearchPage(matches: objects, isTruncated: isTruncated, nextMarker: nextMarker)
+        let local = { @Sendable () async throws -> SearchPage in
+            try await req.application.threadPool.runIfActive {
+                let (objects, _, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+                    bucketName: bucketName, prefix: prefix, delimiter: nil, maxKeys: scanLimit,
+                    marker: marker, keyFilter: filter)
+                return SearchPage(matches: objects, isTruncated: isTruncated, nextMarker: nextMarker)
+            }
         }
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
-            return try local()
+            return try await local()
         }
         let peers = await activePeers(config: config)
-        guard !peers.isEmpty else { return try local() }
+        guard !peers.isEmpty else { return try await local() }
 
-        var pages = [try local()]
+        var pages = [try await local()]
         await withTaskGroup(of: SearchPage?.self) { group in
             for node in peers {
                 group.addTask {
@@ -160,17 +165,19 @@ enum ClusterListingService {
         isTruncated: Bool, nextKeyMarker: String?, nextVersionIdMarker: String?
     ) {
         let local = {
-            try ObjectFileHandler.listAllVersions(
-                bucketName: bucketName, prefix: prefix, delimiter: delimiter,
-                keyMarker: keyMarker, versionIdMarker: versionIdMarker, maxKeys: maxKeys)
+            try await req.application.threadPool.runIfActive {
+                try ObjectFileHandler.listAllVersions(
+                    bucketName: bucketName, prefix: prefix, delimiter: delimiter,
+                    keyMarker: keyMarker, versionIdMarker: versionIdMarker, maxKeys: maxKeys)
+            }
         }
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
-            return try local()
+            return try await local()
         }
         let peers = await activePeers(config: config)
-        guard !peers.isEmpty else { return try local() }
+        guard !peers.isEmpty else { return try await local() }
 
-        let localResult = try local()
+        let localResult = try await local()
         var pages = [
             VersionsPage(
                 versions: localResult.versions, deleteMarkers: localResult.deleteMarkers,
@@ -212,17 +219,19 @@ enum ClusterListingService {
         nextUploadIdMarker: String?
     ) {
         let local = {
-            try MultipartFileHandler.listUploads(
-                bucketName: bucketName, prefix: prefix, keyMarker: keyMarker,
-                uploadIdMarker: uploadIdMarker, maxUploads: maxUploads)
+            try await req.application.threadPool.runIfActive {
+                try MultipartFileHandler.listUploads(
+                    bucketName: bucketName, prefix: prefix, keyMarker: keyMarker,
+                    uploadIdMarker: uploadIdMarker, maxUploads: maxUploads)
+            }
         }
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
-            return try local()
+            return try await local()
         }
         let peers = await activePeers(config: config)
-        guard !peers.isEmpty else { return try local() }
+        guard !peers.isEmpty else { return try await local() }
 
-        let localResult = try local()
+        let localResult = try await local()
         var pages = [
             UploadsPage(uploads: localResult.uploads, isTruncated: localResult.isTruncated)
         ]
@@ -256,7 +265,9 @@ enum ClusterListingService {
     /// an incomplete view - see the type-level doc comment for why this one operation departs
     /// from every other listing's best-effort tolerance.
     static func hasBucketObjects(req: Request, bucketName: String) async throws -> Bool {
-        if ObjectFileHandler.hasBucketObjects(bucketName: bucketName) {
+        if try await req.application.threadPool.runIfActive({
+            ObjectFileHandler.hasBucketObjects(bucketName: bucketName)
+        }) {
             return true
         }
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {

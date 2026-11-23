@@ -437,8 +437,10 @@ struct InternalBucketController: RouteCollection {
         // returns is built from this node's own base address, so it has to be the one that
         // answers. Check locally first (either format), then (only if not local) confirm
         // existence on a responsible peer with a header-only probe rather than pulling the bytes.
-        let localResult = try? ObjectFileHandler.readCurrentObject(
-            bucketName: input.bucket, key: input.key, loadData: false)
+        let localResult = try? await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.readCurrentObject(
+                bucketName: input.bucket, key: input.key, loadData: false)
+        }
         var existsLocally = (localResult ?? nil) != nil
         let (isLocal, _, responsible) = await ObjectRoutingService.erasureCodedReadPlacement(
             req: req, bucketName: input.bucket, key: input.key)
@@ -1035,19 +1037,22 @@ struct InternalBucketController: RouteCollection {
             // Resolve to the on-disk file so large objects can stream straight from it - a
             // console download of a multi-GB object must not buffer it in memory (same pattern
             // as SharedLinkController and the S3 GET handler).
-            var path = try? ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: versionId)
-            if path == nil, versionId == "null" {
-                // The "null" version of a never-versioned key lives at the plain path
-                let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
-                if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
-                    path = plainPath
+            let located: (path: String, location: (meta: ObjectMeta, payloadOffset: Int, payloadSize: Int))? =
+                try? await S3Service.offloadBlockingIO(req) {
+                    var path = try? ObjectFileHandler.resolvePath(
+                        bucketName: bucketName, key: key, versionId: versionId)
+                    if path == nil, versionId == "null" {
+                        // The "null" version of a never-versioned key lives at the plain path
+                        let plainPath = ObjectFileHandler.storagePath(for: bucketName, key: key)
+                        if ObjectFileHandler.keyExists(for: bucketName, key: key, path: plainPath) {
+                            path = plainPath
+                        }
+                    }
+                    guard let path else { return nil }
+                    return (path, try ObjectFileHandler.payloadLocation(path: path))
                 }
-            }
 
-            if let path, let location = try? ObjectFileHandler.payloadLocation(path: path),
-                !location.meta.isDeleteMarker
-            {
+            if let (path, location) = located ?? nil, !location.meta.isDeleteMarker {
                 let meta = location.meta
                 let response: Response
                 if location.payloadSize > Constants.streamingThreshold {
@@ -1056,7 +1061,9 @@ struct InternalBucketController: RouteCollection {
                 } else {
                     // Headers and body from the same read - one consistent snapshot of the file
                     guard
-                        let (freshMeta, data) = try? ObjectFileHandler.read(from: path, loadData: true),
+                        let (freshMeta, data) = try? await S3Service.offloadBlockingIO(req, {
+                            try ObjectFileHandler.read(from: path, loadData: true)
+                        }),
                         let data
                     else {
                         throw Abort(.internalServerError, reason: "Failed to read object data")
@@ -1188,9 +1195,9 @@ struct InternalBucketController: RouteCollection {
         // .fetchObjectToTempFile primitive CopyObject's cross-node source fetch already uses).
         // `isTemp` tells the caller whether that path needs unlinking afterward.
         func resolveObjectFile(key: String) async -> (path: String, isTemp: Bool)? {
-            if let path = try? ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: nil)
-            {
+            if let path = try? await S3Service.offloadBlockingIO(req, {
+                try ObjectFileHandler.resolvePath(bucketName: bucketName, key: key, versionId: nil)
+            }) ?? nil {
                 return (path, false)
             }
 
@@ -2203,10 +2210,10 @@ struct InternalBucketController: RouteCollection {
             return response
         }
 
-        guard
-            let path = try ObjectFileHandler.resolvePath(
-                bucketName: bucketName, key: key, versionId: nil)
-        else {
+        let resolvedPath = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.resolvePath(bucketName: bucketName, key: key, versionId: nil)
+        }
+        guard let path = resolvedPath else {
             throw Abort(.notFound, reason: "Object not found")
         }
 
@@ -2248,7 +2255,9 @@ struct InternalBucketController: RouteCollection {
             return try await ClusterForwardingClient.forward(req: req, candidates: candidates)
         }
 
-        let versions = try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        let versions = try await S3Service.offloadBlockingIO(req) {
+            try ObjectFileHandler.listVersions(bucketName: bucketName, key: key)
+        }
         let dtos = versions.map { ObjectMeta.ResponseDTO(from: $0) }
         // Uses Vapor's own Content encoding (not a hand-rolled JSONEncoder) so the response is
         // byte-identical to what this route returned before routing was added - the console
