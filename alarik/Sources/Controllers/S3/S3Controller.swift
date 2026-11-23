@@ -851,7 +851,6 @@ struct S3Controller: RouteCollection {
         // PUT remain on plain 3x replication for now (multipart's own EC integration is
         // separate, larger work).
         let usesECDestinationRouting = !isUploadPart && !hasTaggingParam
-        let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self]
 
         // UploadPart/UploadPartCopy must pin to the exact node coordinating this upload's
         // Create, not "any responsible node" - see multipartRoutingDecision's doc comment.
@@ -860,17 +859,11 @@ struct S3Controller: RouteCollection {
         // (bucketName, keyPath).
         let peers: [ClusterNodeInfo]
         var ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)?
-        if usesECDestinationRouting, let ecConfig {
-            switch try await ObjectRoutingService.routeForErasureCodedWrite(
-                req: req, bucketName: bucketName, key: keyPath)
-            {
-            case .notClustered:
-                // Unreachable (ecConfig != nil implies cluster mode is on), but fall through to
-                // the plain non-EC write below exactly like a genuinely non-clustered node.
-                peers = []
-            case .local(let localPeers):
-                peers = []
-                ecWriteFanOut = (localPeers, ecConfig)
+        if usesECDestinationRouting {
+            switch try await Self.routeSingleObjectWrite(req: req, bucketName: bucketName, key: keyPath) {
+            case .local(let localPeers, let fanOut):
+                peers = localPeers
+                ecWriteFanOut = fanOut
             case .forwarded(let response):
                 return response
             }
@@ -1441,6 +1434,257 @@ struct S3Controller: RouteCollection {
         return tempPath
     }
 
+    enum SingleObjectWriteRouting {
+        case local(
+            peers: [ClusterNodeInfo],
+            ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)?)
+        case forwarded(Response)
+    }
+
+    /// Routing for a whole-object write (plain PUT, a CopyObject destination): erasure-coded
+    /// and pinned to rank-0 when the cluster is EC-configured, plain replication otherwise.
+    /// Shared with the console's copy endpoint so both write paths place objects identically.
+    static func routeSingleObjectWrite(req: Request, bucketName: String, key: String)
+        async throws -> SingleObjectWriteRouting
+    {
+        if let ecConfig = req.application.storage[ClusterErasureCodingConfigKey.self] {
+            switch try await ObjectRoutingService.routeForErasureCodedWrite(
+                req: req, bucketName: bucketName, key: key)
+            {
+            case .notClustered:
+                // Unreachable (ecConfig != nil implies cluster mode is on), but fall through to
+                // the plain non-EC write exactly like a genuinely non-clustered node.
+                return .local(peers: [], ecWriteFanOut: nil)
+            case .local(let peers):
+                return .local(peers: [], ecWriteFanOut: (peers, ecConfig))
+            case .forwarded(let response):
+                return .forwarded(response)
+            }
+        }
+        switch try await ObjectRoutingService.routeForWrite(
+            req: req, bucketName: bucketName, key: key, requirePrimary: false)
+        {
+        case .local(let peers):
+            return .local(peers: peers, ecWriteFanOut: nil)
+        case .forwarded(let response):
+            return .forwarded(response)
+        }
+    }
+
+    /// What a copy's destination takes besides the bytes. `checksumAlgorithm` nil skips the
+    /// extra read a fresh checksum costs.
+    struct CopyAttributes {
+        var contentType: String
+        var userMetadata: [String: String]
+        var httpHeaders: [String: String]?
+        var tags: [String: String]?
+        var checksumAlgorithm: String?
+
+        /// S3's COPY directive: everything carried over from the source unchanged.
+        static func carriedOver(from source: ObjectMeta) -> CopyAttributes {
+            CopyAttributes(
+                contentType: source.contentType, userMetadata: source.metadata,
+                httpHeaders: source.httpHeaders, tags: source.tags,
+                checksumAlgorithm: source.checksum?.algorithm)
+        }
+    }
+
+    struct CopyOutcome {
+        /// The destination as written, version id included.
+        let meta: ObjectMeta
+        let sourceVersionId: String?
+    }
+
+    /// Copies `copySource` to a destination the caller has already routed to this node, and
+    /// emits the event, replication and cluster-replication side effects of any other write.
+    /// Source and destination can be unrelated buckets/keys, so the source is resolved to a
+    /// local file first (fetched from a peer if need be) and streamed file-to-file in fixed
+    /// windows, never buffered whole. `attributes` runs once the source is known; the S3 handler
+    /// also does its `x-amz-copy-source-if-*` checks there.
+    func copyObject(
+        req: Request,
+        destinationBucket: String,
+        destinationKey: String,
+        copySource: CopySource,
+        versioningStatus: VersioningStatus,
+        peers: [ClusterNodeInfo],
+        ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)?,
+        attributes: (ObjectMeta) throws -> CopyAttributes
+    ) async throws -> CopyOutcome {
+        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
+            try await resolveCopySource(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId)
+        defer { cleanupSource() }
+
+        // Verified against the CopyObject API reference: a delete marker named by version id is
+        // not a copyable object (an implicit latest-is-marker is already NoSuchKey above).
+        if sourceMeta.isDeleteMarker {
+            throw S3Error(
+                status: .badRequest, code: "InvalidRequest",
+                message:
+                    "The source of a copy request may not specifically refer to a delete marker by version id.",
+                requestId: req.id)
+        }
+
+        let attributes = try attributes(sourceMeta)
+
+        // The destination's ETag is the plain MD5 of the copied bytes. A single-part source's
+        // ETag already is exactly that; a multipart source ("-N" suffix) needs one streaming
+        // hash pass over the payload.
+        let etag: String
+        if sourceMeta.etag.contains("-") {
+            etag = try await S3Service.offloadBlockingIO(req) {
+                try ObjectFileHandler.md5HexOfFileRegion(
+                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+            }
+        } else {
+            etag = sourceMeta.etag
+        }
+
+        // A copy is a single-object operation, so the destination gets a fresh FULL_OBJECT
+        // checksum computed over the copied bytes (S3 recomputes rather than carrying the value
+        // over, since a multipart source's stored checksum wouldn't match a single-object
+        // destination).
+        var destinationChecksum: ObjectChecksum?
+        if let checksumAlgorithm = attributes.checksumAlgorithm {
+            let value = try await S3Service.offloadBlockingIO(req) {
+                try ObjectFileHandler.flexibleChecksumOfFileRegion(
+                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize,
+                    algorithm: checksumAlgorithm)
+            }
+            destinationChecksum = value.map {
+                ObjectChecksum(algorithm: checksumAlgorithm, value: $0, type: .fullObject)
+            }
+        }
+
+        var destinationMeta = ObjectMeta(
+            bucketName: destinationBucket,
+            key: destinationKey,
+            size: sourcePayloadSize,
+            contentType: attributes.contentType,
+            etag: etag,
+            metadata: attributes.userMetadata,
+            updatedAt: Date(),
+            tags: attributes.tags,
+            checksum: destinationChecksum,
+            httpHeaders: attributes.httpHeaders
+        )
+
+        // Write with versioning support - payload window-copied from the source file. Real
+        // blocking file IO (open/read/write/fsync/rename), so it's offloaded rather than
+        // tying up the async executor for the whole copy.
+        let copySources = [
+            (path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
+        ]
+        let writtenMeta = destinationMeta
+
+        let versionId: String?
+        if let ecWriteFanOut {
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
+                try Self.prepareErasureCodedVersionedWrite(
+                    metadata: writtenMeta, bucketName: destinationBucket, key: destinationKey,
+                    versioningStatus: versioningStatus)
+            }
+
+            do {
+                try await ErasureCodedWriteCoordinator.write(
+                    app: req.application, bucketName: destinationBucket, key: destinationKey,
+                    objectMeta: versionedMeta, payloadSources: copySources,
+                    peers: ecWriteFanOut.peers,
+                    ecConfig: (ecWriteFanOut.config.dataShards, ecWriteFanOut.config.parityShards),
+                    priorLatestVersionId: priorLatestVersionId)
+            } catch let error as ErasureCodedCoordinatorError {
+                throw S3Error(
+                    status: .serviceUnavailable, code: "ServiceUnavailable",
+                    message: "\(error)", requestId: req.id)
+            }
+
+            if let mintedVersionId {
+                try await S3Service.offloadBlockingIO(req) {
+                    try ObjectFileHandler.updateLatestPointer(
+                        bucketName: destinationBucket, key: destinationKey,
+                        versionId: mintedVersionId)
+                }
+            }
+            versionId = mintedVersionId
+        } else {
+            versionId = try await S3Service.offloadBlockingIO(req) {
+                if versioningStatus != .disabled {
+                    return try ObjectFileHandler.writeVersionedStreamed(
+                        metadata: writtenMeta,
+                        payloadSources: copySources,
+                        bucketName: destinationBucket,
+                        key: destinationKey,
+                        versioningStatus: versioningStatus
+                    )
+                } else {
+                    let destinationPath = ObjectFileHandler.storagePath(
+                        for: destinationBucket, key: destinationKey)
+                    try ObjectFileHandler.writeStreamed(
+                        metadata: writtenMeta, payloadSources: copySources, to: destinationPath)
+                    return nil
+                }
+            }
+        }
+        destinationMeta.versionId = versionId
+
+        await NotificationService.emit(
+            event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
+            size: destinationMeta.size, etag: etag, versionId: versionId,
+            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
+        if !S3Service.isReplicationWrite(req) {
+            await ReplicationService.enqueuePut(
+                app: req.application, bucketName: destinationBucket, key: destinationKey,
+                versionId: versionId)
+        }
+        if ecWriteFanOut == nil {
+            await ClusterReplicationService.replicateWrite(
+                app: req.application, bucketName: destinationBucket, key: destinationKey,
+                versionId: versionId, operation: .put, peers: peers)
+        }
+
+        return CopyOutcome(meta: destinationMeta, sourceVersionId: sourceMeta.versionId)
+    }
+
+    /// The metadata and tagging directives (verified against the CopyObject API reference):
+    /// COPY (the default) carries the source's over wholesale, REPLACE takes them from this
+    /// request instead - all-or-nothing per directive, never merged. Standard headers follow
+    /// the metadata directive, like Content-Type. The checksum is recomputed in the algorithm
+    /// requested here, else the source's.
+    private static func copyAttributes(from req: Request, source: ObjectMeta) throws
+        -> CopyAttributes
+    {
+        var attributes = CopyAttributes.carriedOver(from: source)
+
+        if S3Service.shouldReplaceMetadata(req: req) {
+            attributes.contentType = req.headers.contentType?.description ?? source.contentType
+            attributes.userMetadata = [:]
+            for (name, value) in req.headers where name.lowercased().hasPrefix("x-amz-meta-") {
+                let metaKey = String(name.dropFirst("x-amz-meta-".count)).lowercased()
+                attributes.userMetadata[metaKey] = value
+            }
+            attributes.httpHeaders = S3Service.storedObjectHeaders(from: req.headers)
+        }
+
+        if req.headers.first(name: "x-amz-tagging-directive")?.uppercased() == "REPLACE" {
+            let tagging = Tagging.parseHeaderValue(
+                req.headers.first(name: "x-amz-tagging") ?? "")
+            guard tagging.tags.count <= Tagging.maxTagCount else {
+                throw S3Error(
+                    status: .badRequest, code: "InvalidTag",
+                    message: "Object tags cannot be greater than \(Tagging.maxTagCount).",
+                    requestId: req.id)
+            }
+            attributes.tags = tagging.tags.isEmpty ? nil : tagging.tags
+        }
+
+        if let requested = S3Service.requestedChecksumAlgorithm(req) {
+            attributes.checksumAlgorithm = requested
+        }
+        return attributes
+    }
+
     private func handleCopyObject(
         req: Request,
         destinationBucket: String,
@@ -1470,199 +1714,36 @@ struct S3Controller: RouteCollection {
             }
         }
 
-        // Resolve the source straight to its on-disk file (fetching it from a peer first if
-        // this node doesn't hold it) - the payload is streamed file-to-file in fixed windows,
-        // never buffered whole.
-        let (sourceMeta, sourcePath, sourcePayloadOffset, sourcePayloadSize, cleanupSource) =
-            try await resolveCopySource(
-                req: req, bucketName: copySource.bucketName, key: copySource.key,
-                versionId: copySource.versionId)
-        defer { cleanupSource() }
-
-        // Validate copy conditions (if-match, if-none-match, etc.)
-        try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
-
-        // Determine metadata handling. x-amz-metadata-directive COPY (the default) carries
-        // the source's Content-Type AND user metadata over; REPLACE takes both from this
-        // request's headers instead (verified against the CopyObject API reference - metadata
-        // is all-or-nothing per directive, never merged).
-        let replaceMetadata = S3Service.shouldReplaceMetadata(req: req)
-
-        let contentType: String
-        var userMetadata: [String: String]
-        if replaceMetadata {
-            contentType = req.headers.contentType?.description ?? sourceMeta.contentType
-            userMetadata = [:]
-            for (name, value) in req.headers {
-                if name.lowercased().hasPrefix("x-amz-meta-") {
-                    let metaKey = String(name.dropFirst("x-amz-meta-".count)).lowercased()
-                    userMetadata[metaKey] = value
-                }
-            }
-        } else {
-            contentType = sourceMeta.contentType
-            userMetadata = sourceMeta.metadata
+        let outcome = try await copyObject(
+            req: req, destinationBucket: destinationBucket, destinationKey: destinationKey,
+            copySource: copySource, versioningStatus: versioningStatus, peers: peers,
+            ecWriteFanOut: ecWriteFanOut
+        ) { sourceMeta in
+            try S3Service.validateCopyConditions(req: req, sourceMeta: sourceMeta)
+            return try Self.copyAttributes(from: req, source: sourceMeta)
         }
-
-        // Tags follow their own directive: x-amz-tagging-directive COPY (the default) carries
-        // the source's tag-set over; REPLACE takes it from this request's x-amz-tagging header
-        // (verified against the CopyObject API reference).
-        let tags: [String: String]?
-        if req.headers.first(name: "x-amz-tagging-directive")?.uppercased() == "REPLACE" {
-            let tagging = Tagging.parseHeaderValue(
-                req.headers.first(name: "x-amz-tagging") ?? "")
-            guard tagging.tags.count <= Tagging.maxTagCount else {
-                throw S3Error(
-                    status: .badRequest, code: "InvalidTag",
-                    message: "Object tags cannot be greater than \(Tagging.maxTagCount).",
-                    requestId: req.id)
-            }
-            tags = tagging.tags.isEmpty ? nil : tagging.tags
-        } else {
-            tags = sourceMeta.tags
-        }
-
-        // The destination's ETag is the plain MD5 of the copied bytes. A single-part source's
-        // ETag already is exactly that; a multipart source ("-N" suffix) needs one streaming
-        // hash pass over the payload.
-        let etag: String
-        if sourceMeta.etag.contains("-") {
-            etag = try await S3Service.offloadBlockingIO(req) {
-                try ObjectFileHandler.md5HexOfFileRegion(
-                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
-            }
-        } else {
-            etag = sourceMeta.etag
-        }
-
-        // Checksum: a copy is a single-object operation, so the destination gets a fresh
-        // FULL_OBJECT checksum computed over the copied bytes - in the algorithm requested on the
-        // copy, else the source's algorithm (S3 recomputes rather than carrying the value over,
-        // since a multipart source's stored checksum wouldn't match a single-object destination).
-        // Skipped entirely when neither is present, to avoid a full read on plain copies.
-        let checksumAlgorithm =
-            S3Service.requestedChecksumAlgorithm(req) ?? sourceMeta.checksum?.algorithm
-        var destinationChecksum: ObjectChecksum?
-        if let checksumAlgorithm {
-            let value = try await S3Service.offloadBlockingIO(req) {
-                try ObjectFileHandler.flexibleChecksumOfFileRegion(
-                    path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize,
-                    algorithm: checksumAlgorithm)
-            }
-            destinationChecksum = value.map {
-                ObjectChecksum(algorithm: checksumAlgorithm, value: $0, type: .fullObject)
-            }
-        }
-
-        let destinationMeta = ObjectMeta(
-            bucketName: destinationBucket,
-            key: destinationKey,
-            size: sourcePayloadSize,
-            contentType: contentType,
-            etag: etag,
-            metadata: userMetadata,
-            updatedAt: Date(),
-            tags: tags,
-            checksum: destinationChecksum,
-            // Standard headers follow the metadata directive, like Content-Type.
-            httpHeaders: replaceMetadata
-                ? S3Service.storedObjectHeaders(from: req.headers) : sourceMeta.httpHeaders
-        )
 
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/xml")
-        S3Service.addChecksumHeaders(destinationChecksum, to: &headers)
-
-        // Write with versioning support - payload window-copied from the source file. Real
-        // blocking file IO (open/read/write/fsync/rename), so it's offloaded rather than
-        // tying up the async executor for the whole copy.
-        let copySources = [
-            (path: sourcePath, offset: sourcePayloadOffset, size: sourcePayloadSize)
-        ]
-
-        let versionId: String?
-        if let ecWriteFanOut {
-            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
-                try Self.prepareErasureCodedVersionedWrite(
-                    metadata: destinationMeta, bucketName: destinationBucket, key: destinationKey,
-                    versioningStatus: versioningStatus)
-            }
-
-            do {
-                try await ErasureCodedWriteCoordinator.write(
-                    app: req.application, bucketName: destinationBucket, key: destinationKey,
-                    objectMeta: versionedMeta, payloadSources: copySources,
-                    peers: ecWriteFanOut.peers,
-                    ecConfig: (ecWriteFanOut.config.dataShards, ecWriteFanOut.config.parityShards),
-                    priorLatestVersionId: priorLatestVersionId)
-            } catch let error as ErasureCodedCoordinatorError {
-                throw S3Error(
-                    status: .serviceUnavailable, code: "ServiceUnavailable",
-                    message: "\(error)", requestId: req.id)
-            }
-
-            if let mintedVersionId {
-                try await S3Service.offloadBlockingIO(req) {
-                    try ObjectFileHandler.updateLatestPointer(
-                        bucketName: destinationBucket, key: destinationKey,
-                        versionId: mintedVersionId)
-                }
-            }
-            versionId = mintedVersionId
-        } else {
-            versionId = try await S3Service.offloadBlockingIO(req) {
-                if versioningStatus != .disabled {
-                    return try ObjectFileHandler.writeVersionedStreamed(
-                        metadata: destinationMeta,
-                        payloadSources: copySources,
-                        bucketName: destinationBucket,
-                        key: destinationKey,
-                        versioningStatus: versioningStatus
-                    )
-                } else {
-                    let destinationPath = ObjectFileHandler.storagePath(
-                        for: destinationBucket, key: destinationKey)
-                    try ObjectFileHandler.writeStreamed(
-                        metadata: destinationMeta, payloadSources: copySources, to: destinationPath)
-                    return nil
-                }
-            }
-        }
-        if let versionId {
+        S3Service.addChecksumHeaders(outcome.meta.checksum, to: &headers)
+        if let versionId = outcome.meta.versionId {
             headers.add(name: "x-amz-version-id", value: versionId)
         }
-
-        // Add source version ID if present
-        if let sourceVersionId = sourceMeta.versionId {
+        if let sourceVersionId = outcome.sourceVersionId {
             headers.add(name: "x-amz-copy-source-version-id", value: sourceVersionId)
-        }
-
-        await NotificationService.emit(
-            event: .objectCreatedCopy, bucketName: destinationBucket, key: destinationKey,
-            size: destinationMeta.size, etag: etag, versionId: versionId,
-            requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
-        if !S3Service.isReplicationWrite(req) {
-            await ReplicationService.enqueuePut(
-                app: req.application, bucketName: destinationBucket, key: destinationKey,
-                versionId: versionId)
-        }
-        if ecWriteFanOut == nil {
-            await ClusterReplicationService.replicateWrite(
-                app: req.application, bucketName: destinationBucket, key: destinationKey,
-                versionId: versionId, operation: .put, peers: peers)
         }
 
         // Build copy result response (S3 returns XML for copy operations)
         var copyChecksumXML = ""
-        if let destinationChecksum {
-            let tag = "Checksum\(destinationChecksum.algorithm.uppercased())"
-            copyChecksumXML = "\n    <\(tag)>\(destinationChecksum.value)</\(tag)>"
+        if let checksum = outcome.meta.checksum {
+            let tag = "Checksum\(checksum.algorithm.uppercased())"
+            copyChecksumXML = "\n    <\(tag)>\(checksum.value)</\(tag)>"
         }
         let copyResult = """
             <?xml version="1.0" encoding="UTF-8"?>
             <CopyObjectResult>
-                <LastModified>\(ISO8601DateFormatter().string(from: destinationMeta.updatedAt))</LastModified>
-                <ETag>"\(etag)"</ETag>\(copyChecksumXML)
+                <LastModified>\(ISO8601DateFormatter().string(from: outcome.meta.updatedAt))</LastModified>
+                <ETag>"\(outcome.meta.etag)"</ETag>\(copyChecksumXML)
             </CopyObjectResult>
             """
 

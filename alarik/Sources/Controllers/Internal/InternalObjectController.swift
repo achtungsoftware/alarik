@@ -19,7 +19,7 @@ import Vapor
 import ZIPFoundation
 
 /// The console's object browser endpoints: listing, upload (plain and chunked), download,
-/// delete, per-object tags and metadata, and version history.
+/// delete, copy/move, per-object tags and metadata, and version history.
 struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
     struct StatsDTO: Content {
         let sizeBytes: Int64
@@ -56,6 +56,17 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
         let expiresAt: Date
     }
 
+    struct ObjectCopyRequestDTO: Content {
+        let sourceBucket: String
+        let sourceKey: String
+        /// A specific version; with the same destination key this restores it as current.
+        let sourceVersionId: String?
+        let destinationBucket: String
+        let destinationKey: String
+        /// Remove the source once the copy is durable: move and rename.
+        let deleteSource: Bool?
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("objects").get(use: self.listObjects)
         routes.grouped("objects", "stats").get(use: self.getObjectStats)
@@ -76,6 +87,8 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
                 .DELETE, body: .collect(maxSize: Self.subresourceBodySizeLimit),
                 use: self.abortMultipartUpload)
         routes.grouped("objects").delete(use: self.deleteObject)
+        routes.grouped("objects", "copy")
+            .on(.POST, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.copyObject)
         routes.grouped("objects", "download").post(use: self.downloadObjects)
         routes.grouped("objects", "download-ticket")
             .on(
@@ -342,15 +355,19 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
     /// `MultipartError`; everything else is a genuine server fault and must not masquerade as
     /// the client's mistake (the console only retries 5xx).
     private func abort(forCompletionError error: any Error) -> Abort {
+        abort(for: error, serverFault: "Completing the upload failed.")
+    }
+
+    /// `S3Error`/`MultipartError` carry a client-safe status and message. Anything else is a
+    /// server fault whose detail (paths, peers) goes to the log, never to the client.
+    private func abort(for error: any Error, serverFault: String) -> Abort {
         if let error = error as? S3Error {
             return Abort(error.status, reason: error.message)
         }
         if let error = error as? MultipartError {
             return Abort(error.status, reason: error.message)
         }
-        // The detail goes to the log, never to the client: internal error text names paths and
-        // peers. The console only needs to know it was a server fault.
-        return Abort(.internalServerError, reason: "Completing the upload failed.")
+        return Abort(.internalServerError, reason: serverFault)
     }
 
     @Sendable
@@ -577,6 +594,94 @@ struct InternalObjectController: RouteCollection, ConsoleBucketRoutes {
         }
 
         return .noContent
+    }
+
+    /// Copy, move/rename and version restore for the object browser - all one server-side copy
+    /// (restore is S3's own idiom: copy the old version onto its key as a new current version),
+    /// routed to the destination's owner before anything is read, like every other write.
+    @Sendable
+    func copyObject(req: Request) async throws -> Response {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+        let input = try req.content.decode(ObjectCopyRequestDTO.self)
+        let deleteSource = input.deleteSource ?? false
+
+        guard !input.sourceKey.isEmpty, !input.sourceKey.hasSuffix("/") else {
+            throw Abort(.badRequest, reason: "Source key must name an object, not a folder")
+        }
+        guard !input.destinationKey.hasSuffix("/") else {
+            throw Abort(.badRequest, reason: "Destination key must name an object, not a folder")
+        }
+        try ObjectKeyValidation.validate(input.destinationKey)
+
+        let sameObject =
+            input.sourceBucket == input.destinationBucket
+            && input.sourceKey == input.destinationKey
+        if sameObject && input.sourceVersionId == nil {
+            throw Abort(.badRequest, reason: "Source and destination are the same object")
+        }
+        if sameObject && deleteSource {
+            // Deleting the source afterwards would delete (or mark) the copy just made.
+            throw Abort(.badRequest, reason: "An object cannot be moved onto itself")
+        }
+
+        try await requireOwnedBucketExists(
+            req: req, bucketName: input.sourceBucket, userId: auth.userId)
+        if input.sourceBucket != input.destinationBucket {
+            try await requireOwnedBucketExists(
+                req: req, bucketName: input.destinationBucket, userId: auth.userId)
+        }
+
+        let peers: [ClusterNodeInfo]
+        let ecWriteFanOut: (peers: [ClusterNodeInfo], config: ClusterErasureCodingConfig)?
+        switch try await S3Controller.routeSingleObjectWrite(
+            req: req, bucketName: input.destinationBucket, key: input.destinationKey)
+        {
+        case .local(let localPeers, let fanOut):
+            peers = localPeers
+            ecWriteFanOut = fanOut
+        case .forwarded(let response):
+            return response
+        }
+
+        let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(
+            app: req.application, bucket: input.destinationBucket)
+        let outcome: S3Controller.CopyOutcome
+        do {
+            outcome = try await S3Controller().copyObject(
+                req: req, destinationBucket: input.destinationBucket,
+                destinationKey: input.destinationKey,
+                copySource: CopySource(
+                    bucketName: input.sourceBucket, key: input.sourceKey,
+                    versionId: input.sourceVersionId),
+                versioningStatus: versioningStatus, peers: peers, ecWriteFanOut: ecWriteFanOut
+            ) { .carriedOver(from: $0) }
+        } catch {
+            throw abort(for: error, serverFault: "Copying the object failed.")
+        }
+
+        if deleteSource {
+            // The copy is durable, so the source goes the same way a console delete takes it:
+            // a delete marker on a versioned bucket, a hard delete otherwise.
+            let sourceVersioning =
+                input.sourceBucket == input.destinationBucket
+                ? versioningStatus
+                : await BucketVersioningCache.shared.resolvedStatus(
+                    app: req.application, bucket: input.sourceBucket)
+            let removed = try await ClusterReplicationService.deleteObjectClusterWide(
+                req: req, bucketName: input.sourceBucket, key: input.sourceKey, versionId: nil,
+                versioningStatus: sourceVersioning)
+            await NotificationService.emit(
+                event: removed.isDeleteMarker
+                    ? .objectRemovedDeleteMarkerCreated : .objectRemovedDelete,
+                bucketName: input.sourceBucket, key: input.sourceKey, size: nil, etag: nil,
+                versionId: removed.versionId,
+                requestId: req.id, sourceIP: req.remoteAddress?.ipAddress, app: req.application)
+            await ReplicationService.enqueueDelete(
+                app: req.application, bucketName: input.sourceBucket, key: input.sourceKey,
+                versionId: removed.versionId)
+        }
+
+        return try await ObjectMeta.ResponseDTO(from: outcome.meta).encodeResponse(for: req)
     }
 
     @Sendable
