@@ -983,9 +983,12 @@ struct S3Controller: RouteCollection {
             // Erasure-coded write: mint the version id the same way the plain versioned-write
             // path does (tags/listing behave identically either way), but encode+place shards
             // instead of writing a single `.obj` file.
-            let (versionId, versionedMeta, priorLatestVersionId) = try Self.prepareErasureCodedVersionedWrite(
-                metadata: meta, bucketName: bucketName, key: keyPath,
-                versioningStatus: versioningStatus)
+            let metaToWrite = meta
+            let (versionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
+                try Self.prepareErasureCodedVersionedWrite(
+                    metadata: metaToWrite, bucketName: bucketName, key: keyPath,
+                    versioningStatus: versioningStatus)
+            }
 
             let payloadSources: [(path: String, offset: Int, size: Int)]
             var ecTempSourcePath: String?
@@ -1522,9 +1525,11 @@ struct S3Controller: RouteCollection {
 
         let versionId: String?
         if let ecWriteFanOut {
-            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try Self.prepareErasureCodedVersionedWrite(
-                metadata: destinationMeta, bucketName: destinationBucket, key: destinationKey,
-                versioningStatus: versioningStatus)
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
+                try Self.prepareErasureCodedVersionedWrite(
+                    metadata: destinationMeta, bucketName: destinationBucket, key: destinationKey,
+                    versioningStatus: versioningStatus)
+            }
 
             do {
                 try await ErasureCodedWriteCoordinator.write(
@@ -2319,9 +2324,11 @@ struct S3Controller: RouteCollection {
                 try MultipartFileHandler.prepareCompletion(
                     bucketName: bucketName, uploadId: uploadId, parts: parts)
             }
-            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try prepareErasureCodedVersionedWrite(
-                metadata: plan.objectMeta, bucketName: bucketName, key: key,
-                versioningStatus: versioningStatus)
+            let (mintedVersionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
+                try Self.prepareErasureCodedVersionedWrite(
+                    metadata: plan.objectMeta, bucketName: bucketName, key: key,
+                    versioningStatus: versioningStatus)
+            }
             do {
                 try await ErasureCodedWriteCoordinator.write(
                     app: req.application, bucketName: bucketName, key: key,

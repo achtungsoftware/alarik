@@ -1383,4 +1383,36 @@ extension ObjectFileHandlerTests {
         #expect(payload.count == meta.size)
         #expect(payloads.contains(payload))
     }
+
+    @Test("rewriteMetadata and write wait for the key lock held elsewhere")
+    func writersBlockOnKeyLock() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        try ObjectFileHandler.write(metadata: createTestMetadata(), data: createTestData(), to: path)
+        final class Flag: @unchecked Sendable { var done = false }
+        let metadata = createTestMetadata()
+        let data = createTestData()
+
+        for operation in ["rewrite", "write"] {
+            let flag = Flag()
+            let finished = DispatchSemaphore(value: 0)
+            ObjectKeyLock.withLock(bucketName: "test-bucket", key: "test-key.txt") {
+                Thread {
+                    if operation == "rewrite" {
+                        _ = try? ObjectFileHandler.rewriteMetadata(
+                            bucketName: "test-bucket", key: "test-key.txt", at: path
+                        ) { $0.tags = ["x": "y"] }
+                    } else {
+                        try? ObjectFileHandler.write(metadata: metadata, data: data, to: path)
+                    }
+                    flag.done = true
+                    finished.signal()
+                }.start()
+                Thread.sleep(forTimeInterval: 0.3)
+                #expect(!flag.done, "\(operation) must wait for the key lock")
+            }
+            #expect(finished.wait(timeout: .now() + 5) == .success)
+            #expect(flag.done)
+        }
+    }
 }
