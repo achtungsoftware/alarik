@@ -80,7 +80,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -128,7 +128,7 @@ struct InternalAdminControllerTests {
                     try req.content.encode(createDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -228,7 +228,7 @@ struct InternalAdminControllerTests {
                     try req.content.encode(editDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -412,7 +412,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -714,7 +714,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -741,7 +741,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -901,7 +901,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
 
             // Verify bucket still exists
@@ -1064,7 +1064,7 @@ struct InternalAdminControllerTests {
                     setAccessKeyHeaders(&req, accessKey: nonAdminAccessKey, secretKey: nonAdminSecretKey)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -1334,7 +1334,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -1358,7 +1358,7 @@ struct InternalAdminControllerTests {
                     try req.content.encode(InternalAdminController.PolicyDTO(policy: policyJSON))
                 },
                 afterResponse: { res async in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -1374,7 +1374,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -1499,7 +1499,7 @@ struct InternalAdminControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }

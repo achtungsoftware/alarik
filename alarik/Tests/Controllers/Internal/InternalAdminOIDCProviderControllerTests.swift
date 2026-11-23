@@ -81,7 +81,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -131,7 +131,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     try req.content.encode(createDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
 
             let providers = await OIDCProvider.all(app: app)
@@ -235,7 +235,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     try req.content.encode(editDTO)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
         }
     }
@@ -272,7 +272,7 @@ struct InternalAdminOIDCProviderControllerTests {
                     req.headers.bearerAuthorization = BearerAuthorization(token: token)
                 },
                 afterResponse: { res async throws in
-                    #expect(res.status == .unauthorized)
+                    #expect(res.status == .forbidden)
                 })
 
             let providers = await OIDCProvider.all(app: app)

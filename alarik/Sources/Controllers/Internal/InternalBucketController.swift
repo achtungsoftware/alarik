@@ -740,7 +740,9 @@ struct InternalBucketController: RouteCollection {
         if let error = error as? MultipartError {
             return Abort(error.status, reason: error.message)
         }
-        return Abort(.internalServerError, reason: "Completing the upload failed: \(error)")
+        // The detail goes to the log, never to the client: internal error text names paths and
+        // peers. The console only needs to know it was a server fault.
+        return Abort(.internalServerError, reason: "Completing the upload failed.")
     }
 
     @Sendable
@@ -817,6 +819,7 @@ struct InternalBucketController: RouteCollection {
                 req: req, bucketName: target.bucketName, key: target.key, uploadId: uploadId,
                 parts: body.parts.map { (partNumber: $0.partNumber, etag: $0.etag) }, peers: peers)
         } catch {
+            req.logger.error("Console multipart completion failed: \(error)")
             throw abort(forCompletionError: error)
         }
 
@@ -1166,7 +1169,8 @@ struct InternalBucketController: RouteCollection {
         do {
             archive = try Archive(url: zipURL, accessMode: .create)
         } catch {
-            throw Abort(.internalServerError, reason: "Failed to create ZIP archive: \(error)")
+            req.logger.error("Folder download could not build the ZIP archive: \(error)")
+            throw Abort(.internalServerError, reason: "Failed to create the ZIP archive.")
         }
 
         var addedFiles = 0

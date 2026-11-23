@@ -36,9 +36,11 @@ struct AuthenticatedUser: Authenticatable {
     }
 
     /// Require that the authenticated user is an admin, otherwise throw unauthorized
+    /// 403, not 401: the caller is authenticated and known, just not allowed. A 401 tells
+    /// clients their credentials are bad and makes consoles log the user out.
     func requireAdmin() throws {
         guard isAdmin else {
-            throw Abort(.unauthorized, reason: "User not admin")
+            throw Abort(.forbidden, reason: "Admin privileges required")
         }
     }
 }
