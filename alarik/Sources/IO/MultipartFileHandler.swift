@@ -336,8 +336,68 @@ struct MultipartFileHandler {
         uploadId: String,
         parts: [(partNumber: Int, etag: String)]
     ) throws -> CompletionPlan {
+        try prepareCompletion(
+            uploadDirectory: try uploadPath(for: bucketName, uploadId: uploadId),
+            bucketName: bucketName, parts: parts)
+    }
+
+    /// An upload taken aside for completion. Two concurrent CompleteMultipartUpload calls for
+    /// one id used to race: the second read parts the first was already deleting and failed
+    /// with "payload source ended early". Claiming renames the upload directory, so exactly one
+    /// caller gets it and the other sees NoSuchUpload. `release()` puts a rejected completion
+    /// (ETag mismatch, EntityTooSmall) back for the client to repair; `discard()` removes a
+    /// finished one.
+    struct CompletionClaim {
+        let bucketName: String
+        let uploadId: String
+        /// The renamed directory, with a trailing slash.
+        let directory: String
+        private let liveDirectory: String
+
+        fileprivate init(bucketName: String, uploadId: String, liveDirectory: String, directory: String) {
+            self.bucketName = bucketName
+            self.uploadId = uploadId
+            self.liveDirectory = liveDirectory
+            self.directory = directory
+        }
+
+        func release() {
+            _ = POSIXFile.rename(String(directory.dropLast()), String(liveDirectory.dropLast()))
+        }
+
+        func discard() throws {
+            try FileManager.default.removeItem(atPath: directory)
+            removeBucketDirectoryIfEmpty(bucketName: bucketName)
+        }
+    }
+
+    static let completingSuffix = ".completing"
+
+    static func claimForCompletion(bucketName: String, uploadId: String) throws -> CompletionClaim {
+        let live = try uploadPath(for: bucketName, uploadId: uploadId)
+        let claimed = String(live.dropLast()) + completingSuffix + "/"
+        guard POSIXFile.rename(String(live.dropLast()), String(claimed.dropLast())) == 0 else {
+            throw NSError(
+                domain: "NoSuchUpload", code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+        }
+        return CompletionClaim(
+            bucketName: bucketName, uploadId: uploadId, liveDirectory: live, directory: claimed)
+    }
+
+    static func prepareCompletion(
+        claim: CompletionClaim, parts: [(partNumber: Int, etag: String)]
+    ) throws -> CompletionPlan {
+        try prepareCompletion(uploadDirectory: claim.directory, bucketName: claim.bucketName, parts: parts)
+    }
+
+    private static func prepareCompletion(
+        uploadDirectory: String,
+        bucketName: String,
+        parts: [(partNumber: Int, etag: String)]
+    ) throws -> CompletionPlan {
         // Read upload metadata
-        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
+        let metaPath = uploadDirectory + "meta.json"
         guard FileManager.default.fileExists(atPath: metaPath) else {
             throw NSError(
                 domain: "NoSuchUpload", code: 404,
@@ -376,8 +436,7 @@ struct MultipartFileHandler {
         var totalSize = 0
 
         for part in sortedParts {
-            let partFilePath = try partPath(
-                for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
+            let partFilePath = uploadDirectory + "part-\(part.partNumber)"
 
             guard FileManager.default.fileExists(atPath: partFilePath) else {
                 throw NSError(
@@ -388,8 +447,7 @@ struct MultipartFileHandler {
             }
 
             // Read and verify part metadata
-            let partMetaFilePath = try partMetaPath(
-                for: bucketName, uploadId: uploadId, partNumber: part.partNumber)
+            let partMetaFilePath = uploadDirectory + "part-\(part.partNumber).meta"
             let partSize: Int
             let partChecksum: String?
             if FileManager.default.fileExists(atPath: partMetaFilePath) {
@@ -500,24 +558,40 @@ struct MultipartFileHandler {
         parts: [(partNumber: Int, etag: String)],
         versioningStatus: VersioningStatus
     ) throws -> (etag: String, size: Int, versionId: String?, checksum: ObjectChecksum?) {
-        let plan = try prepareCompletion(bucketName: bucketName, uploadId: uploadId, parts: parts)
+        let claim = try claimForCompletion(bucketName: bucketName, uploadId: uploadId)
+        do {
+            return try completeUpload(claim: claim, parts: parts, versioningStatus: versioningStatus)
+        } catch {
+            claim.release()
+            throw error
+        }
+    }
+
+    /// Assembles the claimed upload into the final object and discards the claim. On failure
+    /// the claim is left for the caller to release.
+    static func completeUpload(
+        claim: CompletionClaim,
+        parts: [(partNumber: Int, etag: String)],
+        versioningStatus: VersioningStatus
+    ) throws -> (etag: String, size: Int, versionId: String?, checksum: ObjectChecksum?) {
+        let plan = try prepareCompletion(claim: claim, parts: parts)
 
         var versionId: String? = nil
         if versioningStatus != .disabled {
             versionId = try ObjectFileHandler.writeVersionedStreamed(
                 metadata: plan.objectMeta,
                 payloadSources: plan.payloadSources,
-                bucketName: bucketName,
+                bucketName: claim.bucketName,
                 key: plan.key,
                 versioningStatus: versioningStatus
             )
         } else {
-            let objectPath = ObjectFileHandler.storagePath(for: bucketName, key: plan.key)
+            let objectPath = ObjectFileHandler.storagePath(for: claim.bucketName, key: plan.key)
             try ObjectFileHandler.writeStreamed(
                 metadata: plan.objectMeta, payloadSources: plan.payloadSources, to: objectPath)
         }
 
-        try abortUpload(bucketName: bucketName, uploadId: uploadId)
+        try claim.discard()
         return (plan.etag, plan.totalSize, versionId, plan.objectMeta.checksum)
     }
 
@@ -532,14 +606,44 @@ struct MultipartFileHandler {
         }
 
         try FileManager.default.removeItem(atPath: uploadDir)
+        removeBucketDirectoryIfEmpty(bucketName: bucketName)
+    }
 
-        // Clean up empty bucket directory if needed
+    private static func removeBucketDirectoryIfEmpty(bucketName: String) {
         let bucketDir = "\(rootPath)\(BucketHandler.encodedBucketName(bucketName))/"
         if let contents = try? FileManager.default.contentsOfDirectory(atPath: bucketDir),
             contents.isEmpty
         {
             try? FileManager.default.removeItem(atPath: bucketDir)
         }
+    }
+
+    /// Default hygiene for uploads nobody completes or aborts: every upload (claimed or not)
+    /// initiated more than `age` ago is removed, bucket by bucket, in every bucket. Lifecycle
+    /// rules can be stricter per bucket; without this nothing ever reclaimed the parts of a
+    /// browser tab closed mid-upload. Returns how many were removed.
+    @discardableResult
+    static func abortUploadsOlderThan(_ age: TimeInterval) -> Int {
+        let fileManager = FileManager.default
+        guard let buckets = try? fileManager.contentsOfDirectory(atPath: rootPath) else { return 0 }
+        let cutoff = Date().addingTimeInterval(-age)
+        var removed = 0
+        for bucket in buckets {
+            let bucketDir = rootPath + bucket + "/"
+            guard let entries = try? fileManager.contentsOfDirectory(atPath: bucketDir) else { continue }
+            for entry in entries {
+                let metaPath = bucketDir + entry + "/meta.json"
+                guard let data = fileManager.contents(atPath: metaPath),
+                    let meta = try? jsonDecoder.decode(MultipartUploadMeta.self, from: data),
+                    meta.initiated < cutoff
+                else { continue }
+                if (try? fileManager.removeItem(atPath: bucketDir + entry)) != nil { removed += 1 }
+            }
+            if let remaining = try? fileManager.contentsOfDirectory(atPath: bucketDir), remaining.isEmpty {
+                try? fileManager.removeItem(atPath: bucketDir)
+            }
+        }
+        return removed
     }
 
     /// The checksum algorithm pinned at CreateMultipartUpload (lowercase suffix), or nil. Used by
@@ -614,7 +718,9 @@ struct MultipartFileHandler {
             return ([], false, nil, nil)
         }
 
+        // An upload mid-completion (renamed aside, see `CompletionClaim`) is no longer listable.
         let uploadIds = try FileManager.default.contentsOfDirectory(atPath: bucketDir)
+            .filter { !$0.hasSuffix(completingSuffix) }
         var uploads: [MultipartUploadMeta] = []
 
         for uploadId in uploadIds {

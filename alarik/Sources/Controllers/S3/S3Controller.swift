@@ -2412,6 +2412,27 @@ struct S3Controller: RouteCollection {
         // Streams every part into the final object and fsyncs before returning - real blocking
         // file IO, offloaded to the blocking-IO thread pool rather than tying up the async
         // executor for a potentially multi-gigabyte assembly.
+        // Taken aside first, so a concurrent completion of the same id cannot read parts this
+        // one is about to delete. Released on any failure so the client can repair and retry.
+        let claim = try await S3Service.offloadBlockingIO(req) {
+            try MultipartFileHandler.claimForCompletion(bucketName: bucketName, uploadId: uploadId)
+        }
+        do {
+            return try await completeClaimedUpload(
+                req: req, claim: claim, key: key, parts: parts, peers: peers,
+                versioningStatus: versioningStatus)
+        } catch {
+            try? await S3Service.offloadBlockingIO(req) { claim.release() }
+            throw error
+        }
+    }
+
+    private static func completeClaimedUpload(
+        req: Request, claim: MultipartFileHandler.CompletionClaim, key: String,
+        parts: [(partNumber: Int, etag: String)], peers: [ClusterNodeInfo],
+        versioningStatus: VersioningStatus
+    ) async throws -> MultipartCompletion {
+        let bucketName = claim.bucketName
         var usedEC = false
         let etag: String
         let versionId: String?
@@ -2422,8 +2443,7 @@ struct S3Controller: RouteCollection {
                 req: req, bucketName: bucketName, key: key)
         {
             let plan = try await S3Service.offloadBlockingIO(req) {
-                try MultipartFileHandler.prepareCompletion(
-                    bucketName: bucketName, uploadId: uploadId, parts: parts)
+                try MultipartFileHandler.prepareCompletion(claim: claim, parts: parts)
             }
             let (mintedVersionId, versionedMeta, priorLatestVersionId) = try await S3Service.offloadBlockingIO(req) {
                 try Self.prepareErasureCodedVersionedWrite(
@@ -2448,9 +2468,7 @@ struct S3Controller: RouteCollection {
                 }
             }
             versionId = mintedVersionId
-            try await S3Service.offloadBlockingIO(req) {
-                try MultipartFileHandler.abortUpload(bucketName: bucketName, uploadId: uploadId)
-            }
+            try await S3Service.offloadBlockingIO(req) { try claim.discard() }
             etag = plan.etag
             finalSize = plan.totalSize
             objectChecksum = plan.objectMeta.checksum
@@ -2458,11 +2476,7 @@ struct S3Controller: RouteCollection {
         } else {
             let result = try await S3Service.offloadBlockingIO(req) {
                 try MultipartFileHandler.completeUpload(
-                    bucketName: bucketName,
-                    uploadId: uploadId,
-                    parts: parts,
-                    versioningStatus: versioningStatus
-                )
+                    claim: claim, parts: parts, versioningStatus: versioningStatus)
             }
             etag = result.etag
             versionId = result.versionId

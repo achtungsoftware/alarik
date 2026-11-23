@@ -254,6 +254,30 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Hourly hygiene for things no request path reclaims: temp files of crashed writers and
+        // multipart uploads nobody completed or aborted (`ALARIK_MULTIPART_MAX_AGE_DAYS`, default
+        // 7, 0 disables). Blocking directory walks, so on the IO pool.
+        let multipartMaxAgeDays =
+            Environment.sanitizedGet("ALARIK_MULTIPART_MAX_AGE_DAYS").flatMap(Double.init) ?? 7
+        app.eventLoopGroup.next().scheduleRepeatedTask(
+            initialDelay: .minutes(10),
+            delay: .hours(1)
+        ) { _ in
+            Task {
+                try? await app.threadPool.runIfActive {
+                    let temps = AtomicObjectWriter.removeOrphanedTempFiles(
+                        under: BucketHandler.rootPath, olderThan: 3600)
+                    if temps > 0 { app.logger.notice("Removed \(temps) orphaned temp file(s)") }
+                    if multipartMaxAgeDays > 0 {
+                        let uploads = MultipartFileHandler.abortUploadsOlderThan(multipartMaxAgeDays * 86400)
+                        if uploads > 0 {
+                            app.logger.notice("Aborted \(uploads) stale multipart upload(s)")
+                        }
+                    }
+                }
+            }
+        }
+
         // CPU/memory gauge sampling for the admin dashboard. Frequent but trivially cheap
         // (a couple of /proc reads); also drives the per-minute history buckets so charts
         // fill in even while nobody is watching the dashboard.

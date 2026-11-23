@@ -661,4 +661,71 @@ struct MultipartFileHandlerTests {
             )
         }
     }
+
+    @Test("claimForCompletion hands the upload to exactly one completer; release puts it back")
+    func completionClaim() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+        let uploadId = try MultipartFileHandler.createUpload(bucketName: "bucket", key: "k")
+        _ = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 1, data: Data("p".utf8))
+
+        let claim = try MultipartFileHandler.claimForCompletion(bucketName: "bucket", uploadId: uploadId)
+        #expect(FileManager.default.fileExists(atPath: claim.directory + "part-1"))
+        #expect(!MultipartFileHandler.uploadExists(bucketName: "bucket", uploadId: uploadId))
+        // A concurrent completer finds nothing.
+        #expect {
+            try MultipartFileHandler.claimForCompletion(bucketName: "bucket", uploadId: uploadId)
+        } throws: { ($0 as NSError).domain == "NoSuchUpload" }
+        // A claimed upload is not listed.
+        let (listed, _, _, _) = try MultipartFileHandler.listUploads(bucketName: "bucket")
+        #expect(listed.isEmpty)
+
+        claim.release()
+        #expect(MultipartFileHandler.uploadExists(bucketName: "bucket", uploadId: uploadId))
+        let (relisted, _, _, _) = try MultipartFileHandler.listUploads(bucketName: "bucket")
+        #expect(relisted.map(\.uploadId) == [uploadId])
+    }
+
+    @Test("completeUpload with a bad ETag releases the claim so the client can retry")
+    func rejectedCompletionReleasesClaim() throws {
+        try cleanupMultipart()
+        try StorageHelper.cleanStorage()
+        defer {
+            try? cleanupMultipart()
+            try? StorageHelper.cleanStorage()
+        }
+        try FileManager.default.createDirectory(
+            atPath: BucketHandler.rootPath + "bucket/", withIntermediateDirectories: true)
+        let uploadId = try MultipartFileHandler.createUpload(bucketName: "bucket", key: "k")
+        let etag = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 1, data: Data("p".utf8))
+        #expect(throws: (any Error).self) {
+            try MultipartFileHandler.completeUpload(
+                bucketName: "bucket", uploadId: uploadId, parts: [(1, "wrong")], versioningStatus: .disabled)
+        }
+        #expect(MultipartFileHandler.uploadExists(bucketName: "bucket", uploadId: uploadId))
+        _ = try MultipartFileHandler.completeUpload(
+            bucketName: "bucket", uploadId: uploadId, parts: [(1, etag)], versioningStatus: .disabled)
+        #expect(!MultipartFileHandler.uploadExists(bucketName: "bucket", uploadId: uploadId))
+    }
+
+    @Test("abortUploadsOlderThan removes stale uploads in every bucket and keeps fresh ones")
+    func staleUploadSweep() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+        let fresh = try MultipartFileHandler.createUpload(bucketName: "bucket-a", key: "fresh")
+        let stale = try MultipartFileHandler.createUpload(bucketName: "bucket-b", key: "stale")
+        let backdated = MultipartUploadMeta(
+            uploadId: stale, bucketName: "bucket-b", key: "stale",
+            contentType: "application/octet-stream", metadata: [:],
+            initiated: Date().addingTimeInterval(-10 * 86400))
+        try JSONEncoder().encode(backdated).write(
+            to: URL(fileURLWithPath: try MultipartFileHandler.metadataPath(for: "bucket-b", uploadId: stale)))
+
+        #expect(MultipartFileHandler.abortUploadsOlderThan(7 * 86400) == 1)
+        #expect(MultipartFileHandler.uploadExists(bucketName: "bucket-a", uploadId: fresh))
+        #expect(!MultipartFileHandler.uploadExists(bucketName: "bucket-b", uploadId: stale))
+        #expect(!FileManager.default.fileExists(atPath: MultipartFileHandler.rootPath + "bucket-b"))
+    }
 }
