@@ -3824,4 +3824,26 @@ struct S3ControllerTests {
             #expect(try await get(["If-None-Match": "\"other\""]) == .ok)
         }
     }
+
+    @Test("Non-S3 errors on S3 routes come back as S3 XML, while console routes keep JSON")
+    func testNonS3ErrorsAreXMLOnS3Routes() async throws {
+        try await withApp { app in
+            // A method the S3 surface does not route at all.
+            try await app.test(
+                .PATCH, "/some-bucket/some-key",
+                afterResponse: { res in
+                    #expect(res.status.code >= 400)
+                    #expect(res.headers.contentType == .xml)
+                    #expect(res.body.string.contains("<Error>"))
+                    #expect(res.body.string.contains("<Code>"))
+                    #expect(res.headers.first(name: "x-amz-request-id") != nil)
+                })
+            try await app.test(
+                .GET, "/api/v1/definitely-not-a-route",
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("\"error\":true"))
+                })
+        }
+    }
 }
