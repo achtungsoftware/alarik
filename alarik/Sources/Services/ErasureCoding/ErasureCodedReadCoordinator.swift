@@ -94,18 +94,29 @@ enum ErasureCodedReadCoordinator {
         }
         let result = gathered!
 
-        // Indices genuinely missing - not held anywhere AND whose rank-holder was reachable during
-        // discovery (so we know it's actually gone, not merely on a briefly-unreachable node whose
-        // shard is very likely fine). Detected for free from the gather's own discovery; drives
+        // Indices genuinely missing, detected for free from the gather's own discovery; drives
         // missing-shard read-repair once the read completes. (Shards the decode finds corrupt are
         // handled separately, via per-holder verify-heal.)
-        let missingIndices = Set(0..<totalShards)
-            .subtracting(result.heldIndices)
-            .intersection(result.reachableRanks)
+        let missingIndices = Self.missingIndices(
+            totalShards: totalShards, held: result.heldIndices,
+            reachableRanks: result.reachableRanks, ownerCount: responsible.count)
 
         return PreparedRead(
             meta: result.meta, gathered: result, bucketName: bucketName, key: key,
             versionId: versionId, responsible: responsible, missingIndices: missingIndices)
+    }
+
+    /// Which shard indices read-repair may rebuild: those no reachable owner holds - and only
+    /// when every owner answered. An unreachable owner's holdings are unknown, and after a
+    /// membership change they need not be the index its rank suggests: judging "index i is gone"
+    /// by whether the node at rank i answered re-created shards that were sitting on the down
+    /// node, read after read, until the reconstruct landed. A down node's shards come back with
+    /// it; a shard that is truly lost while a node is down is the rebalance walk's job.
+    static func missingIndices(
+        totalShards: Int, held: Set<Int>, reachableRanks: Set<Int>, ownerCount: Int
+    ) -> Set<Int> {
+        guard reachableRanks.count >= ownerCount else { return [] }
+        return Set(0..<totalShards).subtracting(held)
     }
 
     /// Streams a prepared read's reconstructed payload (optionally a byte `range`), then fires

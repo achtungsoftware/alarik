@@ -52,10 +52,10 @@ struct GatheredShards {
     /// phase, across the whole responsible set - not just the shards actually fetched). Lets the
     /// read path spot indices missing cluster-wide and trigger read-repair, without a second probe.
     var heldIndices: Set<Int>
-    /// The responsible *ranks* whose node answered discovery. A shard index is only safe to treat
-    /// as "missing" (and reconstruct) when its rank-holder was reachable-but-not-holding it - if
-    /// the holder was simply unreachable, its shard is very likely still there, so reconstructing
-    /// would be wasted churn against a node that's merely briefly down.
+    /// The responsible *ranks* whose node answered discovery. Read-repair treats an index as
+    /// missing only when every owner answered and none holds it: an unreachable owner may hold
+    /// any index after placement drift, not just the one its rank suggests
+    /// (`ErasureCodedReadCoordinator.missingIndices`).
     var reachableRanks: Set<Int>
 
     func cleanup() {
