@@ -298,6 +298,16 @@ struct MultipartFileHandler {
     /// `ObjectMeta` plus the `payloadSources` list the write step streams from. Split out so an
     /// erasure-coded completion (`ErasureCodedWriteCoordinator.write`) can reuse this identical
     /// validation/assembly logic - only the final write step differs.
+    /// S3's minimum for every part but the last. Enforced at CompleteMultipartUpload, where the
+    /// position of each part is finally known.
+    static let minimumPartSize = 5 * 1024 * 1024
+
+    /// `NSError` domains this layer throws for client faults; the S3 layer maps exactly these to
+    /// 4xx responses and treats every other error as a server fault.
+    static let clientErrorDomains: Set<String> = [
+        "InvalidPart", "InvalidPartOrder", "EntityTooSmall", "NoSuchUpload",
+    ]
+
     struct CompletionPlan {
         let key: String
         let objectMeta: ObjectMeta
@@ -394,6 +404,17 @@ struct MultipartFileHandler {
                 ObjectPart(partNumber: part.partNumber, size: partSize, checksum: partChecksum))
             totalSize += partSize
             partEtags.append(S3Service.normalizeETag(part.etag))
+        }
+
+        // Every part but the last must meet S3's minimum, or clients could assemble objects S3
+        // itself would refuse (and later copy them part-for-part into S3 unsuccessfully).
+        if let tooSmall = partDetails.dropLast().first(where: { $0.size < minimumPartSize }) {
+            throw NSError(
+                domain: "EntityTooSmall", code: 400,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Your proposed upload is smaller than the minimum allowed size: part \(tooSmall.partNumber) is \(tooSmall.size) bytes, the minimum is \(minimumPartSize)"
+                ])
         }
 
         // Calculate final ETag (S3 style: MD5 of concatenated binary MD5 hashes + "-" + part count)

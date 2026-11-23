@@ -173,7 +173,8 @@ fi
 # Create part files
 PART1_FILE=$(mktemp)
 PART2_FILE=$(mktemp)
-echo "This is part 1 of the multipart upload. " > "$PART1_FILE"
+# Every part but the last must be at least 5 MiB (S3 rejects smaller ones with EntityTooSmall)
+head -c $((5 * 1024 * 1024)) /dev/urandom > "$PART1_FILE"
 echo "This is part 2 of the multipart upload." > "$PART2_FILE"
 
 # Upload parts
@@ -226,28 +227,17 @@ fi
 
 # Verify the completed object
 echo "Verifying completed multipart object..."
-CONTENT=$(aws_s3 s3 cp s3://multipart-test-bucket/manual-multipart.txt -)
-# Part 1 ends with " \n" (space + newline), Part 2 ends with "\n" (just newline)
-# echo adds newline, so: "text1. \n" + "text2.\n" = expected content
-# AWS CLI s3 cp to stdout preserves the content exactly
+DOWNLOADED_FILE=$(mktemp)
+EXPECTED_FILE=$(mktemp)
+aws_s3 s3 cp s3://multipart-test-bucket/manual-multipart.txt "$DOWNLOADED_FILE" >/dev/null
+cat "$PART1_FILE" "$PART2_FILE" > "$EXPECTED_FILE"
 
-# Use process substitution to get exact expected content (same as what was uploaded)
-EXPECTED_PART1="This is part 1 of the multipart upload. "
-EXPECTED_PART2="This is part 2 of the multipart upload."
-# Combine with newlines (echo adds \n to each)
-EXPECTED=$(printf "%s\n%s\n" "$EXPECTED_PART1" "$EXPECTED_PART2")
-
-if [ "$CONTENT" == "$EXPECTED" ]; then
+if cmp -s "$DOWNLOADED_FILE" "$EXPECTED_FILE"; then
     pass "Completed multipart object has correct content."
 else
     fail "Completed multipart object has unexpected content."
-    echo "  Content length: ${#CONTENT}"
-    echo "  Expected length: ${#EXPECTED}"
-    # Debug: show hex for comparison if lengths differ
-    if [ "${#CONTENT}" != "${#EXPECTED}" ]; then
-        echo "  Expected hex: $(echo -n "$EXPECTED" | xxd -p | head -c 200)"
-        echo "  Got hex: $(echo -n "$CONTENT" | xxd -p | head -c 200)"
-    fi
+    echo "  Content length: $(wc -c < "$DOWNLOADED_FILE")"
+    echo "  Expected length: $(wc -c < "$EXPECTED_FILE")"
 fi
 
 # Test ListMultipartUploads

@@ -2090,8 +2090,9 @@ struct S3ControllerTests {
                     }
                 })
 
-            // Upload two parts
-            let part1Data = Data("Hello, ".utf8)
+            // Upload two parts - every part but the last must meet the 5 MiB minimum
+            let part1Data =
+                Data(repeating: 0x61, count: MultipartFileHandler.minimumPartSize) + Data("Hello, ".utf8)
             let part2Data = Data("World!".utf8)
 
             var etag1: String = ""
@@ -2169,7 +2170,135 @@ struct S3ControllerTests {
                 },
                 afterResponse: { res in
                     #expect(res.status == .ok)
-                    #expect(res.body.string == "Hello, World!")
+                    #expect(res.body.readableBytes == part1Data.count + part2Data.count)
+                    #expect(res.body.string.hasSuffix("Hello, World!"))
+                })
+        }
+    }
+
+    @Test("GET/HEAD ?partNumber serves one part of a multipart object with x-amz-mp-parts-count")
+    func testGetObjectByPartNumber() async throws {
+        let bucketName = "test-multipart-partnumber"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            let key = "parts.bin"
+            var uploadId = ""
+            let createSigned = signedHeaders(for: .POST, path: "/\(bucketName)/\(key)", query: "uploads")
+            try await app.test(
+                .POST, "/\(bucketName)/\(key)?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let body = res.body.string
+                    if let r = body.range(of: "<UploadId>"),
+                        let e = body[r.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(body[r.upperBound..<e.lowerBound])
+                    }
+                })
+
+            let part1 = Data(repeating: 0x41, count: MultipartFileHandler.minimumPartSize)
+            let part2 = Data("second-part".utf8)
+            var etags: [String] = []
+            for (number, data) in [(1, part1), (2, part2)] {
+                let signed = signedHeaders(
+                    for: .PUT, path: "/\(bucketName)/\(key)",
+                    query: "partNumber=\(number)&uploadId=\(uploadId)", body: data)
+                try await app.test(
+                    .PUT, "/\(bucketName)/\(key)?partNumber=\(number)&uploadId=\(uploadId)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                        req.body = ByteBuffer(data: data)
+                    },
+                    afterResponse: { res in
+                        etags.append(res.headers.first(name: "ETag") ?? "")
+                    })
+            }
+            let completeBody = Data(
+                """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etags[0])</ETag></Part>
+                    <Part><PartNumber>2</PartNumber><ETag>\(etags[1])</ETag></Part>
+                </CompleteMultipartUpload>
+                """.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/\(key)", query: "uploadId=\(uploadId)",
+                body: completeBody)
+            try await app.test(
+                .POST, "/\(bucketName)/\(key)?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeBody)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            // Part 2 alone, as a 206 with the part's range and the total part count.
+            let getPart2 = signedHeaders(for: .GET, path: "/\(bucketName)/\(key)", query: "partNumber=2")
+            try await app.test(
+                .GET, "/\(bucketName)/\(key)?partNumber=2",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getPart2)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .partialContent)
+                    #expect(res.body.string == "second-part")
+                    #expect(res.headers.first(name: "x-amz-mp-parts-count") == "2")
+                    #expect(
+                        res.headers.first(name: "Content-Range")
+                            == "bytes \(part1.count)-\(part1.count + part2.count - 1)/\(part1.count + part2.count)")
+                })
+
+            // HEAD reports the part's length and the count without a body.
+            let headPart1 = signedHeaders(for: .HEAD, path: "/\(bucketName)/\(key)", query: "partNumber=1")
+            try await app.test(
+                .HEAD, "/\(bucketName)/\(key)?partNumber=1",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: headPart1)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .partialContent)
+                    #expect(res.headers.first(name: .contentLength) == String(part1.count))
+                    #expect(res.headers.first(name: "x-amz-mp-parts-count") == "2")
+                })
+
+            // Beyond the last part is 416 InvalidPartNumber; combined with Range is 400.
+            let getPart3 = signedHeaders(for: .GET, path: "/\(bucketName)/\(key)", query: "partNumber=3")
+            try await app.test(
+                .GET, "/\(bucketName)/\(key)?partNumber=3",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: getPart3)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .rangeNotSatisfiable)
+                    #expect(res.body.string.contains("<Code>InvalidPartNumber</Code>"))
+                })
+            let withRange = signedHeaders(
+                for: .GET, path: "/\(bucketName)/\(key)", query: "partNumber=1",
+                additionalHeaders: ["Range": "bytes=0-1"])
+            try await app.test(
+                .GET, "/\(bucketName)/\(key)?partNumber=1",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: withRange)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                })
+
+            // A single-part object is part 1 of 1.
+            try await putObject(app, bucketName: bucketName, key: "single.txt", content: "solo")
+            let single = signedHeaders(for: .GET, path: "/\(bucketName)/single.txt", query: "partNumber=1")
+            try await app.test(
+                .GET, "/\(bucketName)/single.txt?partNumber=1",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: single)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .partialContent)
+                    #expect(res.body.string == "solo")
+                    #expect(res.headers.first(name: "x-amz-mp-parts-count") == "1")
                 })
         }
     }
@@ -2435,13 +2564,75 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("CompleteMultipartUpload rejects a non-final part under 5 MiB with EntityTooSmall, not InvalidPart")
+    func testCompleteRejectsSmallNonFinalPart() async throws {
+        let bucketName = "test-multipart-too-small"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            var uploadId = ""
+            let createSigned = signedHeaders(for: .POST, path: "/\(bucketName)/small.bin", query: "uploads")
+            try await app.test(
+                .POST, "/\(bucketName)/small.bin?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let body = res.body.string
+                    if let r = body.range(of: "<UploadId>"),
+                        let e = body[r.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(body[r.upperBound..<e.lowerBound])
+                    }
+                })
+            var etags: [String] = []
+            for (number, text) in [(1, "tiny"), (2, "")] {
+                let data = Data(text.utf8)
+                let signed = signedHeaders(
+                    for: .PUT, path: "/\(bucketName)/small.bin",
+                    query: "partNumber=\(number)&uploadId=\(uploadId)", body: data)
+                try await app.test(
+                    .PUT, "/\(bucketName)/small.bin?partNumber=\(number)&uploadId=\(uploadId)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                        req.body = ByteBuffer(data: data)
+                    },
+                    afterResponse: { res in
+                        // A zero-byte part is accepted at upload time, like S3.
+                        #expect(res.status == .ok)
+                        etags.append(res.headers.first(name: "ETag") ?? "")
+                    })
+            }
+            let completeBody = Data(
+                """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>\(etags[0])</ETag></Part>
+                    <Part><PartNumber>2</PartNumber><ETag>\(etags[1])</ETag></Part>
+                </CompleteMultipartUpload>
+                """.utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/small.bin", query: "uploadId=\(uploadId)",
+                body: completeBody)
+            try await app.test(
+                .POST, "/\(bucketName)/small.bin?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeBody)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("<Code>EntityTooSmall</Code>"))
+                })
+        }
+    }
+
     @Test("UploadPartCopy - Copies a whole source object into a part")
     func testUploadPartCopyBasic() async throws {
         let bucketName = "test-upload-part-copy-basic"
         try await withApp { app in
             try await createBucket(app, bucketName: bucketName)
             try await putObject(
-                app, bucketName: bucketName, key: "source.txt", content: "Hello, ")
+                app, bucketName: bucketName, key: "source.txt",
+                content: String(repeating: "a", count: MultipartFileHandler.minimumPartSize) + "Hello, ")
 
             let createSigned = signedHeaders(
                 for: .POST, path: "/\(bucketName)/dest.txt", query: "uploads")
@@ -2543,7 +2734,8 @@ struct S3ControllerTests {
                 },
                 afterResponse: { res in
                     #expect(res.status == .ok)
-                    #expect(res.body.string == "Hello, World!")
+                    #expect(res.body.string.hasSuffix("Hello, World!"))
+                    #expect(res.body.readableBytes == MultipartFileHandler.minimumPartSize + 13)
                 })
         }
     }
@@ -2947,7 +3139,7 @@ struct S3ControllerTests {
                 })
 
             // Upload parts 1 and 3 (skipping 2) - S3 allows this
-            let part1Data = Data("part 1".utf8)
+            let part1Data = Data(repeating: 0x31, count: MultipartFileHandler.minimumPartSize)
             let part3Data = Data("part 3".utf8)
             var etag1: String = ""
             var etag3: String = ""

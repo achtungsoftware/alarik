@@ -2413,12 +2413,8 @@ struct S3Controller: RouteCollection {
         let spooled = try await StreamingBodySpooler.spool(req: req, authInfo: authInfo)
         defer { spooled.cleanup() }
 
-        // Unlike PutObject, an empty UploadPart is always an error
-        guard spooled.size > 0 else {
-            throw S3Error(
-                status: .badRequest, code: "MissingRequestBodyError",
-                message: "Request body is empty.", requestId: req.id)
-        }
+        // A zero-byte part is accepted, as on S3; whether it is allowed where it sits is
+        // decided at CompleteMultipartUpload (only the last part may be under the minimum).
 
         // Validate Content-MD5 if provided
         try S3Service.validateContentMD5(req: req, spooled: spooled)

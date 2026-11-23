@@ -193,7 +193,7 @@ struct MultipartFileHandlerTests {
         let uploadId = try MultipartFileHandler.createUpload(
             bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32")
 
-        let part1 = Data((0..<5000).map { UInt8($0 % 251) })
+        let part1 = Data((0..<MultipartFileHandler.minimumPartSize).map { UInt8($0 % 251) })
         let part2 = Data((0..<3000).map { UInt8(($0 * 7) % 256) })
         let etag1 = try MultipartFileHandler.writePart(
             bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
@@ -222,7 +222,7 @@ struct MultipartFileHandlerTests {
             bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32",
             checksumType: "FULL_OBJECT")
 
-        let part1 = Data((0..<5000).map { UInt8($0 % 251) })
+        let part1 = Data((0..<MultipartFileHandler.minimumPartSize).map { UInt8($0 % 251) })
         let part2 = Data((0..<3000).map { UInt8(($0 * 7) % 256) })
         let etag1 = try MultipartFileHandler.writePart(
             bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
@@ -257,7 +257,7 @@ struct MultipartFileHandlerTests {
             c.update(ByteBuffer(data: data).readableBytesView)
             return c.finalizeBase64()
         }
-        let part1 = Data((0..<9000).map { UInt8($0 % 256) })
+        let part1 = Data((0..<MultipartFileHandler.minimumPartSize).map { UInt8($0 % 256) })
         let part2 = Data((0..<4000).map { UInt8(($0 * 3) % 256) })
         let etag1 = try MultipartFileHandler.writePart(
             bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
@@ -280,7 +280,7 @@ struct MultipartFileHandlerTests {
         let bucket = "bucket"
         let uploadId = try MultipartFileHandler.createUpload(
             bucketName: bucket, key: "big.bin", checksumAlgorithm: "crc32")
-        let part1 = Data("aaaa".utf8)
+        let part1 = Data(repeating: 0x61, count: MultipartFileHandler.minimumPartSize)
         let part2 = Data("bbbb".utf8)
         let etag1 = try MultipartFileHandler.writePart(
             bucketName: bucket, uploadId: uploadId, partNumber: 1, data: part1,
@@ -544,7 +544,8 @@ struct MultipartFileHandlerTests {
             contentType: "text/plain"
         )
 
-        let part1Data = Data("Hello, ".utf8)
+        // Every part but the last must meet the S3 minimum.
+        let part1Data = Data(repeating: 0x61, count: MultipartFileHandler.minimumPartSize) + Data("Hello, ".utf8)
         let part2Data = Data("World!".utf8)
 
         let etag1 = try MultipartFileHandler.writePart(
@@ -577,7 +578,50 @@ struct MultipartFileHandlerTests {
         let (meta, data) = try ObjectFileHandler.read(from: objectPath)
         #expect(meta.key == "complete-test.txt")
         #expect(meta.contentType == "text/plain")
-        #expect(String(data: data!, encoding: .utf8) == "Hello, World!")
+        #expect(data?.count == part1Data.count + part2Data.count)
+        #expect(data?.suffix(13) == Data("Hello, World!".utf8))
+        // Per-part sizes are recorded for every multipart object (GET ?partNumber needs them).
+        #expect(meta.parts?.map(\.size) == [part1Data.count, part2Data.count])
+    }
+
+    @Test("prepareCompletion rejects a non-final part under the 5 MiB minimum as EntityTooSmall")
+    func rejectsSmallNonFinalPart() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+        let uploadId = try MultipartFileHandler.createUpload(bucketName: "bucket", key: "k")
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 1, data: Data("tiny".utf8))
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 2, data: Data("x".utf8))
+        #expect {
+            try MultipartFileHandler.prepareCompletion(
+                bucketName: "bucket", uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+        } throws: { error in
+            (error as NSError).domain == "EntityTooSmall"
+        }
+    }
+
+    @Test("a zero-byte final part is accepted, and a lone small part is the last part")
+    func zeroByteLastPartAccepted() throws {
+        try cleanupMultipart()
+        defer { try? cleanupMultipart() }
+        let uploadId = try MultipartFileHandler.createUpload(bucketName: "bucket", key: "k")
+        let big = Data(repeating: 0x7a, count: MultipartFileHandler.minimumPartSize)
+        let etag1 = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 1, data: big)
+        let etag2 = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: uploadId, partNumber: 2, data: Data())
+        let plan = try MultipartFileHandler.prepareCompletion(
+            bucketName: "bucket", uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
+        #expect(plan.totalSize == big.count)
+        #expect(plan.objectMeta.parts?.map(\.size) == [big.count, 0])
+
+        let single = try MultipartFileHandler.createUpload(bucketName: "bucket", key: "k2")
+        let soloEtag = try MultipartFileHandler.writePart(
+            bucketName: "bucket", uploadId: single, partNumber: 1, data: Data("solo".utf8))
+        let soloPlan = try MultipartFileHandler.prepareCompletion(
+            bucketName: "bucket", uploadId: single, parts: [(1, soloEtag)])
+        #expect(soloPlan.totalSize == 4)
     }
 
     @Test("completeUpload fails with ETag mismatch")
