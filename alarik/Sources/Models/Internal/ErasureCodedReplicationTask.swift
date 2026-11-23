@@ -52,6 +52,11 @@ final class ErasureCodedReplicationTask: @unchecked Sendable, Codable {
     var state: OutboxRowState
     var lastError: String?
     let createdAt: Date
+    /// For a `.delete` of a non-versioned object: the ETag of the generation being removed. A
+    /// delayed delivery must not remove a key that was re-created in the meantime, so the
+    /// receiver compares before deleting. Nil for versioned deletes (a version id is unique) and
+    /// for rows written before this field existed.
+    var expectedETag: String?
 
     init(
         bucketName: String,
@@ -60,7 +65,8 @@ final class ErasureCodedReplicationTask: @unchecked Sendable, Codable {
         shardIndex: Int,
         operation: Operation,
         targetNodeId: UUID,
-        reason: Reason
+        reason: Reason,
+        expectedETag: String? = nil
     ) {
         self.id = UUID()
         self.bucketName = bucketName
@@ -74,6 +80,7 @@ final class ErasureCodedReplicationTask: @unchecked Sendable, Codable {
         self.nextAttemptAt = Date()
         self.state = .pending
         self.createdAt = Date()
+        self.expectedETag = expectedETag
     }
 }
 

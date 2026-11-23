@@ -51,6 +51,11 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
     var state: OutboxRowState
     var lastError: String?
     let createdAt: Date
+    /// For a `.delete` of a non-versioned object: the ETag of the generation being removed. A
+    /// delayed delivery must not remove a key that was re-created in the meantime, so the
+    /// receiver compares before deleting. Nil for versioned deletes (a version id is unique) and
+    /// for rows written before this field existed.
+    var expectedETag: String?
 
     /// The node whose local mailbox directory this task's file lives in - the node that
     /// enqueued it (and holds the local copy to push), not `targetNodeId`. See the type's own
@@ -64,7 +69,8 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
         operation: Operation,
         targetNodeId: UUID,
         reason: Reason,
-        ownerNodeId: UUID
+        ownerNodeId: UUID,
+        expectedETag: String? = nil
     ) {
         self.id = UUID()
         self.bucketName = bucketName
@@ -78,6 +84,7 @@ final class ClusterReplicationTask: @unchecked Sendable, Codable {
         self.state = .pending
         self.createdAt = Date()
         self.ownerNodeId = ownerNodeId
+        self.expectedETag = expectedETag
     }
 }
 

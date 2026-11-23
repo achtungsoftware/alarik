@@ -294,7 +294,7 @@ struct InternalClusterObjectController: RouteCollection {
         } else {
             outcome = try S3Service.deleteObject(
                 bucketName: bucketName, key: key, versionId: versionId,
-                versioningStatus: versioningStatus)
+                versioningStatus: versioningStatus, expectedETag: req.query[String.self, at: "etag"])
         }
 
         let response = Response(status: .ok)

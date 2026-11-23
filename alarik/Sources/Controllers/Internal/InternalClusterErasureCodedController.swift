@@ -458,12 +458,9 @@ struct InternalClusterErasureCodedController: RouteCollection {
             throw Abort(.badRequest, reason: "Missing bucket/key query parameters")
         }
         let versionId = req.query[String.self, at: "versionId"]
-        try? FileManager.default.removeItem(
-            atPath: ErasureCodedObjectHandler.shardBasePath(
-                bucketName: bucketName, key: key, versionId: versionId))
-        StorageStatsService.shared.noteChange(bucketName: bucketName)
-        // Same as the coordinator's local removal: don't leave the folder behind as a phantom.
-        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
+        ErasureCodedObjectHandler.removeShardDirectory(
+            bucketName: bucketName, key: key, versionId: versionId,
+            unlessETagDiffersFrom: req.query[String.self, at: "etag"])
         return .ok
     }
 

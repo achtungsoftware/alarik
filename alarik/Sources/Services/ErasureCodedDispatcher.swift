@@ -56,9 +56,9 @@ enum ErasureCodedDispatcher {
                     // always this node's own shard directory - remove it directly rather than
                     // looping an HTTP DELETE through to itself. Whole-directory, not a specific
                     // index: a node only ever holds the one shard it's currently responsible for.
-                    try? FileManager.default.removeItem(
-                        atPath: ErasureCodedObjectHandler.shardBasePath(
-                            bucketName: row.bucketName, key: row.key, versionId: row.versionId))
+                    ErasureCodedObjectHandler.removeShardDirectory(
+                        bucketName: row.bucketName, key: row.key, versionId: row.versionId,
+                        unlessETagDiffersFrom: row.expectedETag)
                 }
                 return .success
             } catch {

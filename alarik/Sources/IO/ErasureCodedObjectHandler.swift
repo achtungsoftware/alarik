@@ -248,6 +248,30 @@ enum ErasureCodedObjectHandler {
         !locallyHeldShardIndices(bucketName: bucketName, key: key, versionId: versionId).isEmpty
     }
 
+    /// Removes this node's whole shard directory for (bucketName, key, versionId) - a version
+    /// delete arriving from the coordinator or replayed from the outbox. With `expectedETag`
+    /// the directory stays when the shard it holds belongs to another generation: the key was
+    /// re-created after the delete was issued, and that object is not the one being deleted.
+    /// Returns whether anything was removed.
+    @discardableResult
+    static func removeShardDirectory(
+        bucketName: String, key: String, versionId: String?, unlessETagDiffersFrom expectedETag: String?
+    ) -> Bool {
+        let directory = shardBasePath(bucketName: bucketName, key: key, versionId: versionId)
+        guard FileManager.default.fileExists(atPath: directory) else { return false }
+        if let expectedETag,
+            let header = anyLocalShardHeader(inShardDirectory: directory),
+            header.objectMeta.etag != expectedETag
+        {
+            return false
+        }
+        try? FileManager.default.removeItem(atPath: directory)
+        StorageStatsService.shared.noteChange(bucketName: bucketName)
+        // Don't leave the key's folder behind as a phantom.
+        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
+        return true
+    }
+
     /// Removes just the one `staleShardIndex` shard file (not the whole `.ecshards` directory),
     /// then removes the now-empty directory only if nothing else remains. Distinct from a full
     /// version delete (`shardBasePath` removal): during reindexing a node legitimately holds both

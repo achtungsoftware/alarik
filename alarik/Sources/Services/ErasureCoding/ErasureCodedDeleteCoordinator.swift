@@ -124,12 +124,17 @@ enum ErasureCodedDeleteCoordinator {
         app: Application, bucketName: String, key: String, versionId: String?,
         responsible: [ClusterNodeInfo], selfNodeId: UUID
     ) async throws {
-        try? FileManager.default.removeItem(
-            atPath: ErasureCodedObjectHandler.shardBasePath(
-                bucketName: bucketName, key: key, versionId: versionId))
-        StorageStatsService.shared.noteChange(bucketName: bucketName)
-        // Without this the key's folder lingers as a phantom on every shard holder (issue #25).
-        ObjectFileHandler.pruneEmptyParentDirectories(forKey: key, bucketName: bucketName)
+        // The generation this delete removes, so a peer that gets it late - or from the outbox
+        // after the key was re-created - does not take the new object with it. Only a
+        // non-versioned delete can be ambiguous; a version id names its generation already.
+        let expectedETag =
+            versionId == nil
+            ? ErasureCodedObjectHandler.anyLocalShardHeader(
+                inShardDirectory: ErasureCodedObjectHandler.shardBasePath(
+                    bucketName: bucketName, key: key, versionId: nil))?.objectMeta.etag
+            : nil
+        ErasureCodedObjectHandler.removeShardDirectory(
+            bucketName: bucketName, key: key, versionId: versionId, unlessETagDiffersFrom: nil)
 
         let peers = responsible.filter { $0.id != selfNodeId }
         guard !peers.isEmpty else { return }
@@ -141,7 +146,7 @@ enum ErasureCodedDeleteCoordinator {
                     let ok =
                         (try? await ClusterReplicationClient.deleteShard(
                             app: app, to: peer, bucketName: bucketName, key: key,
-                            versionId: versionId)) != nil
+                            versionId: versionId, expectedETag: expectedETag)) != nil
                     return (peer.id, ok)
                 }
             }
@@ -158,7 +163,7 @@ enum ErasureCodedDeleteCoordinator {
         for peer in undelivered {
             let task = ErasureCodedReplicationTask(
                 bucketName: bucketName, key: key, versionId: versionId, shardIndex: -1,
-                operation: .delete, targetNodeId: peer.id, reason: .write)
+                operation: .delete, targetNodeId: peer.id, reason: .write, expectedETag: expectedETag)
             await OutboxMailbox.enqueue(
                 app: app, collection: OutboxCollections.erasureCodedReplicationTasks, row: task)
         }

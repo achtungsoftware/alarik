@@ -63,7 +63,7 @@ enum ClusterReplicationDispatcher {
                 case .delete:
                     try await ClusterReplicationClient.deleteObject(
                         app: app, to: node, bucketName: row.bucketName, key: row.key,
-                        versionId: row.versionId)
+                        versionId: row.versionId, expectedETag: row.expectedETag)
                 }
                 return .success
             } catch {

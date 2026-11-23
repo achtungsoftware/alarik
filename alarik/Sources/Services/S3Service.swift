@@ -1105,11 +1105,14 @@ struct S3Service {
     /// Deletes a single object, honoring versionId (permanent delete of a specific version)
     /// and bucket versioning status (delete marker vs. permanent delete), matching S3 semantics.
     /// Deleting a key that doesn't exist is treated as success, like S3.
+    /// `expectedETag` is set by a replicated or outbox-replayed delete and names the generation
+    /// it removes: a key re-created since then is a different object and is left alone.
     static func deleteObject(
         bucketName: String,
         key: String,
         versionId: String?,
-        versioningStatus: VersioningStatus
+        versioningStatus: VersioningStatus,
+        expectedETag: String? = nil
     ) throws -> ObjectDeleteOutcome {
         if let versionId = versionId {
             do {
@@ -1145,6 +1148,12 @@ struct S3Service {
         // that's never had versioning on can only ever have the one, current copy.
         let path = ObjectFileHandler.storagePath(for: bucketName, key: key)
         if FileManager.default.fileExists(atPath: path) {
+            if let expectedETag,
+                let current = try? ObjectFileHandler.read(from: path, loadData: false).0,
+                current.etag != expectedETag
+            {
+                return ObjectDeleteOutcome(versionId: nil, isDeleteMarker: false)
+            }
             try FileManager.default.removeItem(atPath: path)
             StorageStatsService.shared.noteChange(bucketName: bucketName)
             // Prune the now-empty folder so it doesn't linger as a phantom in the listing.

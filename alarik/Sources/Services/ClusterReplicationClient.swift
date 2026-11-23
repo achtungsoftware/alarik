@@ -182,9 +182,11 @@ enum ClusterReplicationClient {
     /// responsible for; never set for the outbox dispatcher's plain per-peer catch-up delivery,
     /// which must stay a single, non-recursing copy.
     @discardableResult
+    /// `expectedETag` names the generation a non-versioned delete removes (see
+    /// `ClusterReplicationTask.expectedETag`); the receiver leaves a newer object alone.
     static func deleteObject(
         app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
-        versionId: String?, coordinate: Bool = false
+        versionId: String?, coordinate: Bool = false, expectedETag: String? = nil
     ) async throws -> S3Service.ObjectDeleteOutcome {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
             throw ClusterConfigurationError(description: "This node is not part of a cluster.")
@@ -201,6 +203,9 @@ enum ClusterReplicationClient {
         }
         if coordinate {
             url += "&coordinate=true"
+        }
+        if let expectedETag {
+            url += "&etag=" + (expectedETag.addingPercentEncoding(withAllowedCharacters: allowed) ?? expectedETag)
         }
         var outbound = HTTPClientRequest(url: url)
         outbound.method = .DELETE
@@ -719,9 +724,10 @@ enum ClusterReplicationClient {
     /// currently responsible for, so "delete my shard for this version" is unambiguous. Used for
     /// genuine object deletes and for rebalance reclaim (see `ClusterRebalanceService`'s
     /// `.reclaim` pattern, which this mirrors exactly, including targeting `node == self`).
+    /// `expectedETag`: as for `deleteObject` - a shard of a re-created generation stays.
     static func deleteShard(
         app: Application, to node: ClusterNodeInfo, bucketName: String, key: String,
-        versionId: String?
+        versionId: String?, expectedETag: String? = nil
     ) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
             throw ClusterConfigurationError(description: "This node is not part of a cluster.")
@@ -734,6 +740,9 @@ enum ClusterReplicationClient {
             let encodedVersionId =
                 versionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? versionId
             url += "&versionId=\(encodedVersionId)"
+        }
+        if let expectedETag {
+            url += "&etag=" + (expectedETag.addingPercentEncoding(withAllowedCharacters: allowed) ?? expectedETag)
         }
         var outbound = HTTPClientRequest(url: url)
         outbound.method = .DELETE

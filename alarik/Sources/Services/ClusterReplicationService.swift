@@ -41,7 +41,8 @@ enum ClusterReplicationService {
         key: String,
         versionId: String?,
         operation: ClusterReplicationTask.Operation,
-        peers: [ClusterNodeInfo]
+        peers: [ClusterNodeInfo],
+        expectedETag: String? = nil
     ) async {
         guard !peers.isEmpty else { return }
 
@@ -53,7 +54,7 @@ enum ClusterReplicationService {
             // cluster) - still fan out for eventual consistency, but never block the client on
             // it.
             await enqueueOutbox(app: app, nodes: peers, bucketName: bucketName, key: key,
-                versionId: versionId, operation: operation)
+                versionId: versionId, operation: operation, expectedETag: expectedETag)
             return
         }
 
@@ -63,7 +64,7 @@ enum ClusterReplicationService {
                 group.addTask {
                     let ok = await attemptImmediateDelivery(
                         app: app, node: node, bucketName: bucketName, key: key,
-                        versionId: versionId, operation: operation)
+                        versionId: versionId, operation: operation, expectedETag: expectedETag)
                     return (node, ok)
                 }
             }
@@ -86,7 +87,7 @@ enum ClusterReplicationService {
         guard !undelivered.isEmpty else { return }
         await enqueueOutbox(
             app: app, nodes: undelivered, bucketName: bucketName, key: key, versionId: versionId,
-            operation: operation)
+            operation: operation, expectedETag: expectedETag)
     }
 
     /// Runs a local delete then replicates the outcome to `peers` - the sequence
@@ -145,10 +146,18 @@ enum ClusterReplicationService {
             return S3Service.ObjectDeleteOutcome(versionId: versionId, isDeleteMarker: false)
         }
 
-        let outcome = try await S3Service.offloadBlockingIO(app) {
-            try S3Service.deleteObject(
+        // A non-versioned delete names the generation it removes, so a peer that applies it
+        // late (or from the outbox) leaves a re-created key alone - see
+        // `ClusterReplicationTask.expectedETag`.
+        let (outcome, expectedETag) = try await S3Service.offloadBlockingIO(app) {
+            let expectedETag =
+                versionId == nil && versioningStatus == .disabled
+                ? try? ObjectFileHandler.readCurrentObject(bucketName: bucketName, key: key, loadData: false)?.meta.etag
+                : nil
+            let outcome = try S3Service.deleteObject(
                 bucketName: bucketName, key: key, versionId: versionId,
                 versioningStatus: versioningStatus)
+            return (outcome, expectedETag)
         }
         if outcome.isDeleteMarker {
             await replicateWrite(
@@ -157,7 +166,7 @@ enum ClusterReplicationService {
         } else {
             await replicateWrite(
                 app: app, bucketName: bucketName, key: key, versionId: versionId,
-                operation: .delete, peers: peers)
+                operation: .delete, peers: peers, expectedETag: expectedETag)
         }
         return outcome
     }
@@ -281,13 +290,14 @@ enum ClusterReplicationService {
 
     private static func enqueueOutbox(
         app: Application, nodes: [ClusterNodeInfo], bucketName: String, key: String,
-        versionId: String?, operation: ClusterReplicationTask.Operation
+        versionId: String?, operation: ClusterReplicationTask.Operation, expectedETag: String? = nil
     ) async {
         guard let selfNodeId = app.storage[ClusterConfigurationKey.self]?.nodeId else { return }
         for node in nodes {
             let task = ClusterReplicationTask(
                 bucketName: bucketName, key: key, versionId: versionId, operation: operation,
-                targetNodeId: node.id, reason: .write, ownerNodeId: selfNodeId)
+                targetNodeId: node.id, reason: .write, ownerNodeId: selfNodeId,
+                expectedETag: expectedETag)
             await OutboxMailbox.enqueue(
                 app: app, collection: OutboxCollections.clusterReplicationTasks, row: task)
         }
@@ -296,7 +306,7 @@ enum ClusterReplicationService {
 
     private static func attemptImmediateDelivery(
         app: Application, node: ClusterNodeInfo, bucketName: String, key: String,
-        versionId: String?, operation: ClusterReplicationTask.Operation
+        versionId: String?, operation: ClusterReplicationTask.Operation, expectedETag: String? = nil
     ) async -> Bool {
         do {
             try await withTimeout(synchronousTimeout) {
@@ -308,7 +318,7 @@ enum ClusterReplicationService {
                 case .delete:
                     try await ClusterReplicationClient.deleteObject(
                         app: app, to: node, bucketName: bucketName, key: key,
-                        versionId: versionId)
+                        versionId: versionId, expectedETag: expectedETag)
                 }
             }
             return true
