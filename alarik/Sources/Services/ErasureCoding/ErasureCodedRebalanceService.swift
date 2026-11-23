@@ -286,33 +286,6 @@ enum ErasureCodedRebalanceService {
     private static let debouncer = RebalanceDebouncer()
     private static let minWalkInterval: Duration = .seconds(15)
 
-    private actor RebalanceDebouncer {
-        private var running = false
-        private var pending = false
-
-        /// True when the caller should start a walk now; false when one is already in flight (the
-        /// request is folded into a single trailing walk instead).
-        func requestStart() -> Bool {
-            if running {
-                pending = true
-                return false
-            }
-            running = true
-            return true
-        }
-
-        /// After a walk finishes, whether a coalesced request arrived during it and a trailing
-        /// walk should run.
-        func finish() -> Bool {
-            if pending {
-                pending = false
-                return true
-            }
-            running = false
-            return false
-        }
-    }
-
     static func scheduleRebalance(app: Application, reason: RebalanceReason) async {
         guard app.storage[ClusterConfigurationKey.self] != nil,
             app.storage[ClusterErasureCodingConfigKey.self] != nil

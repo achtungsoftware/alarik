@@ -60,13 +60,25 @@ enum ClusterRebalanceService {
 
     /// Fire-and-forget entry point - never blocks the caller (the NOTIFY dispatch path, or an
     /// admin API request) on a walk that could take a long time over a large cluster.
+    /// Same debouncing as `ErasureCodedRebalanceService`: one walk at a time, a burst of requests
+    /// folded into one trailing walk, starts spaced by `minWalkInterval`. Every heartbeat
+    /// broadcast used to start a fresh concurrent walk here.
+    private static let debouncer = RebalanceDebouncer()
+    private static let minWalkInterval: Duration = .seconds(15)
+
     static func scheduleRebalance(app: Application, reason: RebalanceReason) async {
         guard app.storage[ClusterConfigurationKey.self] != nil else { return }
+        guard await debouncer.requestStart() else { return }
         Task {
-            do {
-                try await rebalance(app: app, reason: reason)
-            } catch {
-                app.logger.error("Cluster rebalance walk failed (reason: \(reason)): \(error)")
+            var runAgain = true
+            while runAgain {
+                do {
+                    try await rebalance(app: app, reason: reason)
+                } catch {
+                    app.logger.error("Cluster rebalance walk failed (reason: \(reason)): \(error)")
+                }
+                runAgain = await debouncer.finish()
+                if runAgain { try? await Task.sleep(for: minWalkInterval) }
             }
         }
     }
