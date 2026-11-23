@@ -53,9 +53,12 @@ struct ClaimElectorate: Equatable {
 actor MetadataClaimRegistry {
     static let shared = MetadataClaimRegistry()
 
-    /// Long enough to cover a claim's check-then-write, short enough that a crashed claimant only
-    /// blocks the name briefly.
-    static let defaultTTL: TimeInterval = 10
+    /// Must outlast the slowest claim body, or the name is up for grabs while its first claimant
+    /// is still writing it: the body gathers the existing record (probe timeout per peer) and
+    /// then fans the write out, waiting `ClusterReplicationService.synchronousTimeout` for a dead
+    /// peer before falling back to the outbox. A crashed claimant blocks the name this long,
+    /// which is acceptable for create-only operations.
+    static let defaultTTL: TimeInterval = 60
 
     private struct Reservation {
         let token: UUID

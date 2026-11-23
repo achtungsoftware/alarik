@@ -34,6 +34,14 @@ struct MetadataClaimRegistryTests {
         #expect(await registry.reserve(collection: "buckets", id: "test", token: second) == false)
     }
 
+    @Test("the reservation outlives the slowest claim body: a gather plus a synchronous shard fan-out")
+    func ttlCoversClaimBody() {
+        let probe = TimeInterval(ClusterReplicationClient.probeTimeout.nanoseconds) / 1_000_000_000
+        let fanOut = TimeInterval(ClusterReplicationService.synchronousTimeout.components.seconds)
+        // Twice the worst case, so a slow peer at each step still cannot expire the claim.
+        #expect(MetadataClaimRegistry.defaultTTL >= 2 * (probe + fanOut))
+    }
+
     @Test("the holder can re-reserve its own token, so a retry isn't locked out")
     func sameTokenIsIdempotent() async {
         let registry = MetadataClaimRegistry()
