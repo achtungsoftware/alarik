@@ -338,7 +338,9 @@ enum ErasureCodedShardGatherer {
                         try await ClusterReplicationClient.pushShard(
                             app: app, to: target.node, sourcePath: source.path,
                             bucketName: bucketName, key: key, versionId: versionId,
-                            shardIndex: target.index)
+                            shardIndex: target.index,
+                            promote: ObjectFileHandler.isCurrentVersion(
+                                bucketName: bucketName, key: key, versionId: versionId))
                         app.logger.info(
                             "Read repair: replaced stale copy of shard \(target.index) for '\(key)' on node \(target.node.id)."
                         )

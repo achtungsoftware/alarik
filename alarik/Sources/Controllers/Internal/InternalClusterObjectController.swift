@@ -216,17 +216,15 @@ struct InternalClusterObjectController: RouteCollection {
                     for: meta.bucketName, key: meta.key, versionId: meta.versionId ?? "null")
             }
 
-            // Demote, write and repoint under one key lock, like the local write paths: a push
-            // interleaving with a local write for the same key otherwise demotes the version
-            // that write just made latest. Blocking IO, so on the IO pool.
+            // Write and repoint under one key lock, like the local write paths, so a push
+            // interleaving with a local write for the same key cannot leave the pointer at the
+            // older of the two. `meta.isLatest` is the sender's statement that this version is
+            // current there (`pushObject` derives it from its own pointer). Blocking IO, so on
+            // the IO pool.
             let payloadSize = size
             let promotesLatest = versioningStatus != .disabled && meta.isLatest
             try await threadPool.runIfActive {
                 try ObjectKeyLock.withLock(bucketName: meta.bucketName, key: meta.key) {
-                    if promotesLatest {
-                        try ObjectFileHandler.markAllVersionsNotLatest(
-                            bucketName: meta.bucketName, key: meta.key)
-                    }
                     try ObjectFileHandler.writeStreamed(
                         metadata: meta, payloadFile: spoolPath, payloadOffset: 0,
                         payloadSize: payloadSize, to: path)

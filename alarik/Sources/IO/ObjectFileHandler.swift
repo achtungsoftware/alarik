@@ -145,7 +145,7 @@ struct ObjectFileHandler {
     /// metadata editor) so changing a small JSON blob doesn't cost a full read+rewrite of a
     /// payload that could be gigabytes. The payload is window-copied from the file to itself
     /// (safe: `AtomicObjectWriter` writes to a distinct temp file and only renames over the
-    /// original once the copy is fully done - same reasoning as `markAllVersionsNotLatest`).
+    /// original once the copy is fully done).
     static func rewriteMetadata(
         bucketName: String, key: String, at path: String, transform: (inout ObjectMeta) -> Void
     ) throws -> ObjectMeta {
@@ -276,12 +276,14 @@ struct ObjectFileHandler {
         guard POSIXFile.read(fd, &jsonBytes, metadataLength) == metadataLength else {
             throw StorageError.corruptHeader(path: path, reason: "incomplete metadata")
         }
-        let meta: ObjectMeta
+        var meta: ObjectMeta
         do {
             meta = try jsonBytes.withUnsafeBufferPointer { try jsonDecoder.decode(ObjectMeta.self, from: Data($0)) }
         } catch {
             throw StorageError.corruptHeader(path: path, reason: "metadata does not decode: \(error)")
         }
+        // The stored flag is write-time intent; the pointer is the truth (`isCurrentVersion`).
+        meta.isLatest = isCurrentVersion(bucketName: meta.bucketName, key: meta.key, versionId: meta.versionId)
 
         var statInfo = stat()
         guard POSIXFile.fstat(fd, &statInfo) == 0 else {
@@ -673,38 +675,42 @@ struct ObjectFileHandler {
     }
 
     /// The current object for `key` out of the forms found on disk, or nil when there is none to
-    /// list. Precedence is erasure-coded > versioned > plain, as listings have always ranked
-    /// them; a delete marker at the head of the versioned chain hides a plain `.obj` left over
-    /// from before versioning was enabled, so a deleted key cannot resurface (the read path
-    /// treats that marker as authoritative too).
+    /// list. The `.latest` pointer names the current version (see `isCurrentVersion`); a delete
+    /// marker there hides the key, a plain `.obj` from before versioning was enabled included.
+    /// Without a pointer the non-versioned form is the object: `key.ecshards/`, else the `.obj`.
     private static func currentObject(
         bucketName: String, key: String, sources: ListedKeySources
     ) -> ObjectMeta? {
+        if sources.versionsDirectory != nil,
+            let versionId = try? getLatestVersionId(bucketName: bucketName, key: key)
+        {
+            // `.obj` version first; an erasure-coded version lives in `<versionId>.ecshards/`
+            // under the same directory and is found by its header.
+            let head =
+                (try? read(from: versionedPath(for: bucketName, key: key, versionId: versionId), loadData: false).0)
+                ?? ErasureCodedObjectHandler.anyLocalShardHeader(
+                    inShardDirectory: ErasureCodedObjectHandler.versionedShardBasePath(
+                        bucketName: bucketName, key: key, versionId: versionId)
+                )?.objectMeta
+            if var head {
+                if head.isDeleteMarker { return nil }
+                head.isLatest = true
+                return head
+            }
+            // A pointer at a version this node cannot read falls through to the older forms.
+        }
+
         var current: ObjectMeta?
-        var tombstoned = false
         if let shardDirectory = sources.shardDirectory,
             let header = ErasureCodedObjectHandler.anyLocalShardHeader(inShardDirectory: shardDirectory),
-            header.objectMeta.isLatest, header.objectMeta.bucketName == bucketName
+            header.objectMeta.bucketName == bucketName, !header.objectMeta.isDeleteMarker
         {
-            if header.objectMeta.isDeleteMarker { tombstoned = true } else { current = header.objectMeta }
+            current = header.objectMeta
         }
-        if current == nil, sources.versionsDirectory != nil {
-            let head: ObjectMeta?
-            if let (meta, _) = try? readVersion(bucketName: bucketName, key: key, versionId: nil, loadData: false) {
-                head = meta
-            } else {
-                // `readVersion` only knows `.obj` versions; an erasure-coded version lives in
-                // `<versionId>.ecshards/` under the same directory and is found by its header.
-                head = ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName, key: key)
-                    .first(where: \.isLatest)
-            }
-            if let head {
-                if head.isDeleteMarker { tombstoned = true } else { current = head }
-            }
-        }
-        if current == nil, !tombstoned, let plainPath = sources.plainPath {
+        if current == nil, let plainPath = sources.plainPath {
             current = try? read(from: plainPath, loadData: false).0
         }
+        current?.isLatest = true
         return current
     }
 
@@ -889,16 +895,10 @@ struct ObjectFileHandler {
                 versionId = ObjectMeta.generateVersionId()
                 path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-                // Mark all existing versions as not latest
-                try markAllVersionsNotLatest(bucketName: bucketName, key: key)
-
             case .suspended:
                 // Use "null" as version ID, overwrite any existing null version
                 versionId = "null"
                 path = versionedPath(for: bucketName, key: key, versionId: versionId)
-
-                // Mark all existing versions as not latest
-                try markAllVersionsNotLatest(bucketName: bucketName, key: key)
 
             case .disabled:
                 // No versioning - use the old single-file path
@@ -908,6 +908,8 @@ struct ObjectFileHandler {
                 path = storagePath(for: bucketName, key: key)
             }
 
+            // `isLatest` here is intent for the write that follows; once on disk, only the
+            // `.latest` pointer says which version is current (`isCurrentVersion`).
             var versionedMeta = metadata
             versionedMeta.versionId = versionId
             versionedMeta.isLatest = true
@@ -1014,6 +1016,21 @@ struct ObjectFileHandler {
         return versionId.isEmpty ? nil : versionId
     }
 
+    /// Whether `versionId` is the key's current version, decided by the `.latest` pointer alone.
+    /// Headers still carry an `isLatest` field, but it is write-time intent, never maintained:
+    /// keeping it true used to rewrite every older version file on each new write. A key with no
+    /// pointer is current only in its non-versioned form (plain `.obj` or `key.ecshards/`, S3's
+    /// `null` version). `readHeader` and `listVersions` stamp this onto what they return.
+    static func isCurrentVersion(bucketName: String, key: String, versionId: String?) -> Bool {
+        isCurrentVersion(
+            pointer: try? getLatestVersionId(bucketName: bucketName, key: key), versionId: versionId)
+    }
+
+    private static func isCurrentVersion(pointer: String?, versionId: String?) -> Bool {
+        guard let pointer else { return versionId == nil || versionId == "null" }
+        return pointer == (versionId ?? "null")
+    }
+
     /// Updates the .latest pointer file. Runs on every write to a versioned bucket, so the
     /// common case (directory already exists) is optimistic: try the write first, and only
     /// pay for stat-ing + creating the parent directory on the rare miss (same pattern as
@@ -1032,43 +1049,6 @@ struct ObjectFileHandler {
         }
     }
 
-    /// Marks all versions of an object as not latest. Runs on every write to a versioned (or
-    /// suspended-versioning) bucket, over every prior version of the key. Only the metadata's
-    /// `isLatest` flag ever needs changing, so this is header-only for every file it checks
-    /// (`payloadLocation`, not `read`), and window-copies the payload back into place rather
-    /// than buffering it as `Data`, avoiding a full read+copy of a multi-gigabyte payload just
-    /// to flip one boolean.
-    static func markAllVersionsNotLatest(bucketName: String, key: String) throws {
-        try ObjectKeyLock.withLock(bucketName: bucketName, key: key) {
-            let basePath = versionedBasePath(for: bucketName, key: key)
-            let baseURL = URL(fileURLWithPath: basePath)
-
-            guard FileManager.default.fileExists(atPath: basePath) else {
-                return
-            }
-
-            let contents = try FileManager.default.contentsOfDirectory(
-                at: baseURL, includingPropertiesForKeys: nil)
-
-            for fileURL in contents where fileURL.pathExtension == "obj" {
-                do {
-                    let snapshot = try openPayloadSnapshot(path: fileURL.path)
-                    defer { _ = POSIXFile.close(snapshot.fd) }
-                    guard snapshot.meta.isLatest else { continue }
-
-                    var updatedMeta = snapshot.meta
-                    updatedMeta.isLatest = false
-                    try writeStreamed(
-                        metadata: updatedMeta, payloadFd: snapshot.fd,
-                        payloadOffset: snapshot.payloadOffset, payloadSize: snapshot.payloadSize,
-                        to: fileURL.path)
-                } catch {
-                    // Skip files we can't read
-                    continue
-                }
-            }
-        }
-    }
 
     /// Lists all versions of an object
     static func listVersions(
@@ -1113,6 +1093,12 @@ struct ObjectFileHandler {
         for meta in ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName, key: key)
         where !versions.contains(where: { $0.versionId == meta.versionId }) {
             versions.append(meta)
+        }
+
+        // `.obj` headers already carry the derived flag (`readHeader`); shard headers do not.
+        let pointer = try? getLatestVersionId(bucketName: bucketName, key: key)
+        for index in versions.indices {
+            versions[index].isLatest = isCurrentVersion(pointer: pointer, versionId: versions[index].versionId)
         }
 
         // S3 order: newest first; the version id breaks exact-timestamp ties so the order - and
@@ -1249,10 +1235,6 @@ struct ObjectFileHandler {
             let versionId = ObjectMeta.generateVersionId()
             let path = versionedPath(for: bucketName, key: key, versionId: versionId)
 
-            // Mark all existing versions as not latest
-            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
-
-            // Create delete marker metadata
             let meta = ObjectMeta(
                 bucketName: bucketName,
                 key: key,
@@ -1292,12 +1274,10 @@ struct ObjectFileHandler {
                 try FileManager.default.removeItem(atPath: plainPath)
             }
 
+            // Prior real versions are never deleted - the pointer below simply stops naming them,
+            // matching prepareVersionedWrite's .suspended case exactly.
             let versionId = "null"
             let path = versionedPath(for: bucketName, key: key, versionId: versionId)
-
-            // Demotes prior real versions to not-latest - never deletes them, matching
-            // prepareVersionedWrite's .suspended case exactly.
-            try markAllVersionsNotLatest(bucketName: bucketName, key: key)
 
             let meta = ObjectMeta(
                 bucketName: bucketName,
@@ -1318,32 +1298,15 @@ struct ObjectFileHandler {
         }
     }
 
-    /// Updates the .latest pointer to the most recent non-deleted version
+    /// Repoints `.latest` at the most recent remaining version, or removes it when none is left.
+    /// Nothing is rewritten: the pointer alone decides what is current.
     private static func updateLatestToMostRecent(bucketName: String, key: String) throws {
         try ObjectKeyLock.withLock(bucketName: bucketName, key: key) {
-            let versions = try listVersions(bucketName: bucketName, key: key)
-
-            // Find the most recent version (already sorted by updatedAt descending)
-            if let mostRecent = versions.first {
-                try updateLatestPointer(bucketName: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
-
-                // Update the metadata to mark it as latest - header-only read + self window-copy
-                // (see markAllVersionsNotLatest) rather than buffering the whole payload just to
-                // flip one boolean.
-                let path = versionedPath(for: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
-                if let snapshot = try? openPayloadSnapshot(path: path) {
-                    defer { _ = POSIXFile.close(snapshot.fd) }
-                    var updatedMeta = snapshot.meta
-                    updatedMeta.isLatest = true
-                    try writeStreamed(
-                        metadata: updatedMeta, payloadFd: snapshot.fd,
-                        payloadOffset: snapshot.payloadOffset, payloadSize: snapshot.payloadSize,
-                        to: path)
-                }
+            if let mostRecent = try listVersions(bucketName: bucketName, key: key).first {
+                try updateLatestPointer(
+                    bucketName: bucketName, key: key, versionId: mostRecent.versionId ?? "null")
             } else {
-                // No versions left, remove the .latest pointer
-                let pointerPath = latestPointerPath(for: bucketName, key: key)
-                try? FileManager.default.removeItem(atPath: pointerPath)
+                try? FileManager.default.removeItem(atPath: latestPointerPath(for: bucketName, key: key))
             }
         }
     }

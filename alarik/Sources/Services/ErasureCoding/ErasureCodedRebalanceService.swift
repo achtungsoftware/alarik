@@ -206,7 +206,9 @@ enum ErasureCodedRebalanceService {
                 bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
             try await S3Service.offloadBlockingIO(app) {
                 try ErasureCodedObjectHandler.commitShardFile(
-                    sourcePath: scratchPath, finalPath: finalPath, bucketName: bucketName, key: key)
+                    sourcePath: scratchPath, finalPath: finalPath, bucketName: bucketName, key: key,
+                    promote: ObjectFileHandler.isCurrentVersion(
+                        bucketName: bucketName, key: key, versionId: versionId))
             }
         } else {
             // Reachable via a manual resync or a future non-dispatcher caller, where the
@@ -214,7 +216,9 @@ enum ErasureCodedRebalanceService {
             // push exactly as before.
             try await ClusterReplicationClient.pushShard(
                 app: app, to: target, sourcePath: scratchPath, bucketName: bucketName, key: key,
-                versionId: versionId, shardIndex: shardIndex)
+                versionId: versionId, shardIndex: shardIndex,
+                promote: ObjectFileHandler.isCurrentVersion(
+                    bucketName: bucketName, key: key, versionId: versionId))
         }
     }
 
@@ -690,7 +694,9 @@ enum ErasureCodedRebalanceService {
                         try await ClusterReplicationClient.pushShard(
                             app: app, to: rightfulOwner, sourcePath: localPath,
                             bucketName: bucketName, key: key, versionId: versionId,
-                            shardIndex: staleShardIndex)
+                            shardIndex: staleShardIndex,
+                            promote: ObjectFileHandler.isCurrentVersion(
+                                bucketName: bucketName, key: key, versionId: versionId))
                     } catch {
                         app.logger.warning(
                             "Kept shard \(staleShardIndex) of '\(bucketName)/\(key)' - could not hand it to its owner \(rightfulOwner.id) yet, retrying next walk: \(error)"

@@ -95,15 +95,9 @@ enum ErasureCodedDeleteCoordinator {
             bucketName: bucketName, key: key, size: 0, contentType: "", etag: "",
             updatedAt: Date(), versionId: versionId, isLatest: true, isDeleteMarker: true)
 
-        // Capture the prior latest before demoting, so a failed-quorum rollback restores it.
-        // Blocking IO (header rewrites of every prior version), so on the IO pool.
+        // Capture the prior latest first, so a failed-quorum rollback restores it.
         let priorLatestVersionId = try await S3Service.offloadBlockingIO(app) {
-            let prior = try? ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: key)
-            try ObjectFileHandler.markAllVersionsNotLatest(bucketName: bucketName, key: key)
-            // markAllVersionsNotLatest only ever looks at `.obj` files - this node's own prior
-            // local EC shards for this key need the EC-aware equivalent too.
-            ErasureCodedObjectHandler.markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
-            return prior
+            try? ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: key)
         }
 
         // No payload - StripeEncoder already handles a zero-byte, zero-source object with no

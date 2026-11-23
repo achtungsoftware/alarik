@@ -1058,4 +1058,80 @@ struct ObjectFileHandlerVersioningTests {
             bucketName: "test-bucket", keyMarker: "k.txt", maxKeys: 10)
         #expect(afterK.map(\.key) == ["z.txt"])
     }
+
+    private func fileIdentity(_ path: String) throws -> (inode: Any?, modified: Date?) {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        return (attributes[.systemFileNumber], attributes[.modificationDate] as? Date)
+    }
+
+    @Test("a new version leaves the older version's file untouched; the pointer alone decides IsLatest")
+    func newVersionDoesNotRewriteOlderVersions() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+        let key = "test-file.txt"
+
+        let v1 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v1"),
+            bucketName: "test-bucket", key: key, versioningStatus: .enabled)
+        let v1Path = ObjectFileHandler.versionedPath(for: "test-bucket", key: key, versionId: v1)
+        let before = try fileIdentity(v1Path)
+
+        let v2 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v2"),
+            bucketName: "test-bucket", key: key, versioningStatus: .enabled)
+        _ = try ObjectFileHandler.createDeleteMarker(bucketName: "test-bucket", key: key)
+        let v3 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v3"),
+            bucketName: "test-bucket", key: key, versioningStatus: .enabled)
+
+        // Three later writes, including a delete marker, never touched v1's file.
+        let after = try fileIdentity(v1Path)
+        #expect("\(before.inode ?? "")" == "\(after.inode ?? "")")
+        #expect(before.modified == after.modified)
+
+        // Yet every reader agrees on exactly one latest - the one the pointer names.
+        #expect(try ObjectFileHandler.read(from: v1Path, loadData: false).0.isLatest == false)
+        #expect(try ObjectFileHandler.readVersion(bucketName: "test-bucket", key: key, versionId: v2).0.isLatest == false)
+        #expect(try ObjectFileHandler.readVersion(bucketName: "test-bucket", key: key, versionId: v3).0.isLatest == true)
+        let chain = try ObjectFileHandler.listVersions(bucketName: "test-bucket", key: key)
+        #expect(chain.filter(\.isLatest).map(\.versionId) == [v3])
+
+        // Moving the pointer is all it takes to change the answer.
+        try ObjectFileHandler.updateLatestPointer(bucketName: "test-bucket", key: key, versionId: v1)
+        #expect(try ObjectFileHandler.read(from: v1Path, loadData: false).0.isLatest == true)
+        #expect(try ObjectFileHandler.listVersions(bucketName: "test-bucket", key: key).filter(\.isLatest).map(\.versionId) == [v1])
+        let (listed, _, _, _) = try ObjectFileHandler.listObjects(bucketName: "test-bucket")
+        #expect(listed.map(\.versionId) == [v1])
+        #expect(listed.first?.isLatest == true)
+    }
+
+    @Test("deleting the current version repoints to the survivor without rewriting it")
+    func deletingLatestRepointsWithoutRewrite() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+        let key = "test-file.txt"
+        let v1 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v1"),
+            bucketName: "test-bucket", key: key, versioningStatus: .enabled)
+        let v2 = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(), data: createTestData("v2"),
+            bucketName: "test-bucket", key: key, versioningStatus: .enabled)
+        let v1Path = ObjectFileHandler.versionedPath(for: "test-bucket", key: key, versionId: v1)
+        let before = try fileIdentity(v1Path)
+
+        try ObjectFileHandler.deleteVersion(bucketName: "test-bucket", key: key, versionId: v2)
+
+        #expect(try ObjectFileHandler.getLatestVersionId(bucketName: "test-bucket", key: key) == v1)
+        let after = try fileIdentity(v1Path)
+        #expect("\(before.inode ?? "")" == "\(after.inode ?? "")")
+        #expect(before.modified == after.modified)
+        let (current, data) = try ObjectFileHandler.readVersion(bucketName: "test-bucket", key: key, versionId: nil)
+        #expect(current.versionId == v1 && current.isLatest == true)
+        #expect(data == createTestData("v1"))
+
+        // The last version gone: no pointer, no current object.
+        try ObjectFileHandler.deleteVersion(bucketName: "test-bucket", key: key, versionId: v1)
+        #expect(try ObjectFileHandler.getLatestVersionId(bucketName: "test-bucket", key: key) == nil)
+        #expect(try ObjectFileHandler.readCurrentObject(bucketName: "test-bucket", key: key, loadData: false) == nil)
+    }
 }

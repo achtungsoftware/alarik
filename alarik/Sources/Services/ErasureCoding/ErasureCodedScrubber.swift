@@ -174,7 +174,9 @@ enum ErasureCodedScrubber {
                 (try? await S3Service.offloadBlockingIO(app) {
                     try ErasureCodedObjectHandler.commitShardFile(
                         sourcePath: tempPath, finalPath: finalPath, bucketName: bucketName,
-                        key: key)
+                        key: key,
+                        promote: ObjectFileHandler.isCurrentVersion(
+                            bucketName: bucketName, key: key, versionId: versionId))
                 }) != nil
             {
                 healed = true

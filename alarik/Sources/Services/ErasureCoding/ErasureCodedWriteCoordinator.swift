@@ -296,9 +296,11 @@ enum ErasureCodedWriteCoordinator {
     ) async -> Bool {
         do {
             try await ClusterReplicationService.withTimeout(ClusterReplicationService.synchronousTimeout) {
+                // A fresh versioned write is the new current version everywhere it lands.
                 try await ClusterReplicationClient.pushShard(
                     app: app, to: node, sourcePath: sourcePath, bucketName: bucketName, key: key,
-                    versionId: versionId, shardIndex: shardIndex, stagingToken: stagingToken)
+                    versionId: versionId, shardIndex: shardIndex, stagingToken: stagingToken,
+                    promote: versionId != nil)
             }
             return true
         } catch {

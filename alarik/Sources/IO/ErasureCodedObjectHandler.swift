@@ -109,18 +109,14 @@ enum ErasureCodedObjectHandler {
 
     /// Moves every shard staged under `token` into the non-versioned shard directory of
     /// (bucketName, key), replacing the previous generation's shard of the same index
-    /// atomically. Runs the same isLatest demotion a direct push does, so a staged write ends
-    /// in exactly the state an in-place one used to.
+    /// atomically. Non-versioned, so no `.latest` pointer is involved.
     static func commitStagedShards(token: String, bucketName: String, key: String) throws {
         defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
         let stagingDir = stagingBasePath(token: token)
         let staged = try FileManager.default.contentsOfDirectory(atPath: stagingDir)
             .filter { $0.hasSuffix(".ecshard") }
-        guard let first = staged.first else {
+        guard !staged.isEmpty else {
             throw ErasureCodedObjectHandlerError.openFailed(path: stagingDir, errno: ENOENT)
-        }
-        if (try? ErasureCodedShardReader(path: stagingDir + first).header.objectMeta.isLatest) == true {
-            markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
         }
 
         let baseDir = shardBasePath(bucketName: bucketName, key: key)
@@ -131,7 +127,8 @@ enum ErasureCodedObjectHandler {
             if POSIXFile.rename(source, destination) != 0 {
                 // Different filesystem (Storage/ split across mounts): copy, then drop the stage.
                 try commitShardFile(
-                    sourcePath: source, finalPath: destination, bucketName: bucketName, key: key)
+                    sourcePath: source, finalPath: destination, bucketName: bucketName, key: key,
+                    promote: false)
                 _ = POSIXFile.unlink(source)
             }
         }
@@ -220,65 +217,7 @@ enum ErasureCodedObjectHandler {
         return updatedHeader
     }
 
-    /// Demotes every OTHER local version's shard for `key` to `isLatest = false` - the EC
-    /// counterpart of `ObjectFileHandler.markAllVersionsNotLatest`. Called on every node that
-    /// receives a shard whose header says `isLatest = true` (see
-    /// `InternalClusterErasureCodedController.handlePush`), not just the write coordinator -
-    /// each of the `k+m` nodes must independently keep its own local `.latest` pointer and
-    /// per-shard `isLatest` flags correct, since any of them can serve a read independently.
-    static func markAllLocalShardsNotLatest(bucketName: String, key: String, exceptVersionId: String? = nil) {
-        // Demote every shard directory holding a locally-latest shard for this key. Two families
-        // of directory can exist simultaneously and both must be swept: the versioned ones under
-        // `key.versions/<versionId>.ecshards/`, and the non-versioned `key.ecshards/` (an object
-        // written while versioning was disabled, still `isLatest` in its own header - missed here,
-        // it would keep claiming latest forever once versioning is later enabled). `exceptVersionId`
-        // lets a commit skip re-demoting the version it's promoting.
-        var shardDirs: [(url: URL, versionId: String?)] = []
 
-        let versionsBase = ObjectFileHandler.versionedBasePath(for: bucketName, key: key)
-        if FileManager.default.fileExists(atPath: versionsBase),
-            let versionDirs = try? FileManager.default.contentsOfDirectory(
-                at: URL(fileURLWithPath: versionsBase), includingPropertiesForKeys: nil)
-        {
-            for dir in versionDirs where dir.pathExtension == "ecshards" {
-                // `<versionId>.ecshards` -> versionId is the filename without the extension.
-                let versionId = dir.deletingPathExtension().lastPathComponent
-                shardDirs.append((dir, versionId))
-            }
-        }
-
-        let plainBase = shardBasePath(bucketName: bucketName, key: key)
-        if FileManager.default.fileExists(atPath: plainBase) {
-            shardDirs.append((URL(fileURLWithPath: plainBase), nil))
-        }
-
-        for (dir, versionId) in shardDirs {
-            if let exceptVersionId, versionId == exceptVersionId { continue }
-            guard
-                let shardFiles = try? FileManager.default.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: nil)
-            else { continue }
-            for shardFile in shardFiles where shardFile.pathExtension == "ecshard" {
-                guard let reader = try? ErasureCodedShardReader(path: shardFile.path) else { continue }
-                let isLatest = reader.header.objectMeta.isLatest
-                reader.close()
-                guard isLatest else { continue }
-                _ = try? rewriteShardMetadata(at: shardFile.path) { $0.isLatest = false }
-            }
-        }
-    }
-
-    /// Promotes this node's local shard(s) for one specific version back to `isLatest = true` -
-    /// the inverse of a demote, used by the failed-quorum restore path to un-demote the prior
-    /// version whose promotion was rolled back. No-op when this node holds no shard for the
-    /// version (nothing local to promote).
-    static func markLocalShardsLatest(bucketName: String, key: String, versionId: String?) {
-        for index in locallyHeldShardIndices(bucketName: bucketName, key: key, versionId: versionId) {
-            let path = shardPath(
-                bucketName: bucketName, key: key, versionId: versionId, shardIndex: index)
-            _ = try? rewriteShardMetadata(at: path) { $0.isLatest = true }
-        }
-    }
 
     /// The shard indices this node physically holds for (bucketName, key[, versionId]) - read
     /// straight from the `.ecshards` directory's filenames. Normally exactly one entry, but
@@ -332,21 +271,18 @@ enum ErasureCodedObjectHandler {
     }
 
     /// Commits an already fully-formed `.ecshard` file (header + every stripe already written)
-    /// into its final on-disk shard path, atomically, with the same isLatest demote-then-write-
-    /// then-repoint sequence every shard-arrival path needs. Used for a *local* commit - when the
-    /// node producing the shard bytes is itself the final destination, this skips the otherwise-
+    /// into its final on-disk shard path, atomically. Used for a *local* commit - when the node
+    /// producing the shard bytes is itself the final destination, this skips the otherwise-
     /// redundant HTTP round trip through `pushShard` in favor of one direct copy.
+    ///
+    /// `promote` moves the key's `.latest` pointer to the shard's version afterwards. The caller
+    /// knows whether that version is current (a fresh write is; a rebalanced or repaired older
+    /// version is not); the header's own `isLatest` is write-time intent and may be stale
+    /// (`ObjectFileHandler.isCurrentVersion`).
     static func commitShardFile(
-        sourcePath: String, finalPath: String, bucketName: String, key: String
+        sourcePath: String, finalPath: String, bucketName: String, key: String, promote: Bool
     ) throws {
         defer { StorageStatsService.shared.noteChange(bucketName: bucketName) }
-        let incomingMeta = try? ErasureCodedShardReader(path: sourcePath).header.objectMeta
-        // Demoting any prior local latest must happen BEFORE the new file lands - mirrors
-        // handlePush's exact ordering (never demote the file we're about to write).
-        if incomingMeta?.isLatest == true {
-            markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
-        }
-
         var writer = try AtomicObjectWriter(finalPath: finalPath)
         do {
             var reader = WindowedFileReader()
@@ -357,22 +293,20 @@ enum ErasureCodedObjectHandler {
             throw error
         }
 
-        if let incomingMeta, incomingMeta.isLatest, let versionId = incomingMeta.versionId {
+        if promote, let versionId = try? ErasureCodedShardReader(path: finalPath).header.objectMeta.versionId {
             try? ObjectFileHandler.updateLatestPointer(
                 bucketName: bucketName, key: key, versionId: versionId)
         }
     }
 
-    /// Undoes a rolled-back latest promotion for one node: repoints `.latest` to `priorVersionId`
-    /// (re-promoting that version's local shard), or removes the pointer entirely when there was
-    /// no prior version. Called on every responsible node after a coordinator's EC write fails
+    /// Undoes a rolled-back latest promotion for one node: repoints `.latest` to `priorVersionId`,
+    /// or removes the pointer entirely when there was no prior version. Called on every responsible node after a coordinator's EC write fails
     /// quorum, so a peer that had already repointed to the now-deleted version doesn't leave
     /// `.latest` dangling at a shardless version (which a subsequent GET would resolve to and 404).
     static func restoreLatest(bucketName: String, key: String, priorVersionId: String?) {
         if let priorVersionId {
             try? ObjectFileHandler.updateLatestPointer(
                 bucketName: bucketName, key: key, versionId: priorVersionId)
-            markLocalShardsLatest(bucketName: bucketName, key: key, versionId: priorVersionId)
         } else {
             let pointerPath = ObjectFileHandler.latestPointerPath(for: bucketName, key: key)
             try? FileManager.default.removeItem(atPath: pointerPath)

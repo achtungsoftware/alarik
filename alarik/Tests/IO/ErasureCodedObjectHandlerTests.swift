@@ -375,6 +375,8 @@ struct ErasureCodedObjectHandlerTests {
             index: 3, meta: versioned,
             to: ErasureCodedObjectHandler.versionedShardPath(
                 bucketName: bucket, key: versioned.key, versionId: "v1", shardIndex: 3))
+        // Every versioned write leaves the pointer behind; it, not the header, makes v1 current.
+        try ObjectFileHandler.updateLatestPointer(bucketName: bucket, key: versioned.key, versionId: "v1")
 
         let discovered = ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucket)
         #expect(Set(discovered.map(\.key)) == ["docs/plain.txt", "docs/versioned.txt"])
@@ -415,5 +417,66 @@ struct ErasureCodedObjectHandlerTests {
         #expect(ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucket).count == 1)
         let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: bucket)
         #expect(objects.map(\.key) == ["k"])
+    }
+
+    @Test("a stale isLatest in a shard header never outranks the .latest pointer")
+    func staleShardHeaderFlagIsIgnored() throws {
+        let bucket = "stale-flag-bucket"
+        defer { try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket)) }
+        try FileManager.default.createDirectory(
+            at: BucketHandler.bucketURL(for: bucket), withIntermediateDirectories: true)
+        let key = "docs/k.txt"
+
+        // An older erasure-coded version whose header still says it is latest (headers are
+        // never rewritten), then a newer plain version that moved the pointer.
+        let old = ObjectMeta(
+            bucketName: bucket, key: key, size: 3, contentType: "text/plain", etag: "old",
+            updatedAt: Date(timeIntervalSinceNow: -60), versionId: "v1", isLatest: true, isDeleteMarker: false)
+        try writeShard(
+            index: 3, meta: old,
+            to: ErasureCodedObjectHandler.versionedShardPath(bucketName: bucket, key: key, versionId: "v1", shardIndex: 3))
+        let newMeta = ObjectMeta(
+            bucketName: bucket, key: key, size: 3, contentType: "text/plain", etag: "new", updatedAt: Date())
+        let v2 = try ObjectFileHandler.writeVersioned(
+            metadata: newMeta, data: Data("new".utf8), bucketName: bucket, key: key, versioningStatus: .enabled)
+
+        let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: bucket)
+        #expect(objects.map(\.versionId) == [v2])
+        let chain = try ObjectFileHandler.listVersions(bucketName: bucket, key: key)
+        #expect(chain.map(\.versionId) == [v2, "v1"])
+        #expect(chain.map(\.isLatest) == [true, false])
+
+        // Deleting the plain version repoints at the erasure-coded one, which the listing then
+        // serves from its shard header - as current, whatever the header's flag says.
+        try ObjectFileHandler.deleteVersion(bucketName: bucket, key: key, versionId: v2)
+        #expect(try ObjectFileHandler.getLatestVersionId(bucketName: bucket, key: key) == "v1")
+        let (afterDelete, _, _, _) = try ObjectFileHandler.listObjects(bucketName: bucket)
+        #expect(afterDelete.map(\.versionId) == ["v1"])
+        #expect(afterDelete.first?.etag == "old")
+    }
+
+    @Test("commitShardFile moves the pointer only when the caller promotes the version")
+    func commitShardFilePromotesOnlyOnRequest() throws {
+        let bucket = "promote-bucket"
+        defer { try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket)) }
+        let key = "k"
+        let meta = ObjectMeta(
+            bucketName: bucket, key: key, size: 0, contentType: "text/plain", etag: "e",
+            updatedAt: Date(), versionId: "v9", isLatest: true, isDeleteMarker: false)
+        let source = NSTemporaryDirectory() + "shard-\(UUID().uuidString).ecshard"
+        defer { try? FileManager.default.removeItem(atPath: source) }
+        try writeShard(index: 0, meta: meta, to: source)
+        let final = ErasureCodedObjectHandler.versionedShardPath(
+            bucketName: bucket, key: key, versionId: "v9", shardIndex: 0)
+
+        // A rebalanced or repaired copy of an older version: header says latest, caller says no.
+        try ErasureCodedObjectHandler.commitShardFile(
+            sourcePath: source, finalPath: final, bucketName: bucket, key: key, promote: false)
+        #expect(FileManager.default.fileExists(atPath: final))
+        #expect(try ObjectFileHandler.getLatestVersionId(bucketName: bucket, key: key) == nil)
+
+        try ErasureCodedObjectHandler.commitShardFile(
+            sourcePath: source, finalPath: final, bucketName: bucket, key: key, promote: true)
+        #expect(try ObjectFileHandler.getLatestVersionId(bucketName: bucket, key: key) == "v9")
     }
 }

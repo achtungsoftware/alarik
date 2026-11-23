@@ -1137,13 +1137,12 @@ struct S3Controller: RouteCollection {
         guard versioningStatus != .disabled else {
             return (nil, metadata, nil)
         }
-        // Capture the version `.latest` pointed at BEFORE the demote below, so a failed-quorum
-        // rollback can restore it (see ErasureCodedWriteCoordinator.rollback).
+        // Capture the version `.latest` points at BEFORE the write, so a failed-quorum rollback
+        // can restore it (see ErasureCodedWriteCoordinator.rollback).
         let priorLatestVersionId = try? ObjectFileHandler.getLatestVersionId(
             bucketName: bucketName, key: key)
         let (versionId, _, versionedMeta) = try ObjectFileHandler.prepareVersionedWrite(
             metadata: metadata, bucketName: bucketName, key: key, versioningStatus: versioningStatus)
-        ErasureCodedObjectHandler.markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
         return (versionId, versionedMeta, priorLatestVersionId)
     }
 

@@ -200,9 +200,8 @@ struct InternalClusterErasureCodedController: RouteCollection {
         let parityShards: Int
     }
 
-    /// Repoints this node's `.latest` pointer for (bucket, key) back to `priorVersionId` and
-    /// re-promotes that version's local shard to `isLatest = true` - the peer side of a
-    /// coordinator's failed-quorum rollback. A missing `priorVersionId` means the key had no prior
+    /// Repoints this node's `.latest` pointer for (bucket, key) back to `priorVersionId` - the
+    /// peer side of a coordinator's failed-quorum rollback. A missing `priorVersionId` means the key had no prior
     /// version at all (a first-ever write that failed), so the pointer is removed outright. Idempotent
     /// and safe to broadcast to every responsible node, whether or not it actually received the
     /// rolled-back shard.
@@ -400,19 +399,22 @@ struct InternalClusterErasureCodedController: RouteCollection {
             throw error
         }
 
-        // Peek the spooled shard's header (cheap - no stripe data touched) to learn whether this
-        // is a new "latest" version before committing it - demoting any prior local latest must
-        // happen BEFORE the new file lands, mirroring InternalClusterObjectController.handlePush's
-        // exact ordering for `.obj` (never demote the file we're about to write).
-        // A staged shard isn't live yet: demotion and the pointer update happen at commit, so a
-        // write that misses quorum leaves the previous generation exactly as it was.
-        let incomingMeta: ObjectMeta? = isStaged ? nil : try? await threadPool.runIfActive {
-            try ErasureCodedShardReader(path: spoolPath).header.objectMeta
-        }
-        if incomingMeta?.isLatest == true {
-            try? await threadPool.runIfActive {
-                ErasureCodedObjectHandler.markAllLocalShardsNotLatest(bucketName: bucketName, key: key)
-            }
+        // Whether to move this node's `.latest` pointer to the pushed version is the sender's
+        // call (`promote=1`): a fresh write promotes, a rebalance or repair of an older version
+        // must not. A sender that predates the parameter says it through the shard header
+        // instead - write-time intent, consulted only then. A staged shard is non-versioned and
+        // never moves a pointer.
+        let versionId = req.query[String.self, at: "versionId"]
+        let promote: Bool
+        if isStaged || versionId == nil {
+            promote = false
+        } else if let flag = req.query[String.self, at: "promote"] {
+            promote = flag == "1"
+        } else {
+            promote =
+                (try? await threadPool.runIfActive {
+                    try ErasureCodedShardReader(path: spoolPath).header.objectMeta.isLatest
+                }) ?? false
         }
 
         let payloadSize = size
@@ -435,7 +437,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
 
         _ = POSIXFile.unlink(spoolPath)
 
-        if let incomingMeta, incomingMeta.isLatest, let versionId = incomingMeta.versionId {
+        if promote, let versionId {
             try? await threadPool.runIfActive {
                 try ObjectFileHandler.updateLatestPointer(
                     bucketName: bucketName, key: key, versionId: versionId)

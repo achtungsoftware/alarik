@@ -370,9 +370,14 @@ enum ClusterReplicationClient {
     /// `StripeEncoder`) to `node`'s internal shard-push endpoint. The `.ecshard` format is
     /// already fully self-describing (header + per-stripe checksums), so this is a raw byte
     /// copy - no repacking needed, unlike `pushObject`'s JSON-meta-header dance.
+    /// `promote` tells the receiver to move its `.latest` pointer to this shard's version: a
+    /// fresh write promotes, a rebalance or repair promotes only the version that is current
+    /// here (`ObjectFileHandler.isCurrentVersion`). The shard header's own `isLatest` is not
+    /// trusted for that, since it is never updated after the write.
     static func pushShard(
         app: Application, to node: ClusterNodeInfo, sourcePath: String, bucketName: String,
-        key: String, versionId: String?, shardIndex: Int, stagingToken: String? = nil
+        key: String, versionId: String?, shardIndex: Int, stagingToken: String? = nil,
+        promote: Bool = false
     ) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
             throw ClusterConfigurationError(description: "This node is not part of a cluster.")
@@ -389,6 +394,7 @@ enum ClusterReplicationClient {
         var suffix = shardQuerySuffix(
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
         if let stagingToken { suffix += "&staging=" + stagingQueryValue(stagingToken) }
+        if promote { suffix += "&promote=1" }
         var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/push" + suffix)
         outbound.method = .POST
         outbound.headers.replaceOrAdd(
