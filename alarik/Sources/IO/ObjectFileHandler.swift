@@ -734,11 +734,11 @@ struct ObjectFileHandler {
             latestByKey[$0] == nil && !tombstonedKeys.contains($0)
         }
 
-        // EC objects never appear in the `.obj` walk above - shard index 0's header already
-        // carries the current `isLatest`/`isDeleteMarker` state directly (no separate pointer
-        // read needed), so this is a straight filter over local shard-0 headers, applying the
-        // same prefix/marker/delimiter rules the `.obj` pass applies.
-        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName)
+        // EC objects never appear in the `.obj` walk above - every shard header carries the
+        // current `isLatest`/`isDeleteMarker` state directly (no separate pointer read needed),
+        // so this is a straight filter over the local shard headers, applying the same
+        // prefix/marker/delimiter rules the `.obj` pass applies.
+        for meta in ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName)
         where meta.isLatest {
             let key = meta.key
             if !prefix.isEmpty && !key.hasPrefix(prefix) { continue }
@@ -910,19 +910,23 @@ struct ObjectFileHandler {
                 {
                     if meta.isDeleteMarker { tombstonedKeys.insert(key) }
                     resolve(key, meta, rank: 1)
+                } else if let meta = ErasureCodedObjectHandler.listLocalShardVersions(
+                    bucketName: bucketName, key: key
+                ).first(where: \.isLatest) {
+                    // `readVersion` only knows `.obj` versions; an erasure-coded version lives in
+                    // `<versionId>.ecshards/` under the same directory and is found by its header.
+                    if meta.isDeleteMarker { tombstonedKeys.insert(key) }
+                    resolve(key, meta, rank: 2)
                 }
             } else if name.hasSuffix(".ecshards") {
                 let key = listed
-                let shardZeroPath = entry.appendingPathComponent("0.ecshard").path
-                if let reader = try? ErasureCodedShardReader(path: shardZeroPath) {
-                    let header = reader.header
-                    reader.close()
-                    // Trust the header over the filename, exactly like `listLocalShardZeroEntries`.
-                    if header.shardIndex == 0, header.objectMeta.isLatest,
-                        header.objectMeta.bucketName == bucketName
-                    {
-                        resolve(key, header.objectMeta, rank: 2)
-                    }
+                // Whichever shard index this node holds - see `listLocalShardVersions`. Trust the
+                // header over the filename.
+                if let header = ErasureCodedObjectHandler.anyLocalShardHeader(
+                    inShardDirectory: entry.path),
+                    header.objectMeta.isLatest, header.objectMeta.bucketName == bucketName
+                {
+                    resolve(key, header.objectMeta, rank: 2)
                 }
             } else {
                 commonPrefixesSet.insert(listed)
@@ -1283,9 +1287,9 @@ struct ObjectFileHandler {
             }
         }
 
-        // EC versions of this key - shard index 0 is this node's one-hit-per-version signal,
-        // no re-read needed (see `listAllVersions`'s identical reasoning).
-        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName, key: key)
+        // EC versions of this key, one entry per version from whichever shard this node holds
+        // (see `listAllVersions`'s identical reasoning).
+        for meta in ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName, key: key)
         where !versions.contains(where: { $0.versionId == meta.versionId }) {
             versions.append(meta)
         }
@@ -1400,12 +1404,11 @@ struct ObjectFileHandler {
             }
         }
 
-        // EC versions never appear in the `.obj` walk above - shard index 0 is this node's
-        // one-hit-per-version signal (see `ErasureCodedObjectHandler.listLocalShardZeroEntries`),
-        // so every entry here is already exactly one `ObjectMeta`, no re-read needed. Same
-        // prefix/delimiter/marker filtering as the `.obj` pass, duplicated rather than shared -
-        // this function already favors that style over extracting a filter closure.
-        for meta in ErasureCodedObjectHandler.listLocalShardZeroEntries(bucketName: bucketName) {
+        // EC versions never appear in the `.obj` walk above - `listLocalShardVersions` yields
+        // exactly one `ObjectMeta` per version this node holds any shard of, no re-read needed.
+        // Same prefix/delimiter/marker filtering as the `.obj` pass, duplicated rather than
+        // shared - this function already favors that style over extracting a filter closure.
+        for meta in ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName) {
             let objectKey = meta.key
 
             if !prefix.isEmpty && !objectKey.hasPrefix(prefix) {

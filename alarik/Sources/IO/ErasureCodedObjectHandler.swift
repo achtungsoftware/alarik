@@ -444,16 +444,60 @@ enum ErasureCodedObjectHandler {
         return results
     }
 
-    /// Every local shard-0 header for `bucketName` (optionally restricted to one `key`) - the EC
-    /// analog of walking `.obj` files, used by listing/lifecycle code that must see both formats.
-    /// Shard index 0 lives on rank-0 by construction, so this yields exactly one hit per (key,
-    /// version) this node is rank-0 for, and the header's `ObjectMeta` is already complete (no
-    /// separate re-read needed). Scoped to this one bucket's directory, and only files literally
-    /// named `0.ecshard` are opened, so cost stays bounded on every S3 listing/stats request.
-    static func listLocalShardZeroEntries(bucketName: String, key: String? = nil) -> [ObjectMeta] {
-        localShardZeroEntries(bucketName: bucketName) { meta in
-            key == nil || meta.key == key
+    /// Every version of every erasure-coded object this node holds **any** shard of, one entry
+    /// per (key, version) - the object-data counterpart of `listLocalShardEntries`. Discovery
+    /// used to require shard index 0, which made an object vanish from every listing (and the
+    /// admin placement view) whenever its shard-0 holder was down, even though it stayed
+    /// perfectly readable from the surviving shards. Every shard header carries the full
+    /// `ObjectMeta`, so any index answers. Scoped to `key`'s own directories when given.
+    static func listLocalShardVersions(bucketName: String, key: String? = nil) -> [ObjectMeta] {
+        let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
+        let roots: [String]
+        if let key {
+            roots = [
+                shardBasePath(bucketName: bucketName, key: key),
+                "\(bucketPath)/\(sanitizedKey(key)).versions/",
+            ]
+        } else {
+            roots = [bucketPath]
         }
+
+        var byVersion: [String: ObjectMeta] = [:]
+        var ordered: [ObjectMeta] = []
+        for root in roots {
+            guard
+                let enumerator = FileManager.default.enumerator(
+                    at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.isDirectoryKey],
+                    // No .skipsHiddenFiles: dot-prefixed keys are real objects.
+                    options: [])
+            else { continue }
+            for case let fileURL as URL in enumerator where fileURL.pathExtension == "ecshard" {
+                guard let reader = try? ErasureCodedShardReader(path: fileURL.path) else { continue }
+                let meta = reader.header.objectMeta
+                reader.close()
+                // Trust the header over the path, and never leak another bucket's record.
+                guard meta.bucketName == bucketName, key == nil || meta.key == key else { continue }
+                let id = meta.key + "\u{0}" + (meta.versionId ?? "")
+                if byVersion.updateValue(meta, forKey: id) == nil { ordered.append(meta) }
+            }
+        }
+        return ordered
+    }
+
+    /// The header of whichever shard file a `<key>.ecshards/` directory holds locally - any
+    /// index, for the same reason as `listLocalShardVersions`.
+    static func anyLocalShardHeader(inShardDirectory directory: String) -> ErasureCodedShardHeader? {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
+            return nil
+        }
+        for name in names.sorted() where name.hasSuffix(".ecshard") {
+            guard let reader = try? ErasureCodedShardReader(path: directory + "/" + name) else {
+                continue
+            }
+            defer { reader.close() }
+            return reader.header
+        }
+        return nil
     }
 
     /// Every locally-held record under `keyPrefix`, discovered from **any** shard index rather
@@ -500,34 +544,6 @@ enum ErasureCodedObjectHandler {
             byKey[header.objectMeta.key] = header.objectMeta
         }
         return Array(byKey.values)
-    }
-
-    private static func localShardZeroEntries(
-        bucketName: String, matching: (ObjectMeta) -> Bool
-    ) -> [ObjectMeta] {
-        let bucketPath = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
-        guard
-            let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: bucketPath),
-                includingPropertiesForKeys: [.isDirectoryKey],
-                // No .skipsHiddenFiles: dot-prefixed keys are real objects; the
-                // "0.ecshard" filter below excludes everything else.
-                options: [])
-        else { return [] }
-
-        var results: [ObjectMeta] = []
-        for case let fileURL as URL in enumerator {
-            guard fileURL.lastPathComponent == "0.ecshard" else { continue }
-            guard let reader = try? ErasureCodedShardReader(path: fileURL.path) else { continue }
-            let header = reader.header
-            reader.close()
-            // Belt-and-braces: trust the header over the filename, and never leak another
-            // bucket's meta if a file was somehow misplaced.
-            guard header.shardIndex == 0, header.objectMeta.bucketName == bucketName else { continue }
-            guard matching(header.objectMeta) else { continue }
-            results.append(header.objectMeta)
-        }
-        return results
     }
 }
 

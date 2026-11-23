@@ -343,4 +343,77 @@ struct ErasureCodedObjectHandlerTests {
             FileManager.default.fileExists(
                 atPath: ErasureCodedObjectHandler.stagingBasePath(token: "new-token")))
     }
+
+    // MARK: - Any-shard discovery
+
+    /// A header-only shard file (zero stripes) at `path`, enough for discovery and listing.
+    private func writeShard(index: Int, meta: ObjectMeta, to path: String) throws {
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        var writer = try ErasureCodedShardWriter(
+            path: path,
+            header: ErasureCodedShardHeader(
+                shardIndex: index, dataShards: 2, parityShards: 2, stripeUnitSize: 4096,
+                stripeCount: 0, objectMeta: meta))
+        try writer.finish()
+    }
+
+    @Test("objects whose only local shard is not index 0 are still listed, as current and as versions")
+    func listingsDiscoverAnyShardIndex() throws {
+        let bucket = "anyshard-bucket"
+        defer { try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket)) }
+        let plain = ObjectMeta(
+            bucketName: bucket, key: "docs/plain.txt", size: 3, contentType: "text/plain",
+            etag: "e1", updatedAt: Date(), versionId: nil, isLatest: true, isDeleteMarker: false)
+        try writeShard(
+            index: 2, meta: plain,
+            to: ErasureCodedObjectHandler.shardPath(bucketName: bucket, key: plain.key, shardIndex: 2))
+        let versioned = ObjectMeta(
+            bucketName: bucket, key: "docs/versioned.txt", size: 3, contentType: "text/plain",
+            etag: "e2", updatedAt: Date(), versionId: "v1", isLatest: true, isDeleteMarker: false)
+        try writeShard(
+            index: 3, meta: versioned,
+            to: ErasureCodedObjectHandler.versionedShardPath(
+                bucketName: bucket, key: versioned.key, versionId: "v1", shardIndex: 3))
+
+        let discovered = ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucket)
+        #expect(Set(discovered.map(\.key)) == ["docs/plain.txt", "docs/versioned.txt"])
+        #expect(
+            ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucket, key: "docs/plain.txt")
+                .map(\.key) == ["docs/plain.txt"])
+
+        // Folder view (directory fast path) and recursive walk both see the plain object.
+        let (folder, _, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: bucket, prefix: "docs/", delimiter: "/")
+        #expect(Set(folder.map(\.key)) == ["docs/plain.txt", "docs/versioned.txt"])
+        let (recursive, _, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: bucket, prefix: "docs/", delimiter: nil)
+        #expect(Set(recursive.map(\.key)) == ["docs/plain.txt", "docs/versioned.txt"])
+
+        // The versions listing sees the version held only as shard 3.
+        let (versions, _, _, _, _, _) = try ObjectFileHandler.listAllVersions(
+            bucketName: bucket, prefix: "", delimiter: nil, keyMarker: nil, versionIdMarker: nil,
+            maxKeys: 1000)
+        #expect(versions.contains { $0.key == "docs/versioned.txt" && $0.versionId == "v1" })
+        #expect(
+            try ObjectFileHandler.listVersions(bucketName: bucket, key: "docs/versioned.txt")
+                .map(\.versionId) == ["v1"])
+    }
+
+    @Test("two local shards of one version are one listing entry")
+    func duplicateIndicesCollapse() throws {
+        let bucket = "anyshard-dup-bucket"
+        defer { try? FileManager.default.removeItem(at: BucketHandler.bucketURL(for: bucket)) }
+        let meta = ObjectMeta(
+            bucketName: bucket, key: "k", size: 1, contentType: "text/plain", etag: "e",
+            updatedAt: Date(), versionId: nil, isLatest: true, isDeleteMarker: false)
+        for index in [1, 3] {
+            try writeShard(
+                index: index, meta: meta,
+                to: ErasureCodedObjectHandler.shardPath(bucketName: bucket, key: "k", shardIndex: index))
+        }
+        #expect(ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucket).count == 1)
+        let (objects, _, _, _) = try ObjectFileHandler.listObjects(bucketName: bucket)
+        #expect(objects.map(\.key) == ["k"])
+    }
 }
