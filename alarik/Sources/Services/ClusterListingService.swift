@@ -600,9 +600,12 @@ enum ClusterListingService {
         }
         commonPrefixes.sort()
 
+        // Same order as `ObjectFileHandler.listAllVersions`, so pages merged across nodes resume
+        // from the same position the local lister would.
         combined.sort {
             if $0.meta.key != $1.meta.key { return $0.meta.key < $1.meta.key }
-            return $0.meta.updatedAt > $1.meta.updatedAt
+            if $0.meta.updatedAt != $1.meta.updatedAt { return $0.meta.updatedAt > $1.meta.updatedAt }
+            return ($0.meta.versionId ?? "null") < ($1.meta.versionId ?? "null")
         }
 
         let dedupedCount = combined.count
@@ -616,7 +619,7 @@ enum ClusterListingService {
         var nextVersionIdMarker: String?
         if isTruncated, let last = limited.last {
             nextKeyMarker = last.meta.key
-            nextVersionIdMarker = last.meta.versionId
+            nextVersionIdMarker = last.meta.versionId ?? "null"
         }
 
         return (versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker)

@@ -1334,184 +1334,83 @@ struct ObjectFileHandler {
             return ([], [], [], false, nil, nil)
         }
 
-        var allVersions: [ObjectMeta] = []
-        var allDeleteMarkers: [ObjectMeta] = []
+        // Every version (or delete marker) under `prefix`, before any marker is applied.
+        // Paging is positional over the fully sorted list below, never a filter on version id
+        // strings: version ids are random, so `versionId <= marker` skipped and duplicated
+        // versions across pages.
+        var entries: [(meta: ObjectMeta, isDeleteMarker: Bool)] = []
         var commonPrefixSet: Set<String> = []
+
+        func admit(_ meta: ObjectMeta) {
+            if !prefix.isEmpty && !meta.key.hasPrefix(prefix) { return }
+            if let commonPrefix = Self.commonPrefix(of: meta.key, prefix: prefix, delimiter: delimiter) {
+                commonPrefixSet.insert(commonPrefix)
+                return
+            }
+            entries.append((meta, meta.isDeleteMarker))
+        }
 
         // Collect all .obj files (both versioned and non-versioned)
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "obj" else { continue }
 
-            // Parse the path to get key and version info
-            let relativePath = fileURL.path.replacingOccurrences(
-                of: bucketURL.path + "/",
-                with: ""
-            )
-
-            // Determine if this is a versioned path
-            var objectKey: String
+            // Cheap name-based prefix check before paying for the header read.
+            let relativePath = fileURL.path.replacingOccurrences(of: bucketURL.path + "/", with: "")
+            let objectKey: String
             if relativePath.contains(".versions/") {
-                // Versioned path: key.versions/versionId.obj
-                let parts = relativePath.components(separatedBy: ".versions/")
-                objectKey = parts[0]
+                objectKey = relativePath.components(separatedBy: ".versions/")[0]
             } else {
-                // Non-versioned path: key.obj
                 objectKey = String(relativePath.dropLast(4))
             }
+            if !prefix.isEmpty && !objectKey.hasPrefix(prefix) { continue }
 
-            // Apply prefix filter
-            if !prefix.isEmpty && !objectKey.hasPrefix(prefix) {
-                continue
-            }
-
-            // Handle delimiter for folder-like navigation
-            if let delimiter = delimiter, !delimiter.isEmpty, let delimiterChar = delimiter.first {
-                // Get the part after prefix
-                let afterPrefix = String(objectKey.dropFirst(prefix.count))
-
-                // Check if there's a delimiter in the remaining path
-                if let delimiterIndex = afterPrefix.firstIndex(of: delimiterChar) {
-                    // This is a "folder" - extract the common prefix
-                    let folderPrefix = prefix + String(afterPrefix[..<afterPrefix.index(after: delimiterIndex)])
-                    commonPrefixSet.insert(folderPrefix)
-                    continue  // Don't include this as a version entry
-                }
-            }
-
-            // Read metadata
-            do {
-                let (meta, _) = try read(from: fileURL.path, loadData: false)
-
-                // Apply marker filtering
-                if let keyMarker = keyMarker {
-                    if meta.key < keyMarker {
-                        continue
-                    }
-                    if meta.key == keyMarker, let versionIdMarker = versionIdMarker {
-                        if let versionId = meta.versionId, versionId <= versionIdMarker {
-                            continue
-                        }
-                    }
-                }
-
-                if meta.isDeleteMarker {
-                    allDeleteMarkers.append(meta)
-                } else {
-                    allVersions.append(meta)
-                }
-            } catch {
-                continue
-            }
+            guard let (meta, _) = try? read(from: fileURL.path, loadData: false) else { continue }
+            admit(meta)
         }
 
         // EC versions never appear in the `.obj` walk above - `listLocalShardVersions` yields
         // exactly one `ObjectMeta` per version this node holds any shard of, no re-read needed.
-        // Same prefix/delimiter/marker filtering as the `.obj` pass, duplicated rather than
-        // shared - this function already favors that style over extracting a filter closure.
         for meta in ErasureCodedObjectHandler.listLocalShardVersions(bucketName: bucketName) {
-            let objectKey = meta.key
+            admit(meta)
+        }
 
-            if !prefix.isEmpty && !objectKey.hasPrefix(prefix) {
-                continue
-            }
+        // S3 order: key ascending, newest version first; version id breaks exact timestamp ties
+        // so the order is stable across requests.
+        entries.sort {
+            if $0.meta.key != $1.meta.key { return $0.meta.key < $1.meta.key }
+            if $0.meta.updatedAt != $1.meta.updatedAt { return $0.meta.updatedAt > $1.meta.updatedAt }
+            return ($0.meta.versionId ?? "null") < ($1.meta.versionId ?? "null")
+        }
 
-            if let delimiter, !delimiter.isEmpty, let delimiterChar = delimiter.first {
-                let afterPrefix = String(objectKey.dropFirst(prefix.count))
-                if let delimiterIndex = afterPrefix.firstIndex(of: delimiterChar) {
-                    let folderPrefix = prefix + String(afterPrefix[..<afterPrefix.index(after: delimiterIndex)])
-                    commonPrefixSet.insert(folderPrefix)
-                    continue
-                }
-            }
-
-            if let keyMarker {
-                if meta.key < keyMarker {
-                    continue
-                }
-                if meta.key == keyMarker, let versionIdMarker {
-                    if let versionId = meta.versionId, versionId <= versionIdMarker {
-                        continue
-                    }
-                }
-            }
-
-            if meta.isDeleteMarker {
-                allDeleteMarkers.append(meta)
+        // Resume after the marker's position. A key marker alone (or a version marker that no
+        // longer exists) resumes after the whole key.
+        var start = 0
+        if let keyMarker, !keyMarker.isEmpty {
+            if let versionIdMarker, !versionIdMarker.isEmpty,
+                let position = entries.firstIndex(where: {
+                    $0.meta.key == keyMarker && ($0.meta.versionId ?? "null") == versionIdMarker
+                })
+            {
+                start = position + 1
             } else {
-                allVersions.append(meta)
+                start = entries.firstIndex(where: { $0.meta.key > keyMarker }) ?? entries.count
             }
         }
 
-        // Sort by key, then by updatedAt descending
-        allVersions.sort {
-            if $0.key != $1.key {
-                return $0.key < $1.key
-            }
-            return $0.updatedAt > $1.updatedAt
+        let page = entries[start..<Swift.min(entries.count, start + Swift.max(maxKeys, 0))]
+        let isTruncated = start + Swift.max(maxKeys, 0) < entries.count
+        let versions = page.filter { !$0.isDeleteMarker }.map(\.meta)
+        let deleteMarkers = page.filter(\.isDeleteMarker).map(\.meta)
+
+        // Folders before the key marker were already listed on an earlier page.
+        let sortedCommonPrefixes = commonPrefixSet.sorted().filter { prefixEntry in
+            guard let keyMarker, !keyMarker.isEmpty else { return true }
+            return prefixEntry > keyMarker
         }
 
-        allDeleteMarkers.sort {
-            if $0.key != $1.key {
-                return $0.key < $1.key
-            }
-            return $0.updatedAt > $1.updatedAt
-        }
-
-        // Sort common prefixes
-        let sortedCommonPrefixes = commonPrefixSet.sorted()
-
-        // Apply maxKeys limit
-        let totalCount = allVersions.count + allDeleteMarkers.count
-        let isTruncated = totalCount > maxKeys
-
-        var limitedVersions = allVersions
-        var limitedDeleteMarkers = allDeleteMarkers
-
-        if isTruncated {
-            // Merge and limit
-            var combined: [(meta: ObjectMeta, isDeleteMarker: Bool)] = []
-            combined.append(contentsOf: allVersions.map { ($0, false) })
-            combined.append(contentsOf: allDeleteMarkers.map { ($0, true) })
-
-            combined.sort {
-                if $0.meta.key != $1.meta.key {
-                    return $0.meta.key < $1.meta.key
-                }
-                return $0.meta.updatedAt > $1.meta.updatedAt
-            }
-
-            let limited = Array(combined.prefix(maxKeys))
-            limitedVersions = limited.filter { !$0.isDeleteMarker }.map { $0.meta }
-            limitedDeleteMarkers = limited.filter { $0.isDeleteMarker }.map { $0.meta }
-        }
-
-        // Get next markers
-        var nextKeyMarker: String? = nil
-        var nextVersionIdMarker: String? = nil
-
-        if isTruncated {
-            // Find the last item to get next markers
-            let lastVersion = limitedVersions.last
-            let lastDeleteMarker = limitedDeleteMarkers.last
-
-            if let lv = lastVersion, let ldm = lastDeleteMarker {
-                if lv.key > ldm.key || (lv.key == ldm.key && lv.updatedAt < ldm.updatedAt) {
-                    nextKeyMarker = lv.key
-                    nextVersionIdMarker = lv.versionId
-                } else {
-                    nextKeyMarker = ldm.key
-                    nextVersionIdMarker = ldm.versionId
-                }
-            } else if let lv = lastVersion {
-                nextKeyMarker = lv.key
-                nextVersionIdMarker = lv.versionId
-            } else if let ldm = lastDeleteMarker {
-                nextKeyMarker = ldm.key
-                nextVersionIdMarker = ldm.versionId
-            }
-        }
-
-        return (limitedVersions, limitedDeleteMarkers, sortedCommonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker)
+        let nextKeyMarker = isTruncated ? page.last?.meta.key : nil
+        let nextVersionIdMarker = isTruncated ? (page.last?.meta.versionId ?? "null") : nil
+        return (versions, deleteMarkers, sortedCommonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker)
     }
 
     /// Deletes a specific version of an object

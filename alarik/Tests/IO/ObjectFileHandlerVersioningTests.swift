@@ -1017,4 +1017,45 @@ struct ObjectFileHandlerVersioningTests {
             bucketName: "test-bucket", prefix: "", delimiter: nil)
         #expect(recursive.map(\.key) == ["other.txt"])
     }
+
+    @Test("listAllVersions pages by position: every version once, newest first, markers resume correctly")
+    func testListAllVersionsPaging() throws {
+        setupTestBucket()
+        defer { cleanupTestBucket() }
+        var ids: [String] = []
+        for i in 0..<5 {
+            ids.append(
+                try ObjectFileHandler.writeVersioned(
+                    metadata: createTestMetadata(key: "k.txt"), data: createTestData("v\(i)"),
+                    bucketName: "test-bucket", key: "k.txt", versioningStatus: .enabled))
+        }
+        _ = try ObjectFileHandler.writeVersioned(
+            metadata: createTestMetadata(key: "z.txt"), data: createTestData("z"),
+            bucketName: "test-bucket", key: "z.txt", versioningStatus: .enabled)
+
+        var collected: [String] = []
+        var keyMarker: String?
+        var versionIdMarker: String?
+        var pages = 0
+        repeat {
+            let (versions, _, _, isTruncated, nextKey, nextVersion) = try ObjectFileHandler.listAllVersions(
+                bucketName: "test-bucket", keyMarker: keyMarker, versionIdMarker: versionIdMarker,
+                maxKeys: 2)
+            collected.append(contentsOf: versions.compactMap(\.versionId))
+            keyMarker = isTruncated ? nextKey : nil
+            versionIdMarker = isTruncated ? nextVersion : nil
+            pages += 1
+        } while keyMarker != nil
+        #expect(pages == 3)
+        #expect(collected.count == 6)
+        #expect(Set(collected).count == 6)
+        // Newest version of k.txt comes first; the only version of z.txt comes last.
+        #expect(collected.first == ids.last)
+        #expect(collected.prefix(5).allSatisfy { ids.contains($0) })
+
+        // A key marker alone resumes after the whole key.
+        let (afterK, _, _, _, _, _) = try ObjectFileHandler.listAllVersions(
+            bucketName: "test-bucket", keyMarker: "k.txt", maxKeys: 10)
+        #expect(afterK.map(\.key) == ["z.txt"])
+    }
 }

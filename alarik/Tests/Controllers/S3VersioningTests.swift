@@ -1403,4 +1403,50 @@ struct S3VersioningTests {
                 })
         }
     }
+
+    @Test("List versions - paging with key-marker and version-id-marker visits every version exactly once")
+    func testListVersionsPagination() async throws {
+        let bucketName = "test-list-versions-paging"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await enableVersioning(app, bucketName: bucketName)
+            var expected: Set<String> = []
+            for i in 1...3 {
+                expected.insert(try #require(try await putObject(app, bucketName: bucketName, key: "a.txt", content: "a\(i)")))
+            }
+            expected.insert(try #require(try await putObject(app, bucketName: bucketName, key: "b.txt", content: "b")))
+
+            var seen: [String] = []
+            var query = "versions&max-keys=2"
+            var pages = 0
+            while pages < 10 {
+                pages += 1
+                let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
+                var body = ""
+                try await app.test(
+                    .GET, "/\(bucketName)?\(query)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        body = res.body.string
+                    })
+                let ids = body.components(separatedBy: "<VersionId>").dropFirst()
+                    .compactMap { $0.components(separatedBy: "</VersionId>").first }
+                seen.append(contentsOf: ids)
+                guard body.contains("<IsTruncated>true</IsTruncated>") else { break }
+                func tag(_ name: String) -> String? {
+                    body.components(separatedBy: "<\(name)>").dropFirst().first?
+                        .components(separatedBy: "</\(name)>").first
+                }
+                let nextKey = try #require(tag("NextKeyMarker"))
+                let nextVersion = try #require(tag("NextVersionIdMarker"))
+                query = "versions&max-keys=2&key-marker=\(nextKey)&version-id-marker=\(nextVersion)"
+            }
+            #expect(pages == 2)
+            #expect(seen.count == 4)
+            #expect(Set(seen) == expected)
+        }
+    }
 }
