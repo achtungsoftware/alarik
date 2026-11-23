@@ -118,6 +118,37 @@ declare global {
         user?: User;
     }
 
+    // LifecycleRule - `/api/v1/buckets/:name/lifecycle`
+    export interface LifecycleRule {
+        id: string;
+        enabled: boolean;
+        prefix: string;
+        expirationDays?: number | null;
+        noncurrentVersionExpirationDays?: number | null;
+        abortIncompleteMultipartUploadDays?: number | null;
+    }
+
+    // CORSRule - `/api/v1/buckets/:name/cors`
+    export interface CORSRule {
+        id?: string | null;
+        allowedOrigins: string[];
+        allowedMethods: string[];
+        allowedHeaders: string[];
+        exposeHeaders: string[];
+        maxAgeSeconds?: number | null;
+    }
+
+    // `POST /api/v1/objects/copy`: copy, move/rename (deleteSource) and version restore
+    // (sourceVersionId onto the same key).
+    export interface ObjectCopyRequest {
+        sourceBucket: string;
+        sourceKey: string;
+        sourceVersionId?: string;
+        destinationBucket: string;
+        destinationKey: string;
+        deleteSource?: boolean;
+    }
+
     // ObjectMeta.ResponseDTO
     // `POST /api/v1/objects/download-ticket`: a signed, short-lived URL credential the browser
     // redeems itself at `GET /api/v1/objects/download?ticket=...`.

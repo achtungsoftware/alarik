@@ -104,6 +104,15 @@ export function useObjectService() {
         }
     }
 
+    /// One server-side copy; the caller decides what it means (copy, move, rename, restore).
+    /// Errors propagate so the dialog that asked can show them inline.
+    async function copyObject(request: ObjectCopyRequest): Promise<BrowserItem> {
+        return await useApi()<BrowserItem>(`/objects/copy`, {
+            method: "POST",
+            body: request,
+        });
+    }
+
     /// Asks the API for a download ticket and returns the URL the browser can fetch on its own.
     /// The browser streams the bytes itself - native progress, no copy of the object in memory,
     /// previews that can seek - which a fetch-then-blob flow could not do.
@@ -174,6 +183,9 @@ export function useObjectService() {
         // Delete operations
         deleteObject,
         deleteObjects,
+
+        // Copy operations
+        copyObject,
 
         // Download operations
         downloadObjects,

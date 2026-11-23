@@ -29,11 +29,12 @@ const props = withDefaults(
 
 const emit = defineEmits(["update:open", "close", "versionDeleted", "saved"]);
 const open = ref(props.open);
-const { downloadTicketUrl, triggerBrowserDownload } = useObjectService();
+const { downloadTicketUrl, triggerBrowserDownload, copyObject } = useObjectService();
 const toast = useToast();
 const versions = ref<BrowserItem[]>([]);
 const loadingVersions = ref(false);
 const deletingVersionId = ref<string | null>(null);
+const restoringVersionId = ref<string | null>(null);
 const openPreviewModal = ref(false);
 const previewObject = ref<BrowserItem | null>(null);
 const tagRows = ref<{ key: string; value: string }[]>([]);
@@ -275,6 +276,39 @@ async function deleteVersion(versionId: string) {
     }
 }
 
+/// S3's own way to bring an old version back: copy it onto the key as the new current
+/// version. The old version stays in the history, nothing is overwritten.
+async function restoreVersion(versionId: string) {
+    if (!props.item || !props.bucketName) return;
+    restoringVersionId.value = versionId;
+    try {
+        await copyObject({
+            sourceBucket: props.bucketName,
+            sourceKey: props.item.key,
+            sourceVersionId: versionId,
+            destinationBucket: props.bucketName,
+            destinationKey: props.item.key,
+        });
+        toast.add({
+            title: "Version Restored",
+            description: `Version ${versionId.substring(0, 8)}... is the current version again`,
+            icon: "i-lucide-circle-check",
+            color: "success",
+        });
+        await fetchVersions();
+        emit("saved");
+    } catch (error) {
+        toast.add({
+            title: "Restore Failed",
+            description: errorMessage(error, "Failed to restore version"),
+            icon: "i-lucide-circle-x",
+            color: "error",
+        });
+    } finally {
+        restoringVersionId.value = null;
+    }
+}
+
 async function downloadVersion(versionId: string) {
     if (!props.item || !props.bucketName) return;
 
@@ -420,7 +454,7 @@ function getVersionStatusBadge(version: BrowserItem) {
                     <template #header>
                         <CardHeader title="Versions" size="sm" :badge="versions.length > 0 ? versions.length : undefined">
                             <template #rightContent>
-                                <UButton v-if="!loadingVersions" icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" @click="fetchVersions" />
+                                <UButton v-if="!loadingVersions" icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" aria-label="Reload versions" @click="fetchVersions" />
                             </template>
                         </CardHeader>
                     </template>
@@ -451,6 +485,7 @@ function getVersionStatusBadge(version: BrowserItem) {
                                             variant="ghost"
                                             size="xs"
                                             title="Preview this version"
+                                            aria-label="Preview this version"
                                             @click="
                                                 () => {
                                                     previewObject = version;
@@ -458,8 +493,19 @@ function getVersionStatusBadge(version: BrowserItem) {
                                                 }
                                             "
                                         />
-                                        <UButton v-if="!version.isDeleteMarker" icon="i-lucide-download" color="neutral" variant="ghost" size="xs" title="Download this version" @click="downloadVersion(version.versionId!)" />
-                                        <UButton icon="i-lucide-trash-2" color="error" variant="ghost" size="xs" title="Delete this version permanently" :loading="deletingVersionId === version.versionId" @click="deleteVersion(version.versionId!)" />
+                                        <UButton v-if="!version.isDeleteMarker" icon="i-lucide-download" color="neutral" variant="ghost" size="xs" title="Download this version" aria-label="Download this version" @click="downloadVersion(version.versionId!)" />
+                                        <UButton
+                                            v-if="!version.isDeleteMarker && !version.isLatest"
+                                            icon="i-lucide-history"
+                                            color="primary"
+                                            variant="ghost"
+                                            size="xs"
+                                            title="Restore as current version"
+                                            aria-label="Restore as current version"
+                                            :loading="restoringVersionId === version.versionId"
+                                            @click="restoreVersion(version.versionId!)"
+                                        />
+                                        <UButton icon="i-lucide-trash-2" color="error" variant="ghost" size="xs" title="Delete this version permanently" aria-label="Delete this version permanently" :loading="deletingVersionId === version.versionId" @click="deleteVersion(version.versionId!)" />
                                     </div>
                                 </div>
                             </div>

@@ -15,7 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import type { BreadcrumbItem, TableColumn, TableRow } from "@nuxt/ui";
+import type { BreadcrumbItem, DropdownMenuItem, TableColumn, TableRow } from "@nuxt/ui";
+import type { ObjectCopyMode } from "~/components/ObjectCopyModal.vue";
 
 definePageMeta({
     layout: "dashboard",
@@ -55,6 +56,15 @@ const openBucketSettingsModal = ref(false);
 const selectedBucketForSettings = ref<Bucket | null>(null);
 const openShareModal = ref(false);
 const shareObject = ref<BrowserItem | null>(null);
+const openCopyModal = ref(false);
+const copyObjectTarget = ref<BrowserItem | null>(null);
+const copyMode = ref<ObjectCopyMode>("copy");
+
+function openCopyDialog(item: BrowserItem, mode: ObjectCopyMode) {
+    copyObjectTarget.value = item;
+    copyMode.value = mode;
+    openCopyModal.value = true;
+}
 
 const searchInput = ref("");
 const searchQuery = ref("");
@@ -556,6 +566,27 @@ const columns: TableColumn<BrowserItem>[] = [
                         handleSingleDelete(item);
                     },
                 }),
+                h(
+                    resolveComponent("UDropdownMenu"),
+                    {
+                        items: [
+                            { label: "Copy to...", icon: "i-lucide-copy", onSelect: () => openCopyDialog(item, "copy") },
+                            { label: "Move to...", icon: "i-lucide-folder-input", onSelect: () => openCopyDialog(item, "move") },
+                            { label: "Rename", icon: "i-lucide-pencil", onSelect: () => openCopyDialog(item, "rename") },
+                        ] satisfies DropdownMenuItem[],
+                    },
+                    {
+                        default: () =>
+                            h(resolveComponent("UButton"), {
+                                icon: "i-lucide-ellipsis-vertical",
+                                variant: "subtle",
+                                color: "neutral",
+                                size: "sm",
+                                "aria-label": "More actions",
+                                onClick: (e: Event) => e.stopPropagation(),
+                            }),
+                    }
+                ),
             ]);
         },
     },
@@ -740,6 +771,7 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
     <BucketSettingsModal v-if="selectedBucketForSettings && openBucketSettingsModal" v-model:open="openBucketSettingsModal" :bucket="selectedBucketForSettings" @saved="refreshBuckets" />
     <ShareFileModal v-if="shareObject && openShareModal" v-model:open="openShareModal" :bucket="currentBucket" :item="shareObject" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
+    <ObjectCopyModal v-if="copyObjectTarget && openCopyModal" v-model:open="openCopyModal" :bucket="currentBucket" :item="copyObjectTarget" :mode="copyMode" @done="refresh" />
     <UploadProgressSlideover />
 
     <UDashboardPanel
