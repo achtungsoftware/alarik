@@ -334,7 +334,7 @@ struct InternalBucketController: RouteCollection {
             app: req.application, bucketName: create.name, userId: auth.userId,
             versioningEnabled: create.versioningEnabled)
 
-        // Fetch the created bucket from the database to get the ID
+        // Read the created bucket back from the store to get the ID
         guard let bucket = try await Bucket.find(app: req.application, name: create.name),
             bucket.userId == auth.userId
         else {

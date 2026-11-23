@@ -31,7 +31,7 @@ enum OutboxDeliveryOutcome {
 
 /// Same-key-in-flight tracking for one drain pass. `@unchecked Sendable`: only ever touched
 /// synchronously on the actor's executor, between `await` points, never from inside a
-/// `group.addTask` child closure - same pattern this codebase already uses for Fluent models.
+/// `group.addTask` child closure.
 private final class DrainState<Row: OutboxRow>: @unchecked Sendable {
     var remaining: [Row]
     var inFlightKeys: Set<String> = []

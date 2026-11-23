@@ -79,10 +79,9 @@ enum ClusterReplicationClient {
         let metaJSON = try JSONEncoder().encode(snapshot.meta)
         let metaHeaderValue = Data(metaJSON).base64EncodedString()
 
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/objects/push")
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/objects/push",
+            method: .POST, secret: config.secret)
         outbound.headers.replaceOrAdd(name: objectMetaHeaderName, value: metaHeaderValue)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/octet-stream")
         outbound.body = .stream(
@@ -121,11 +120,9 @@ enum ClusterReplicationClient {
         }
 
         for node in candidates {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/objects/exists" + urlSuffix)
-            outbound.method = .GET
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/objects/exists" + urlSuffix,
+                method: .GET, secret: config.secret)
             do {
                 let response = try await app.http.client.shared.execute(
                     outbound, timeout: requestTimeout, logger: app.logger)
@@ -152,11 +149,9 @@ enum ClusterReplicationClient {
         let urlSuffix = "?bucket=\(encodedBucket)&key=\(encodedKey)"
 
         for node in candidates {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/objects/latest-version" + urlSuffix)
-            outbound.method = .GET
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/objects/latest-version" + urlSuffix,
+                method: .GET, secret: config.secret)
             do {
                 let response = try await app.http.client.shared.execute(
                     outbound, timeout: requestTimeout, logger: app.logger)
@@ -207,10 +202,8 @@ enum ClusterReplicationClient {
         if let expectedETag {
             url += "&etag=" + (expectedETag.addingPercentEncoding(withAllowedCharacters: allowed) ?? expectedETag)
         }
-        var outbound = HTTPClientRequest(url: url)
-        outbound.method = .DELETE
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: url, method: .DELETE, secret: config.secret)
 
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
@@ -279,10 +272,8 @@ enum ClusterReplicationClient {
     private static func fetchOnce(
         app: Application, secret: String, url: String, requestId: String
     ) async throws -> (path: String, meta: ObjectMeta) {
-        var outbound = HTTPClientRequest(url: url)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: url, method: .GET, secret: secret)
 
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
@@ -400,10 +391,9 @@ enum ClusterReplicationClient {
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
         if let stagingToken { suffix += "&staging=" + stagingQueryValue(stagingToken) }
         if promote { suffix += "&promote=1" }
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/push" + suffix)
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/push" + suffix,
+            method: .POST, secret: config.secret)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/octet-stream")
         outbound.body = .stream(
             fileByteStream(threadPool: app.threadPool, fd: fd, offset: 0, length: fileSize),
@@ -424,10 +414,9 @@ enum ClusterReplicationClient {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return false }
         let suffix = shardQuerySuffix(
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/exists" + suffix)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/exists" + suffix,
+            method: .GET, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
@@ -462,11 +451,9 @@ enum ClusterReplicationClient {
     ) async -> [HeldShard]? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
         let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/ecshards/held" + suffix + "&detail=1")
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/held" + suffix + "&detail=1",
+            method: .GET, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
@@ -492,10 +479,9 @@ enum ClusterReplicationClient {
     ) async -> [Int]? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
         let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/held" + suffix)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/held" + suffix,
+            method: .GET, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
@@ -525,10 +511,8 @@ enum ClusterReplicationClient {
             let encoded = priorVersionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? priorVersionId
             url += "&priorVersionId=\(encoded)"
         }
-        var outbound = HTTPClientRequest(url: url)
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: url, method: .POST, secret: config.secret)
         _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: probeTimeout, logger: app.logger)
     }
@@ -543,10 +527,9 @@ enum ClusterReplicationClient {
     ) async -> (dataShards: Int, parityShards: Int)? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
         let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/encoding" + suffix)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/encoding" + suffix,
+            method: .GET, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
@@ -570,10 +553,9 @@ enum ClusterReplicationClient {
     ) async -> ObjectMeta? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return nil }
         let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/meta" + suffix)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/meta" + suffix,
+            method: .GET, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: probeTimeout, logger: app.logger)
@@ -595,11 +577,9 @@ enum ClusterReplicationClient {
     ) async {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return }
         let suffix = shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: versionId)
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/ecshards/verify-heal" + suffix)
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/verify-heal" + suffix,
+            method: .POST, secret: config.secret)
         _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: probeTimeout, logger: app.logger)
     }
@@ -643,9 +623,8 @@ enum ClusterReplicationClient {
     private static func fetchShardOnce(
         app: Application, secret: String, url: String, requestId: String
     ) async throws -> String {
-        var outbound = HTTPClientRequest(url: url)
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: url, method: .GET, secret: secret)
 
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
@@ -706,11 +685,9 @@ enum ClusterReplicationClient {
         let allowed = CharacterSet.urlQueryAllowed
         let encodedBucket = bucketName.addingPercentEncoding(withAllowedCharacters: allowed) ?? bucketName
         let encodedPrefix = prefix.addingPercentEncoding(withAllowedCharacters: allowed) ?? prefix
-        var outbound = HTTPClientRequest(
-            url: "\(node.address)/internal/cluster/objects/prune?bucket=\(encodedBucket)&prefix=\(encodedPrefix)")
-        outbound.method = .DELETE
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: "\(node.address)/internal/cluster/objects/prune?bucket=\(encodedBucket)&prefix=\(encodedPrefix)",
+            method: .DELETE, secret: config.secret)
 
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
@@ -744,10 +721,8 @@ enum ClusterReplicationClient {
         if let expectedETag {
             url += "&etag=" + (expectedETag.addingPercentEncoding(withAllowedCharacters: allowed) ?? expectedETag)
         }
-        var outbound = HTTPClientRequest(url: url)
-        outbound.method = .DELETE
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: url, method: .DELETE, secret: config.secret)
 
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
@@ -770,10 +745,9 @@ enum ClusterReplicationClient {
         }
         let suffix = shardQuerySuffix(
             bucketName: bucketName, key: key, versionId: versionId, shardIndex: shardIndex)
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/ecshards/metadata" + suffix)
-        outbound.method = .PATCH
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/metadata" + suffix,
+            method: .PATCH, secret: config.secret)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
         outbound.body = .bytes(try JSONEncoder().encode(meta))
 
@@ -814,11 +788,9 @@ enum ClusterReplicationClient {
         let suffix =
             shardVersionQuerySuffix(bucketName: bucketName, key: key, versionId: nil)
             + "&staging=" + stagingQueryValue(token)
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/ecshards/commit-staged" + suffix)
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/commit-staged" + suffix,
+            method: .POST, secret: config.secret)
         let response = try await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
         guard (200..<300).contains(response.status.code) else {
@@ -829,11 +801,9 @@ enum ClusterReplicationClient {
     /// Best-effort: drops a stage that will not be committed on `node`.
     static func discardStagedShards(app: Application, to node: ClusterNodeInfo, token: String) async {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/ecshards/staged?staging=" + stagingQueryValue(token))
-        outbound.method = .DELETE
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/ecshards/staged?staging=" + stagingQueryValue(token),
+            method: .DELETE, secret: config.secret)
         _ = try? await app.http.client.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)
     }

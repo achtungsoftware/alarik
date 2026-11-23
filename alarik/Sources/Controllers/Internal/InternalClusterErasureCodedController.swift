@@ -215,7 +215,7 @@ struct InternalClusterErasureCodedController: RouteCollection {
         }
         let priorVersionId = req.query[String.self, at: "priorVersionId"]
         try await req.application.threadPool.runIfActive {
-            ErasureCodedObjectHandler.restoreLatest(
+            try ErasureCodedObjectHandler.restoreLatest(
                 bucketName: bucketName, key: key, priorVersionId: priorVersionId)
         }
         return .ok

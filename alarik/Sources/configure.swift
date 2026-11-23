@@ -187,7 +187,7 @@ public func configure(_ app: Application) async throws {
         try await CreateDefaultBuckets.run(app: app)
     }
 
-    // The webhook dispatcher needs the app for db/client access; configured in every
+    // The webhook dispatcher needs the app for its storage root and HTTP client; configured in every
     // environment so tests can drive drains manually (only the periodic tick below is
     // gated to non-testing)
     await NotificationDispatcher.shared.configure(app: app)
@@ -335,8 +335,8 @@ public func configure(_ app: Application) async throws {
 
         // Webhook outbox tick: fresh events are delivered near-instantly via the explicit
         // wake() in NotificationService - this tick exists to pick up retries whose backoff
-        // has elapsed (and anything left over from before a restart). The drain query is a
-        // single indexed SELECT, so a 2-second cadence costs effectively nothing when idle.
+        // has elapsed (and anything left over from before a restart). The drain is a readdir of
+        // this node's own mailbox directory, so a 2-second cadence costs effectively nothing idle.
         app.eventLoopGroup.next().scheduleRepeatedTask(
             initialDelay: .seconds(2),
             delay: .seconds(2)
@@ -362,8 +362,8 @@ public func configure(_ app: Application) async throws {
         // Cluster replication outbox tick - same reasoning as the two ticks above: fresh
         // quorum-fanout catch-up and rebalance/reclaim tasks are woken near-instantly via the
         // explicit wake() in ClusterReplicationService/ClusterRebalanceService, this tick exists
-        // to pick up retries whose backoff has elapsed. Cheap single indexed SELECT against an
-        // always-empty table when cluster mode is off, same as the other two outboxes when
+        // to pick up retries whose backoff has elapsed. A readdir of an always-empty mailbox
+        // directory when cluster mode is off, same as the other two outboxes when
         // their respective features are unused.
         app.eventLoopGroup.next().scheduleRepeatedTask(
             initialDelay: .seconds(2),

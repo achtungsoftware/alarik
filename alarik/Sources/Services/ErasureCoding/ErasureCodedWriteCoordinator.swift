@@ -218,8 +218,13 @@ enum ErasureCodedWriteCoordinator {
         }
 
         guard versionId != nil else { return }
-        ErasureCodedObjectHandler.restoreLatest(
-            bucketName: bucketName, key: key, priorVersionId: priorLatestVersionId)
+        do {
+            try ErasureCodedObjectHandler.restoreLatest(
+                bucketName: bucketName, key: key, priorVersionId: priorLatestVersionId)
+        } catch {
+            app.logger.error(
+                "Rollback of '\(key)' in '\(bucketName)' could not restore the previous version pointer: \(error)")
+        }
         await withTaskGroup(of: Void.self) { group in
             for peer in peers {
                 group.addTask {

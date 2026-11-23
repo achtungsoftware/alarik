@@ -65,12 +65,10 @@ struct InternalAdminController: RouteCollection {
         let computedAt: Date
     }
 
-    /// `listBuckets`'s response shape - deliberately NOT the raw `Bucket` model. Fluent's
-    /// `Fields.encode` serializes every `@Field` with no exclusions, and `Bucket.$user`'s
-    /// eager-loaded `User` would do the same for `passwordHash` - `Bucket.ResponseDTO` (used
-    /// elsewhere) also doesn't carry ownership at all, so this exists specifically to answer
-    /// "which user owns this bucket" for the admin console without ever serializing a full
-    /// `User`/`Bucket` model to the wire.
+    /// `listBuckets`'s response shape - deliberately NOT the raw `Bucket` model, which would put
+    /// every stored field on the wire, nor `Bucket.ResponseDTO`, which carries no ownership at
+    /// all. This exists to answer "which user owns this bucket" for the admin console without
+    /// serializing a full `User` or `Bucket` record.
     struct AdminBucketDTO: Content {
         let id: UUID?
         let name: String

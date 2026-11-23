@@ -317,8 +317,10 @@ enum ErasureCodedObjectHandler {
             throw error
         }
 
-        if promote, let versionId = try? ErasureCodedShardReader(path: finalPath).header.objectMeta.versionId {
-            try? ObjectFileHandler.updateLatestPointer(
+        // A promotion whose pointer write fails is a write that did not land: the version sits
+        // on disk invisible, or the previous one keeps being served. The caller must know.
+        if promote, let versionId = try ErasureCodedShardReader(path: finalPath).header.objectMeta.versionId {
+            try ObjectFileHandler.updateLatestPointer(
                 bucketName: bucketName, key: key, versionId: versionId)
         }
     }
@@ -327,9 +329,9 @@ enum ErasureCodedObjectHandler {
     /// or removes the pointer entirely when there was no prior version. Called on every responsible node after a coordinator's EC write fails
     /// quorum, so a peer that had already repointed to the now-deleted version doesn't leave
     /// `.latest` dangling at a shardless version (which a subsequent GET would resolve to and 404).
-    static func restoreLatest(bucketName: String, key: String, priorVersionId: String?) {
+    static func restoreLatest(bucketName: String, key: String, priorVersionId: String?) throws {
         if let priorVersionId {
-            try? ObjectFileHandler.updateLatestPointer(
+            try ObjectFileHandler.updateLatestPointer(
                 bucketName: bucketName, key: key, versionId: priorVersionId)
         } else {
             let pointerPath = ObjectFileHandler.latestPointerPath(for: bucketName, key: key)

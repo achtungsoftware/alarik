@@ -19,7 +19,7 @@ import Vapor
 
 /// In-memory mirror of every bucket's notification configuration, loaded at boot and kept in
 /// sync on writes - so the object write/delete hot paths can check "does this bucket have any
-/// webhook rules?" with a single actor dictionary lookup and zero database access.
+/// webhook rules?" with a single actor dictionary lookup and no metadata-store read.
 final actor NotificationConfigCache: StoreBackedCache {
     public static let shared = NotificationConfigCache()
 

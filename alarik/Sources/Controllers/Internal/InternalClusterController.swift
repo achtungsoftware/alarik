@@ -310,9 +310,9 @@ struct InternalClusterController: RouteCollection {
         let auth = try req.auth.require(AuthenticatedUser.self)
         try auth.requireAdmin()
 
-        // Cluster-wide fan-out (`OutboxMailbox`'s mailboxes are per-owner-node, not a shared
-        // table) then tallied in Swift - matches the "full-scan-then-filter" idiom already used
-        // for every other cluster-wide outbox view in this migration.
+        // Cluster-wide fan-out (`OutboxMailbox`'s mailboxes are per-owner-node, not one shared
+        // store) then tallied in Swift - the same "collect, then filter" shape every other
+        // cluster-wide outbox view uses.
         let tasks = await OutboxMailbox.listAllAcrossCluster(
             ClusterReplicationTask.self, app: req.application,
             collection: OutboxCollections.clusterReplicationTasks)

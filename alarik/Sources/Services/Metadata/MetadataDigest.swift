@@ -169,11 +169,9 @@ actor MetadataReloadGate {
             var components = URLComponents()
             components.queryItems = [URLQueryItem(name: "collection", value: collection)]
             let query = "?" + (components.percentEncodedQuery ?? "")
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/metadata/digest" + query)
-            outbound.method = .GET
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/metadata/digest" + query,
+                method: .GET, secret: secret)
             do {
                 let response = try await LightweightClusterControlClient.shared.execute(
                     outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)

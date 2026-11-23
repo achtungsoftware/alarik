@@ -82,7 +82,7 @@ struct S3Controller: RouteCollection {
 
         // Handle subresource queries (location, policy, versioning config) - always requires
         // strict auth. The bucket is only fetched here (not unconditionally up front) since
-        // it's only needed by the ?versioning/?policy responses - no need to hit the DB for
+        // it's only needed by the ?versioning/?policy responses - no need to read the record for
         // every plain ListObjects call, anonymous or not.
         let shouldHandle = S3Service.shouldHandleSubresource(query: query)
         if shouldHandle {

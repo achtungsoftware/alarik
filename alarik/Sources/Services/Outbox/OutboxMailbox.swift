@@ -240,7 +240,8 @@ enum OutboxMailbox {
         row.nextAttemptAt = Date()
         row.lastError = nil
         if row.state == .failed { row.state = .pending }
-        try? update(row, collection: collection)
+        // A retry that could not be written back did not happen; the caller reports failure.
+        guard (try? update(row, collection: collection)) != nil else { return nil }
         return row
     }
 
@@ -253,27 +254,42 @@ enum OutboxMailbox {
     static func enqueue<Row: OutboxMailboxRow>(app: Application, collection: String, row: Row) async {
         let selfId = selfNodeId(app: app)
         if row.ownerNodeId == selfId {
-            try? store(row, collection: collection)
+            storeOrReport(row, collection: collection, app: app)
             return
         }
         guard let config = app.storage[ClusterConfigurationKey.self],
             let owner = await ClusterNodeCache.shared.get(id: row.ownerNodeId)
         else {
-            spoolPendingEnqueue(row, collection: collection)
+            spoolPendingEnqueue(row, collection: collection, app: app)
             return
         }
         let delivered = await sendEnqueueRPC(
             app: app, node: owner, secret: config.secret, collection: collection, row: row)
         if !delivered {
-            spoolPendingEnqueue(row, collection: collection)
+            spoolPendingEnqueue(row, collection: collection, app: app)
         }
     }
 
-    private static func spoolPendingEnqueue<Row: OutboxMailboxRow>(_ row: Row, collection: String) {
+    /// The file IS the task: a write that fails is work that will never run, and must be said.
+    private static func storeOrReport<Row: OutboxMailboxRow>(_ row: Row, collection: String, app: Application) {
+        do {
+            try store(row, collection: collection)
+        } catch {
+            app.logger.error(
+                "Could not file \(Row.self) task \(row.id) in '\(collection)' - the queued work is lost: \(error)")
+        }
+    }
+
+    private static func spoolPendingEnqueue<Row: OutboxMailboxRow>(_ row: Row, collection: String, app: Application) {
         let path = OutboxMailboxFileHandler.taskPath(
             root: OutboxMailboxFileHandler.pendingEnqueueRootPath, collection: collection,
             ownerNodeId: row.ownerNodeId, taskId: row.id)
-        try? OutboxMailboxFileHandler.write(path: path, data: try JSONEncoder().encode(row))
+        do {
+            try OutboxMailboxFileHandler.write(path: path, data: try JSONEncoder().encode(row))
+        } catch {
+            app.logger.error(
+                "Could not spool \(Row.self) task \(row.id) for node \(row.ownerNodeId) - the queued work is lost: \(error)")
+        }
     }
 
     /// Retries every task still sitting in this node's own pending-enqueue spool - called on the
@@ -299,7 +315,7 @@ enum OutboxMailbox {
             }
 
             if row.ownerNodeId == selfId {
-                try? store(row, collection: collection)
+                storeOrReport(row, collection: collection, app: app)
                 OutboxMailboxFileHandler.remove(path: spoolPath)
                 continue
             }
@@ -318,12 +334,9 @@ enum OutboxMailbox {
         app: Application, node: ClusterNodeInfo, secret: String, collection: String, row: Row
     ) async -> Bool {
         do {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/outbox/enqueue"
-                    + querySuffix(collection: collection))
-            outbound.method = .POST
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/outbox/enqueue" + querySuffix(collection: collection),
+                method: .POST, secret: secret)
             outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
             outbound.body = .bytes(ByteBuffer(data: try JSONEncoder().encode(row)))
             let response = try await LightweightClusterControlClient.shared.execute(
@@ -405,12 +418,9 @@ enum OutboxMailbox {
         ownerNodeId: UUID, taskId: UUID, data: Data
     ) async {
         do {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/outbox/backup"
-                    + querySuffix(collection: collection, ownerNodeId: ownerNodeId, taskId: taskId))
-            outbound.method = .POST
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/outbox/backup" + querySuffix(collection: collection, ownerNodeId: ownerNodeId, taskId: taskId),
+                method: .POST, secret: secret)
             outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
             outbound.body = .bytes(ByteBuffer(data: data))
             _ = try await LightweightClusterControlClient.shared.execute(
@@ -573,11 +583,9 @@ enum OutboxMailbox {
         _ type: Row.Type, app: Application, node: ClusterNodeInfo, secret: String, collection: String
     ) async -> [Row] {
         do {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/outbox/list" + querySuffix(collection: collection))
-            outbound.method = .GET
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/outbox/list" + querySuffix(collection: collection),
+                method: .GET, secret: secret)
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
             guard response.status == .ok else { return [] }
@@ -619,12 +627,9 @@ enum OutboxMailbox {
         app: Application, node: ClusterNodeInfo, secret: String, collection: String, taskId: UUID
     ) async -> Bool {
         do {
-            var outbound = HTTPClientRequest(
-                url: node.address + "/internal/cluster/outbox/retry"
-                    + querySuffix(collection: collection, taskId: taskId))
-            outbound.method = .POST
-            outbound.headers.replaceOrAdd(
-                name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+            var outbound = HTTPClientRequest.internalCluster(
+                url: node.address + "/internal/cluster/outbox/retry" + querySuffix(collection: collection, taskId: taskId),
+                method: .POST, secret: secret)
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
             return response.status == .ok
@@ -662,12 +667,9 @@ enum OutboxMailbox {
     private static func sendPurgeBucketRPC(
         app: Application, node: ClusterNodeInfo, secret: String, collection: String, bucketName: String
     ) async {
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/outbox/purge-bucket"
-                + querySuffix(collection: collection, bucketName: bucketName))
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/outbox/purge-bucket" + querySuffix(collection: collection, bucketName: bucketName),
+            method: .POST, secret: secret)
         _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
     }
@@ -701,12 +703,9 @@ enum OutboxMailbox {
     private static func sendPurgeTargetRPC(
         app: Application, node: ClusterNodeInfo, secret: String, collection: String, targetNodeId: UUID
     ) async {
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/outbox/purge-target"
-                + querySuffix(collection: collection, targetNodeId: targetNodeId))
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/outbox/purge-target" + querySuffix(collection: collection, targetNodeId: targetNodeId),
+            method: .POST, secret: secret)
         _ = try? await LightweightClusterControlClient.shared.execute(
             outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
     }

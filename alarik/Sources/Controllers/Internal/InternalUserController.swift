@@ -142,7 +142,7 @@ struct InternalUserController: RouteCollection {
             )
         }
         // One notify for the whole key, not per bucket - accessKeyBucket/upsert reloads this
-        // key's entire bucket set from the DB in one shot on the receiving end.
+        // key's entire bucket set from the store in one shot on the receiving end.
         CacheInvalidationService.notify(
             app: req.application, cache: "accessKeyBucket", op: .upsert, key: create.accessKey)
 

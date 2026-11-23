@@ -558,12 +558,9 @@ enum MetadataStore {
         token: UUID
     ) async -> Bool {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return false }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/\(path)"
-                + querySuffix(collection: collection, id: id) + "&token=\(token.uuidString)")
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/\(path)" + querySuffix(collection: collection, id: id) + "&token=\(token.uuidString)",
+            method: .POST, secret: config.secret)
         do {
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
@@ -944,12 +941,9 @@ enum MetadataStore {
         guard let node, let config = app.storage[ClusterConfigurationKey.self] else {
             throw MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
         }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/put"
-                + querySuffix(collection: collection, id: id))
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/put" + querySuffix(collection: collection, id: id),
+            method: .POST, secret: config.secret)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/octet-stream")
         outbound.body = .bytes(ByteBuffer(data: value))
         let response = try await LightweightClusterControlClient.shared.execute(
@@ -965,12 +959,9 @@ enum MetadataStore {
         guard let node, let config = app.storage[ClusterConfigurationKey.self] else {
             throw MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
         }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/put-if-absent"
-                + querySuffix(collection: collection, id: id))
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/put-if-absent" + querySuffix(collection: collection, id: id),
+            method: .POST, secret: config.secret)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/octet-stream")
         outbound.body = .bytes(ByteBuffer(data: value))
         let response = try await LightweightClusterControlClient.shared.execute(
@@ -987,12 +978,9 @@ enum MetadataStore {
         guard let node, let config = app.storage[ClusterConfigurationKey.self] else {
             throw MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
         }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/delete"
-                + querySuffix(collection: collection, id: id))
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/delete" + querySuffix(collection: collection, id: id),
+            method: .POST, secret: config.secret)
         let response = try await LightweightClusterControlClient.shared.execute(
             outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
         guard response.status == .ok else {
@@ -1006,12 +994,9 @@ enum MetadataStore {
         guard let node, let config = app.storage[ClusterConfigurationKey.self] else {
             throw MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
         }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/consume-if-present"
-                + querySuffix(collection: collection, id: id) + "&token=\(token)")
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/consume-if-present" + querySuffix(collection: collection, id: id) + "&token=\(token)",
+            method: .POST, secret: config.secret)
         let response = try await LightweightClusterControlClient.shared.execute(
             outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
         if response.status == .notFound { return nil }

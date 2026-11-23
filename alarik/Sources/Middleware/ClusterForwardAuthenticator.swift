@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import AsyncHTTPClient
 import Vapor
 
 /// Inter-node auth for cluster traffic - deliberately separate from `InternalAuthenticator`
@@ -53,5 +54,16 @@ struct ClusterSecretMiddleware: AsyncMiddleware {
             throw Abort(.unauthorized, reason: "Invalid cluster secret.")
         }
         return try await next.respond(to: request)
+    }
+}
+
+extension HTTPClientRequest {
+    /// A request to a peer's internal API, carrying the cluster secret. Every inter-node call is
+    /// built through here, so the authentication header can never be forgotten on one of them.
+    static func internalCluster(url: String, method: HTTPMethod, secret: String) -> HTTPClientRequest {
+        var request = HTTPClientRequest(url: url)
+        request.method = method
+        request.headers.replaceOrAdd(name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        return request
     }
 }

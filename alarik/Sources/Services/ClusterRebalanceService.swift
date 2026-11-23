@@ -183,7 +183,7 @@ enum ClusterRebalanceService {
             // and this loop used to unconditionally insert a fresh copy row per (key, target)
             // pair every single pass with no check for one already outstanding - on a cluster
             // with any membership churn, that's unbounded duplicate-row growth in the outbox
-            // table for exactly the same copy work. Existing `.pending` work for a (key, target)
+            // for exactly the same copy work. Existing `.pending` work for a (key, target)
             // pair is already covered, so it's skipped; an existing `.failed` (dead-lettered) one
             // is replaced with a fresh retry instead of either being left to silently expire via
             // `purgeExpiredFailures` or piling up yet another duplicate row alongside it - the

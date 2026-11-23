@@ -504,7 +504,7 @@ enum ClusterListingService {
         await ClusterNodeCache.shared.activeNodes().filter { $0.id != config.nodeId }
     }
 
-    // MARK: - Pure merge functions (no DB/HTTP - directly unit-testable)
+    // MARK: - Pure merge functions (no storage or HTTP - directly unit-testable)
 
     struct ObjectsPage {
         let objects: [ObjectMeta]

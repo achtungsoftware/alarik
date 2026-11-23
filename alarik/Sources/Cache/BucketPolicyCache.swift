@@ -18,7 +18,7 @@ import Foundation
 import Vapor
 
 /// Caches already-parsed bucket policies (and public access block settings) so the request hot
-/// path (every anonymous request) never touches the database or re-parses JSON. Both live in one
+/// path (every anonymous request) never touches the metadata store or re-parses JSON. Both live in one
 /// cache, rather than as two separate actors, since they're loaded/invalidated at the exact same
 /// lifecycle points and together answer one question: "can an anonymous caller in?" Mirrors
 /// BucketVersioningCache.

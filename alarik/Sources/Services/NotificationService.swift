@@ -33,7 +33,7 @@ enum S3EventType: String, Sendable {
 /// Builds AWS-compatible event payloads and enqueues them into the persistent outbox
 /// (`notification_deliveries`). Delivery itself happens asynchronously in
 /// `NotificationDispatcher` - the request path only ever pays for a cache lookup, and,
-/// when rules match, one SQLite insert per matching rule.
+/// when rules match, one outbox row written per matching rule.
 struct NotificationService {
 
     // MARK: - AWS event message structure (v2.4)

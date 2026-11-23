@@ -19,7 +19,7 @@ import Vapor
 
 /// In-memory mirror of every bucket's replication configuration, loaded at boot and kept in
 /// sync on writes - so the object write/delete hot paths can check "does this bucket replicate
-/// anywhere?" with a single actor dictionary lookup and zero database access. Mirrors
+/// anywhere?" with a single actor dictionary lookup and no metadata-store read. Mirrors
 /// `NotificationConfigCache` exactly.
 final actor ReplicationConfigCache: StoreBackedCache {
     public static let shared = ReplicationConfigCache()

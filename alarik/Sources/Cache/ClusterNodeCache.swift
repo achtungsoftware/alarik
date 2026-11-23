@@ -57,7 +57,7 @@ struct ClusterNodeInfo: Sendable, Equatable {
 }
 
 /// This is every node's in-memory view of cluster membership - `PlacementService` and
-/// `ObjectRoutingService` read `activeNodes(...)` on every request rather than hitting the DB.
+/// `ObjectRoutingService` read `activeNodes(...)` on every request rather than the metadata store.
 /// Deliberately **not** a `StoreBackedCache`, unlike every other cache here.
 ///
 /// The read-through those use resolves a miss by reading `MetadataStore` - but `MetadataStore`

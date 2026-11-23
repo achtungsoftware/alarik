@@ -311,12 +311,9 @@ enum MetadataListingService {
         app: Application, node: ClusterNodeInfo, collection: String
     ) async -> (entries: [EnvelopeEntry], ok: Bool)? {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return ([], true) }
-        var outbound = HTTPClientRequest(
-            url: node.address + "/internal/cluster/metadata/list"
-                + querySuffix(collection: collection))
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/metadata/list" + querySuffix(collection: collection),
+            method: .GET, secret: config.secret)
         do {
             // `probeTimeout` (5s), not `requestTimeout` (10 minutes, sized for large shard
             // transfers) - this is a bounded control-plane listing call on the boot-time

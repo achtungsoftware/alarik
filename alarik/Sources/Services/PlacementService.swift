@@ -18,7 +18,7 @@ import Crypto
 import Foundation
 
 /// Deterministic, coordination-free object placement. Pure functions of `(bucketName, key,
-/// activeNodes)` - no DB/actor access, so this is unit-testable without a running cluster, and
+/// activeNodes)` - no storage or actor access, so this is unit-testable without a running cluster, and
 /// any node can compute the same answer independently without asking anyone else.
 enum PlacementService {
     /// Cluster-wide replication factor - not a per-bucket setting.

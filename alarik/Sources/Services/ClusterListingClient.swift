@@ -143,10 +143,8 @@ enum ClusterListingClient {
             return key + "=" + encodedValue
         }.joined(separator: "&")
 
-        var outbound = HTTPClientRequest(url: "\(node.address)\(path)?\(queryString)")
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: "\(node.address)\(path)?\(queryString)", method: .GET, secret: config.secret)
 
         let response = try await LightweightClusterControlClient.shared.execute(
             outbound, timeout: requestTimeout, logger: app.logger)

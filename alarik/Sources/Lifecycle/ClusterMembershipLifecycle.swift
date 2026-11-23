@@ -320,10 +320,8 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     private func queryMembers(app: Application, address: String, config: ClusterConfiguration) async
         -> [ClusterNodeInfo]?
     {
-        var outbound = HTTPClientRequest(url: address + "/internal/cluster/members")
-        outbound.method = .GET
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: address + "/internal/cluster/members", method: .GET, secret: config.secret)
         do {
             // `LightweightClusterControlClient.shared`, not `app.http.client.shared` - see its
             // doc comment: this boot-blocking, retried probe must never queue behind unrelated

@@ -172,10 +172,8 @@ enum CacheInvalidationService {
         app: Application, node: ClusterNodeInfo, secret: String, message: CacheInvalidationMessage,
         timeout: TimeAmount = .seconds(2)
     ) async throws {
-        var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/cache-invalidate")
-        outbound.method = .POST
-        outbound.headers.replaceOrAdd(
-            name: ClusterForwardAuthenticator.secretHeaderName, value: secret)
+        var outbound = HTTPClientRequest.internalCluster(
+            url: node.address + "/internal/cluster/cache-invalidate", method: .POST, secret: secret)
         outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
         outbound.body = .bytes(ByteBuffer(data: try JSONEncoder().encode(message)))
         // `LightweightClusterControlClient.shared`, not `app.http.client.shared` - see its own
