@@ -931,9 +931,23 @@ struct S3Controller: RouteCollection {
         if req.headers.first(name: "If-Match") != nil
             || req.headers.first(name: "If-None-Match") != nil
         {
-            let existing = try ObjectFileHandler.readCurrentObject(
-                bucketName: bucketName, key: keyPath, loadData: false)
-            try S3Service.validateConditionalPutHeaders(req: req, existingMeta: existing?.meta)
+            // Either format: an erasure-coded current object lives in shards, which the plain
+            // `.obj` lookup cannot see - it would have let `If-None-Match: *` overwrite it.
+            let existing: ObjectMeta? = try await S3Service.offloadBlockingIO(req) {
+                let currentVersionId =
+                    ObjectFileHandler.isVersioned(bucketName: bucketName, key: keyPath)
+                    ? try ObjectFileHandler.getLatestVersionId(bucketName: bucketName, key: keyPath)
+                    : nil
+                if let shardPath = Self.localHeldShardPath(
+                    req: req, bucketName: bucketName, key: keyPath, versionId: currentVersionId)
+                {
+                    let meta = try ErasureCodedShardReader(path: shardPath).header.objectMeta
+                    return meta.isDeleteMarker ? nil : meta
+                }
+                return try ObjectFileHandler.readCurrentObject(
+                    bucketName: bucketName, key: keyPath, loadData: false)?.meta
+            }
+            try S3Service.validateConditionalPutHeaders(req: req, existingMeta: existing)
         }
 
         // Stream the body to a spool file with bounded memory - never buffered whole. The
