@@ -558,6 +558,7 @@ struct InternalBucketController: RouteCollection {
 
         // Construct the full key path (prefix + filename)
         let keyPath = prefix.isEmpty ? spooled.filename : "\(prefix)\(spooled.filename)"
+        try ObjectKeyValidation.validate(keyPath)
 
         let etag = spooled.md5Hex
 
@@ -704,6 +705,7 @@ struct InternalBucketController: RouteCollection {
         else {
             throw Abort(.badRequest, reason: "Missing 'bucket' or 'key' query parameter")
         }
+        try ObjectKeyValidation.validate(key)
         try await requireOwnedBucketExists(req: req, bucketName: bucketName, userId: auth.userId)
         let routing = try await ObjectRoutingService.routeForWrite(
             req: req, bucketName: bucketName, key: key, requirePrimary: true)

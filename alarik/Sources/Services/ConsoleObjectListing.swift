@@ -93,7 +93,7 @@ enum ConsoleObjectListing {
         while objectIndex < objects.count || prefixIndex < commonPrefixes.count {
             let nextObject = objectIndex < objects.count ? objects[objectIndex] : nil
             let nextPrefix = prefixIndex < commonPrefixes.count ? commonPrefixes[prefixIndex] : nil
-            if let nextObject, nextPrefix == nil || nextObject.key < nextPrefix! {
+            if let nextObject, nextPrefix == nil || S3KeyOrder.precedes(nextObject.key, nextPrefix!) {
                 items.append(ObjectMeta.ResponseDTO(from: nextObject))
                 objectIndex += 1
             } else if let nextPrefix {

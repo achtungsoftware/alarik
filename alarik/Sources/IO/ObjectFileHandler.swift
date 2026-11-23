@@ -627,11 +627,6 @@ struct ObjectFileHandler {
         case commonPrefix(String)
     }
 
-    /// The one comparison every listing sorts and pages by. S3 orders keys by UTF-8 bytes; this
-    /// is the place to change when that is made exact.
-    @inline(__always)
-    static func keyPrecedes(_ a: String, _ b: String) -> Bool { a < b }
-
     /// Walks a bucket's keys under `prefix` in S3 order, visiting each key once - with every
     /// on-disk form it has - or, where `delimiter` rolls a whole subtree up, its common prefix
     /// once. Stops as soon as `visit` returns false, so a page costs the entries it lists plus the
@@ -734,11 +729,11 @@ struct ObjectFileHandler {
             for entry in entries {
                 let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
                 guard let (kind, listed) = Self.classify(entry.lastPathComponent, isDirectory: isDir, under: listedPrefix),
-                    listed.hasPrefix(prefix), isAfterMarker(listed, kind: kind)
+                    S3KeyOrder.hasPrefix(listed, prefix), isAfterMarker(listed, kind: kind)
                 else { continue }
                 siblings.append(Sibling(listed: listed, path: entry.path, kind: kind))
             }
-            siblings.sort { ObjectFileHandler.keyPrecedes($0.listed, $1.listed) }
+            siblings.sort { S3KeyOrder.precedes($0.listed, $1.listed) }
 
             var index = 0
             while index < siblings.count {
@@ -751,7 +746,7 @@ struct ObjectFileHandler {
 
                 // Every form of one key sorts together; hand them over as a group.
                 var sources = ListedKeySources()
-                while index < siblings.count, siblings[index].listed == sibling.listed {
+                while index < siblings.count, S3KeyOrder.same(siblings[index].listed, sibling.listed) {
                     switch siblings[index].kind {
                     case .plain: sources.plainPath = siblings[index].path
                     case .versions: sources.versionsDirectory = siblings[index].path
@@ -765,7 +760,7 @@ struct ObjectFileHandler {
                 if let rollup = ObjectFileHandler.commonPrefix(of: key, prefix: prefix, delimiter: delimiter) {
                     // The marker key itself can only roll up to a prefix listed on the page
                     // that produced the marker.
-                    if let marker, !ObjectFileHandler.keyPrecedes(marker, key) { continue }
+                    if let marker, !S3KeyOrder.precedes(marker, key) { continue }
                     guard emitCommonPrefix(rollup, visit: visit) else { return false }
                 } else {
                     guard visit(.key(key, sources)) else { return false }
@@ -784,7 +779,7 @@ struct ObjectFileHandler {
             else {
                 return walk(subdirectory, listedPrefix: directory.listed, delimiter: delimiter, visit: visit)
             }
-            if let marker, !ObjectFileHandler.keyPrecedes(marker, directory.listed) {
+            if let marker, !S3KeyOrder.precedes(marker, directory.listed) {
                 // The marker lies inside (`isAfterMarker` let nothing else through): the prefix
                 // was listed on an earlier page unless a key after the marker is still in
                 // there. Finding one is enough.
@@ -803,18 +798,19 @@ struct ObjectFileHandler {
         }
 
         private mutating func emitCommonPrefix(_ rollup: String, visit: (ListingEntry) -> Bool) -> Bool {
-            guard rollup != marker, rollup != lastCommonPrefix else { return true }
+            if let marker, S3KeyOrder.same(rollup, marker) { return true }
+            if let lastCommonPrefix, S3KeyOrder.same(rollup, lastCommonPrefix) { return true }
             lastCommonPrefix = rollup
             return visit(.commonPrefix(rollup))
         }
 
         /// Whether an entry listed as `listed` can still contribute to the page.
         private func isAfterMarker(_ listed: String, kind: Kind) -> Bool {
-            guard let marker, !ObjectFileHandler.keyPrecedes(marker, listed) else { return true }
+            guard let marker, !S3KeyOrder.precedes(marker, listed) else { return true }
             switch kind {
             // A directory the marker lies inside holds keys after it (`docs/` for `docs/b`).
-            case .directory: return marker.hasPrefix(listed)
-            case .plain, .versions, .shards: return visitMarkerKey && listed == marker
+            case .directory: return S3KeyOrder.hasPrefix(marker, listed)
+            case .plain, .versions, .shards: return visitMarkerKey && S3KeyOrder.same(listed, marker)
             }
         }
     }
@@ -922,7 +918,8 @@ struct ObjectFileHandler {
     /// key sits directly at this level or no delimiter applies.
     static func commonPrefix(of key: String, prefix: String, delimiter: String?) -> String? {
         guard let delimiter, delimiter.count == 1, let delimChar = delimiter.first else { return nil }
-        let keyAfterPrefix = key.dropFirst(prefix.count)
+        // Byte offsets, like the prefix match itself (see `S3KeyOrder`).
+        let keyAfterPrefix = Substring(key.utf8.dropFirst(prefix.utf8.count))
         guard let delimiterIndex = keyAfterPrefix.firstIndex(of: delimChar) else { return nil }
         return prefix + String(keyAfterPrefix[..<delimiterIndex]) + delimiter
     }
@@ -1334,7 +1331,7 @@ struct ObjectFileHandler {
                 nextVersionIdMarker = nil
             case .key(let key, _):
                 var chain = (try? listVersions(bucketName: bucketName, key: key)) ?? []
-                if key == keyMarker {
+                if let keyMarker, S3KeyOrder.same(key, keyMarker) {
                     guard let versionIdMarker,
                         let position = chain.firstIndex(where: { ($0.versionId ?? "null") == versionIdMarker })
                     else { return true }

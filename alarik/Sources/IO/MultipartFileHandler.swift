@@ -733,16 +733,16 @@ struct MultipartFileHandler {
             let meta = try jsonDecoder.decode(MultipartUploadMeta.self, from: metaData)
 
             // Apply prefix filter
-            if !prefix.isEmpty && !meta.key.hasPrefix(prefix) {
+            if !prefix.isEmpty && !S3KeyOrder.hasPrefix(meta.key, prefix) {
                 continue
             }
 
             // Apply marker filter
             if let keyMarker = keyMarker {
-                if meta.key < keyMarker {
+                if S3KeyOrder.precedes(meta.key, keyMarker) {
                     continue
                 }
-                if meta.key == keyMarker, let uploadIdMarker = uploadIdMarker {
+                if S3KeyOrder.same(meta.key, keyMarker), let uploadIdMarker = uploadIdMarker {
                     if meta.uploadId <= uploadIdMarker {
                         continue
                     }
@@ -754,8 +754,8 @@ struct MultipartFileHandler {
 
         // Sort by key, then by uploadId
         uploads.sort {
-            if $0.key != $1.key {
-                return $0.key < $1.key
+            if !S3KeyOrder.same($0.key, $1.key) {
+                return S3KeyOrder.precedes($0.key, $1.key)
             }
             return $0.uploadId < $1.uploadId
         }

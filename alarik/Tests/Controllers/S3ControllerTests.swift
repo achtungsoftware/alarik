@@ -4135,4 +4135,50 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("Object key limits - a NUL is InvalidArgument, an over-long key or segment is KeyTooLongError")
+    func testObjectKeyValidated() async throws {
+        let bucketName = "key-limits-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            func expectRejected(_ key: String, code: String, method: HTTPMethod = .PUT) async throws {
+                let body = method == .PUT ? Data("x".utf8) : nil
+                let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+                let signed = signedHeaders(for: method, path: "/\(bucketName)/\(encodedKey)", body: body)
+                try await app.test(
+                    method, "/\(bucketName)/\(encodedKey)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                        if let body { req.body = ByteBuffer(data: body) }
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .badRequest, "\(method) \(code)")
+                        #expect(res.body.string.contains("<Code>\(code)</Code>"), "\(method) \(code): \(res.body.string)")
+                    })
+            }
+
+            try await expectRejected("bad\u{0}key", code: "InvalidArgument")
+            try await expectRejected("bad\u{0}key", code: "InvalidArgument", method: .GET)
+            let overLong = String(repeating: "k/", count: 520)
+            try await expectRejected(overLong, code: "KeyTooLongError")
+            try await expectRejected(overLong, code: "KeyTooLongError", method: .HEAD)
+            try await expectRejected(overLong, code: "KeyTooLongError", method: .DELETE)
+            let longSegment = "docs/" + String(repeating: "s", count: ObjectKeyValidation.maxComponentBytes + 1)
+            try await expectRejected(longSegment, code: "KeyTooLongError")
+
+            // Right at the limits the object is stored and read back.
+            let atLimit = String(repeating: "s", count: ObjectKeyValidation.maxComponentBytes)
+                + "/" + String(repeating: "t", count: ObjectKeyValidation.maxComponentBytes)
+            try await putObject(app, bucketName: bucketName, key: atLimit, content: "ok")
+            let signed = signedHeaders(for: .GET, path: "/\(bucketName)/\(atLimit)")
+            try await app.test(
+                .GET, "/\(bucketName)/\(atLimit)",
+                beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string == "ok")
+                })
+        }
+    }
 }

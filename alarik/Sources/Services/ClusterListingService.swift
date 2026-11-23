@@ -142,16 +142,16 @@ enum ClusterListingService {
     /// re-found by the next step, which resumes every node from that same position. Pure, so
     /// it's unit-tested directly.
     static func mergeSearchPages(_ pages: [SearchPage]) -> SearchPage {
-        let bound = pages.compactMap { $0.isTruncated ? $0.nextMarker : nil }.min()
+        let bound = pages.compactMap { $0.isTruncated ? $0.nextMarker : nil }.min(by: S3KeyOrder.precedes)
         var seen = Set<String>()
         var matches: [ObjectMeta] = []
         for page in pages {
             for match in page.matches where seen.insert(match.key).inserted {
-                if let bound, match.key > bound { continue }
+                if let bound, S3KeyOrder.precedes(bound, match.key) { continue }
                 matches.append(match)
             }
         }
-        matches.sort { $0.key < $1.key }
+        matches.sort { S3KeyOrder.precedes($0.key, $1.key) }
         return SearchPage(matches: matches, isTruncated: bound != nil, nextMarker: bound)
     }
 
@@ -556,7 +556,7 @@ enum ClusterListingService {
                 entries.append(.prefix(prefix))
             }
         }
-        entries.sort { $0.sortKey < $1.sortKey }
+        entries.sort { S3KeyOrder.precedes($0.sortKey, $1.sortKey) }
 
         let dedupedCount = entries.count
         let isTruncated = dedupedCount > maxKeys || anyTruncated
@@ -624,11 +624,11 @@ enum ClusterListingService {
         entries.sort {
             switch ($0, $1) {
             case (.version(let a, _), .version(let b, _)):
-                if a.key != b.key { return a.key < b.key }
+                if !S3KeyOrder.same(a.key, b.key) { return S3KeyOrder.precedes(a.key, b.key) }
                 if a.updatedAt != b.updatedAt { return a.updatedAt > b.updatedAt }
                 return (a.versionId ?? "null") < (b.versionId ?? "null")
             default:
-                return $0.key < $1.key
+                return S3KeyOrder.precedes($0.key, $1.key)
             }
         }
 
@@ -680,7 +680,7 @@ enum ClusterListingService {
         }
 
         uploads.sort {
-            if $0.key != $1.key { return $0.key < $1.key }
+            if !S3KeyOrder.same($0.key, $1.key) { return S3KeyOrder.precedes($0.key, $1.key) }
             return $0.uploadId < $1.uploadId
         }
 

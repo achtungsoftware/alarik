@@ -1454,6 +1454,26 @@ struct InternalBucketControllerTests {
         return etag
     }
 
+    @Test("Console multipart - a key that cannot become a path is refused before any upload state exists")
+    func testConsoleMultipartRejectsInvalidKey() async throws {
+        try await withApp { app in
+            let token = try await createUserAndLogin(app)
+            try await createBucket(app, token: token, name: "mp-key-bucket")
+            let segment = String(repeating: "s", count: ObjectKeyValidation.maxComponentBytes + 1)
+            for key in ["bad%00key", "docs/\(segment)"] {
+                try await app.test(
+                    .POST, "/api/v1/objects/multipart?bucket=mp-key-bucket&key=\(key)&contentType=text/plain",
+                    beforeRequest: { req in
+                        req.headers.bearerAuthorization = BearerAuthorization(token: token)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .badRequest, "\(key)")
+                    })
+            }
+            #expect(try MultipartFileHandler.listUploads(bucketName: "mp-key-bucket").uploads.isEmpty)
+        }
+    }
+
     @Test("Console multipart - create, upload parts, complete yields the assembled object")
     func testConsoleMultipartRoundTrip() async throws {
         try await withApp { app in

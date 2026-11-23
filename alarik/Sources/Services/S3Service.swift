@@ -74,7 +74,9 @@ struct S3Service {
         return bucketName
     }
 
-    static func extractObjectKey(from req: Request) -> String {
+    /// The object key of the request, checked against `ObjectKeyValidation` before any handler
+    /// turns it into a path.
+    static func extractObjectKey(from req: Request) throws -> String {
         var key = req.parameters.getCatchall().joined(separator: "/")
         // The catch-all drops a trailing empty component, turning the folder key `docs/` into
         // the plain key `docs` - a folder marker would be stored (and later deleted) under the
@@ -82,6 +84,7 @@ struct S3Service {
         if !key.isEmpty, req.url.path.hasSuffix("/") { key += "/" }
         // Already percent-decoded: RoutingKit decodes catch-all components when it matches
         // them. Decoding again turned a literal `%20` in a key into a space.
+        try ObjectKeyValidation.validate(key, requestId: req.id)
         return key
     }
 

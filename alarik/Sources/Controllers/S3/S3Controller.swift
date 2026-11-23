@@ -333,7 +333,7 @@ struct S3Controller: RouteCollection {
     @Sendable
     func handleObjectHead(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
-        let keyPath = S3Service.extractObjectKey(from: req)
+        let keyPath = try S3Service.extractObjectKey(from: req)
 
         try await S3Service.verifyBucketExists(
             bucketName, app: req.application, requestId: req.id)
@@ -819,7 +819,7 @@ struct S3Controller: RouteCollection {
         // otherwise crash the process.
         try await StreamingBodySpooler.withGuaranteedBodyDrain(req: req) {
         let bucketName = try S3Service.extractBucketName(from: req)
-        let keyPath = S3Service.extractObjectKey(from: req)
+        let keyPath = try S3Service.extractObjectKey(from: req)
 
         guard !keyPath.isEmpty else {
             throw S3Error(
@@ -1669,7 +1669,7 @@ struct S3Controller: RouteCollection {
     @Sendable
     func handleObjectGet(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
-        let keyPath = S3Service.extractObjectKey(from: req)
+        let keyPath = try S3Service.extractObjectKey(from: req)
 
         try await S3Service.verifyBucketExists(
             bucketName, app: req.application, requestId: req.id)
@@ -1941,7 +1941,7 @@ struct S3Controller: RouteCollection {
     @Sendable
     func handleObjectDelete(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
-        let keyPath = S3Service.extractObjectKey(from: req)
+        let keyPath = try S3Service.extractObjectKey(from: req)
 
         try await S3Service.verifyBucketExists(
             bucketName, app: req.application, requestId: req.id)
@@ -2236,7 +2236,7 @@ struct S3Controller: RouteCollection {
     @Sendable
     func handleObjectPost(req: Request) async throws -> Response {
         let bucketName = try S3Service.extractBucketName(from: req)
-        let keyPath = S3Service.extractObjectKey(from: req)
+        let keyPath = try S3Service.extractObjectKey(from: req)
         let query = req.url.query ?? ""
 
         try await S3Service.verifyBucketExists(
