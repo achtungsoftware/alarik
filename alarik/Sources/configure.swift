@@ -194,6 +194,8 @@ public func configure(_ app: Application) async throws {
     // (cache-invalidation broadcasts, membership seed queries) - see its own doc comment for why
     // that traffic gets a separate client from `app.http.client.shared`.
     app.lifecycle.use(LightweightClusterControlClient.ShutdownHandler())
+    app.storage[WebhookHTTPClient.Key.self] = WebhookHTTPClient.make()
+    app.lifecycle.use(WebhookHTTPClient.ShutdownHandler())
 
     try routes(app)
 

@@ -54,14 +54,12 @@ enum WebhookURLValidator {
         // Loopback / localhost by name
         if bare == "localhost" || bare.hasSuffix(".localhost") { return true }
 
-        // IPv6 checks only apply to actual IPv6 literals (which always contain a colon) -
-        // guarding on that avoids misclassifying a public hostname like "fcdn.example.com"
-        // or "fd-images.net" as an fc00::/7 ULA address.
+        // IPv6 literals always contain a colon - guarding on that avoids misclassifying a
+        // public hostname like "fcdn.example.com" or "fd-images.net" as an fc00::/7 address.
         if bare.contains(":") {
-            // loopback ::1, link-local fe80::/10, unique-local fc00::/7 (fc.. / fd..)
-            if bare == "::1" || bare.hasPrefix("fe80:") || bare.hasPrefix("fc") || bare.hasPrefix("fd") {
-                return true
-            }
+            if let bytes = parseIPv6(bare) { return isInternalIPv6(bytes) }
+            // Not parseable (a zone id such as `fe80::1%en0`): fall back to the textual check.
+            return bare == "::1" || bare.hasPrefix("fe80:") || bare.hasPrefix("fc") || bare.hasPrefix("fd")
         }
 
         // IPv4: classify against the same 32-bit value regardless of how it was written -
@@ -70,17 +68,69 @@ enum WebhookURLValidator {
         // client will happily connect to any of them even though a naive "exactly four decimal
         // octets" string check only recognizes the first. See parseNumericIPv4.
         if let address = parseNumericIPv4(bare) {
-            let a = (address >> 24) & 0xFF
-            let b = (address >> 16) & 0xFF
-            if a == 127 { return true }  // loopback 127.0.0.0/8
-            if a == 10 { return true }  // private 10.0.0.0/8
-            if a == 172, (16...31).contains(b) { return true }  // private 172.16.0.0/12
-            if a == 192, b == 168 { return true }  // private 192.168.0.0/16
-            if a == 169, b == 254 { return true }  // link-local / metadata 169.254.0.0/16
-            if a == 0 { return true }  // 0.0.0.0/8 "this host"
+            return isInternalIPv4(address)
         }
 
         return false
+    }
+
+    /// Loopback, private, link-local/metadata and "this host" ranges.
+    static func isInternalIPv4(_ address: UInt32) -> Bool {
+        let a = (address >> 24) & 0xFF
+        let b = (address >> 16) & 0xFF
+        if a == 127 { return true }  // loopback 127.0.0.0/8
+        if a == 10 { return true }  // private 10.0.0.0/8
+        if a == 172, (16...31).contains(b) { return true }  // private 172.16.0.0/12
+        if a == 192, b == 168 { return true }  // private 192.168.0.0/16
+        if a == 169, b == 254 { return true }  // link-local / metadata 169.254.0.0/16
+        if a == 0 { return true }  // 0.0.0.0/8 "this host"
+        return false
+    }
+
+    /// The 16 bytes of an IPv6 literal (no brackets, no zone id), via the same parser the
+    /// socket layer uses, so every spelling of one address classifies the same way.
+    static func parseIPv6(_ host: String) -> [UInt8]? {
+        var address = in6_addr()
+        guard host.withCString({ inet_pton(AF_INET6, $0, &address) }) == 1 else { return nil }
+        return withUnsafeBytes(of: &address) { Array($0) }
+    }
+
+    /// An IPv6 address is internal when it is loopback or unspecified, link-local (fe80::/10),
+    /// unique-local (fc00::/7), or carries an internal IPv4 address inside it: IPv4-mapped
+    /// (`::ffff:127.0.0.1`), the deprecated IPv4-compatible form (`::127.0.0.1`), NAT64
+    /// (`64:ff9b::7f00:1`) and 6to4 (`2002:7f00:1::`). A resolver turns each of those into a
+    /// connection to the embedded IPv4 host, so they must be judged as that host.
+    static func isInternalIPv6(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count == 16 else { return true }
+        if bytes.allSatisfy({ $0 == 0 }) { return true }  // :: unspecified
+        if bytes[0..<15].allSatisfy({ $0 == 0 }), bytes[15] == 1 { return true }  // ::1
+        if bytes[0] == 0xfe, bytes[1] & 0xc0 == 0x80 { return true }  // fe80::/10
+        if bytes[0] & 0xfe == 0xfc { return true }  // fc00::/7
+        if let embedded = embeddedIPv4(in: bytes) { return isInternalIPv4(embedded) }
+        return false
+    }
+
+    /// The IPv4 address an IPv6 address stands for, if it is one of the transition forms.
+    static func embeddedIPv4(in bytes: [UInt8]) -> UInt32? {
+        guard bytes.count == 16 else { return nil }
+        func ipv4(at offset: Int) -> UInt32 {
+            UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16
+                | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])
+        }
+        let leadingZeros = bytes[0..<10].allSatisfy { $0 == 0 }
+        if leadingZeros, bytes[10] == 0xff, bytes[11] == 0xff { return ipv4(at: 12) }  // ::ffff:a.b.c.d
+        if leadingZeros, bytes[10] == 0, bytes[11] == 0, bytes[12..<16].contains(where: { $0 != 0 }),
+            !(bytes[12..<15].allSatisfy({ $0 == 0 }) && bytes[15] == 1)
+        {
+            return ipv4(at: 12)  // ::a.b.c.d (IPv4-compatible, deprecated)
+        }
+        if bytes[0] == 0x00, bytes[1] == 0x64, bytes[2] == 0xff, bytes[3] == 0x9b,
+            bytes[4..<12].allSatisfy({ $0 == 0 })
+        {
+            return ipv4(at: 12)  // 64:ff9b::/96 NAT64
+        }
+        if bytes[0] == 0x20, bytes[1] == 0x02 { return ipv4(at: 2) }  // 2002::/16 6to4
+        return nil
     }
 
     /// Parses `host` using the same permissive numeric rules libc's `inet_aton` (and therefore

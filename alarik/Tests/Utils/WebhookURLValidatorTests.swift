@@ -21,6 +21,25 @@ import Testing
 @Suite("WebhookURLValidator tests")
 struct WebhookURLValidatorTests {
 
+    @Test("IPv6 literals are classified by address, including the IPv4 they may carry")
+    func ipv6Classification() {
+        let internalHosts = [
+            "[::1]", "[::]", "[0:0:0:0:0:0:0:1]", "[fe80::1]", "[FE80::abcd]", "[fc00::1]", "[fd12::1]",
+            // IPv4-mapped, IPv4-compatible, NAT64 and 6to4 spellings of loopback/metadata/private.
+            "[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "[::ffff:169.254.169.254]", "[::127.0.0.1]",
+            "[64:ff9b::7f00:1]", "[64:ff9b::a9fe:a9fe]", "[2002:7f00:1::]", "[2002:c0a8:101::]",
+        ]
+        for host in internalHosts {
+            #expect(WebhookURLValidator.isInternalHost("http://\(host)/hook"), "\(host)")
+        }
+        let publicHosts = ["[2001:db8::1]", "[::ffff:8.8.8.8]", "[64:ff9b::808:808]", "[2002:808:808::]", "[2607:f8b0::1]"]
+        for host in publicHosts {
+            #expect(!WebhookURLValidator.isInternalHost("http://\(host)/hook"), "\(host)")
+        }
+        // A zone id defeats the parser; the textual fallback still catches link-local.
+        #expect(WebhookURLValidator.isInternalHost("http://[fe80::1%25en0]/hook"))
+    }
+
     @Test("valid http(s) URLs pass structure validation")
     func validStructure() throws {
         try WebhookURLValidator.validateStructure("https://example.com/hook")

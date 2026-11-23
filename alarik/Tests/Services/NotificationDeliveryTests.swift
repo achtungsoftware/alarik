@@ -69,6 +69,13 @@ struct NotificationDeliveryTests {
                 let ok = await state.record(body: body, signature: sig)
                 return Response(status: ok ? .ok : .serviceUnavailable)
             }
+            // A receiver that answers with a redirect to the real hook - a delivery that follows
+            // it would be recorded there.
+            app.post("redirect") { req async throws -> Response in
+                let response = Response(status: .temporaryRedirect)
+                response.headers.replaceOrAdd(name: .location, value: "/hook")
+                return response
+            }
 
             try await app.server.start(address: .hostname("127.0.0.1", port: 0))
             guard let port = app.http.server.shared.localAddress?.port else {
@@ -166,6 +173,36 @@ struct NotificationDeliveryTests {
             let sig = try #require(delivery.signature)
             let expected = NotificationService.signature(payload: delivery.body, secret: "sup3rsecret")
             #expect(sig == expected)
+        }
+    }
+
+    @Test("a webhook answered with a redirect is a failed delivery, never followed")
+    func redirectIsNotFollowed() async throws {
+        let receiver = try await FakeReceiver.start()
+        defer { Task { try? await receiver.shutdown() } }
+
+        try await withApp { app in
+            let admin = try await User.findByUsername(app: app, username: "alarik")!
+            let bucketModel = Bucket(name: "notif-redirect", userId: admin.id)
+            let redirectURL = receiver.url.replacingOccurrences(of: "/hook", with: "/redirect")
+            let rule = NotificationRule(
+                id: UUID(), url: redirectURL, secret: nil, events: ["s3:ObjectCreated:*"],
+                prefix: nil, suffix: nil, enabled: true)
+            let config = NotificationConfiguration(rules: [rule])
+            bucketModel.notificationConfig = config
+            try await bucketModel.save(app: app)
+            await NotificationConfigCache.shared.setConfig(for: "notif-redirect", config: config)
+
+            await NotificationService.emit(
+                event: .objectCreatedPut, bucketName: "notif-redirect", key: "k", size: 1,
+                etag: "e", versionId: nil, requestId: "REQ", sourceIP: nil, app: app)
+            #expect(try await waitForDeliveries(receiver, atLeast: 1, timeout: 2) == false)
+
+            // The task is still queued as a failed attempt, with the redirect status recorded.
+            let pending = ownedDeliveries(app)
+            #expect(pending.count == 1)
+            #expect(pending.first?.attempts ?? 0 >= 1)
+            #expect(pending.first?.lastError?.contains("307") == true)
         }
     }
 

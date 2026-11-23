@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import AsyncHTTPClient
 import Foundation
 import Vapor
 
@@ -36,17 +37,19 @@ enum NotificationDispatcher {
         },
         attemptDelivery: { row, app in
             do {
-                let response = try await app.client.post(URI(string: row.url)) { clientReq in
-                    clientReq.headers.contentType = .json
-                    clientReq.headers.replaceOrAdd(name: .userAgent, value: "Alarik-Webhook")
-                    if let secret = row.secret, !secret.isEmpty {
-                        clientReq.headers.replaceOrAdd(
-                            name: "X-Alarik-Signature-256",
-                            value: NotificationService.signature(payload: row.payload, secret: secret)
-                        )
-                    }
-                    clientReq.body = ByteBuffer(string: row.payload)
-                }.get()
+                var outbound = HTTPClientRequest(url: row.url)
+                outbound.method = .POST
+                outbound.headers.replaceOrAdd(name: .contentType, value: "application/json")
+                outbound.headers.replaceOrAdd(name: .userAgent, value: "Alarik-Webhook")
+                if let secret = row.secret, !secret.isEmpty {
+                    outbound.headers.replaceOrAdd(
+                        name: "X-Alarik-Signature-256",
+                        value: NotificationService.signature(payload: row.payload, secret: secret))
+                }
+                outbound.body = .bytes(ByteBuffer(string: row.payload))
+                // `WebhookHTTPClient`, never `app.client`: a redirect is answered as a failure.
+                let response = try await WebhookHTTPClient.client(for: app).execute(
+                    outbound, timeout: WebhookHTTPClient.timeout, logger: app.logger)
                 guard (200..<300).contains(response.status.code) else {
                     return .failure(NotificationDispatcherError.httpStatus(response.status.code))
                 }

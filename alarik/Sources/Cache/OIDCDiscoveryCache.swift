@@ -213,14 +213,23 @@ final actor OIDCDiscoveryCache {
         guard let host = URL(string: urlString)?.host?.lowercased() else {
             throw Abort(.badRequest, reason: "Invalid OIDC provider URL.")
         }
-        if host.hasPrefix("fe80:") || host.hasPrefix("[fe80:") {
+        let bare = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+        if let bytes = WebhookURLValidator.parseIPv6(bare) {
+            // Link-local, or the metadata address inside a transition form (`::ffff:169.254.169.254`).
+            if bytes[0] == 0xfe, bytes[1] & 0xc0 == 0x80 {
+                throw Abort(.badRequest, reason: "OIDC provider URL points to a blocked address.")
+            }
+            if let embedded = WebhookURLValidator.embeddedIPv4(in: bytes), (embedded >> 16) == 0xA9FE {
+                throw Abort(.badRequest, reason: "OIDC provider URL points to a blocked address.")
+            }
+        } else if bare.hasPrefix("fe80:") {
             throw Abort(.badRequest, reason: "OIDC provider URL points to a blocked address.")
         }
         // A plain prefix check only catches "169.254.x.x" written out in dotted-decimal - the
         // same address reachable via "2852039166" (decimal), "0xA9FEA9FE" (hex), or "169.254.1"
         // (short form) would slip through. Reuse WebhookURLValidator's numeric-form parser so
         // every equivalent spelling of the metadata address is caught the same way.
-        if let address = WebhookURLValidator.parseNumericIPv4(host), (address >> 16) == 0xA9FE {
+        if let address = WebhookURLValidator.parseNumericIPv4(bare), (address >> 16) == 0xA9FE {
             throw Abort(.badRequest, reason: "OIDC provider URL points to a blocked address.")
         }
     }
