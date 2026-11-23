@@ -39,6 +39,32 @@ struct ClusterErasureCodingConfigTests {
         try body()
     }
 
+    @Test("the first boot pins k+m to the store; a later boot with other values is refused")
+    func pinRefusesLayoutChange() throws {
+        let path = NSTemporaryDirectory() + "ec-pin-\(UUID().uuidString)/erasure_coding.json"
+        defer { try? FileManager.default.removeItem(atPath: (path as NSString).deletingLastPathComponent) }
+        let original = ClusterErasureCodingConfig(dataShards: 4, parityShards: 2, scrubIntervalHours: 1)
+
+        try original.enforcePin(at: path)
+        #expect(FileManager.default.fileExists(atPath: path))
+        // Same layout again, with an unrelated setting changed: fine.
+        try ClusterErasureCodingConfig(dataShards: 4, parityShards: 2, scrubIntervalHours: 0).enforcePin(at: path)
+
+        #expect(throws: ClusterErasureCodingConfigError.self) {
+            try ClusterErasureCodingConfig(dataShards: 2, parityShards: 2, scrubIntervalHours: 1).enforcePin(at: path)
+        }
+        do {
+            try ClusterErasureCodingConfig(dataShards: 4, parityShards: 3, scrubIntervalHours: 1).enforcePin(at: path)
+        } catch let error as ClusterErasureCodingConfigError {
+            #expect(error.description.contains("CLUSTER_EC_PARITY_SHARDS=2"))
+            #expect(error.description.contains("m=3"))
+        }
+
+        // A pin that cannot be read stops boot instead of being overwritten.
+        try Data("not json".utf8).write(to: URL(fileURLWithPath: path))
+        #expect(throws: ClusterErasureCodingConfigError.self) { try original.enforcePin(at: path) }
+    }
+
     @Test("resolves to the default k=4/m=2 when both env vars are unset")
     func resolvesToDefaultWhenUnset() throws {
         try withEnv(["CLUSTER_EC_DATA_SHARDS": nil, "CLUSTER_EC_PARITY_SHARDS": nil]) {

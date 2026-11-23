@@ -64,6 +64,47 @@ struct ClusterErasureCodingConfig: Sendable, Equatable {
             dataShards: dataShards, parityShards: parityShards, scrubIntervalHours: scrubIntervalHours)
     }
 
+    /// Where the layout a store was written with is recorded, next to `cluster_node_id`.
+    static let pinFilePath = "Storage/erasure_coding.json"
+
+    /// The part of the layout that is baked into every stripe on disk.
+    struct Pin: Codable, Equatable {
+        let dataShards: Int
+        let parityShards: Int
+    }
+
+    /// Refuses to boot when `k+m` no longer matches what this store was written with.
+    ///
+    /// A stripe encodes with one Cauchy matrix and decodes only with the same one: changing
+    /// `CLUSTER_EC_DATA_SHARDS`/`CLUSTER_EC_PARITY_SHARDS` on an existing store does not
+    /// re-encode anything, it makes every read and reconstruction use the wrong matrix and
+    /// produce garbage that passes no checksum. The first clustered boot records the layout;
+    /// every later boot compares. Changing the layout means a fresh store (or a migration tool),
+    /// never an environment edit. An unreadable pin also stops boot: overwriting it would turn a
+    /// disk fault into exactly the silent mismatch this guards against.
+    func enforcePin(at path: String = ClusterErasureCodingConfig.pinFilePath) throws {
+        let current = Pin(dataShards: dataShards, parityShards: parityShards)
+        if FileManager.default.fileExists(atPath: path) {
+            let recorded: Pin
+            do {
+                recorded = try JSONDecoder().decode(Pin.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            } catch {
+                throw ClusterErasureCodingConfigError(
+                    description: "Could not read the erasure-coding layout recorded at '\(path)': \(error)")
+            }
+            guard recorded == current else {
+                throw ClusterErasureCodingConfigError(
+                    description:
+                        "This store was written with CLUSTER_EC_DATA_SHARDS=\(recorded.dataShards) CLUSTER_EC_PARITY_SHARDS=\(recorded.parityShards), but the environment now says k=\(dataShards)/m=\(parityShards). Existing stripes would decode with the wrong matrix - restore the recorded values ('\(path)'), or start from an empty store."
+                )
+            }
+            return
+        }
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try JSONEncoder().encode(current).write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
     private static func parseShardCount(envVar: String, minimum: Int, defaultValue: Int) throws -> Int {
         guard let raw = Environment.sanitizedGet(envVar) else { return defaultValue }
         guard let value = Int(raw), value >= minimum else {

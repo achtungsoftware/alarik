@@ -83,6 +83,9 @@ public func configure(_ app: Application) async throws {
             nodeId: nodeId, address: clusterNodeAddress, secret: clusterSecret, seeds: seeds)
         app.storage[ClusterErasureCodingConfigKey.self] = erasureCodingConfig
         app.storage[ClusterMetadataErasureCodingConfigKey.self] = metadataErasureCodingConfig
+        // Object-data k+m is pinned to the store; metadata's auto-capped layout is not, since
+        // its readers discover each record's k+m from the shard headers.
+        try erasureCodingConfig.enforcePin()
     }
 
     // Spool files are per-request transients; anything still here is an orphan from an
