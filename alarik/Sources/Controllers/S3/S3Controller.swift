@@ -819,6 +819,11 @@ struct S3Controller: RouteCollection {
                 message: "Invalid argument", requestId: req.id)
         }
 
+        // NoSuchBucket before AccessDenied, as on S3 and as GET/HEAD already do here - the
+        // ownership map answered "no bucket" with a 403, which sent clients chasing credentials.
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
+
         let authInfo = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // Computed once and reused for both the routing decision below and the dispatch check

@@ -3846,4 +3846,32 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("PUT and DELETE on a missing bucket answer NoSuchBucket, not AccessDenied")
+    func testMissingBucketIsNoSuchBucket() async throws {
+        try await withApp { app in
+            let data = Data("x".utf8)
+            let put = signedHeaders(for: .PUT, path: "/no-such-bucket-here/key.txt", body: data)
+            try await app.test(
+                .PUT, "/no-such-bucket-here/key.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: put)
+                    req.body = ByteBuffer(data: data)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("<Code>NoSuchBucket</Code>"))
+                })
+            let delete = signedHeaders(for: .DELETE, path: "/no-such-bucket-here/key.txt")
+            try await app.test(
+                .DELETE, "/no-such-bucket-here/key.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: delete)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .notFound)
+                    #expect(res.body.string.contains("<Code>NoSuchBucket</Code>"))
+                })
+        }
+    }
 }
