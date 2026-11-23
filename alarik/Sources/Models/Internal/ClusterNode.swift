@@ -46,13 +46,15 @@ final class ClusterNode: @unchecked Sendable, MetadataRecord {
     var status: Status
     var joinedAt: Date
 
-    /// Updated on every heartbeat tick. A node is treated as unavailable by every other node once
-    /// this exceeds the staleness window (`ClusterMembershipLifecycle.heartbeatStaleness`) - no
-    /// separate failure-detector state, this field *is* the failure detector.
+    /// As of the record's last durable write - a join or a status/address change, never a
+    /// heartbeat. Live heartbeats are kept in `ClusterNodeCache` (`ClusterNodeInfo.lastHeartbeatAt`),
+    /// which is the failure detector: a node is unavailable once its cached heartbeat exceeds
+    /// `ClusterNodeCache.heartbeatStaleness`.
     var lastHeartbeatAt: Date
 
-    /// Self-reported disk capacity, refreshed on every heartbeat tick. `nil` until this node's
-    /// first post-upgrade heartbeat - always treated as "unknown" (fail open), never as "full".
+    /// Self-reported disk capacity as of the last durable write; the cache carries the live
+    /// values. `nil` until the node first reported it - treated as "unknown" (fail open), never
+    /// as "full".
     var totalBytes: Int64?
     var availableBytes: Int64?
 

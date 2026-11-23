@@ -345,67 +345,32 @@ enum MetadataStore {
     /// change is picked up on the very next call. Shard counts come from the metadata-specific
     /// config (graceful auto-cap), never the object-data config (which hard-refuses an undersized
     /// cluster) - metadata availability must never depend on object-data k+m fitting the cluster.
-    /// `cluster-nodes/*` records are the exception, pinned to k=1/m=0: they're rewritten on every
-    /// heartbeat, and a single-shard record can never disagree with itself under that churn.
+    ///
+    /// Membership records (`cluster-nodes/<id>`) route like every other record. They used to be
+    /// pinned to the node they describe, which made a node's record unreadable - and its status
+    /// unchangeable - the moment that node was down, and let a cluster restarted without it
+    /// forget it existed and re-place its keys. The heartbeat that used to rewrite the record on
+    /// every tick now lives only in `ClusterNodeCache`; the replicated record changes on join,
+    /// address or status changes (`ClusterMembershipLifecycle.heartbeatLoop`).
     static func resolveRouting(app: Application, key: String) async -> Routing {
         let metadataConfig = app.storage[ClusterMetadataErasureCodingConfigKey.self] ?? .default
-        let isClusterNode = key.hasPrefix("\(MetadataCollections.clusterNodes)/")
         guard let config = app.storage[ClusterConfigurationKey.self] else {
-            let (dataShards, parityShards) =
-                isClusterNode ? (1, 0) : metadataConfig.effective(activeNodeCount: 1)
+            let (dataShards, parityShards) = metadataConfig.effective(activeNodeCount: 1)
             return Routing(
                 responsible: [], selfNodeId: nil, dataShards: dataShards,
                 parityShards: parityShards)
-        }
-
-        // A `cluster-nodes/<X>` record is always coordinated by node X itself, bypassing HRW
-        // ranking entirely, regardless of who initiates the write (e.g. an admin drain relayed
-        // through another node). HRW ranking shifts with membership, so routing through the
-        // computed rank-0 could land on a node that's down for unrelated reasons, leaving the
-        // write stuck until it recovers. Routing both reads and writes through X itself ensures
-        // the record for X lives in exactly one place, so every write and read always agree.
-        if isClusterNode {
-            let targetIdString = String(key.dropFirst("\(MetadataCollections.clusterNodes)/".count))
-            if let targetId = UUID(uuidString: targetIdString) {
-                let targetInfo: ClusterNodeInfo?
-                if targetId == config.nodeId {
-                    // Self - always resolvable from local config, even before any peer has ever
-                    // heard of this node (first-ever boot, nothing in `ClusterNodeCache` yet).
-                    targetInfo = ClusterNodeInfo(
-                        id: config.nodeId, address: config.address, status: .active,
-                        lastHeartbeatAt: Date())
-                } else {
-                    targetInfo = await ClusterNodeCache.shared.get(id: targetId)
-                }
-                if let targetInfo {
-                    return Routing(
-                        responsible: [targetInfo], selfNodeId: config.nodeId, dataShards: 1,
-                        parityShards: 0)
-                }
-                // Target genuinely unknown to this node (a peer this node hasn't discovered at
-                // all yet) - nothing to route to directly; fall through to the best-effort
-                // HRW-based computation below, the same fallback every other collection uses.
-                // Loud, because a write taking this path lands somewhere the owner-pinned READ
-                // path will never look - it stays wrong until the owner's next heartbeat
-                // self-write supersedes it, and that dependency should be visible in logs.
-                app.logger.warning(
-                    "cluster-nodes record for unknown node \(targetId) routed via HRW fallback - unreadable by the owner-pinned read path until that node's own heartbeat rewrites it."
-                )
-            }
         }
 
         // Registered nodes, not live ones: a record must stay where it was written even
         // while a replica is down. See `ClusterNodeCache.placementNodes`.
         let active = await ClusterNodeCache.shared.placementNodes()
         guard !active.isEmpty else {
-            let (dataShards, parityShards) =
-                isClusterNode ? (1, 0) : metadataConfig.effective(activeNodeCount: 1)
+            let (dataShards, parityShards) = metadataConfig.effective(activeNodeCount: 1)
             return Routing(
                 responsible: [], selfNodeId: config.nodeId, dataShards: dataShards,
                 parityShards: parityShards)
         }
-        let (dataShards, parityShards) =
-            isClusterNode ? (1, 0) : metadataConfig.effective(activeNodeCount: active.count)
+        let (dataShards, parityShards) = metadataConfig.effective(activeNodeCount: active.count)
         let responsible = PlacementService.responsibleNodes(
             bucketName: MetadataNamespace.bucketName, key: key, activeNodes: active,
             count: dataShards + parityShards)

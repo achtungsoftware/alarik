@@ -46,6 +46,34 @@ struct MetadataStoreTests {
         let count: Int
     }
 
+    // MARK: - Routing
+
+    @Test("a membership record is placed like any other record, not pinned to the node it describes")
+    func membershipRecordsRouteByPlacement() async throws {
+        try await withApp { app in
+            let selfId = UUID()
+            app.storage[ClusterConfigurationKey.self] = ClusterConfiguration(
+                nodeId: selfId, address: "http://self.internal", secret: "test-secret")
+            let nodes = [selfId, UUID(), UUID(), UUID()].map {
+                ClusterNodeInfo(id: $0, address: "http://\($0).internal", status: .active, lastHeartbeatAt: Date())
+            }
+            await ClusterNodeCache.shared.load(initialData: nodes)
+            defer { Task { await ClusterNodeCache.shared.load(initialData: []) } }
+
+            let subject = nodes[2].id
+            let key = MetadataNamespace.key(collection: MetadataCollections.clusterNodes, id: subject.uuidString)
+            let routing = await MetadataStore.resolveRouting(app: app, key: key)
+            let expected = PlacementService.responsibleNodes(
+                bucketName: MetadataNamespace.bucketName, key: key, activeNodes: nodes, count: 3)
+            #expect(routing.dataShards == 1 && routing.parityShards == 2)
+            #expect(routing.responsible.map(\.id) == expected.map(\.id))
+            // The subject's own record is readable without the subject: three owners, chosen by
+            // the key, not by who the record is about.
+            #expect(routing.responsible.count == 3)
+            await ClusterNodeCache.shared.load(initialData: [])
+        }
+    }
+
     // MARK: - Round trip
 
     @Test("get returns nil for a record that was never written")

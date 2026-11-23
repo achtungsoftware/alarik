@@ -64,6 +64,25 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     private var lastKnownJoinedAt: Date?
     private var lastKnownStatus: ClusterNode.Status = .active
 
+    /// The durable fields of this node's membership record. The record is replicated like any
+    /// other metadata (`MetadataStore.resolveRouting`), so it is written only when one of these
+    /// changes or a previous write failed - never per heartbeat. Liveness and capacity travel
+    /// through `ClusterNodeCache` and the membership gossip instead.
+    struct PersistedMembership: Equatable {
+        let address: String
+        let status: ClusterNode.Status
+        let joinedAt: Date
+
+        init(_ node: ClusterNode) {
+            address = node.address
+            status = node.status
+            joinedAt = node.joinedAt
+        }
+    }
+
+    /// What the record last successfully held, nil until the first write lands.
+    private var persisted: PersistedMembership?
+
     func didBootAsync(_ app: Application) async throws {
         guard let config = app.storage[ClusterConfigurationKey.self] else {
             // Cluster mode off - nothing to register, and no peers to discover, so the
@@ -355,7 +374,9 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
         // the local cache upsert below still runs, and the durable write retries on the next tick.
         do {
             try await node.save(app: app)
+            persisted = PersistedMembership(node)
         } catch {
+            persisted = nil
             app.logger.warning(
                 "Cluster self-registration write failed - continuing with the in-memory update, the next heartbeat tick will retry the durable write: \(error)"
             )
@@ -380,8 +401,8 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     /// view has converged can legitimately fail even though the record is durable. Requiring a
     /// successful read first would permanently wedge the heartbeat on a single boot-time hiccup.
     /// Instead the read is best-effort (only used to preserve fields this loop doesn't own, like
-    /// an admin-initiated `draining` status); the write always goes through, self-correcting once
-    /// every node's view converges.
+    /// an admin-initiated `draining` status). The tick always refreshes the in-memory liveness;
+    /// the durable record is rewritten only when its own fields changed (`PersistedMembership`).
     private func heartbeatLoop(app: Application, config: ClusterConfiguration) async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(Self.heartbeatInterval))
@@ -418,17 +439,21 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             node.totalBytes = totalBytes
             node.availableBytes = availableBytes
 
-            // Best-effort, not gating the cache update below: `node.save` forwards to whichever
-            // node currently ranks rank-0 for this node's own record, not necessarily reachable.
-            // Skipping the local cache upsert on a save failure would let a coordinator that's
-            // merely temporarily down leave this perfectly healthy node excluding ITSELF from its
-            // own `activeNodes()`. The durable write is simply retried on the next tick.
-            do {
-                try await node.save(app: app)
-            } catch {
-                app.logger.warning(
-                    "Cluster heartbeat durable write failed - the local cache still updates below, and the next tick retries: \(error)"
-                )
+            // The record is written only when its durable fields changed (or the last write
+            // failed): a heartbeat is cache-only. Best-effort, not gating the cache update below:
+            // `node.save` runs through whichever owner coordinates this record, not necessarily
+            // reachable, and a healthy node must never exclude ITSELF from its own `activeNodes()`
+            // because of that. The durable write is simply retried on the next tick.
+            let wanted = PersistedMembership(node)
+            if persisted != wanted {
+                do {
+                    try await node.save(app: app)
+                    persisted = wanted
+                } catch {
+                    app.logger.warning(
+                        "Cluster membership durable write failed - the local cache still updates below, and the next tick retries: \(error)"
+                    )
+                }
             }
 
             await ClusterNodeCache.shared.upsert(

@@ -105,11 +105,10 @@ final class LoadCacheLifecycle: LifecycleHandler {
     /// must therefore stay ungated; only the timer, which runs when nothing is known to have
     /// happened, may skip.
     static func reloadAll(app: Application, gated: Bool = false) async throws {
-        // Membership first, and never gated: `cluster-nodes` records are rewritten by every
-        // heartbeat, so their digest always differs and gating on it would never skip anything.
-        // This is also the durable backstop for membership now that the 5-second refresh tick is
-        // bounded gossip rather than a full collection pull - it recovers a node that is
-        // registered on disk but has fallen out of every live peer's cache.
+        // Membership first, and never gated: this is the durable backstop for membership now
+        // that the refresh tick is bounded gossip rather than a full collection pull - it recovers
+        // a node that is registered on disk but has fallen out of every live peer's cache. The
+        // records are replicated like all metadata, so a node that is down is still listed.
         // `reconcile`, not `load`: `ClusterNode.all` is a best-effort fan-out, so a peer merely
         // slow to answer must not have its (still-fresher) cached entry clobbered by its absence.
         let clusterNodeData = await ClusterNode.all(app: app).map { node in

@@ -137,17 +137,26 @@ struct InternalClusterController: RouteCollection {
 
         let nodes = await ClusterNode.all(app: req.application)
             .sorted { $0.joinedAt < $1.joinedAt }
+        // The record is the roster (it alone knows a node that has been down for a while); the
+        // cache has the heartbeats and capacity, which the record carries only as of its last
+        // durable write.
+        let live = Dictionary(
+            uniqueKeysWithValues: await ClusterNodeCache.shared.all().map { ($0.id, $0) })
         let now = Date()
         return nodes.map { node -> ClusterNodeDTO in
+            let cached = live[node.id]
+            let lastHeartbeatAt = max(node.lastHeartbeatAt, cached?.lastHeartbeatAt ?? .distantPast)
+            let totalBytes = cached?.totalBytes ?? node.totalBytes
+            let availableBytes = cached?.availableBytes ?? node.availableBytes
             let isHealthy =
-                node.status == .active
-                && now.timeIntervalSince(node.lastHeartbeatAt) <= ClusterNodeCache.heartbeatStaleness
+                node.status == .active && !(cached?.reportedOffline ?? false)
+                && now.timeIntervalSince(lastHeartbeatAt) <= ClusterNodeCache.heartbeatStaleness
             return ClusterNodeDTO(
                 id: node.id, address: node.address, status: node.status.rawValue, joinedAt: node.joinedAt,
-                lastHeartbeatAt: node.lastHeartbeatAt, isHealthy: isHealthy,
-                totalBytes: node.totalBytes, availableBytes: node.availableBytes,
+                lastHeartbeatAt: lastHeartbeatAt, isHealthy: isHealthy,
+                totalBytes: totalBytes, availableBytes: availableBytes,
                 isNearFull: ClusterCapacityPolicy.isNearFull(
-                    totalBytes: node.totalBytes, availableBytes: node.availableBytes))
+                    totalBytes: totalBytes, availableBytes: availableBytes))
         }
     }
 
