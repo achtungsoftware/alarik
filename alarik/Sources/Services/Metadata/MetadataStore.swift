@@ -733,6 +733,7 @@ enum MetadataStore {
         let allKnown = await ClusterNodeCache.shared.reachablePeers()
         let hasWiderFallback = allKnown.count > routing.responsible.count
 
+        var absentAmongOwners = false
         do {
             return try await attemptGather(
                 app: app, key: key, candidates: routing.responsible, routing: routing,
@@ -741,6 +742,7 @@ enum MetadataStore {
             // Genuinely not found among `routing.responsible` - still worth widening before
             // concluding absence, for the same placement-drift reason as below.
             guard hasWiderFallback else { return nil }
+            absentAmongOwners = true
         } catch let error as S3Error where error.code == "ServiceUnavailable" && hasWiderFallback {
             // Found but under-gathered from THIS candidate set specifically - swallowed here
             // only because a strictly wider candidate set exists to retry against next. If the
@@ -748,6 +750,18 @@ enum MetadataStore {
             // enough healthy shards anywhere" and must propagate as ServiceUnavailable, not be
             // silently reinterpreted as "not found" (a caller like login/auth must never treat
             // a temporarily-unreconstructable record as if it never existed).
+        }
+
+        // The owners already proved absence by quorum; widening only hunts for copies that
+        // placement drift left on other nodes. If no reachable node holds a shard, that settles
+        // it. Letting the widened gather decide instead would apply its absence rule to ALL known
+        // nodes - a quorum of the whole cluster - so two unrelated nodes being down made every
+        // create fail with "not enough shards" for a record that never existed.
+        if absentAmongOwners,
+            await discoverShardCounts(
+                app: app, key: key, candidates: allKnown, selfNodeId: selfNodeId) == nil
+        {
+            return nil
         }
 
         // `routing.responsible` can exclude the node(s) that actually hold this record if it was
