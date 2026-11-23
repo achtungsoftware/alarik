@@ -985,7 +985,7 @@ struct ObjectFileHandlerVersioningTests {
         let (finalMeta, finalData) = try ObjectFileHandler.read(from: path, loadData: true)
         #expect(finalMeta.tags == ["env": "prod"])
         #expect(finalMeta.etag == metadata.etag)
-        #expect(finalMeta.size == metadata.size)
+        #expect(finalMeta.size == data.count)
         #expect(finalData == data)
     }
 

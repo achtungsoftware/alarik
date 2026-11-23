@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import Crypto
 import Foundation
+import NIOCore
 import Testing
 
 @testable import Alarik
@@ -70,7 +72,8 @@ struct ObjectFileHandlerTests {
         // Verify metadata
         #expect(readMeta.bucketName == metadata.bucketName)
         #expect(readMeta.key == metadata.key)
-        #expect(readMeta.size == metadata.size)
+        // The writer stamps the size from the payload it wrote, whatever the caller passed.
+        #expect(readMeta.size == data.count)
         #expect(readMeta.contentType == metadata.contentType)
         #expect(readMeta.etag == metadata.etag)
         #expect(readMeta.metadata == metadata.metadata)
@@ -1414,5 +1417,62 @@ extension ObjectFileHandlerTests {
             #expect(finished.wait(timeout: .now() + 5) == .success)
             #expect(flag.done)
         }
+    }
+
+    @Test("a payload that does not match its header is refused: wrong length and flipped bytes")
+    func integrityChecks() throws {
+        let path = createTempPath()
+        defer { cleanup(path: path) }
+        let data = Data("verified payload bytes".utf8)
+        var meta = createTestMetadata()
+        meta.size = data.count
+        meta.etag = Insecure.MD5.hash(data: data).hexString()
+        try ObjectFileHandler.write(metadata: meta, data: data, to: path)
+        _ = try ObjectFileHandler.read(from: path)
+
+        // Flip one payload byte: size still matches, the MD5 does not.
+        let fd = POSIXFile.openWrite(path, O_WRONLY, 0o644)
+        var statInfo = stat()
+        _ = POSIXFile.fstat(fd, &statInfo)
+        _ = POSIXFile.lseek(fd, off_t(Int(statInfo.st_size) - 1), SEEK_SET)
+        var flipped: UInt8 = 0x21
+        _ = POSIXFile.write(fd, &flipped, 1)
+        _ = POSIXFile.close(fd)
+        #expect {
+            try ObjectFileHandler.read(from: path)
+        } throws: { error in
+            if case IntegrityError.checksumMismatch = error { return true }
+            return false
+        }
+        // Header-only reads do not hash, and the length still agrees.
+        #expect(try ObjectFileHandler.read(from: path, loadData: false).0.key == meta.key)
+
+        // Truncate: the header promises more bytes than exist.
+        try FileHandle(forWritingAtPath: path)!.truncate(atOffset: UInt64(Int(statInfo.st_size) - 5))
+        #expect {
+            try ObjectFileHandler.read(from: path, loadData: false)
+        } throws: { error in
+            if case IntegrityError.sizeMismatch = error { return true }
+            return false
+        }
+        #expect(throws: (any Error).self) { try ObjectFileHandler.payloadLocation(path: path) }
+    }
+
+    @Test("PayloadVerifier prefers a stored full-object checksum and skips unverifiable multipart ETags")
+    func payloadVerifierSelection() throws {
+        let data = Data("abc".utf8)
+        var crc = TrailerChecksum(trailerHeaderName: "x-amz-checksum-crc32")!
+        crc.update(ByteBuffer(data: data).readableBytesView)
+        var meta = createTestMetadata()
+        meta.etag = "deadbeef-3"
+        meta.checksum = ObjectChecksum(algorithm: "crc32", value: crc.finalizeBase64(), type: .fullObject)
+        var verifier = try #require(PayloadVerifier(meta: meta, path: "p"))
+        data.withUnsafeBytes { verifier.update($0) }
+        try verifier.verify()
+
+        var unverifiable = createTestMetadata()
+        unverifiable.etag = "deadbeef-3"
+        unverifiable.checksum = nil
+        #expect(PayloadVerifier(meta: unverifiable, path: "p") == nil)
     }
 }

@@ -38,6 +38,11 @@ struct ObjectFileHandler {
     /// never see a partial object) and durably (fsync of both the file and its directory
     /// before acknowledging, unless `ALARIK_FSYNC=false`; see `AtomicObjectWriter`).
     static func write(metadata: ObjectMeta, data: Data, to path: String) throws {
+        // The header's size is stamped from the bytes actually written, never trusted from the
+        // caller: reads verify the two agree, so a caller's stale size would make its own
+        // object unreadable.
+        var metadata = metadata
+        metadata.size = data.count
         try ObjectKeyLock.withLock(bucketName: metadata.bucketName, key: metadata.key) {
             defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
             var writer = try AtomicObjectWriter(finalPath: path)
@@ -88,6 +93,9 @@ struct ObjectFileHandler {
         payloadSources: [(path: String, offset: Int, size: Int)],
         to path: String
     ) throws {
+        // Size stamped from the sources, same reasoning as `write(metadata:data:to:)`.
+        var metadata = metadata
+        metadata.size = payloadSources.reduce(0) { $0 + $1.size }
         try ObjectKeyLock.withLock(bucketName: metadata.bucketName, key: metadata.key) {
             defer { StorageStatsService.shared.noteChange(bucketName: metadata.bucketName) }
             var writer = try AtomicObjectWriter(finalPath: path)
@@ -311,8 +319,13 @@ struct ObjectFileHandler {
             }
 
             let payloadOffset = 4 + Int(metadataLength)
-            let payloadSize = Int(statInfo.st_size) - payloadOffset
-            return (fd, meta, payloadOffset, Swift.max(0, payloadSize))
+            let payloadSize = Swift.max(0, Int(statInfo.st_size) - payloadOffset)
+            // A truncated or over-long payload must never be served under a header that
+            // promises another length.
+            guard payloadSize == meta.size else {
+                throw IntegrityError.sizeMismatch(path: path, expected: meta.size, actual: payloadSize)
+            }
+            return (fd, meta, payloadOffset, payloadSize)
         } catch {
             _ = POSIXFile.close(fd)
             throw error
@@ -363,12 +376,24 @@ struct ObjectFileHandler {
             try jsonDecoder.decode(ObjectMeta.self, from: Data(buffer))
         }
 
+        let dataOffset = 4 + Int(metadataLength)
+
+        // The header's size against the file's: a truncated object is damaged, not short.
+        var statInfo = stat()
+        guard POSIXFile.fstat(fd, &statInfo) == 0 else {
+            throw NSError(
+                domain: "FileError", code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Could not stat file"])
+        }
+        let dataSize = Swift.max(0, Int(statInfo.st_size) - dataOffset)
+        guard dataSize == metadata.size else {
+            throw IntegrityError.sizeMismatch(path: path, expected: metadata.size, actual: dataSize)
+        }
+
         // For metadata-only reads, we're done
         if !loadData {
             return (metadata, nil)
         }
-
-        let dataOffset = 4 + Int(metadataLength)
 
         // For range reads
         if let range = range {
@@ -387,27 +412,19 @@ struct ObjectFileHandler {
             return (metadata, Data(rangeBytes[0..<rangeRead]))
         }
 
-        // For full reads, get file size and read remaining data
-        var statInfo = stat()
-        guard POSIXFile.fstat(fd, &statInfo) == 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not stat file"])
-        }
-
-        let fileSize = Int(statInfo.st_size)
-        let dataSize = fileSize - dataOffset
-
-        if dataSize <= 0 {
-            return (metadata, Data())
-        }
-
+        // Full read: the whole payload, verified against the header's checksum.
         var dataBytes = [UInt8](repeating: 0, count: dataSize)
-        let dataRead = POSIXFile.read(fd, &dataBytes, dataSize)
-        guard dataRead == dataSize else {
-            throw NSError(
-                domain: "InvalidFile", code: 0,
-                userInfo: [NSLocalizedDescriptionKey: "Incomplete data"])
+        if dataSize > 0 {
+            let dataRead = POSIXFile.read(fd, &dataBytes, dataSize)
+            guard dataRead == dataSize else {
+                throw NSError(
+                    domain: "InvalidFile", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Incomplete data"])
+            }
+        }
+        if var verifier = PayloadVerifier(meta: metadata, path: path) {
+            dataBytes.withUnsafeBytes { verifier.update($0) }
+            try verifier.verify()
         }
 
         return (metadata, Data(dataBytes))

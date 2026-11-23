@@ -170,11 +170,21 @@ struct S3Service {
                             message: "The object changed while the response was being prepared")
                     }
 
+                    // A whole-object stream is verified as it goes; a mismatch at the end
+                    // aborts the response so the client sees a failed transfer, not a wrong body.
+                    var verifier = range == nil ? PayloadVerifier(meta: snapshot.meta, path: path) : nil
                     try await StreamingIOLoops.readWindowed(
                         threadPool: threadPool, fd: fd, offset: snapshot.payloadOffset + start,
                         length: length, chunkSize: Constants.streamingReadChunkSize
                     ) { chunk in
+                        verifier?.update(chunk.readableBytesView)
                         try await writer.writeBuffer(chunk)
+                    }
+                    do {
+                        try verifier?.verify()
+                    } catch {
+                        req.logger.error("\(error)")
+                        throw error
                     }
                     _ = POSIXFile.close(fd)
                 } catch is IOLoopError {
