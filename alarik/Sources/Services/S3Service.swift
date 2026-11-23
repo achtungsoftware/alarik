@@ -35,6 +35,10 @@ struct ListObjectsParams {
     let isV2: Bool
     let startAfter: String?
     let continuationToken: String?
+    /// `encoding-type=url`: keys, prefixes and markers in the response are percent-encoded.
+    let urlEncodeKeys: Bool
+    /// V2 only returns `Owner` on request (`fetch-owner=true`); V1 always does.
+    let fetchOwner: Bool
 }
 
 struct S3Service {
@@ -360,6 +364,13 @@ struct S3Service {
         // the original `start-after` on every page, so the old precedence restarted at page 1.
         let marker = isV2 ? (continuationToken ?? startAfter) : req.query[String.self, at: "marker"]
 
+        let encodingType = req.query[String.self, at: "encoding-type"]
+        if let encodingType, encodingType.lowercased() != "url" {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument",
+                message: "Invalid Encoding Method specified in Request", requestId: req.id)
+        }
+
         return ListObjectsParams(
             bucketName: bucketName,
             prefix: prefix,
@@ -368,24 +379,47 @@ struct S3Service {
             marker: marker,
             isV2: isV2,
             startAfter: startAfter,
-            continuationToken: continuationToken
+            continuationToken: continuationToken,
+            urlEncodeKeys: encodingType != nil,
+            fetchOwner: req.query[String.self, at: "fetch-owner"]?.lowercased() == "true"
         )
     }
 
-    static func buildObjectEntries(from objects: [ObjectMeta]) -> [ObjectEntry] {
+    /// `encoding-type=url` percent-encodes a value the way S3 does: everything but RFC 3986
+    /// unreserved characters and `/`, so keys with characters XML 1.0 cannot carry stay listable.
+    static func urlEncodeListingValue(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-_.~/")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    /// The bucket owner for listing responses, or nil when the bucket or its user is gone.
+    static func bucketOwner(app: Application, bucketName: String) async -> OwnerEntry? {
+        guard let bucket = try? await Bucket.find(app: app, name: bucketName),
+            let user = try? await User.find(app: app, id: bucket.userId)
+        else { return nil }
+        return OwnerEntry(id: user.id.uuidString, displayName: user.username)
+    }
+
+    static func buildObjectEntries(
+        from objects: [ObjectMeta], owner: OwnerEntry? = nil, urlEncodeKeys: Bool = false
+    ) -> [ObjectEntry] {
         return objects.map { meta in
             ObjectEntry(
-                key: meta.key,
+                key: urlEncodeKeys ? urlEncodeListingValue(meta.key) : meta.key,
                 lastModified: meta.updatedAt.iso8601String,
                 etag: "\"\(meta.etag)\"",
                 size: meta.size,
-                storageClass: "STANDARD"
+                storageClass: "STANDARD",
+                owner: owner
             )
         }
     }
 
-    static func buildCommonPrefixEntries(from prefixes: [String]) -> [CommonPrefix] {
-        prefixes.map { CommonPrefix(prefix: $0) }
+    static func buildCommonPrefixEntries(
+        from prefixes: [String], urlEncodeKeys: Bool = false
+    ) -> [CommonPrefix] {
+        prefixes.map { CommonPrefix(prefix: urlEncodeKeys ? urlEncodeListingValue($0) : $0) }
     }
 
     static func buildListObjectsResponse(
@@ -393,23 +427,32 @@ struct S3Service {
         objects: [ObjectMeta],
         commonPrefixes: [String],
         isTruncated: Bool,
-        nextMarker: String?
+        nextMarker: String?,
+        owner: OwnerEntry? = nil
     ) throws -> Data {
         let encoder = XMLEncoder()
         encoder.outputFormatting = .prettyPrinted
 
-        let objectEntries = buildObjectEntries(from: objects)
-        let commonPrefixEntries = buildCommonPrefixEntries(from: commonPrefixes)
+        let encode: (String?) -> String? = { value in
+            value.map { params.urlEncodeKeys ? urlEncodeListingValue($0) : $0 }
+        }
+        let objectEntries = buildObjectEntries(
+            from: objects, owner: owner, urlEncodeKeys: params.urlEncodeKeys)
+        let commonPrefixEntries = buildCommonPrefixEntries(
+            from: commonPrefixes, urlEncodeKeys: params.urlEncodeKeys)
+        let encodingType = params.urlEncodeKeys ? "url" : nil
 
         if params.isV2 {
             let result = ListBucketResultV2(
                 name: params.bucketName,
-                prefix: params.prefix,
-                startAfter: params.startAfter,
+                prefix: encode(params.prefix) ?? "",
+                startAfter: encode(params.startAfter),
                 continuationToken: params.continuationToken,
                 nextContinuationToken: isTruncated ? (nextMarker ?? "") : nil,
                 keyCount: objectEntries.count + commonPrefixEntries.count,
                 maxKeys: params.maxKeys,
+                delimiter: encode(params.delimiter),
+                encodingType: encodingType,
                 isTruncated: isTruncated,
                 contents: objectEntries,
                 commonPrefixes: commonPrefixEntries
@@ -420,10 +463,12 @@ struct S3Service {
         } else {
             let result = ListBucketResult(
                 name: params.bucketName,
-                prefix: params.prefix,
-                marker: params.marker,
-                nextMarker: isTruncated ? nextMarker : nil,
+                prefix: encode(params.prefix) ?? "",
+                marker: encode(params.marker),
+                nextMarker: isTruncated ? encode(nextMarker) : nil,
                 maxKeys: params.maxKeys,
+                delimiter: encode(params.delimiter),
+                encodingType: encodingType,
                 isTruncated: isTruncated,
                 contents: objectEntries,
                 commonPrefixes: commonPrefixEntries

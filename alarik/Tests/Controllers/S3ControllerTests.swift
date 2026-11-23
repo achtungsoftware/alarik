@@ -4027,4 +4027,112 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("Listings carry Delimiter, Owner (V1 always, V2 on fetch-owner) and encoding-type=url")
+    func testListingXmlFields() async throws {
+        let bucketName = "test-listing-fields"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "docs/a b.txt", content: "a")
+            try await putObject(app, bucketName: bucketName, key: "top.txt", content: "t")
+
+            func list(_ query: String) async throws -> String {
+                let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
+                var body = ""
+                try await app.test(
+                    .GET, "/\(bucketName)?\(query)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .ok, "\(query)")
+                        body = res.body.string
+                    })
+                return body
+            }
+
+            let v1 = try await list("delimiter=/")
+            #expect(v1.contains("<Delimiter>/</Delimiter>"))
+            #expect(v1.contains("<Owner>") && v1.contains("<ID>") && v1.contains("<DisplayName>alarik</DisplayName>"))
+            #expect(v1.contains("<Prefix>docs/</Prefix>"))
+
+            let v2 = try await list("list-type=2")
+            #expect(!v2.contains("<Owner>"))
+            let v2Owner = try await list("list-type=2&fetch-owner=true")
+            #expect(v2Owner.contains("<Owner>"))
+
+            let encoded = try await list("list-type=2&encoding-type=url")
+            #expect(encoded.contains("<EncodingType>url</EncodingType>"))
+            #expect(encoded.contains("<Key>docs/a%20b.txt</Key>"))
+            #expect(!encoded.contains("<Key>docs/a b.txt</Key>"))
+
+            let bad = signedHeaders(for: .GET, path: "/\(bucketName)", query: "encoding-type=base64")
+            try await app.test(
+                .GET, "/\(bucketName)?encoding-type=base64",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: bad)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .badRequest)
+                    #expect(res.body.string.contains("<Code>InvalidArgument</Code>"))
+                })
+        }
+    }
+
+    @Test("ListMultipartUploads honours delimiter and both multipart listings report Initiator and Owner")
+    func testMultipartListingsFields() async throws {
+        let bucketName = "test-multipart-listing-fields"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            var uploadIds: [String: String] = [:]
+            for key in ["folder/inner.bin", "root.bin"] {
+                let signed = signedHeaders(for: .POST, path: "/\(bucketName)/\(key)", query: "uploads")
+                try await app.test(
+                    .POST, "/\(bucketName)/\(key)?uploads",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        let body = res.body.string
+                        if let r = body.range(of: "<UploadId>"),
+                            let e = body[r.upperBound...].range(of: "</UploadId>")
+                        {
+                            uploadIds[key] = String(body[r.upperBound..<e.lowerBound])
+                        }
+                    })
+            }
+
+            let listSigned = signedHeaders(for: .GET, path: "/\(bucketName)", query: "uploads&delimiter=/")
+            try await app.test(
+                .GET, "/\(bucketName)?uploads&delimiter=/",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let body = res.body.string
+                    #expect(body.contains("<Delimiter>/</Delimiter>"))
+                    #expect(body.contains("<CommonPrefixes>") && body.contains("<Prefix>folder/</Prefix>"))
+                    #expect(body.contains("<Key>root.bin</Key>"))
+                    #expect(!body.contains("<Key>folder/inner.bin</Key>"))
+                    #expect(body.contains("<Initiator>") && body.contains("<DisplayName>alarik</DisplayName>"))
+                    #expect(body.contains("<StorageClass>STANDARD</StorageClass>"))
+                })
+
+            let uploadId = try #require(uploadIds["root.bin"])
+            let partsSigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/root.bin", query: "uploadId=\(uploadId)")
+            try await app.test(
+                .GET, "/\(bucketName)/root.bin?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: partsSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Initiator>"))
+                    #expect(res.body.string.contains("<Owner>"))
+                    #expect(res.body.string.contains("<StorageClass>STANDARD</StorageClass>"))
+                })
+        }
+    }
 }

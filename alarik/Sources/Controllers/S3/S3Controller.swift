@@ -112,13 +112,19 @@ struct S3Controller: RouteCollection {
                 marker: params.marker
             )
 
+        // Owner costs two metadata reads, so only when the response carries it.
+        let owner =
+            (!params.isV2 || params.fetchOwner)
+            ? await S3Service.bucketOwner(app: req.application, bucketName: bucketName) : nil
+
         // listObjects already returns the latest version of each object and filters delete markers
         let xmlData = try S3Service.buildListObjectsResponse(
             params: params,
             objects: objects,
             commonPrefixes: commonPrefixes,
             isTruncated: isTruncated,
-            nextMarker: nextMarker
+            nextMarker: nextMarker,
+            owner: owner
         )
 
         return S3Service.buildXMLResponse(data: xmlData)
@@ -1671,7 +1677,7 @@ struct S3Controller: RouteCollection {
             {
                 return forwarded
             }
-            return try handleListParts(
+            return try await handleListParts(
                 req: req,
                 bucketName: bucketName,
                 key: keyPath,
@@ -1920,6 +1926,8 @@ struct S3Controller: RouteCollection {
         let bucketName = try S3Service.extractBucketName(from: req)
         let keyPath = S3Service.extractObjectKey(from: req)
 
+        try await S3Service.verifyBucketExists(
+            bucketName, app: req.application, requestId: req.id)
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
 
         // AbortMultipartUpload must pin to the exact node coordinating this upload's Create,
@@ -2666,7 +2674,7 @@ struct S3Controller: RouteCollection {
         bucketName: String,
         key: String,
         uploadId: String
-    ) throws -> Response {
+    ) async throws -> Response {
         // Verify upload exists - a missing/aborted upload must surface as NoSuchUpload,
         // not as whatever the file layer throws (which would become a 500)
         guard MultipartFileHandler.uploadExists(bucketName: bucketName, uploadId: uploadId) else {
@@ -2711,6 +2719,8 @@ struct S3Controller: RouteCollection {
         let algorithmXml =
             checksumAlgorithm.map { "\n    <ChecksumAlgorithm>\($0.uppercased())</ChecksumAlgorithm>" }
             ?? ""
+        let owner = await S3Service.bucketOwner(app: req.application, bucketName: bucketName)
+        let ownerXml = owner.map { "\n    <Initiator>\($0.xml)</Initiator>\n    <Owner>\($0.xml)</Owner>" } ?? ""
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
             <ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -2720,7 +2730,8 @@ struct S3Controller: RouteCollection {
                 <PartNumberMarker>\(partNumberMarker)</PartNumberMarker>
                 <NextPartNumberMarker>\(nextPartNumberMarker ?? 0)</NextPartNumberMarker>
                 <MaxParts>\(maxParts)</MaxParts>
-                <IsTruncated>\(isTruncated)</IsTruncated>\(algorithmXml)
+                <IsTruncated>\(isTruncated)</IsTruncated>\(algorithmXml)\(ownerXml)
+                <StorageClass>STANDARD</StorageClass>
             \(partsXml)
             </ListPartsResult>
             """
@@ -2836,11 +2847,12 @@ struct S3Controller: RouteCollection {
         -> Response
     {
         let prefix = req.query[String.self, at: "prefix"] ?? ""
+        let delimiter = req.query[String.self, at: "delimiter"]
         let keyMarker = req.query[String.self, at: "key-marker"]
         let uploadIdMarker = req.query[String.self, at: "upload-id-marker"]
         let maxUploads = try S3Service.listLimit(from: req, name: "max-uploads")
 
-        let (uploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
+        let (allUploads, isTruncated, nextKeyMarker, nextUploadIdMarker) =
             try await ClusterListingService.listUploads(
                 req: req,
                 bucketName: bucketName,
@@ -2850,16 +2862,38 @@ struct S3Controller: RouteCollection {
                 maxUploads: maxUploads
             )
 
+        // A delimiter rolls uploads below a "folder" up into CommonPrefixes, like ListObjects.
+        var uploads: [MultipartUploadMeta] = []
+        var commonPrefixes: [String] = []
+        for upload in allUploads {
+            if let commonPrefix = ObjectFileHandler.commonPrefix(of: upload.key, prefix: prefix, delimiter: delimiter) {
+                if !commonPrefixes.contains(commonPrefix) { commonPrefixes.append(commonPrefix) }
+            } else {
+                uploads.append(upload)
+            }
+        }
+
+        let owner = await S3Service.bucketOwner(app: req.application, bucketName: bucketName)
+        let ownerXml = owner.map { "\n            <Initiator>\($0.xml)</Initiator>\n            <Owner>\($0.xml)</Owner>" } ?? ""
         var uploadsXml = ""
         for upload in uploads {
             uploadsXml += """
                     <Upload>
                         <Key>\(upload.key.xmlEscaped)</Key>
-                        <UploadId>\(upload.uploadId)</UploadId>
+                        <UploadId>\(upload.uploadId)</UploadId>\(ownerXml)
+                        <StorageClass>STANDARD</StorageClass>
                         <Initiated>\(upload.initiated.iso8601String)</Initiated>
                     </Upload>
                 """
         }
+        for commonPrefix in commonPrefixes {
+            uploadsXml += """
+                    <CommonPrefixes>
+                        <Prefix>\(commonPrefix.xmlEscaped)</Prefix>
+                    </CommonPrefixes>
+                """
+        }
+        let delimiterXml = delimiter.map { "\n    <Delimiter>\($0.xmlEscaped)</Delimiter>" } ?? ""
 
         let xml = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -2871,7 +2905,7 @@ struct S3Controller: RouteCollection {
                 <NextUploadIdMarker>\((nextUploadIdMarker ?? "").xmlEscaped)</NextUploadIdMarker>
                 <MaxUploads>\(maxUploads)</MaxUploads>
                 <IsTruncated>\(isTruncated)</IsTruncated>
-                <Prefix>\(prefix.xmlEscaped)</Prefix>
+                <Prefix>\(prefix.xmlEscaped)</Prefix>\(delimiterXml)
             \(uploadsXml)
             </ListMultipartUploadsResult>
             """

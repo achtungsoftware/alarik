@@ -103,16 +103,20 @@ struct ListBucketResult: Encodable {
     let marker: String?
     let nextMarker: String?
     let maxKeys: Int
+    let delimiter: String?
+    let encodingType: String?
     let isTruncated: Bool
     let contents: [ObjectEntry]
     let commonPrefixes: [CommonPrefix]
-    
+
     enum CodingKeys: String, CodingKey {
         case name = "Name"
         case prefix = "Prefix"
         case marker = "Marker"
         case nextMarker = "NextMarker"
         case maxKeys = "MaxKeys"
+        case delimiter = "Delimiter"
+        case encodingType = "EncodingType"
         case isTruncated = "IsTruncated"
         case contents = "Contents"
         case commonPrefixes = "CommonPrefixes"
@@ -127,10 +131,12 @@ struct ListBucketResultV2: Encodable {
     let nextContinuationToken: String?
     let keyCount: Int
     let maxKeys: Int
+    let delimiter: String?
+    let encodingType: String?
     let isTruncated: Bool
     let contents: [ObjectEntry]
     let commonPrefixes: [CommonPrefix]
-    
+
     enum CodingKeys: String, CodingKey {
         case name = "Name"
         case prefix = "Prefix"
@@ -139,6 +145,8 @@ struct ListBucketResultV2: Encodable {
         case nextContinuationToken = "NextContinuationToken"
         case keyCount = "KeyCount"
         case maxKeys = "MaxKeys"
+        case delimiter = "Delimiter"
+        case encodingType = "EncodingType"
         case isTruncated = "IsTruncated"
         case contents = "Contents"
         case commonPrefixes = "CommonPrefixes"
@@ -151,13 +159,31 @@ struct ObjectEntry: Encodable {
     let etag: String
     let size: Int
     let storageClass: String
-    
+    /// Present in every V1 listing and in V2 with `fetch-owner=true`, as on S3.
+    let owner: OwnerEntry?
+
     enum CodingKeys: String, CodingKey {
         case key = "Key"
         case lastModified = "LastModified"
         case etag = "ETag"
         case size = "Size"
         case storageClass = "StorageClass"
+        case owner = "Owner"
+    }
+}
+
+/// The bucket owner as S3 reports it: the owning user's id and username.
+struct OwnerEntry: Encodable {
+    let id: String
+    let displayName: String
+
+    enum CodingKeys: String, CodingKey {
+        case id = "ID"
+        case displayName = "DisplayName"
+    }
+
+    var xml: String {
+        "<ID>\(id.xmlEscaped)</ID><DisplayName>\(displayName.xmlEscaped)</DisplayName>"
     }
 }
 
