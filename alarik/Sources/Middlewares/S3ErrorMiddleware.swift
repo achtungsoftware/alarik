@@ -64,7 +64,35 @@ struct S3ErrorMiddleware: Middleware {
 
     /// Maps a non-`S3Error` to the closest S3 error code. Client faults (`Abort` 4xx) keep their
     /// reason; server faults never leak internals into the body.
+    /// A disk-full failure surfaced by the storage layer (`AtomicObjectWriter`, spool sink,
+    /// Foundation file writes). Reported as 507 so a client does not retry it as a 500.
+    static func isOutOfSpace(_ error: any Error) -> Bool {
+        if let writeError = error as? AtomicObjectWriter.WriteError {
+            switch writeError {
+            case .writeFailed(let code), .fsyncFailed(let code), .openFailed(_, let code),
+                .renameFailed(let code):
+                return code == ENOSPC || code == EDQUOT
+            case .alreadyFinished:
+                return false
+            }
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            return nsError.code == Int(ENOSPC) || nsError.code == Int(EDQUOT)
+        }
+        if nsError.domain == NSCocoaErrorDomain {
+            return nsError.code == CocoaError.fileWriteOutOfSpace.rawValue
+        }
+        return false
+    }
+
     private static func s3Classification(of error: any Error) -> (HTTPStatus, String, String) {
+        if isOutOfSpace(error) {
+            return (
+                .insufficientStorage, "InsufficientStorage",
+                "Not enough storage space is available to complete this request."
+            )
+        }
         let abort = error as? any AbortError
         let status = abort?.status ?? .internalServerError
         let reason = abort?.reason ?? ""

@@ -133,6 +133,11 @@ enum StreamingBodySpooler {
     /// Pass nil only for anonymous/presigned requests, which never use signed chunked
     /// encoding.
     static func spool(req: Request, authInfo: S3AuthInfo?) async throws -> SpooledBody {
+        try DiskSpace.ensureRoom(
+            forUpload: req.headers.first(name: "x-amz-decoded-content-length").flatMap(Int.init)
+                ?? req.headers.first(name: .contentLength).flatMap(Int.init),
+            requestId: req.id)
+
         let declaredSha = req.headers.first(name: "x-amz-content-sha256")
         let isChunked = S3PayloadHash.isStreaming(declaredSha)
 

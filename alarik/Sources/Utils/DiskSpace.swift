@@ -20,6 +20,41 @@ import Vapor
 /// Platform-branched filesystem capacity lookup, shared by the admin storage-stats endpoint and
 /// the cluster heartbeat's self-reported capacity.
 enum DiskSpace {
+    /// Hard floor of free space below which uploads are refused, as a percentage of the volume
+    /// holding `Storage/`. Independent of the cluster's soft `CLUSTER_MIN_FREE_PERCENT`
+    /// redirect: this one applies on every node, clustered or not, because a disk that fills
+    /// completely takes metadata writes down with it. `ALARIK_MIN_FREE_PERCENT`, default 1.
+    static func minFreePercent() -> Double {
+        Environment.sanitizedGet("ALARIK_MIN_FREE_PERCENT").flatMap(Double.init) ?? 1.0
+    }
+
+    /// Whether an upload of `declaredLength` bytes (nil when unknown) fits without taking the
+    /// volume below the floor. Unknown capacity (0 total) fails open.
+    static func hasRoom(
+        total: Int64, available: Int64, declaredLength: Int?, minFreePercent: Double
+    ) -> Bool {
+        guard total > 0 else { return true }
+        let remaining = available - Int64(declaredLength ?? 0)
+        return Double(remaining) / Double(total) * 100 >= minFreePercent
+    }
+
+    /// Throws `InsufficientStorage` when the volume cannot take `declaredLength` more bytes
+    /// without crossing the floor. Checked before a body is spooled, so a doomed upload is
+    /// refused at once instead of failing with ENOSPC after transferring gigabytes.
+    static func ensureRoom(forUpload declaredLength: Int?, requestId: String) throws {
+        let (total, available) = availableAndTotal(for: URL(fileURLWithPath: BucketHandler.rootPath))
+        guard
+            hasRoom(
+                total: total, available: available, declaredLength: declaredLength,
+                minFreePercent: minFreePercent())
+        else {
+            throw S3Error(
+                status: .insufficientStorage, code: "InsufficientStorage",
+                message: "Not enough storage space is available to store this object.",
+                requestId: requestId)
+        }
+    }
+
     static func availableAndTotal(for url: URL) -> (total: Int64, available: Int64) {
         // Test-only override: e2e cluster tests run multiple node processes on one machine
         // sharing a single physical disk, so every node always reports virtually identical real
