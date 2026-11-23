@@ -273,7 +273,11 @@ enum ClusterListingService {
         guard let config = req.application.storage[ClusterConfigurationKey.self] else {
             return false
         }
-        let peers = await activePeers(config: config)
+        // Every registered peer, not the live set: a node that is down - crashed, or stopped and
+        // announced it - may still hold this bucket's objects, and "could not ask" must fail
+        // the delete, never pass it. Only a decommissioned node, whose data has moved off, is
+        // out of the question.
+        let peers = await ClusterNodeCache.shared.reachablePeers().filter { $0.id != config.nodeId }
         guard !peers.isEmpty else { return false }
 
         return try await withThrowingTaskGroup(of: Bool.self) { group in
