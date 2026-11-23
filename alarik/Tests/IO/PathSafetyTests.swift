@@ -42,7 +42,9 @@ struct PathSafetyTests {
         let bucket = "b"
         let key = "../docs/../x"
         let stem = ObjectFileHandler.keyBasePath(bucketName: bucket, key: key)
-        #expect(stem == "Storage/buckets/b//docs//x")
+        // `..` is stripped first; the components it leaves empty are then escaped so they cannot
+        // collapse on disk (`KeyPathEncoding`).
+        #expect(stem == "Storage/buckets/b/~/docs/~/x")
         #expect(ObjectFileHandler.storagePath(for: bucket, key: key) == stem + ".obj")
         #expect(ObjectFileHandler.versionedBasePath(for: bucket, key: key) == stem + ".versions/")
         #expect(ErasureCodedObjectHandler.shardBasePath(bucketName: bucket, key: key) == stem + ".ecshards/")
