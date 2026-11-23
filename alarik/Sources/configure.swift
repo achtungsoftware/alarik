@@ -313,6 +313,18 @@ public func configure(_ app: Application) async throws {
             }
         }
 
+        // Outbox durability for the two collections nothing else can rebuild (webhooks, bucket
+        // replication): mirror this node's rows to peers and adopt rows of nodes that left.
+        // See `OutboxMailbox.runBackupSweep`.
+        if app.storage[ClusterConfigurationKey.self] != nil {
+            app.eventLoopGroup.next().scheduleRepeatedTask(
+                initialDelay: .seconds(30),
+                delay: .seconds(60)
+            ) { task in
+                Task { await OutboxMailbox.runBackupSweep(app: app) }
+            }
+        }
+
         // Webhook outbox tick: fresh events are delivered near-instantly via the explicit
         // wake() in NotificationService - this tick exists to pick up retries whose backoff
         // has elapsed (and anything left over from before a restart). The drain query is a

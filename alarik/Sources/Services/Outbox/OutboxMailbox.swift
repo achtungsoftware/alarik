@@ -56,11 +56,38 @@ enum OutboxMailbox {
     /// mirroring outright (single-node deployments have no peers to mirror to anyway).
     static let defaultReplicaCount = 2
 
-    private static func replicaCount(app: Application) -> Int {
-        guard let raw = Environment.sanitizedGet("CLUSTER_METADATA_REPLICA_COUNT"),
-            let value = Int(raw), value >= 1
-        else { return defaultReplicaCount }
-        return value
+    /// `CLUSTER_OUTBOX_REPLICA_COUNT`; `CLUSTER_METADATA_REPLICA_COUNT` is the name it shipped
+    /// under and is still honoured.
+    static func replicaCount(app: Application) -> Int {
+        for name in ["CLUSTER_OUTBOX_REPLICA_COUNT", "CLUSTER_METADATA_REPLICA_COUNT"] {
+            if let raw = Environment.sanitizedGet(name), let value = Int(raw), value >= 1 {
+                return value
+            }
+        }
+        return defaultReplicaCount
+    }
+
+    /// The collections that have no independent ground truth to rebuild from, and so are the
+    /// ones mirrored: a lost webhook or bucket-replication row is a delivery that never happens.
+    /// Cluster replication and shard repair rows are backstopped by the rebalance walks.
+    static let mirroredCollections = [
+        OutboxCollections.notificationDeliveries, OutboxCollections.replicationTasks,
+    ]
+
+    /// One periodic pass of the durability scheme: re-mirror this node's own rows, then adopt
+    /// rows whose owner has dropped out of the cluster. Wakes the dispatchers when anything was
+    /// adopted so the work resumes without waiting for their own tick.
+    static func runBackupSweep(app: Application) async {
+        guard app.storage[ClusterConfigurationKey.self] != nil else { return }
+        await mirrorBackups(
+            NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
+        await mirrorBackups(ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
+        let adoptedDeliveries = await promoteOrphanedBackups(
+            NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
+        let adoptedReplications = await promoteOrphanedBackups(
+            ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
+        if adoptedDeliveries > 0 { NotificationDispatcher.shared.wake() }
+        if adoptedReplications > 0 { ReplicationDispatcher.shared.wake() }
     }
 
     /// This node's own stable identity for mailbox-ownership purposes. Prefers
@@ -391,10 +418,11 @@ enum OutboxMailbox {
     /// this node's own `outbox/<collection>/<selfId>/`, re-owning it. A deterministic HRW
     /// tie-break (via `PlacementService`) among the other backup-holders ensures at most one
     /// promotes any given task, even though every holder runs this sweep independently.
+    @discardableResult
     static func promoteOrphanedBackups<Row: OutboxMailboxRow>(
         _ type: Row.Type, app: Application, collection: String
-    ) async {
-        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+    ) async -> Int {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return 0 }
         let selfId = config.nodeId
         // Liveness decides WHETHER to promote (is the owner gone?); stable placement decides WHO
         // promotes. Electing from the live set would let two nodes with slightly different
@@ -406,8 +434,9 @@ enum OutboxMailbox {
 
         let backupEntries = OutboxMailboxFileHandler.listAllOwnerTaskIds(
             root: OutboxMailboxFileHandler.backupRootPath, collection: collection)
-        guard !backupEntries.isEmpty else { return }
+        guard !backupEntries.isEmpty else { return 0 }
 
+        var promoted = 0
         for (ownerNodeId, taskId) in backupEntries {
             guard !activeIds.contains(ownerNodeId) else { continue }
 
@@ -433,9 +462,21 @@ enum OutboxMailbox {
             }
 
             row.ownerNodeId = selfId
-            try? update(row, collection: collection)
+            do {
+                try update(row, collection: collection)
+            } catch {
+                app.logger.warning(
+                    "Could not adopt outbox task \(taskId) of departed node \(ownerNodeId): \(error)")
+                continue
+            }
             OutboxMailboxFileHandler.remove(path: backupPath)
+            promoted += 1
         }
+        if promoted > 0 {
+            app.logger.notice(
+                "Adopted \(promoted) queued \(collection) task(s) whose owner left the cluster.")
+        }
+        return promoted
     }
 
     // MARK: - Reassignment on graceful drain
