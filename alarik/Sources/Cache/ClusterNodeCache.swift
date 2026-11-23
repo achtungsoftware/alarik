@@ -142,6 +142,19 @@ final actor ClusterNodeCache {
         nodes[node.id] = node
     }
 
+    /// An operator changed the node's standing (drain, decommission). Applied outright: unlike a
+    /// gossiped snapshot, this is not a guess about the node that a fresher heartbeat could
+    /// contradict, so it must not go through `reconcile`'s freshness rule - the record's
+    /// heartbeat is only as recent as its last durable write, and a peer whose cache held a
+    /// fresher heartbeat used to drop the status change and keep gossiping the old standing.
+    func setStatus(id: UUID, status: ClusterNode.Status) {
+        guard let existing = nodes[id] else { return }
+        nodes[id] = ClusterNodeInfo(
+            id: existing.id, address: existing.address, status: status,
+            lastHeartbeatAt: existing.lastHeartbeatAt, totalBytes: existing.totalBytes,
+            availableBytes: existing.availableBytes, reportedOffline: existing.reportedOffline)
+    }
+
     /// The node announced it is stopping: drop it from the live set now, keep its standing.
     func markOffline(id: UUID) {
         guard let existing = nodes[id] else { return }

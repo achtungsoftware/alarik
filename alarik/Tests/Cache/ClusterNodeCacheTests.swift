@@ -36,6 +36,24 @@ struct ClusterNodeCacheTests {
         #expect(fetched?.status == .active)
     }
 
+    @Test("an operator's status change applies regardless of the heartbeat the cache holds")
+    func setStatusIgnoresFreshness() async {
+        let cache = ClusterNodeCache()
+        let id = UUID()
+        let fresh = Date()
+        await cache.upsert(ClusterNodeInfo(id: id, address: "http://a:8080", status: .active, lastHeartbeatAt: fresh))
+        await cache.setStatus(id: id, status: .draining)
+        #expect(await cache.get(id: id)?.status == .draining)
+        #expect(await cache.get(id: id)?.lastHeartbeatAt == fresh)
+        #expect(await cache.placementNodes().isEmpty)
+        // A gossiped snapshot with the same heartbeat cannot revive it.
+        await cache.reconcile(snapshot: [ClusterNodeInfo(id: id, address: "http://a:8080", status: .active, lastHeartbeatAt: fresh)])
+        #expect(await cache.get(id: id)?.status == .draining)
+        // Unknown node: nothing to change.
+        await cache.setStatus(id: UUID(), status: .removed)
+        #expect(await cache.all().count == 1)
+    }
+
     @Test("a node that announced its shutdown leaves the live set at once but keeps its placement")
     func markOfflineDropsLivenessOnly() async {
         let cache = ClusterNodeCache()

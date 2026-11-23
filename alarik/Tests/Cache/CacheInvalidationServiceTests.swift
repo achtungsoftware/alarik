@@ -81,6 +81,27 @@ struct CacheInvalidationServiceTests {
         }
     }
 
+    @Test("a clusterNodeStatus message changes the standing even against a fresher cached heartbeat")
+    func statusMessageAppliesOutright() async throws {
+        try await withApp { app in
+            let id = UUID()
+            await ClusterNodeCache.shared.load(initialData: [
+                ClusterNodeInfo(id: id, address: "http://peer.internal", status: .active, lastHeartbeatAt: Date())
+            ])
+            try await CacheReloadDispatch.apply(
+                message: CacheInvalidationMessage(
+                    cache: CacheInvalidationService.clusterNodeStatusCache, op: .upsert, key: id.uuidString,
+                    nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
+                        id: id, address: "http://peer.internal", status: .draining,
+                        // The record's heartbeat: as of its last durable write, well in the past.
+                        lastHeartbeatAt: Date(timeIntervalSinceNow: -3600), totalBytes: nil, availableBytes: nil)),
+                app: app)
+            #expect(await ClusterNodeCache.shared.get(id: id)?.status == .draining)
+            #expect(await ClusterNodeCache.shared.placementNodes().isEmpty)
+            await ClusterNodeCache.shared.load(initialData: [])
+        }
+    }
+
     @Test("a clusterNodeOffline message marks the node unreachable without touching its standing")
     func offlineMessageMarksNode() async throws {
         try await withApp { app in

@@ -64,6 +64,9 @@ struct CacheInvalidationMessage: Codable, Sendable {
 enum CacheInvalidationService {
     /// `cache` name of the goodbye a stopping node sends; `key` is its id.
     static let clusterNodeOfflineCache = "clusterNodeOffline"
+    /// `cache` name of an operator's status change (drain, decommission); `key` is the node id
+    /// and `nodeInfo.status` the new standing. See `ClusterNodeCache.setStatus`.
+    static let clusterNodeStatusCache = "clusterNodeStatus"
 
     /// Tells every live peer this node is stopping, so they stop forwarding to it now rather
     /// than after `ClusterNodeCache.heartbeatStaleness`. One attempt per peer with a short

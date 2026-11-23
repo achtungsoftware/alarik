@@ -218,6 +218,14 @@ enum CacheReloadDispatch {
                 await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
                 await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
             }
+        case (CacheInvalidationService.clusterNodeStatusCache, .upsert):
+            // An operator's decision about a node's standing, applied regardless of heartbeat
+            // freshness (`ClusterNodeCache.setStatus`). Placement changed, so walk.
+            if let uuid = UUID(uuidString: message.key), let status = message.nodeInfo?.status {
+                await ClusterNodeCache.shared.setStatus(id: uuid, status: status)
+                await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+                await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
+            }
         case (CacheInvalidationService.clusterNodeOfflineCache, .upsert):
             // A node stopping gracefully. Liveness only - its standing is unchanged, so no
             // rebalance: a restart must not shuffle data.

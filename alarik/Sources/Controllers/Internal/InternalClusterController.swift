@@ -207,22 +207,24 @@ struct InternalClusterController: RouteCollection {
             ReplicationTask.self, app: req.application, collection: OutboxCollections.replicationTasks,
             departingNodeId: nodeId)
 
-        await ClusterNodeCache.shared.upsert(
-            ClusterNodeInfo(
-                id: nodeId, address: node.address, status: .draining,
-                lastHeartbeatAt: node.lastHeartbeatAt,
-                totalBytes: node.totalBytes, availableBytes: node.availableBytes))
-        CacheInvalidationService.notify(
-            app: req.application, cache: "clusterNode", op: .upsert, key: nodeId.uuidString,
+        // The standing changes everywhere at once and outright: a status message, not a snapshot
+        // upsert that peers would weigh against the heartbeat they hold (`ClusterNodeCache
+        // .setStatus`). Awaited, so the response means every live peer has stopped placing on
+        // the node - not that it will within a gossip round, during which a peer still gossiping
+        // the old standing would revive it here.
+        await ClusterNodeCache.shared.setStatus(id: nodeId, status: .draining)
+        await CacheInvalidationService.notifyAndWait(
+            app: req.application, cache: CacheInvalidationService.clusterNodeStatusCache, op: .upsert,
+            key: nodeId.uuidString,
             nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
                 id: nodeId, address: node.address, status: .draining,
                 lastHeartbeatAt: node.lastHeartbeatAt, totalBytes: node.totalBytes,
                 availableBytes: node.availableBytes))
-        // `CacheReloadDispatch`'s `("clusterNode", .upsert)` case triggers a rebalance walk on
-        // every node that RECEIVES the broadcast above - but `notify` deliberately excludes the
-        // caller itself (see `resync`'s identical doc comment), so without this explicit call,
-        // whichever admin node happens to field this drain request would never run its own walk,
-        // even if it physically holds shards that now need to move off the just-drained node.
+        // The status message triggers a rebalance walk on every node that RECEIVES it - but the
+        // broadcast deliberately excludes the caller itself (see `resync`'s identical doc
+        // comment), so without this explicit call, whichever admin node happens to field this
+        // drain request would never run its own walk, even if it physically holds shards that
+        // now need to move off the just-drained node.
         await ClusterRebalanceService.scheduleRebalance(
             app: req.application, reason: .membershipChange)
         await ErasureCodedRebalanceService.scheduleRebalance(
@@ -267,13 +269,11 @@ struct InternalClusterController: RouteCollection {
         node.status = .removed
         try await node.save(app: req.application)
 
-        await ClusterNodeCache.shared.upsert(
-            ClusterNodeInfo(
-                id: nodeId, address: node.address, status: .removed,
-                lastHeartbeatAt: node.lastHeartbeatAt,
-                totalBytes: node.totalBytes, availableBytes: node.availableBytes))
-        CacheInvalidationService.notify(
-            app: req.application, cache: "clusterNode", op: .upsert, key: nodeId.uuidString,
+        // Same authoritative status message as `drainNode`.
+        await ClusterNodeCache.shared.setStatus(id: nodeId, status: .removed)
+        await CacheInvalidationService.notifyAndWait(
+            app: req.application, cache: CacheInvalidationService.clusterNodeStatusCache, op: .upsert,
+            key: nodeId.uuidString,
             nodeInfo: InternalClusterMetadataController.ClusterMemberWire(
                 id: nodeId, address: node.address, status: .removed,
                 lastHeartbeatAt: node.lastHeartbeatAt, totalBytes: node.totalBytes,
