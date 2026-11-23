@@ -420,26 +420,8 @@ struct InternalClusterErasureCodedController: RouteCollection {
             try await threadPool.runIfActive {
                 var writer = try AtomicObjectWriter(finalPath: path)
                 do {
-                    let sourceFd = POSIXFile.open(spoolPath, O_RDONLY)
-                    guard sourceFd >= 0 else {
-                        throw Abort(.internalServerError, reason: "Could not reopen shard spool file")
-                    }
-                    defer { _ = POSIXFile.close(sourceFd) }
-
-                    let windowSize = Constants.fileCopyWindowSize
-                    var window = [UInt8](repeating: 0, count: windowSize)
-                    var remaining = payloadSize
-                    while remaining > 0 {
-                        let toRead = Swift.min(windowSize, remaining)
-                        let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
-                        guard bytesRead > 0 else {
-                            throw Abort(.internalServerError, reason: "Shard spool file ended early")
-                        }
-                        try window.withUnsafeBytes { raw in
-                            try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-                        }
-                        remaining -= bytesRead
-                    }
+                    var reader = WindowedFileReader()
+                    try reader.read(path: spoolPath, offset: 0, size: payloadSize) { try writer.writeRaw($0) }
                     try writer.finish()
                 } catch {
                     writer.abort()

@@ -237,26 +237,8 @@ enum ErasureCodedWriteCoordinator {
         // approach the receiving side of a network shard push uses.
         var writer = try AtomicObjectWriter(finalPath: finalPath)
         do {
-            let sourceFd = POSIXFile.open(scratchPath, O_RDONLY)
-            guard sourceFd >= 0 else { throw ClusterProxyError.objectNotFound }
-            defer { _ = POSIXFile.close(sourceFd) }
-
-            var statInfo = stat()
-            guard POSIXFile.fstat(sourceFd, &statInfo) == 0 else {
-                throw ClusterProxyError.objectNotFound
-            }
-            var remaining = Int(statInfo.st_size)
-            let windowSize = Constants.fileCopyWindowSize
-            var window = [UInt8](repeating: 0, count: windowSize)
-            while remaining > 0 {
-                let toRead = Swift.min(windowSize, remaining)
-                let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
-                guard bytesRead > 0 else { throw ClusterProxyError.objectNotFound }
-                try window.withUnsafeBytes { raw in
-                    try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-                }
-                remaining -= bytesRead
-            }
+            var reader = WindowedFileReader()
+            try reader.readFile(at: scratchPath) { try writer.writeRaw($0) }
             try writer.finish()
         } catch {
             writer.abort()

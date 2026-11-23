@@ -101,22 +101,12 @@ struct ObjectFileHandler {
             var writer = try AtomicObjectWriter(finalPath: path)
             do {
                 try writeHeader(metadata: metadata, to: writer)
-
-                var window = [UInt8](repeating: 0, count: Constants.fileCopyWindowSize)
-
+                var reader = WindowedFileReader()
                 for source in payloadSources {
-                    let sourceFd = POSIXFile.open(source.path, O_RDONLY)
-                    guard sourceFd >= 0 else {
-                        throw NSError(
-                            domain: "FileError", code: Int(errno),
-                            userInfo: [NSLocalizedDescriptionKey: "Could not open payload source"])
+                    try reader.read(path: source.path, offset: source.offset, size: source.size) {
+                        try writer.writeRaw($0)
                     }
-                    defer { _ = POSIXFile.close(sourceFd) }
-                    try copyRegion(
-                        fd: sourceFd, offset: source.offset, size: source.size, into: writer,
-                        window: &window)
                 }
-
                 try writer.finish()
             } catch {
                 writer.abort()
@@ -138,8 +128,10 @@ struct ObjectFileHandler {
         var writer = try AtomicObjectWriter(finalPath: path)
         do {
             try writeHeader(metadata: metadata, to: writer)
-            var window = [UInt8](repeating: 0, count: Constants.fileCopyWindowSize)
-            try copyRegion(fd: fd, offset: payloadOffset, size: payloadSize, into: writer, window: &window)
+            var reader = WindowedFileReader()
+            try reader.read(fd: fd, offset: payloadOffset, size: payloadSize, path: path) {
+                try writer.writeRaw($0)
+            }
             try writer.finish()
         } catch {
             writer.abort()
@@ -147,26 +139,6 @@ struct ObjectFileHandler {
         }
     }
 
-    /// Copies `size` bytes from `offset` of `fd` into `writer`, one window at a time.
-    private static func copyRegion(
-        fd: Int32, offset: Int, size: Int, into writer: AtomicObjectWriter, window: inout [UInt8]
-    ) throws {
-        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
-        var remaining = size
-        while remaining > 0 {
-            let toRead = Swift.min(window.count, remaining)
-            let bytesRead = POSIXFile.read(fd, &window, toRead)
-            guard bytesRead > 0 else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Payload source ended early"])
-            }
-            try window.withUnsafeBytes { raw in
-                try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-            }
-            remaining -= bytesRead
-        }
-    }
 
     /// Updates an object's metadata in place without ever buffering its payload - used by
     /// tagging/metadata-only endpoints (PutObjectTagging, DeleteObjectTagging, the console's
@@ -194,32 +166,9 @@ struct ObjectFileHandler {
     /// CopyObject when the source's own ETag isn't a plain MD5 (multipart "-N" ETags) and the
     /// destination needs one without buffering the payload.
     static func md5HexOfFileRegion(path: String, offset: Int, size: Int) throws -> String {
-        let fd = POSIXFile.open(path, O_RDONLY)
-        guard fd >= 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
-        }
-        defer { _ = POSIXFile.close(fd) }
-        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
-
         var md5 = Insecure.MD5()
-        let windowSize = Constants.fileCopyWindowSize
-        var window = [UInt8](repeating: 0, count: windowSize)
-        var remaining = size
-        while remaining > 0 {
-            let toRead = Swift.min(windowSize, remaining)
-            let bytesRead = POSIXFile.read(fd, &window, toRead)
-            guard bytesRead > 0 else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "File region ended early"])
-            }
-            window.withUnsafeBytes { raw in
-                md5.update(bufferPointer: UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-            }
-            remaining -= bytesRead
-        }
+        var reader = WindowedFileReader()
+        try reader.read(path: path, offset: offset, size: size) { md5.update(bufferPointer: $0) }
         return md5.finalize().hexString()
     }
 
@@ -232,31 +181,8 @@ struct ObjectFileHandler {
         guard var checksum = TrailerChecksum(trailerHeaderName: "x-amz-checksum-\(algorithm)") else {
             return nil
         }
-        let fd = POSIXFile.open(path, O_RDONLY)
-        guard fd >= 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
-        }
-        defer { _ = POSIXFile.close(fd) }
-        _ = POSIXFile.lseek(fd, off_t(offset), SEEK_SET)
-
-        let windowSize = Constants.fileCopyWindowSize
-        var window = [UInt8](repeating: 0, count: windowSize)
-        var remaining = size
-        while remaining > 0 {
-            let toRead = Swift.min(windowSize, remaining)
-            let bytesRead = POSIXFile.read(fd, &window, toRead)
-            guard bytesRead > 0 else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "File region ended early"])
-            }
-            window.withUnsafeBytes { raw in
-                checksum.update(rawBufferPointer: UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-            }
-            remaining -= bytesRead
-        }
+        var reader = WindowedFileReader()
+        try reader.read(path: path, offset: offset, size: size) { checksum.update(rawBufferPointer: $0) }
         return checksum.finalizeBase64()
     }
 

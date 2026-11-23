@@ -248,36 +248,14 @@ struct MultipartFileHandler {
                 userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
         }
 
-        let sourceFd = POSIXFile.open(sourcePath, O_RDONLY)
-        guard sourceFd >= 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not open copy source"])
-        }
-        defer { _ = POSIXFile.close(sourceFd) }
-        _ = POSIXFile.lseek(sourceFd, off_t(sourceOffset), SEEK_SET)
-
         let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
         var writer = try AtomicObjectWriter(finalPath: partPath)
         var md5 = Insecure.MD5()
         do {
-            let windowSize = Constants.fileCopyWindowSize
-            var window = [UInt8](repeating: 0, count: windowSize)
-            var remaining = sourceSize
-            while remaining > 0 {
-                let toRead = Swift.min(windowSize, remaining)
-                let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
-                guard bytesRead > 0 else {
-                    throw NSError(
-                        domain: "InvalidFile", code: 0,
-                        userInfo: [NSLocalizedDescriptionKey: "Copy source ended early"])
-                }
-                try window.withUnsafeBytes { raw in
-                    let slice = UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead))
-                    md5.update(bufferPointer: slice)
-                    try writer.writeRaw(slice)
-                }
-                remaining -= bytesRead
+            var reader = WindowedFileReader()
+            try reader.read(path: sourcePath, offset: sourceOffset, size: sourceSize) { slice in
+                md5.update(bufferPointer: slice)
+                try writer.writeRaw(slice)
             }
             try writer.finish()
         } catch {

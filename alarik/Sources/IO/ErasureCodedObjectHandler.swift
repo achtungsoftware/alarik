@@ -349,29 +349,8 @@ enum ErasureCodedObjectHandler {
 
         var writer = try AtomicObjectWriter(finalPath: finalPath)
         do {
-            let sourceFd = POSIXFile.open(sourcePath, O_RDONLY)
-            guard sourceFd >= 0 else {
-                throw ErasureCodedObjectHandlerError.openFailed(path: sourcePath, errno: errno)
-            }
-            defer { _ = POSIXFile.close(sourceFd) }
-            var statInfo = stat()
-            guard POSIXFile.fstat(sourceFd, &statInfo) == 0 else {
-                throw ErasureCodedObjectHandlerError.openFailed(path: sourcePath, errno: errno)
-            }
-            var remaining = Int(statInfo.st_size)
-            let windowSize = Constants.fileCopyWindowSize
-            var window = [UInt8](repeating: 0, count: windowSize)
-            while remaining > 0 {
-                let toRead = Swift.min(windowSize, remaining)
-                let bytesRead = POSIXFile.read(sourceFd, &window, toRead)
-                guard bytesRead > 0 else {
-                    throw ErasureCodedObjectHandlerError.shortRead(path: sourcePath)
-                }
-                try window.withUnsafeBytes { raw in
-                    try writer.writeRaw(UnsafeRawBufferPointer(rebasing: raw.prefix(bytesRead)))
-                }
-                remaining -= bytesRead
-            }
+            var reader = WindowedFileReader()
+            try reader.readFile(at: sourcePath) { try writer.writeRaw($0) }
             try writer.finish()
         } catch {
             writer.abort()
