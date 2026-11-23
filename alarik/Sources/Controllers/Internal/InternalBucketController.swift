@@ -881,16 +881,7 @@ struct InternalBucketController: RouteCollection {
             // before touching disk - a prefix that's entirely ".." components (e.g. "../../")
             // sanitizes down to empty and must be rejected outright, not silently listed as
             // "zero matching keys, nothing to do".
-            var sanitizedPrefix = key
-            if sanitizedPrefix.contains("..") {
-                let components = sanitizedPrefix.components(separatedBy: "/")
-                sanitizedPrefix = components.map { $0.replacingOccurrences(of: "..", with: "") }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: "/")
-                if key.hasSuffix("/") && !sanitizedPrefix.hasSuffix("/") {
-                    sanitizedPrefix += "/"
-                }
-            }
+            let sanitizedPrefix = PathSafety.sanitizedPrefix(key)
             guard !sanitizedPrefix.isEmpty && sanitizedPrefix != "/" else {
                 throw Abort(.internalServerError, reason: "Invalid prefix for deletion")
             }

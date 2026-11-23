@@ -33,14 +33,7 @@ struct BucketHandler {
     /// `../../etc`-style traversal. Every bucket-name-to-path construction site should route
     /// through this rather than re-implementing its own encoding.
     static func encodedBucketName(_ name: String) -> String {
-        let sanitized: String
-        if name.contains("..") {
-            let components = name.components(separatedBy: "/")
-            sanitized = components.map { $0.replacingOccurrences(of: "..", with: "") }.joined(
-                separator: "/")
-        } else {
-            sanitized = name
-        }
+        let sanitized = PathSafety.strippingDotDot(name)
         return sanitized.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sanitized
     }
 
@@ -133,14 +126,7 @@ struct BucketHandler {
     static func calculateStats(bucketName: String, prefix: String = "") -> (
         sizeBytes: Int64, objectCount: Int
     ) {
-        var sanitizedPrefix = prefix
-        if sanitizedPrefix.contains("..") {
-            let components = sanitizedPrefix.components(separatedBy: "/")
-            sanitizedPrefix = components.map { $0.replacingOccurrences(of: "..", with: "") }
-                .filter { !$0.isEmpty }
-                .joined(separator: "/")
-        }
-
+        let sanitizedPrefix = PathSafety.sanitizedPrefix(prefix)
         let url =
             sanitizedPrefix.isEmpty
             ? bucketURL(for: bucketName)

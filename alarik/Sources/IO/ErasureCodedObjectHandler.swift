@@ -61,18 +61,10 @@ enum ErasureCodedObjectHandler {
     static let jsonEncoder = JSONEncoder()
     static let jsonDecoder = JSONDecoder()
 
-    private static func sanitizedKey(_ key: String) -> String {
-        guard key.contains("..") else { return key }
-        return key.components(separatedBy: "/")
-            .map { $0.replacingOccurrences(of: "..", with: "") }
-            .joined(separator: "/")
-    }
-
     /// Directory holding every shard file for the non-versioned (or versioning-disabled)
     /// current object at `key`.
     static func shardBasePath(bucketName: String, key: String) -> String {
-        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
-        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey(key)).ecshards/"
+        ObjectFileHandler.keyBasePath(bucketName: bucketName, key: key) + ".ecshards/"
     }
 
     static func shardPath(bucketName: String, key: String, shardIndex: Int) -> String {
@@ -85,9 +77,8 @@ enum ErasureCodedObjectHandler {
     /// containing path metacharacters must never escape the `.versions/` directory, especially
     /// here where delete paths remove this directory recursively.
     static func versionedShardBasePath(bucketName: String, key: String, versionId: String) -> String {
-        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
-        let safeVersionId = ObjectFileHandler.sanitizedVersionId(versionId)
-        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey(key)).versions/\(safeVersionId).ecshards/"
+        ObjectFileHandler.versionedBasePath(for: bucketName, key: key)
+            + ObjectFileHandler.sanitizedVersionId(versionId) + ".ecshards/"
     }
 
     static func versionedShardPath(
@@ -456,7 +447,7 @@ enum ErasureCodedObjectHandler {
         if let key {
             roots = [
                 shardBasePath(bucketName: bucketName, key: key),
-                "\(bucketPath)/\(sanitizedKey(key)).versions/",
+                ObjectFileHandler.versionedBasePath(for: bucketName, key: key),
             ]
         } else {
             roots = [bucketPath]
@@ -521,7 +512,7 @@ enum ErasureCodedObjectHandler {
         // record - purely to throw away the ones whose key didn't match.
         let searchRoot: String
         if let lastSlash = keyPrefix.lastIndex(of: "/") {
-            searchRoot = "\(bucketPath)/\(sanitizedKey(String(keyPrefix[..<lastSlash])))"
+            searchRoot = "\(bucketPath)/\(PathSafety.strippingDotDot(String(keyPrefix[..<lastSlash])))"
         } else {
             searchRoot = bucketPath
         }

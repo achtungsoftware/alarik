@@ -430,21 +430,15 @@ struct ObjectFileHandler {
         return (metadata, Data(dataBytes))
     }
 
-    /// Generates the storage path for an object.
+    /// `Storage/buckets/<bucket>/<key>` - the stem every on-disk form of a key hangs off:
+    /// `.obj`, `.versions/`, `.ecshards/`. Bucket and key are made path-safe here, once.
+    static func keyBasePath(bucketName: String, key: String) -> String {
+        "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))/\(PathSafety.strippingDotDot(key))"
+    }
+
+    /// The non-versioned object file for a key.
     static func storagePath(for bucketName: String, key: String) -> String {
-        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
-
-        // Optimize path sanitization
-        let sanitizedKey: String
-        if key.contains("..") {
-            let components = key.components(separatedBy: "/")
-            sanitizedKey = components.map { $0.replacingOccurrences(of: "..", with: "") }.joined(
-                separator: "/")
-        } else {
-            sanitizedKey = key
-        }
-
-        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey).obj"
+        keyBasePath(bucketName: bucketName, key: key) + ".obj"
     }
 
     /// Checks if an object exists (as a directory/file).
@@ -927,18 +921,7 @@ struct ObjectFileHandler {
     /// Returns the base directory path for versioned objects
     /// Structure: Storage/buckets/{bucket}/{key}/.versions/
     static func versionedBasePath(for bucketName: String, key: String) -> String {
-        let encodedBucket = BucketHandler.encodedBucketName(bucketName)
-
-        let sanitizedKey: String
-        if key.contains("..") {
-            let components = key.components(separatedBy: "/")
-            sanitizedKey = components.map { $0.replacingOccurrences(of: "..", with: "") }.joined(
-                separator: "/")
-        } else {
-            sanitizedKey = key
-        }
-
-        return "\(BucketHandler.rootPath)\(encodedBucket)/\(sanitizedKey).versions/"
+        keyBasePath(bucketName: bucketName, key: key) + ".versions/"
     }
 
     /// Neutralizes path metacharacters in a client-supplied version id before it's interpolated
