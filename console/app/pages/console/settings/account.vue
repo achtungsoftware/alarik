@@ -24,8 +24,18 @@ const state = reactive({
     newPassword: "",
 });
 
+// The server demands the current password for a rename as well as for a password change (a
+// rename can bind the account to someone else's SSO identity). Ask for it up front instead of
+// letting the request bounce.
+const isRenaming = computed(() => state.username.trim() !== user.value.username);
+const needsCurrentPassword = computed(() => isRenaming.value || state.newPassword !== "");
+
 async function submitForm(event: FormSubmitEvent<any>) {
     event.preventDefault();
+    if (needsCurrentPassword.value && state.currentPassword === "") {
+        error.value = "Enter your current password to change your username or password.";
+        return;
+    }
     try {
         isLoading.value = true;
         error.value = "";
@@ -121,7 +131,7 @@ async function deleteAccount() {
                             <UInput v-model="state.username" placeholder="Username" size="lg" variant="subtle" />
                         </UFormField>
 
-                        <UFormField name="currentPassword" label="Current Password" description="Required to change your password" class="flex flex-col sm:flex-row justify-between items-start sm:gap-4">
+                        <UFormField name="currentPassword" label="Current Password" description="Required to change your username or password" :required="needsCurrentPassword" class="flex flex-col sm:flex-row justify-between items-start sm:gap-4">
                             <UInput v-model="state.currentPassword" type="password" placeholder="Current Password" size="lg" variant="subtle" />
                         </UFormField>
 
