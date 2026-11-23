@@ -579,58 +579,79 @@ enum ClusterListingService {
 
     /// Same shape as `mergeObjectsPages`; dedup key is `(key, versionId ?? "null")` since
     /// versions and delete markers share one id-space per key (a given version id is either a
-    /// real version or a delete marker, never both). commonPrefixes are unioned/sorted but
-    /// deliberately never counted toward `maxKeys`/`isTruncated` - preserving the existing local
-    /// `ObjectFileHandler.listAllVersions` quirk rather than "fixing" it as a side effect of
-    /// this change.
+    /// real version or a delete marker, never both). Common prefixes count toward `maxKeys` and
+    /// take part in the truncation window exactly as the local lister counts them; a page that
+    /// ends on one resumes after the whole folder (key marker only).
     static func mergeVersionsPages(
         _ pages: [VersionsPage], maxKeys: Int
     ) -> (
         versions: [ObjectMeta], deleteMarkers: [ObjectMeta], commonPrefixes: [String],
         isTruncated: Bool, nextKeyMarker: String?, nextVersionIdMarker: String?
     ) {
+        enum Entry {
+            case version(ObjectMeta, isDeleteMarker: Bool)
+            case prefix(String)
+            var key: String {
+                switch self {
+                case .version(let m, _): m.key
+                case .prefix(let p): p
+                }
+            }
+        }
+
         var seen = Set<String>()
         var seenPrefixes = Set<String>()
-        var combined: [(meta: ObjectMeta, isDeleteMarker: Bool)] = []
-        var commonPrefixes: [String] = []
+        var entries: [Entry] = []
         var anyTruncated = false
 
         for page in pages {
             anyTruncated = anyTruncated || page.isTruncated
             for meta in page.versions
             where seen.insert("\(meta.key)\u{0}\(meta.versionId ?? "null")").inserted {
-                combined.append((meta, false))
+                entries.append(.version(meta, isDeleteMarker: false))
             }
             for meta in page.deleteMarkers
             where seen.insert("\(meta.key)\u{0}\(meta.versionId ?? "null")").inserted {
-                combined.append((meta, true))
+                entries.append(.version(meta, isDeleteMarker: true))
             }
             for prefix in page.commonPrefixes where seenPrefixes.insert(prefix).inserted {
-                commonPrefixes.append(prefix)
+                entries.append(.prefix(prefix))
             }
         }
-        commonPrefixes.sort()
 
         // Same order as `ObjectFileHandler.listAllVersions`, so pages merged across nodes resume
-        // from the same position the local lister would.
-        combined.sort {
-            if $0.meta.key != $1.meta.key { return $0.meta.key < $1.meta.key }
-            if $0.meta.updatedAt != $1.meta.updatedAt { return $0.meta.updatedAt > $1.meta.updatedAt }
-            return ($0.meta.versionId ?? "null") < ($1.meta.versionId ?? "null")
+        // from the same position the local lister would. A folder and a key never share a name.
+        entries.sort {
+            switch ($0, $1) {
+            case (.version(let a, _), .version(let b, _)):
+                if a.key != b.key { return a.key < b.key }
+                if a.updatedAt != b.updatedAt { return a.updatedAt > b.updatedAt }
+                return (a.versionId ?? "null") < (b.versionId ?? "null")
+            default:
+                return $0.key < $1.key
+            }
         }
 
-        let dedupedCount = combined.count
-        let isTruncated = dedupedCount > maxKeys || anyTruncated
-        let limited = Array(combined.prefix(maxKeys))
+        let isTruncated = entries.count > maxKeys || anyTruncated
+        let limited = entries.prefix(maxKeys)
 
-        let versions = limited.filter { !$0.isDeleteMarker }.map(\.meta)
-        let deleteMarkers = limited.filter(\.isDeleteMarker).map(\.meta)
+        var versions: [ObjectMeta] = []
+        var deleteMarkers: [ObjectMeta] = []
+        var commonPrefixes: [String] = []
+        for entry in limited {
+            switch entry {
+            case .version(let meta, let isDeleteMarker):
+                if isDeleteMarker { deleteMarkers.append(meta) } else { versions.append(meta) }
+            case .prefix(let p):
+                commonPrefixes.append(p)
+            }
+        }
 
         var nextKeyMarker: String?
         var nextVersionIdMarker: String?
         if isTruncated, let last = limited.last {
-            nextKeyMarker = last.meta.key
-            nextVersionIdMarker = last.meta.versionId ?? "null"
+            nextKeyMarker = last.key
+            if case .version(let meta, _) = last { nextVersionIdMarker = meta.versionId ?? "null" }
         }
 
         return (versions, deleteMarkers, commonPrefixes, isTruncated, nextKeyMarker, nextVersionIdMarker)

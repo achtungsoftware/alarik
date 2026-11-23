@@ -177,16 +177,36 @@ struct ClusterListingServiceTests {
         #expect(result.nextVersionIdMarker == "v1")
     }
 
-    @Test("versions: commonPrefixes are unioned/sorted but never counted toward truncation")
-    func versionsCommonPrefixesNotCountedTowardTruncation() {
+    @Test("versions: common prefixes merge in key order and count toward the page like keys")
+    func versionsCommonPrefixesCountTowardTruncation() {
         let local = ClusterListingService.VersionsPage(
-            versions: [object("k", versionId: "v1")], deleteMarkers: [],
+            versions: [object("m", versionId: "v1")], deleteMarkers: [],
             commonPrefixes: ["z-prefix/", "a-prefix/"], isTruncated: false)
+        let peer = ClusterListingService.VersionsPage(
+            versions: [], deleteMarkers: [],
+            // Duplicate of local's folder - merged away.
+            commonPrefixes: ["a-prefix/"], isTruncated: false)
 
-        let result = ClusterListingService.mergeVersionsPages([local], maxKeys: 1000)
+        let all = ClusterListingService.mergeVersionsPages([local, peer], maxKeys: 1000)
+        #expect(all.commonPrefixes == ["a-prefix/", "z-prefix/"])
+        #expect(all.versions.map(\.key) == ["m"])
+        #expect(all.isTruncated == false)
 
-        #expect(result.commonPrefixes == ["a-prefix/", "z-prefix/"])
-        #expect(result.isTruncated == false)
+        // Three entries in key order (a-prefix/, m, z-prefix/); a page of two ends on the key.
+        let two = ClusterListingService.mergeVersionsPages([local, peer], maxKeys: 2)
+        #expect(two.commonPrefixes == ["a-prefix/"])
+        #expect(two.versions.map(\.key) == ["m"])
+        #expect(two.isTruncated == true)
+        #expect(two.nextKeyMarker == "m")
+        #expect(two.nextVersionIdMarker == "v1")
+
+        // A page ending on a folder resumes after the whole folder: key marker only.
+        let one = ClusterListingService.mergeVersionsPages([local, peer], maxKeys: 1)
+        #expect(one.commonPrefixes == ["a-prefix/"])
+        #expect(one.versions.isEmpty)
+        #expect(one.isTruncated == true)
+        #expect(one.nextKeyMarker == "a-prefix/")
+        #expect(one.nextVersionIdMarker == nil)
     }
 
     // MARK: - mergeUploadsPages

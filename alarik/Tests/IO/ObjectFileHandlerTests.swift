@@ -1338,6 +1338,140 @@ struct ObjectFileHandlerPaginationTests {
         #expect(try listed(after: "docs/z") == ["z.txt"])
         #expect(try listed(after: "docs/") == ["z.txt"])
     }
+
+    private func putVersioned(_ key: String) throws -> String {
+        let meta = ObjectMeta(
+            bucketName: bucket, key: key, size: 1, contentType: "text/plain", etag: "e",
+            updatedAt: Date())
+        return try ObjectFileHandler.writeVersioned(
+            metadata: meta, data: Data("x".utf8), bucketName: bucket, key: key,
+            versioningStatus: .enabled)
+    }
+
+    @Test("a flat listing yields nested keys in S3 order across folder boundaries, page by page")
+    func flatListingOrderAcrossFolders() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        // "-" (0x2D) and "." (0x2E) sort before "/" (0x2F): a file named like a folder sits
+        // between its siblings and the folder's contents, and "foo" itself comes first.
+        let keys = ["foo", "foo-bar", "foo.txt", "foo/", "foo/a", "foo/b/c", "foo/b/d", "foo/z", "fop", "zz"]
+        for key in keys.shuffled() { try put(key) }
+        _ = try putVersioned("foo/b/v")  // a versioned key sorts like any other
+
+        let sorted = (keys + ["foo/b/v"]).sorted()
+        for pageSize in [1, 3, 4, 100] {
+            #expect(try pageThrough(prefix: "", delimiter: nil, maxKeys: pageSize) == sorted, "page size \(pageSize)")
+        }
+        // A prefix that is not a directory boundary, with and without a delimiter.
+        #expect(try pageThrough(prefix: "foo/b", delimiter: nil, maxKeys: 2) == ["foo/b/c", "foo/b/d", "foo/b/v"])
+        #expect(try pageThrough(prefix: "foo", delimiter: "/", maxKeys: 2) == ["foo", "foo-bar", "foo.txt", "foo/"])
+        // A marker deep inside a folder resumes exactly there.
+        let (objects, _, _, _) = try ObjectFileHandler.listObjects(
+            bucketName: bucket, prefix: "", delimiter: nil, maxKeys: 3, marker: "foo/b/c")
+        #expect(objects.map(\.key) == ["foo/b/d", "foo/b/v", "foo/z"])
+    }
+
+    @Test("the ordered walk visits each key once in order, groups its forms and stops when asked")
+    func orderedWalkStopsEarly() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        for key in ["a/1", "a/2", "b", "c/1"] { try put(key) }
+        _ = try putVersioned("b")  // plain + versioned forms of one key
+
+        var visited: [String] = []
+        var groupedForms = 0
+        ObjectFileHandler.walkKeysInOrder(bucketName: bucket, prefix: "", delimiter: nil, marker: nil) { entry in
+            guard case .key(let key, let sources) = entry else { return false }
+            if sources.plainPath != nil && sources.versionsDirectory != nil { groupedForms += 1 }
+            visited.append(key)
+            return visited.count < 3
+        }
+        #expect(visited == ["a/1", "a/2", "b"])
+        #expect(groupedForms == 1)
+
+        // With a delimiter a folder is one entry and is never descended into.
+        visited = []
+        ObjectFileHandler.walkKeysInOrder(bucketName: bucket, prefix: "", delimiter: "/", marker: nil) { entry in
+            switch entry {
+            case .key(let key, _): visited.append(key)
+            case .commonPrefix(let p): visited.append(p)
+            }
+            return true
+        }
+        #expect(visited == ["a/", "b", "c/"])
+    }
+
+    @Test("a deleted versioned key is neither listed nor counted, and never leaves a page truncated")
+    func tombstonedKeysAreNotEntries() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        try put("a")
+        _ = try putVersioned("b")
+        _ = try ObjectFileHandler.createDeleteMarker(bucketName: bucket, key: "b")
+        try put("c")
+        // A plain object from before versioning was enabled, deleted afterwards: the marker wins.
+        try put("d")
+        _ = try putVersioned("d")
+        _ = try ObjectFileHandler.createDeleteMarker(bucketName: bucket, key: "d")
+
+        let (page, _, isTruncated, nextMarker) = try ObjectFileHandler.listObjects(
+            bucketName: bucket, maxKeys: 2)
+        #expect(page.map(\.key) == ["a", "c"])
+        // "d" is the only thing after the page and it is a tombstone: the page is complete.
+        #expect(isTruncated == false)
+        #expect(nextMarker == nil)
+
+        // Versions listings see the markers.
+        let (versions, markers, _, _, _, _) = try ObjectFileHandler.listAllVersions(bucketName: bucket)
+        #expect(versions.map(\.key) == ["a", "b", "c", "d", "d"])
+        #expect(markers.map(\.key) == ["b", "d"])
+    }
+
+    @Test("a versions listing counts folders toward the page and resumes after them")
+    func versionsListingPagesFolders() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        let v1 = try putVersioned("docs/a")
+        let v2 = try putVersioned("docs/a")
+        _ = try putVersioned("img/p")
+        _ = try putVersioned("m")
+        _ = try putVersioned("z")
+
+        var names: [String] = []
+        var keyMarker: String?
+        var versionIdMarker: String?
+        var pages = 0
+        repeat {
+            let (versions, _, prefixes, isTruncated, nextKey, nextVersion) = try ObjectFileHandler.listAllVersions(
+                bucketName: bucket, delimiter: "/", keyMarker: keyMarker, versionIdMarker: versionIdMarker,
+                maxKeys: 1)
+            #expect(versions.count + prefixes.count == 1)
+            names += prefixes + versions.map(\.key)
+            keyMarker = isTruncated ? nextKey : nil
+            versionIdMarker = isTruncated ? nextVersion : nil
+            pages += 1
+            #expect(pages < 20)
+        } while keyMarker != nil
+        #expect(names == ["docs/", "img/", "m", "z"])
+        #expect(pages == 4)
+
+        // Without a delimiter the two versions of docs/a page newest-first by position, and a
+        // key marker inside a folder keeps the folder when versions remain in it.
+        let (first, _, _, truncated, nextKey, nextVersion) = try ObjectFileHandler.listAllVersions(
+            bucketName: bucket, maxKeys: 1)
+        #expect(first.map(\.versionId) == [v2])
+        #expect(truncated && nextKey == "docs/a" && nextVersion == v2)
+        let (second, _, _, _, _, _) = try ObjectFileHandler.listAllVersions(
+            bucketName: bucket, keyMarker: nextKey, versionIdMarker: nextVersion, maxKeys: 1)
+        #expect(second.map(\.versionId) == [v1])
+
+        let (_, _, folders, _, _, _) = try ObjectFileHandler.listAllVersions(
+            bucketName: bucket, delimiter: "/", keyMarker: "docs/0", maxKeys: 10)
+        #expect(folders == ["docs/", "img/"])
+        let (_, _, foldersAfter, _, _, _) = try ObjectFileHandler.listAllVersions(
+            bucketName: bucket, delimiter: "/", keyMarker: "docs/b", maxKeys: 10)
+        #expect(foldersAfter == ["img/"])
+    }
 }
 
 extension ObjectFileHandlerTests {
