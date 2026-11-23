@@ -891,22 +891,28 @@ struct S3Service {
             // authorization failure, not an artifact of a cold cache.
             throw S3Error(status: .forbidden, code: "AccessDenied", message: "Access Denied")
         case .unavailable:
-            // The grant could not be determined at all (this node's metadata store was briefly
-            // unreadable - most often moments after a restart). Answering `AccessDenied` here
-            // tells the client its credentials are wrong, which is both false and final: S3
-            // clients do not retry a 403. A 503 says what is actually true and is retried.
-            throw S3Error(
-                status: .serviceUnavailable, code: "ServiceUnavailable",
-                message: "Could not verify access to this bucket right now - please retry.",
-                requestId: req.id)
+            throw bucketAccessUnavailable(requestId: req.id)
         }
+    }
+
+    /// The grant could not be determined at all (this node's metadata store was briefly
+    /// unreadable - most often moments after a restart). Answering `AccessDenied` would tell
+    /// the client its credentials are wrong, which is both false and final: S3 clients do not
+    /// retry a 403. A 503 says what is actually true and is retried.
+    private static func bucketAccessUnavailable(requestId: String) -> S3Error {
+        S3Error(
+            status: .serviceUnavailable, code: "ServiceUnavailable",
+            message: "Could not verify access to this bucket right now - please retry.",
+            requestId: requestId)
     }
 
     /// Authenticates the request if any credentials are present (header or query), exactly like
     /// `authenticateWithCache` - a malformed/expired signature always fails here and is never
-    /// treated as anonymous. Only a true absence of credentials falls through to the bucket
-    /// policy, and only for actions in the small public-access whitelist (`S3PolicyAction`).
-    /// Returns nil when the request was authorized anonymously via policy.
+    /// treated as anonymous. The bucket owner is always allowed. Everyone else - no credentials,
+    /// or a valid key that does not own the bucket - is checked against the bucket policy, for
+    /// actions in the small public-access whitelist (`S3PolicyAction`): `Principal: "*"` means
+    /// every caller, so a public bucket must not be 200 anonymously but 403 for a signed
+    /// request from another account's key. Returns nil when authorized anonymously via policy.
     static func authenticateOrAuthorizePublic(
         req: Request,
         bucketName: String,
@@ -917,20 +923,38 @@ struct S3Service {
             req.headers.first(name: "authorization") != nil
             || req.query[String.self, at: "X-Amz-Algorithm"] != nil
 
-        if hasCredentials {
-            return try await authenticateWithCache(req: req, bucketName: bucketName)
+        guard hasCredentials else {
+            try await authorizeViaBucketPolicy(req: req, bucketName: bucketName, action: action, key: key)
+            return nil
         }
 
-        // Both lookups go through the store-backed accessors, never the raw cache maps. A bucket
-        // this node hasn't cached yet is the normal state right after a restart, and answering
-        // from a cold cache gets BOTH directions wrong: a legitimately public bucket is refused
-        // (its policy simply isn't cached yet), while a bucket an admin explicitly restricted is
-        // served anonymously (its public-access-block isn't cached either). The second of those
-        // is a data exposure, so neither may be answered from cache alone.
-        //
-        // RestrictPublicBuckets blocks anonymous access outright, regardless of what the bucket
-        // policy says - it only ever affects this no-credentials branch, never authenticated
-        // (owner/SigV4) requests.
+        let authInfo = try await SigV4Validator.authenticateRequest(for: req)
+        switch await AccessKeyBucketMapCache.shared.accessDecision(
+            app: req.application, accessKey: authInfo.accessKey, bucket: bucketName)
+        {
+        case .found(true):
+            return authInfo
+        case .found(false), .absent:
+            try await authorizeViaBucketPolicy(req: req, bucketName: bucketName, action: action, key: key)
+            return authInfo
+        case .unavailable:
+            throw bucketAccessUnavailable(requestId: req.id)
+        }
+    }
+
+    /// Throws `AccessDenied` unless the bucket policy grants `action` to everyone.
+    ///
+    /// Both lookups go through the store-backed accessors, never the raw cache maps. A bucket
+    /// this node hasn't cached yet is the normal state right after a restart, and answering
+    /// from a cold cache gets BOTH directions wrong: a legitimately public bucket is refused
+    /// (its policy simply isn't cached yet), while a bucket an admin explicitly restricted is
+    /// served anonymously (its public-access-block isn't cached either). The second of those
+    /// is a data exposure, so neither may be answered from cache alone.
+    ///
+    /// RestrictPublicBuckets blocks every non-owner regardless of what the policy says.
+    private static func authorizeViaBucketPolicy(
+        req: Request, bucketName: String, action: S3PolicyAction, key: String?
+    ) async throws {
         if await BucketPolicyCache.shared.resolvedPublicAccessBlock(app: req.application, bucket: bucketName)?
             .restrictPublicBuckets == true
         {

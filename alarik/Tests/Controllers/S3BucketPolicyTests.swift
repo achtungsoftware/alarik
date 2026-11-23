@@ -51,7 +51,9 @@ struct S3BucketPolicyTests {
         path: String,
         query: String? = nil,
         body: Data? = nil,
-        additionalHeaders: [String: String] = [:]
+        additionalHeaders: [String: String] = [:],
+        accessKey: String = accessKey,
+        secretKey: String = secretKey
     ) -> HTTPHeaders {
         var fullPath = path
         if let query = query, !query.isEmpty {
@@ -703,6 +705,55 @@ struct S3BucketPolicyTests {
                 #expect(response.body.string.contains("<Code>MalformedPolicy</Code>"))
                 #expect(response.body.string.contains("Unsupported Statement element"))
             }
+        }
+    }
+
+    @Test("A public-read policy also grants a signed request from a key that does not own the bucket")
+    func testPolicyAppliesToAuthenticatedNonOwner() async throws {
+        let bucketName = "test-policy-other-account"
+        let otherKey = "OTHERACCOUNTKEY123"
+        let otherSecret = "otherAccountSecret123"
+        try await withApp { app in
+            _ = try await createNonAdminUserWithAccessKey(app, accessKey: otherKey, secretKey: otherSecret)
+            try await createBucket(app, bucketName: bucketName)
+            try await putObject(app, bucketName: bucketName, key: "public.txt", content: "hello")
+
+            func getAsOther() async throws -> HTTPStatus {
+                let signed = signedHeaders(
+                    for: .GET, path: "/\(bucketName)/public.txt", accessKey: otherKey,
+                    secretKey: otherSecret)
+                var status = HTTPStatus.internalServerError
+                try await app.test(
+                    .GET, "/\(bucketName)/public.txt",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        status = res.status
+                    })
+                return status
+            }
+
+            // No policy: another account's key is refused, like anonymous.
+            #expect(try await getAsOther() == .forbidden)
+
+            // Public read: everyone includes authenticated non-owners.
+            _ = try await putPolicy(
+                app, bucketName: bucketName, policyJSON: publicReadPolicy(bucketName: bucketName))
+            #expect(try await getAsOther() == .ok)
+
+            // A wrong signature is never downgraded to anonymous, policy or not.
+            let badlySigned = signedHeaders(
+                for: .GET, path: "/\(bucketName)/public.txt", accessKey: otherKey,
+                secretKey: "not-the-secret")
+            try await app.test(
+                .GET, "/\(bucketName)/public.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: badlySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .forbidden)
+                })
         }
     }
 }
