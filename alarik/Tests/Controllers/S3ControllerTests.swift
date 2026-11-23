@@ -3874,4 +3874,157 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("Standard object headers are stored on PUT, replayed on GET/HEAD, copied by directive, and overridable per request")
+    func testStoredStandardHeaders() async throws {
+        let bucketName = "test-stored-headers"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            let data = Data("compressed-bytes".utf8)
+            let putSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/archive.gz", body: data,
+                additionalHeaders: [
+                    "Content-Encoding": "gzip", "Cache-Control": "max-age=60",
+                    "Content-Disposition": "attachment; filename=\"archive.gz\"",
+                    "Content-Language": "en", "Expires": "Thu, 01 Dec 2030 16:00:00 GMT",
+                ])
+            try await app.test(
+                .PUT, "/\(bucketName)/archive.gz",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: putSigned)
+                    req.body = ByteBuffer(data: data)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            for method in [HTTPMethod.GET, .HEAD] {
+                let signed = signedHeaders(for: method, path: "/\(bucketName)/archive.gz")
+                try await app.test(
+                    method, "/\(bucketName)/archive.gz",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        #expect(res.headers.first(name: "Content-Encoding") == "gzip")
+                        #expect(res.headers.first(name: "Cache-Control") == "max-age=60")
+                        #expect(res.headers.first(name: "Content-Disposition") == "attachment; filename=\"archive.gz\"")
+                        #expect(res.headers.first(name: "Content-Language") == "en")
+                        #expect(res.headers.first(name: "Expires") == "Thu, 01 Dec 2030 16:00:00 GMT")
+                    })
+            }
+
+            // Signed `response-*` overrides win for that response only.
+            let overridden = signedHeaders(
+                for: .GET, path: "/\(bucketName)/archive.gz",
+                query: "response-content-disposition=inline&response-content-type=text/plain")
+            try await app.test(
+                .GET, "/\(bucketName)/archive.gz?response-content-disposition=inline&response-content-type=text/plain",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: overridden)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.headers.first(name: "Content-Disposition") == "inline")
+                    #expect(res.headers.first(name: "Content-Type") == "text/plain")
+                    #expect(res.headers.first(name: "Content-Encoding") == "gzip")
+                })
+
+            // COPY (default directive) carries them over; REPLACE takes them from the request.
+            let copySigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/copied.gz",
+                additionalHeaders: ["x-amz-copy-source": "/\(bucketName)/archive.gz"])
+            try await app.test(
+                .PUT, "/\(bucketName)/copied.gz",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: copySigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+            let replaceSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/replaced.gz",
+                additionalHeaders: [
+                    "x-amz-copy-source": "/\(bucketName)/archive.gz",
+                    "x-amz-metadata-directive": "REPLACE", "Cache-Control": "no-store",
+                ])
+            try await app.test(
+                .PUT, "/\(bucketName)/replaced.gz",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: replaceSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+            for (key, encoding, cache) in [("copied.gz", "gzip", "max-age=60"), ("replaced.gz", nil, "no-store")] {
+                let head = signedHeaders(for: .HEAD, path: "/\(bucketName)/\(key)")
+                try await app.test(
+                    .HEAD, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: head)
+                    },
+                    afterResponse: { res in
+                        #expect(res.headers.first(name: "Content-Encoding") == encoding, "\(key)")
+                        #expect(res.headers.first(name: "Cache-Control") == cache, "\(key)")
+                    })
+            }
+
+            // CreateMultipartUpload headers end up on the completed object.
+            var uploadId = ""
+            let createSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/mp.bin", query: "uploads",
+                additionalHeaders: ["Cache-Control": "public"])
+            try await app.test(
+                .POST, "/\(bucketName)/mp.bin?uploads",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: createSigned)
+                },
+                afterResponse: { res in
+                    let body = res.body.string
+                    if let r = body.range(of: "<UploadId>"),
+                        let e = body[r.upperBound...].range(of: "</UploadId>")
+                    {
+                        uploadId = String(body[r.upperBound..<e.lowerBound])
+                    }
+                })
+            let part = Data("only-part".utf8)
+            var etag = ""
+            let partSigned = signedHeaders(
+                for: .PUT, path: "/\(bucketName)/mp.bin", query: "partNumber=1&uploadId=\(uploadId)",
+                body: part)
+            try await app.test(
+                .PUT, "/\(bucketName)/mp.bin?partNumber=1&uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: partSigned)
+                    req.body = ByteBuffer(data: part)
+                },
+                afterResponse: { res in
+                    etag = res.headers.first(name: "ETag") ?? ""
+                })
+            let completeBody = Data(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\(etag)</ETag></Part></CompleteMultipartUpload>".utf8)
+            let completeSigned = signedHeaders(
+                for: .POST, path: "/\(bucketName)/mp.bin", query: "uploadId=\(uploadId)",
+                body: completeBody)
+            try await app.test(
+                .POST, "/\(bucketName)/mp.bin?uploadId=\(uploadId)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: completeSigned)
+                    req.body = ByteBuffer(data: completeBody)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+            let headMp = signedHeaders(for: .HEAD, path: "/\(bucketName)/mp.bin")
+            try await app.test(
+                .HEAD, "/\(bucketName)/mp.bin",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: headMp)
+                },
+                afterResponse: { res in
+                    #expect(res.headers.first(name: "Cache-Control") == "public")
+                })
+        }
+    }
 }

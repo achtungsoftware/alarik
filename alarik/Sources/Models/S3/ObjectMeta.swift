@@ -46,6 +46,11 @@ struct ObjectMeta: Codable {
     /// multipart metadata lean); nil for single-part objects.
     var parts: [ObjectPart]?
 
+    /// Standard HTTP headers stored with the object and replayed on GET/HEAD (`Cache-Control`,
+    /// `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`), keyed by
+    /// lowercase header name. Optional for the same backward-compat reason as `tags`.
+    var httpHeaders: [String: String]?
+
     init(
         bucketName: String,
         key: String,
@@ -59,7 +64,8 @@ struct ObjectMeta: Codable {
         isDeleteMarker: Bool = false,
         tags: [String: String]? = nil,
         checksum: ObjectChecksum? = nil,
-        parts: [ObjectPart]? = nil
+        parts: [ObjectPart]? = nil,
+        httpHeaders: [String: String]? = nil
     ) {
         self.bucketName = bucketName
         self.key = key
@@ -74,6 +80,7 @@ struct ObjectMeta: Codable {
         self.tags = tags
         self.checksum = checksum
         self.parts = parts
+        self.httpHeaders = httpHeaders
     }
 
     /// Generates a new version ID (UUID without dashes)

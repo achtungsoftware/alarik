@@ -250,6 +250,9 @@ struct S3Service {
         for (key, value) in meta.metadata {
             response.headers.add(name: "x-amz-meta-\(key)", value: value)
         }
+        for (name, value) in meta.httpHeaders ?? [:] {
+            response.headers.replaceOrAdd(name: name, value: value)
+        }
 
         if let range = range {
             response.headers.add(
@@ -260,6 +263,39 @@ struct S3Service {
         }
 
         return response
+    }
+
+    /// The standard HTTP headers S3 stores with an object (`PutObject`, `CreateMultipartUpload`,
+    /// `CopyObject` with `REPLACE`) and replays on every GET/HEAD. Dropping them turned a
+    /// `Content-Encoding: gzip` upload into undecodable bytes on download.
+    static let storedObjectHeaderNames = [
+        "cache-control", "content-disposition", "content-encoding", "content-language", "expires",
+    ]
+
+    static func storedObjectHeaders(from headers: HTTPHeaders) -> [String: String]? {
+        var stored: [String: String] = [:]
+        for name in storedObjectHeaderNames {
+            if let value = headers.first(name: name) { stored[name] = value }
+        }
+        return stored.isEmpty ? nil : stored
+    }
+
+    /// GET's `response-*` query overrides (`response-content-disposition` on a presigned
+    /// download link, for example). Only honoured on signed requests, as on S3.
+    static func applyResponseHeaderOverrides(req: Request, to response: Response) {
+        let overrides = [
+            ("response-content-type", "content-type"),
+            ("response-content-language", "content-language"),
+            ("response-expires", "expires"),
+            ("response-cache-control", "cache-control"),
+            ("response-content-disposition", "content-disposition"),
+            ("response-content-encoding", "content-encoding"),
+        ]
+        for (parameter, header) in overrides {
+            if let value = req.query[String.self, at: parameter] {
+                response.headers.replaceOrAdd(name: header, value: value)
+            }
+        }
     }
 
     /// `partNumber` on GET/HEAD selects one part of a multipart object, served as the byte range

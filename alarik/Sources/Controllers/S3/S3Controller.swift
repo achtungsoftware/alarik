@@ -981,6 +981,7 @@ struct S3Controller: RouteCollection {
                 meta.metadata[metaKey] = value
             }
         }
+        meta.httpHeaders = S3Service.storedObjectHeaders(from: req.headers)
 
         // x-amz-tagging sets tags inline at upload time - URL query-string encoded (verified
         // against the PutObject API reference)
@@ -1548,7 +1549,10 @@ struct S3Controller: RouteCollection {
             metadata: userMetadata,
             updatedAt: Date(),
             tags: tags,
-            checksum: destinationChecksum
+            checksum: destinationChecksum,
+            // Standard headers follow the metadata directive, like Content-Type.
+            httpHeaders: replaceMetadata
+                ? S3Service.storedObjectHeaders(from: req.headers) : sourceMeta.httpHeaders
         )
 
         var headers = HTTPHeaders()
@@ -1694,9 +1698,14 @@ struct S3Controller: RouteCollection {
         // Check for versionId query parameter
         let versionId = req.query[String.self, at: "versionId"]
 
-        _ = try await S3Service.authenticateOrAuthorizePublic(
+        let authInfo = try await S3Service.authenticateOrAuthorizePublic(
             req: req, bucketName: bucketName,
             action: versionId != nil ? .getObjectVersion : .getObject, key: keyPath)
+        // `response-*` overrides apply to signed requests only, as on S3.
+        let applyOverrides: (Response) -> Response = { response in
+            if authInfo != nil { S3Service.applyResponseHeaderOverrides(req: req, to: response) }
+            return response
+        }
 
         // EC-aware locality: any of the wider top-(k+m) responsible nodes can serve a read
         // (no pinning needed, unlike writes) - a strict superset of the plain top-3 check
@@ -1808,7 +1817,7 @@ struct S3Controller: RouteCollection {
                             try await writer.writeBuffer(chunk)
                         }
                     }, count: bodyLength)
-                return response
+                return applyOverrides(response)
             }
         }
 
@@ -1875,7 +1884,7 @@ struct S3Controller: RouteCollection {
                 response.headers.replaceOrAdd(
                     name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
             }
-            return response
+            return applyOverrides(response)
         }
 
         // Small payloads: one buffered read is cheaper than a threadpool round trip. The
@@ -1902,7 +1911,7 @@ struct S3Controller: RouteCollection {
             response.headers.replaceOrAdd(
                 name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
         }
-        return response
+        return applyOverrides(response)
     }
 
     // DELETE /:bucketName/*key
@@ -2278,7 +2287,8 @@ struct S3Controller: RouteCollection {
             contentType: contentType,
             metadata: metadata,
             checksumAlgorithm: checksumAlgorithm,
-            checksumType: checksumType
+            checksumType: checksumType,
+            httpHeaders: S3Service.storedObjectHeaders(from: req.headers)
         )
 
         let xml = """

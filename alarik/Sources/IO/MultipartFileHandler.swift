@@ -81,7 +81,8 @@ struct MultipartFileHandler {
         contentType: String = "application/octet-stream",
         metadata: [String: String] = [:],
         checksumAlgorithm: String? = nil,
-        checksumType: String? = nil
+        checksumType: String? = nil,
+        httpHeaders: [String: String]? = nil
     ) throws -> String {
         let uploadId = generateUploadId()
         let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
@@ -101,7 +102,8 @@ struct MultipartFileHandler {
             metadata: metadata,
             initiated: Date(),
             checksumAlgorithm: checksumAlgorithm,
-            checksumType: checksumType
+            checksumType: checksumType,
+            httpHeaders: httpHeaders
         )
 
         let metaData = try jsonEncoder.encode(meta)
@@ -450,6 +452,7 @@ struct MultipartFileHandler {
         // Per-part sizes are kept for every multipart object: `GET ?partNumber` needs them to
         // serve one part's byte range, checksummed or not.
         objectMeta.parts = partDetails
+        objectMeta.httpHeaders = uploadMeta.httpHeaders
 
         // Object checksum: only when the upload pinned an algorithm at Create and every part
         // carried a checksum (a single missing one makes it unverifiable, so we store none rather

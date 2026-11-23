@@ -31,6 +31,9 @@ struct MultipartUploadMeta: Codable {
     /// The checksum type the client requested (`FULL_OBJECT` / `COMPOSITE`), if any. The effective
     /// type is still constrained by the algorithm at completion (see `multipartChecksumType`).
     var checksumType: String? = nil
+    /// Standard HTTP headers given at CreateMultipartUpload, stored with the completed object
+    /// (see `ObjectMeta.httpHeaders`). Optional: older upload directories decode as nil.
+    var httpHeaders: [String: String]? = nil
 }
 
 /// Metadata stored for each uploaded part
