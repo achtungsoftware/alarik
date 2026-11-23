@@ -60,7 +60,7 @@ enum StreamingBodySpooler {
     /// Builds the checksum computer for whatever algorithm the request's `x-amz-trailer` header
     /// declares, or nil when none is declared or it names an algorithm we don't implement (those
     /// bodies are still decoded and stored - just not checksum-verified, see `TrailerChecksum`).
-    private static func trailerChecksum(from req: Request) -> TrailerChecksum? {
+    static func trailerChecksum(from req: Request) -> TrailerChecksum? {
         guard let trailer = req.headers.first(name: "x-amz-trailer") else { return nil }
         for name in trailer.split(separator: ",") {
             if let checksum = TrailerChecksum(

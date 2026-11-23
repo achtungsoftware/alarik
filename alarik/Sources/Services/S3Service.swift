@@ -1089,51 +1089,49 @@ struct S3Service {
 
     /// Collects the request body as a `String`.
     static func collectBodyString(req: Request) async throws -> String {
-        let maxBodySize = req.application.routes.defaultMaxBodySize.value
-        let buffer = try await req.body.collect(max: maxBodySize).get() ?? ByteBuffer()
-        try verifyDeferredPayloadHash(req: req, bodyView: buffer.readableBytesView)
-        return String(buffer: buffer)
+        String(decoding: try await collectBodyData(req: req), as: UTF8.self)
     }
 
-    /// Collects the request body and, when the request uses AWS chunked transfer encoding,
-    /// strips the chunk framing to return only the actual content bytes.
-    /// Returns empty `Data` for requests with no body (valid for PutObject zero-byte objects).
+    /// Collects a small request body (subresource PUTs, multi-object delete, multipart
+    /// completion) with the same aws-chunked handling the object spooler has: all three
+    /// streaming forms are decoded (signed chunks verified, trailers consumed), and a plain body
+    /// is checked against its declared payload hash. Returns empty `Data` for no body.
     static func collectBodyData(req: Request) async throws -> Data {
         let maxBodySize = req.application.routes.defaultMaxBodySize.value
-        let bodyBuffer = try await req.body.collect(max: maxBodySize).get()
-        var buffer = bodyBuffer ?? ByteBuffer()
+        let buffer = try await req.body.collect(max: maxBodySize).get() ?? ByteBuffer()
 
-        if req.headers.first(name: "x-amz-content-sha256")
-            == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-        {
-            // Signed streaming body: decode the framing AND verify every chunk signature.
-            // Under a `body: .stream` route the SigV4 validator couldn't do this at auth time
-            // (the bytes hadn't arrived), so this is where the deferred check lands; under a
-            // buffered route it's a re-verification, which is cheap for these small bodies.
+        let declaredSha = req.headers.first(name: "x-amz-content-sha256")
+        let isChunked =
+            S3PayloadHash.isStreaming(declaredSha)
+            || req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") == true
+        guard isChunked else {
+            try verifyDeferredPayloadHash(req: req, bodyView: buffer.readableBytesView)
+            return Data(buffer.readableBytesView)
+        }
+
+        // Signed chunk forms must verify every chunk against the SigV4 chain. Under a
+        // `body: .stream` route the validator could not do this at auth time (the bytes had not
+        // arrived), so this is where the deferred check lands.
+        var signatureValidator: ChunkSignatureValidator? = nil
+        if let declaredSha, S3PayloadHash.hasChunkSignatures(declaredSha) {
             guard req.headers.first(name: "authorization") != nil else {
                 throw S3Error(
                     status: .forbidden, code: "AccessDenied", message: "Access Denied",
                     requestId: req.id)
             }
             let authInfo = try S3AuthParser.parse(request: req)
-            let decoder = StreamingChunkDecoder(
-                signatureValidator: try await SigV4Validator.chunkSignatureValidator(
-                    for: authInfo))
-            var decoded = Data()
-            try await decoder.feed(buffer) { decoded.append(contentsOf: $0) }
-            try decoder.verifyComplete(
-                declaredDecodedLength: req.headers
-                    .first(name: "x-amz-decoded-content-length")
-                    .flatMap(Int.init))
-            return decoded
+            signatureValidator = try await SigV4Validator.chunkSignatureValidator(for: authInfo)
         }
-
-        if req.headers.first(name: "Content-Encoding")?.contains("aws-chunked") == true {
-            return try ChunkedDataDecoder.decode(buffer: &buffer)
-        }
-
-        try verifyDeferredPayloadHash(req: req, bodyView: buffer.readableBytesView)
-        return Data(buffer.readableBytesView)
+        let expectsTrailer = declaredSha.map(S3PayloadHash.hasTrailer) ?? false
+        let decoder = StreamingChunkDecoder(
+            signatureValidator: signatureValidator, expectsTrailer: expectsTrailer,
+            trailerChecksum: expectsTrailer ? StreamingBodySpooler.trailerChecksum(from: req) : nil)
+        var decoded = Data()
+        try await decoder.feed(buffer) { decoded.append(contentsOf: $0) }
+        try decoder.verifyComplete(
+            declaredDecodedLength: req.headers.first(name: "x-amz-decoded-content-length")
+                .flatMap(Int.init))
+        return decoded
     }
 
     /// The deferred counterpart of the SigV4 validator's payload-hash check for routes
@@ -1145,8 +1143,8 @@ struct S3Service {
     private static func verifyDeferredPayloadHash(req: Request, bodyView: ByteBufferView) throws {
         guard req.headers.first(name: "authorization") != nil,
             let declared = req.headers.first(name: "x-amz-content-sha256"),
-            declared != "UNSIGNED-PAYLOAD",
-            declared != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            declared != S3PayloadHash.unsigned,
+            !S3PayloadHash.isStreaming(declared)
         else { return }
         let computed = Crypto.SHA256.hash(data: bodyView).hexString()
         guard computed == declared.lowercased() else {

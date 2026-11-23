@@ -68,7 +68,7 @@ struct S3TrailerChecksumTests {
     /// the canonical payload hash, and `content-encoding`, `x-amz-decoded-content-length` and
     /// `x-amz-trailer` are all signed headers.
     private func signUnsignedTrailer(
-        path: String, decodedLength: Int, trailerHeader: String
+        path: String, decodedLength: Int, trailerHeader: String, canonicalQuery: String = ""
     ) -> HTTPHeaders {
         let payloadHash = S3PayloadHash.streamingUnsignedTrailer
         let (amzDate, dateStamp) = amzTimestamps()
@@ -85,7 +85,7 @@ struct S3TrailerChecksumTests {
         let signedHeaderNames = signed.map { $0.0 }.joined(separator: ";")
         let canonicalHeaders = signed.map { "\($0.0):\($0.1)\n" }.joined()
         let canonicalRequest = [
-            "PUT", path, "", canonicalHeaders, signedHeaderNames, payloadHash,
+            "PUT", path, canonicalQuery, canonicalHeaders, signedHeaderNames, payloadHash,
         ].joined(separator: "\n")
 
         let scope = "\(dateStamp)/\(region)/s3/aws4_request"
@@ -586,5 +586,54 @@ struct S3TrailerChecksumTests {
                 "AWS4-HMAC-SHA256 Credential=\(accessKey)/\(scope), SignedHeaders=\(names), "
                 + "Signature=\(signature)")
         return headers
+    }
+
+    @Test("a subresource PUT (tagging) sent as STREAMING-UNSIGNED-PAYLOAD-TRAILER is decoded, not rejected")
+    func taggingBodyWithUnsignedTrailer() async throws {
+        let bucketName = "trailer-tagging-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            let put = signPutWithChecksumHeader(
+                path: "/\(bucketName)/tagged.txt", payload: Data("x".utf8),
+                checksum: "")
+            _ = put  // the object is created below with a plain signed PUT
+            let plain = sotoSigned(method: .PUT, path: "/\(bucketName)/tagged.txt")
+            try await app.test(
+                .PUT, "/\(bucketName)/tagged.txt",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: plain)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let tagging = Data(
+                "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>".utf8)
+            let wire = frameUnsignedTrailer(tagging)
+            let headers = signUnsignedTrailer(
+                path: "/\(bucketName)/tagged.txt", decodedLength: tagging.count,
+                trailerHeader: "x-amz-checksum-crc32", canonicalQuery: "tagging=")
+            try await app.test(
+                .PUT, "/\(bucketName)/tagged.txt?tagging",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: headers)
+                    req.body = ByteBuffer(data: wire)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok || res.status == .noContent, "\(res.status) \(res.body.string)")
+                })
+
+            let get = sotoSigned(method: .GET, path: "/\(bucketName)/tagged.txt", query: "tagging")
+            try await app.test(
+                .GET, "/\(bucketName)/tagged.txt?tagging",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: get)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Key>env</Key>"))
+                    #expect(res.body.string.contains("<Value>prod</Value>"))
+                })
+        }
     }
 }
