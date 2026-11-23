@@ -251,6 +251,13 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
             } else {
                 let backoff = min(30.0 * pow(2.0, Double(row.attempts)), 3600.0)
                 row.nextAttemptAt = Date().addingTimeInterval(backoff)
+                // First failure only: one line per row explains a stalled queue without a
+                // log storm when a peer is down for the whole backoff ladder.
+                if row.attempts == 1 {
+                    app.logger.info(
+                        "\(logContext) delivery failed (attempt 1/\(maxAttempts), retrying in \(Int(backoff))s): \(describeFailure(row)): \(error)"
+                    )
+                }
             }
             do {
                 try await persist(row, app)
