@@ -19,12 +19,12 @@ import NIOCore
 import Vapor
 
 /// Whether writes are flushed to stable storage before being acknowledged, via `ALARIK_FSYNC`.
-/// On by default - an acknowledged PUT must survive a power failure.
-/// `ALARIK_FSYNC=false` opts out for deployments that prefer throughput
-/// over crash-durability - benchmarks, scratch data, or CI. The write remains atomic via
-/// temp-file + rename either way; only the flush-to-medium is skipped.
-///
-/// Deliberately does **not** additionally fsync the parent directory after the rename
+/// On by default - an acknowledged PUT must survive a power failure, which takes two flushes:
+/// the file's bytes, and the parent directory entry the rename created (on ext4/XFS a power
+/// loss between the two loses the entry, so an acknowledged object vanishes or silently
+/// reverts to its previous version). `ALARIK_FSYNC=false` opts out for deployments that prefer
+/// throughput over crash-durability - benchmarks, scratch data, or CI. The write remains atomic
+/// via temp-file + rename either way; only the flush-to-medium is skipped.
 enum Durability {
     static var fsyncEnabled: Bool {
         Environment.sanitizedGet("ALARIK_FSYNC")?.lowercased() != "false"
@@ -36,13 +36,18 @@ enum Durability {
         guard fsyncEnabled else { return 0 }
         return POSIXFile.fsyncData(fd)
     }
+
+    /// Flushes the directory entries of `path`'s parent if fsync is enabled.
+    static func flushParentDirectory(of path: String) -> Int32 {
+        guard fsyncEnabled else { return 0 }
+        return POSIXFile.fsyncDirectory((path as NSString).deletingLastPathComponent)
+    }
 }
 
 /// Writes a file atomically and durably: bytes go to a temp file in the destination's
-/// directory, are fsynced (F_FULLFSYNC on Darwin), then renamed into place. Readers never
-/// observe a partial file, and once `finish()` returns the payload is on stable storage
-/// (unless `ALARIK_FSYNC=false`) - see `Durability` for why the rename's directory entry
-/// itself isn't separately fsynced.
+/// directory, are fsynced (F_FULLFSYNC on Darwin), renamed into place, and the directory is
+/// fsynced so the new entry is durable too. Readers never observe a partial file, and once
+/// `finish()` returns the object is on stable storage (unless `ALARIK_FSYNC=false`).
 ///
 /// This replaces Foundation's `.atomic` write option, which gives the same atomicity but
 /// no durability - the OS could still be holding everything in the page cache when the
@@ -143,6 +148,11 @@ struct AtomicObjectWriter {
         guard POSIXFile.rename(tempPath, finalPath) == 0 else {
             _ = POSIXFile.unlink(tempPath)
             throw WriteError.renameFailed(errno: errno)
+        }
+        // The entry is visible now; make it durable. A failure here is a failed write for the
+        // same reason a failed file flush is - the object may not survive a crash.
+        guard Durability.flushParentDirectory(of: finalPath) == 0 else {
+            throw WriteError.fsyncFailed(errno: errno)
         }
     }
 

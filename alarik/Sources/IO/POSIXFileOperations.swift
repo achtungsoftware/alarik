@@ -130,6 +130,21 @@ enum POSIXFile {
         #endif
     }
 
+    /// Flushes a directory's entries to stable storage - what makes a rename into it durable.
+    /// Plain `fsync` on the directory descriptor; F_FULLFSYNC is for file contents.
+    static func fsyncDirectory(_ path: String) -> Int32 {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return -1 }
+        defer { _ = close(fd) }
+        #if canImport(Darwin)
+            return Darwin.fsync(fd)
+        #elseif canImport(Glibc)
+            return Glibc.fsync(fd)
+        #elseif canImport(Musl)
+            return Musl.fsync(fd)
+        #endif
+    }
+
     static func rename(_ oldPath: String, _ newPath: String) -> Int32 {
         oldPath.withCString { cOld in
             newPath.withCString { cNew in
