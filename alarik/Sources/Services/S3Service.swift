@@ -285,7 +285,9 @@ struct S3Service {
         let isV2 = listType == "2"
         let startAfter = req.query[String.self, at: "start-after"]
         let continuationToken = req.query[String.self, at: "continuation-token"]
-        let marker = isV2 ? (startAfter ?? continuationToken) : req.query[String.self, at: "marker"]
+        // S3 ignores `start-after` once a `continuation-token` is present; paginators resend
+        // the original `start-after` on every page, so the old precedence restarted at page 1.
+        let marker = isV2 ? (continuationToken ?? startAfter) : req.query[String.self, at: "marker"]
 
         return ListObjectsParams(
             bucketName: bucketName,

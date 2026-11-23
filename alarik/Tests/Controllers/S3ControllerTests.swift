@@ -3494,4 +3494,43 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("ListObjectsV2 - continuation-token takes precedence over a resent start-after")
+    func testContinuationTokenBeatsStartAfter() async throws {
+        let bucketName = "list-v2-start-after-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+                try await putObject(app, bucketName: bucketName, key: key, content: key)
+            }
+
+            func page(_ query: String) async throws -> String {
+                let signed = signedHeaders(for: .GET, path: "/\(bucketName)", query: query)
+                var body = ""
+                try await app.test(
+                    .GET, "/\(bucketName)?\(query)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: signed)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .ok)
+                        body = res.body.string
+                    })
+                return body
+            }
+
+            let first = try await page("list-type=2&max-keys=1&start-after=a.txt")
+            #expect(first.contains("<Key>b.txt</Key>"))
+            let token = try #require(
+                first.range(of: "<NextContinuationToken>").map {
+                    String(first[$0.upperBound...].prefix { $0 != "<" })
+                })
+
+            // A paginator resends start-after with the token; the token must win.
+            let second = try await page(
+                "list-type=2&max-keys=1&start-after=a.txt&continuation-token=\(token)")
+            #expect(second.contains("<Key>c.txt</Key>"), "\(second)")
+            #expect(!second.contains("<Key>b.txt</Key>"))
+        }
+    }
 }
