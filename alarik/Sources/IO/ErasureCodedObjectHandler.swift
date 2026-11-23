@@ -160,6 +160,25 @@ enum ErasureCodedObjectHandler {
         try? FileManager.default.removeItem(atPath: stagingDirectory)
     }
 
+    /// Periodic counterpart for a running node: a stage whose coordinator died between push
+    /// and commit is never committed or discarded by anyone. A write finishes within the
+    /// synchronous push timeout, so anything older than `age` is such an orphan. One readdir.
+    static func removeStagingOrphans(olderThan age: TimeInterval) {
+        let fileManager = FileManager.default
+        guard let tokens = try? fileManager.contentsOfDirectory(atPath: stagingDirectory) else {
+            return
+        }
+        let cutoff = Date().addingTimeInterval(-age)
+        for token in tokens {
+            let path = stagingDirectory + token
+            guard
+                let modified = (try? fileManager.attributesOfItem(atPath: path))?[.modificationDate]
+                    as? Date, modified < cutoff
+            else { continue }
+            try? fileManager.removeItem(atPath: path)
+        }
+    }
+
     /// Version-aware convenience overloads: a `nil` `versionId` selects the non-versioned path,
     /// a non-`nil` one the versioned path. Collapses the `versionId != nil ? versioned : plain`
     /// ternary that otherwise recurs at every shard call site into one place.

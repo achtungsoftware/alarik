@@ -290,8 +290,8 @@ enum ErasureCodedWriteCoordinator {
                         app.logger.warning(
                             "Committing staged EC shard \(offset + 1) of '\(key)' on node \(peer.id) failed - falling back to async repair: \(error)"
                         )
-                        await ClusterReplicationClient.discardStagedShards(
-                            app: app, to: peer, token: token)
+                        // Detached for the same reason as above: the peer may have just died.
+                        Task { await ClusterReplicationClient.discardStagedShards(app: app, to: peer, token: token) }
                         return (offset + 1, false)
                     }
                 }

@@ -232,6 +232,10 @@ public func configure(_ app: Application) async throws {
                     app.logger.error("Failed to clean up expired shared links: \(error)")
                 }
 
+                // Staged EC shards whose coordinator died before committing them - see
+                // `ErasureCodedObjectHandler.removeStagingOrphans`.
+                ErasureCodedObjectHandler.removeStagingOrphans(olderThan: 3600)
+
                 // In-flight OIDC login attempts (state/nonce/PKCE verifier) older than 10
                 // minutes - a login that never completes a round-trip should not linger.
                 do {

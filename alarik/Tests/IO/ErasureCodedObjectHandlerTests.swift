@@ -324,4 +324,23 @@ struct ErasureCodedObjectHandlerTests {
         ErasureCodedObjectHandler.cleanupStagingOrphans()
         #expect(!FileManager.default.fileExists(atPath: ErasureCodedObjectHandler.stagingDirectory))
     }
+
+    @Test("removeStagingOrphans drops only stages older than the cutoff")
+    func removeStagingOrphansByAge() throws {
+        defer { ErasureCodedObjectHandler.cleanupStagingOrphans() }
+        try write("old", to: ErasureCodedObjectHandler.stagingShardPath(token: "old-token", shardIndex: 0))
+        try write("new", to: ErasureCodedObjectHandler.stagingShardPath(token: "new-token", shardIndex: 0))
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-7200)],
+            ofItemAtPath: ErasureCodedObjectHandler.stagingBasePath(token: "old-token"))
+
+        ErasureCodedObjectHandler.removeStagingOrphans(olderThan: 3600)
+
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: ErasureCodedObjectHandler.stagingBasePath(token: "old-token")))
+        #expect(
+            FileManager.default.fileExists(
+                atPath: ErasureCodedObjectHandler.stagingBasePath(token: "new-token")))
+    }
 }
