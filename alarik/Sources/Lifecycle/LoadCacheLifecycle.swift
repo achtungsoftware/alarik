@@ -224,53 +224,63 @@ final class LoadCacheLifecycle: LifecycleHandler {
 
         // Removal reconciliation - the upsert-only loads above can never DROP an entry, which
         // fixed wrongful drops but leaves the mirror problem: a node that missed every retry of
-        // a `.remove` broadcast keeps a revoked key or deleted bucket cached forever. Absence
-        // from a listing is only authoritative when the listing is verifiably COMPLETE (every
-        // peer answered, no record skipped) - so removals happen exactly then, and never against
-        // a partial snapshot. This is the periodic anti-entropy pass that bounds how long a
-        // missed removal can survive: one complete reload cycle.
+        // a `.remove` broadcast keeps a revoked key or deleted bucket cached. Two sources say a
+        // cached entry is gone. A tombstone seen on any peer is positive evidence and counts
+        // even from a partial listing - without it, one unreachable node kept a revoked key
+        // valid everywhere else indefinitely. Mere absence counts only against a verifiably
+        // COMPLETE listing (every peer answered, no record skipped): "absent from a partial
+        // snapshot" and "deleted" are indistinguishable.
+        //
+        // Both are confirmed against the store before dropping: a key created DURING the
+        // listing fan-out is absent from the snapshot yet already broadcast into this cache, and
+        // a bucket name can be deleted and re-created. A store error keeps the entry
+        // (conservative; retried next cycle).
+        var staleKeys = keyListing.tombstonedIds
         if keyListing.complete {
             let cachedKeys = await AccessKeySecretKeyMapCache.shared.getMap().keys
-            for cached in cachedKeys where !keyListing.presentIds.contains(cached) {
-                // Confirm against the store before dropping: a key created DURING the listing
-                // fan-out is absent from the snapshot yet already broadcast into this cache -
-                // absence must be re-checked at a later instant than the snapshot's. A store
-                // error keeps the entry (conservative; retried next cycle).
-                let confirmed: AccessKey?
-                do { confirmed = try await AccessKey.find(app: app, accessKey: cached) } catch {
-                    continue
-                }
-                guard confirmed == nil else { continue }
-                app.logger.notice(
-                    "Cache reconcile: dropping access key '\(cached)' absent from a complete cluster-wide listing (deleted while this node missed the removal broadcast)."
-                )
-                await AccessKeySecretKeyMapCache.shared.remove(accessKey: cached)
-                await AccessKeyUserMapCache.shared.remove(accessKey: cached)
-                await AccessKeyBucketMapCache.shared.removeAccessKey(cached)
-            }
+            staleKeys.formUnion(cachedKeys.filter { !keyListing.presentIds.contains($0) })
         }
-        if bucketListing.complete {
-            let cachedBuckets = await BucketVersioningCache.shared.getMap().keys
-            for cached in cachedBuckets where !bucketListing.presentIds.contains(cached) {
-                // Same created-during-fan-out race (and same store-error-keeps-entry policy) as
-                // access keys above.
-                let confirmedBucket: Bucket?
-                do { confirmedBucket = try await Bucket.find(app: app, name: cached) } catch {
-                    continue
-                }
-                guard confirmedBucket == nil else { continue }
-                app.logger.notice(
-                    "Cache reconcile: dropping bucket '\(cached)' absent from a complete cluster-wide listing (deleted while this node missed the removal broadcast)."
-                )
-                await BucketVersioningCache.shared.removeBucket(cached)
-                await BucketPolicyCache.shared.removePolicy(for: cached)
-                await BucketPolicyCache.shared.removePublicAccessBlock(for: cached)
-                await NotificationConfigCache.shared.removeBucket(cached)
-                await ReplicationConfigCache.shared.removeBucket(cached)
-                await AccessKeyBucketMapCache.shared.removeAll(for: cached)
-            }
+        for cached in staleKeys where await AccessKeySecretKeyMapCache.shared.exists(accessKey: cached) {
+            let confirmed: AccessKey?
+            do { confirmed = try await AccessKey.find(app: app, accessKey: cached) } catch { continue }
+            guard confirmed == nil else { continue }
+            app.logger.notice(
+                "Cache reconcile: dropping access key '\(cached)' deleted while this node missed the removal broadcast."
+            )
+            await dropAccessKey(cached)
         }
 
+        var staleBuckets = bucketListing.tombstonedIds
+        if bucketListing.complete {
+            let cachedBuckets = await BucketVersioningCache.shared.getMap().keys
+            staleBuckets.formUnion(cachedBuckets.filter { !bucketListing.presentIds.contains($0) })
+        }
+        for cached in staleBuckets where await BucketVersioningCache.shared.getMap()[cached] != nil {
+            let confirmedBucket: Bucket?
+            do { confirmedBucket = try await Bucket.find(app: app, name: cached) } catch { continue }
+            guard confirmedBucket == nil else { continue }
+            app.logger.notice(
+                "Cache reconcile: dropping bucket '\(cached)' deleted while this node missed the removal broadcast."
+            )
+            await dropBucket(cached)
+        }
+    }
+
+    /// Every cache that remembers an access key.
+    static func dropAccessKey(_ accessKey: String) async {
+        await AccessKeySecretKeyMapCache.shared.remove(accessKey: accessKey)
+        await AccessKeyUserMapCache.shared.remove(accessKey: accessKey)
+        await AccessKeyBucketMapCache.shared.removeAccessKey(accessKey)
+    }
+
+    /// Every cache that remembers a bucket.
+    static func dropBucket(_ bucketName: String) async {
+        await BucketVersioningCache.shared.removeBucket(bucketName)
+        await BucketPolicyCache.shared.removePolicy(for: bucketName)
+        await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
+        await NotificationConfigCache.shared.removeBucket(bucketName)
+        await ReplicationConfigCache.shared.removeBucket(bucketName)
+        await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
     }
 
     // MARK: - Per-bucket mappers

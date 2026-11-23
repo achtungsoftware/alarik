@@ -57,6 +57,10 @@ enum MetadataListingService {
         /// payload a typed decode later drops, so reconcile-style callers never mistake
         /// "stored but undecodable" for "gone".
         let presentIds: Set<String>
+        /// Ids whose newest known envelope is a tombstone. Unlike absence, a tombstone is
+        /// positive evidence of a deletion, so it is authoritative even in a partial listing -
+        /// the one way a node that missed the removal broadcast learns of it while a peer is down.
+        let tombstonedIds: Set<String>
         let complete: Bool
     }
 
@@ -117,8 +121,10 @@ enum MetadataListingService {
                     payload: payload, collection: collection,
                     storedVersion: envelope.schemaVersion, logger: app.logger))
         }
+        let tombstonedIds = Set(merged.compactMap { id, envelope in envelope.isTombstone ? id : nil })
         return VerifiedListing(
-            entries: entries, presentIds: Set(entries.map(\.id)), complete: complete)
+            entries: entries, presentIds: Set(entries.map(\.id)), tombstonedIds: tombstonedIds,
+            complete: complete)
     }
 
     static func count(app: Application, collection: String) async -> Int {
@@ -142,7 +148,7 @@ enum MetadataListingService {
     /// they just can't be read by this binary), so reconciliation callers won't purge them.
     static func listVerified<T: Decodable>(
         _ type: T.Type, app: Application, collection: String
-    ) async -> (records: [T], presentIds: Set<String>, complete: Bool) {
+    ) async -> (records: [T], presentIds: Set<String>, tombstonedIds: Set<String>, complete: Bool) {
         let listing = await listVerified(app: app, collection: collection)
         var decoded: [T] = []
         decoded.reserveCapacity(listing.entries.count)
@@ -155,7 +161,7 @@ enum MetadataListingService {
                 )
             }
         }
-        return (decoded, listing.presentIds, listing.complete)
+        return (decoded, listing.presentIds, listing.tombstonedIds, listing.complete)
     }
 
     /// This node's own live records, decoded - no network fan-out at all.

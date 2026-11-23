@@ -50,11 +50,12 @@ extension MetadataRecord {
         await MetadataListingService.list(Self.self, app: app, collection: metadataCollection)
     }
 
-    /// `all` plus the listing's completeness verdict - see `LoadCacheLifecycle.reloadAll`, which
-    /// may only reconcile REMOVALS against a listing that is verifiably complete.
+    /// `all` plus what `LoadCacheLifecycle.reloadAll` needs to reconcile REMOVALS: the ids seen
+    /// as tombstones (authoritative even from a partial listing) and the completeness verdict
+    /// (absence counts only against a complete one).
     static func allVerified(
         app: Application
-    ) async -> (records: [Self], presentIds: Set<String>, complete: Bool) {
+    ) async -> (records: [Self], presentIds: Set<String>, tombstonedIds: Set<String>, complete: Bool) {
         await MetadataListingService.listVerified(
             Self.self, app: app, collection: metadataCollection)
     }

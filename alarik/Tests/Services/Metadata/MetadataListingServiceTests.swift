@@ -116,6 +116,21 @@ struct MetadataListingServiceTests {
         }
     }
 
+    @Test("a verified listing reports deleted ids as tombstoned, separately from live ids")
+    func verifiedListingReportsTombstones() async throws {
+        try await withApp { app in
+            let collection = "list-tombstone-\(UUID().uuidString)"
+            try await MetadataStore.put(app: app, collection: collection, id: "kept", value: Data("1".utf8))
+            try await MetadataStore.put(app: app, collection: collection, id: "gone", value: Data("2".utf8))
+            try await MetadataStore.delete(app: app, collection: collection, id: "gone")
+
+            let listing = await MetadataListingService.listVerified(app: app, collection: collection)
+            #expect(listing.presentIds == ["kept"])
+            #expect(listing.tombstonedIds == ["gone"])
+            #expect(listing.complete)
+        }
+    }
+
     @Test("count matches the number of records in the collection")
     func countMatchesListCount() async throws {
         try await withApp { app in
