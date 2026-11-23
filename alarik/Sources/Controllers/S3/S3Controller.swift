@@ -2363,12 +2363,10 @@ struct S3Controller: RouteCollection {
             completion = try await Self.completeMultipartUpload(
                 req: req, bucketName: bucketName, key: key, uploadId: uploadId, parts: parts,
                 peers: peers)
-        } catch let error as NSError where MultipartFileHandler.clientErrorDomains.contains(error.domain) {
-            // Only the storage layer's deliberate client-fault domains become 4xx. Anything else
+        } catch let error as MultipartError {
+            // Only the multipart layer's deliberate client faults become 4xx. Anything else
             // (disk full, IO errors) is a server fault and must not be reported as InvalidPart.
-            throw S3Error(
-                status: error.domain == "NoSuchUpload" ? .notFound : .badRequest, code: error.domain,
-                message: error.localizedDescription, requestId: req.id)
+            throw S3Error(status: error.status, code: error.s3Code, message: error.message, requestId: req.id)
         }
         let etag = completion.etag
         let versionId = completion.versionId

@@ -43,9 +43,7 @@ struct MultipartFileHandler {
     /// is constructed. Rejection matches the "no such upload" case; a real upload ID never fails.
     private static func validateUploadId(_ uploadId: String) throws {
         guard uploadId.count == 32, uploadId.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
     }
 
@@ -136,17 +134,13 @@ struct MultipartFileHandler {
     ) throws -> String {
         // Validate part number (S3 allows 1-10000)
         guard partNumber >= 1 && partNumber <= 10000 else {
-            throw NSError(
-                domain: "InvalidPartNumber", code: 400,
-                userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
+            throw MultipartError.invalidPartNumber(partNumber)
         }
 
         // Verify upload exists
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let etag = S3Service.computeETag(data)
@@ -176,15 +170,11 @@ struct MultipartFileHandler {
         checksum: String? = nil
     ) throws -> String {
         guard partNumber >= 1 && partNumber <= 10000 else {
-            throw NSError(
-                domain: "InvalidPartNumber", code: 400,
-                userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
+            throw MultipartError.invalidPartNumber(partNumber)
         }
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
@@ -194,26 +184,16 @@ struct MultipartFileHandler {
         // bytes the client believes are stored.
         if Durability.fsyncEnabled {
             let fd = POSIXFile.open(spoolPath, O_RDONLY)
-            guard fd >= 0 else {
-                throw NSError(
-                    domain: "FileError", code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "Could not open spooled part"])
-            }
+            guard fd >= 0 else { throw StorageError.openFailed(path: spoolPath, errno: errno) }
             let flushed = Durability.flush(fd)
             _ = POSIXFile.close(fd)
-            guard flushed == 0 else {
-                throw NSError(
-                    domain: "FileError", code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "Could not flush part to disk"])
-            }
+            guard flushed == 0 else { throw StorageError.flushFailed(path: spoolPath, errno: errno) }
         }
         if POSIXFile.rename(spoolPath, partPath) != 0 {
             // EXDEV: Storage/spool and Storage/multipart live on different filesystems
             // (unusual, but possible with per-directory mounts) - fall back to a copy
             guard errno == EXDEV else {
-                throw NSError(
-                    domain: "FileError", code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "Could not move part into place"])
+                throw StorageError.moveFailed(from: spoolPath, to: partPath, errno: errno)
             }
             try? FileManager.default.removeItem(atPath: partPath)
             try FileManager.default.copyItem(atPath: spoolPath, toPath: partPath)
@@ -237,15 +217,11 @@ struct MultipartFileHandler {
         sourceSize: Int
     ) throws -> String {
         guard partNumber >= 1 && partNumber <= 10000 else {
-            throw NSError(
-                domain: "InvalidPartNumber", code: 400,
-                userInfo: [NSLocalizedDescriptionKey: "Part number must be between 1 and 10000"])
+            throw MultipartError.invalidPartNumber(partNumber)
         }
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
@@ -295,11 +271,6 @@ struct MultipartFileHandler {
     /// position of each part is finally known.
     static let minimumPartSize = 5 * 1024 * 1024
 
-    /// `NSError` domains this layer throws for client faults; the S3 layer maps exactly these to
-    /// 4xx responses and treats every other error as a server fault.
-    static let clientErrorDomains: Set<String> = [
-        "InvalidPart", "InvalidPartOrder", "EntityTooSmall", "NoSuchUpload",
-    ]
 
     struct CompletionPlan {
         let key: String
@@ -355,9 +326,7 @@ struct MultipartFileHandler {
         let live = try uploadPath(for: bucketName, uploadId: uploadId)
         let claimed = String(live.dropLast()) + completingSuffix + "/"
         guard POSIXFile.rename(String(live.dropLast()), String(claimed.dropLast())) == 0 else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
         return CompletionClaim(
             bucketName: bucketName, uploadId: uploadId, liveDirectory: live, directory: claimed)
@@ -377,9 +346,7 @@ struct MultipartFileHandler {
         // Read upload metadata
         let metaPath = uploadDirectory + "meta.json"
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let metaData = try Data(contentsOf: URL(fileURLWithPath: metaPath))
@@ -393,12 +360,7 @@ struct MultipartFileHandler {
         var seenPartNumbers = Set<Int>()
         for part in sortedParts {
             if seenPartNumbers.contains(part.partNumber) {
-                throw NSError(
-                    domain: "InvalidPartOrder", code: 400,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "Duplicate part number: \(part.partNumber)"
-                    ])
+                throw MultipartError.duplicatePart(part.partNumber)
             }
             seenPartNumbers.insert(part.partNumber)
         }
@@ -417,11 +379,7 @@ struct MultipartFileHandler {
             let partFilePath = uploadDirectory + "part-\(part.partNumber)"
 
             guard FileManager.default.fileExists(atPath: partFilePath) else {
-                throw NSError(
-                    domain: "InvalidPart", code: 400,
-                    userInfo: [
-                        NSLocalizedDescriptionKey: "Part \(part.partNumber) does not exist"
-                    ])
+                throw MultipartError.missingPart(part.partNumber)
             }
 
             // Read and verify part metadata
@@ -434,12 +392,7 @@ struct MultipartFileHandler {
 
                 // Verify ETag matches
                 if partMeta.etag != S3Service.normalizeETag(part.etag) {
-                    throw NSError(
-                        domain: "InvalidPart", code: 400,
-                        userInfo: [
-                            NSLocalizedDescriptionKey:
-                                "ETag mismatch for part \(part.partNumber)"
-                        ])
+                    throw MultipartError.etagMismatch(partNumber: part.partNumber)
                 }
                 partSize = partMeta.size
                 partChecksum = partMeta.checksum
@@ -460,12 +413,8 @@ struct MultipartFileHandler {
         // Every part but the last must meet S3's minimum, or clients could assemble objects S3
         // itself would refuse (and later copy them part-for-part into S3 unsuccessfully).
         if let tooSmall = partDetails.dropLast().first(where: { $0.size < minimumPartSize }) {
-            throw NSError(
-                domain: "EntityTooSmall", code: 400,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Your proposed upload is smaller than the minimum allowed size: part \(tooSmall.partNumber) is \(tooSmall.size) bytes, the minimum is \(minimumPartSize)"
-                ])
+            throw MultipartError.entityTooSmall(
+                partNumber: tooSmall.partNumber, size: tooSmall.size, minimum: minimumPartSize)
         }
 
         // Calculate final ETag (S3 style: MD5 of concatenated binary MD5 hashes + "-" + part count)
@@ -578,9 +527,7 @@ struct MultipartFileHandler {
         let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
 
         guard FileManager.default.fileExists(atPath: uploadDir) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         try FileManager.default.removeItem(atPath: uploadDir)
@@ -643,9 +590,7 @@ struct MultipartFileHandler {
     ) throws -> (parts: [MultipartPartMeta], isTruncated: Bool, nextPartNumberMarker: Int?) {
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let uploadDir = try uploadPath(for: bucketName, uploadId: uploadId)
@@ -757,9 +702,7 @@ struct MultipartFileHandler {
     static func getUploadMeta(bucketName: String, uploadId: String) throws -> MultipartUploadMeta {
         let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
         guard FileManager.default.fileExists(atPath: metaPath) else {
-            throw NSError(
-                domain: "NoSuchUpload", code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "The specified upload does not exist"])
+            throw MultipartError.noSuchUpload
         }
 
         let metaData = try Data(contentsOf: URL(fileURLWithPath: metaPath))

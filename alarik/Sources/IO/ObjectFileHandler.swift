@@ -357,9 +357,7 @@ struct ObjectFileHandler {
             let path = storagePath(for: bucketName, key: key)
 
             guard FileManager.default.fileExists(atPath: path) else {
-                throw NSError(
-                    domain: "ObjectNotFound", code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "Object does not exist"])
+                throw StorageError.objectNotFound(bucket: bucketName, key: key)
             }
 
             try FileManager.default.removeItem(atPath: path)
@@ -935,9 +933,7 @@ struct ObjectFileHandler {
         } else if isVersioned(bucketName: bucketName, key: key) {
             // Read latest version from versioned storage
             guard let latestVersionId = try getLatestVersionId(bucketName: bucketName, key: key) else {
-                throw NSError(
-                    domain: "ObjectNotFound", code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "No versions found for object"])
+                throw StorageError.objectNotFound(bucket: bucketName, key: key)
             }
             path = versionedPath(for: bucketName, key: key, versionId: latestVersionId)
         } else {
@@ -1226,9 +1222,7 @@ struct ObjectFileHandler {
                         return
                     }
                 }
-                throw NSError(
-                    domain: "ObjectNotFound", code: 404,
-                    userInfo: [NSLocalizedDescriptionKey: "Version does not exist"])
+                throw StorageError.versionNotFound(bucket: bucketName, key: key, versionId: versionId)
             }
 
             // Check if this is the latest version

@@ -597,7 +597,8 @@ struct MultipartFileHandlerTests {
             try MultipartFileHandler.prepareCompletion(
                 bucketName: "bucket", uploadId: uploadId, parts: [(1, etag1), (2, etag2)])
         } throws: { error in
-            (error as NSError).domain == "EntityTooSmall"
+            if case MultipartError.entityTooSmall = error { return true }
+            return false
         }
     }
 
@@ -676,7 +677,10 @@ struct MultipartFileHandlerTests {
         // A concurrent completer finds nothing.
         #expect {
             try MultipartFileHandler.claimForCompletion(bucketName: "bucket", uploadId: uploadId)
-        } throws: { ($0 as NSError).domain == "NoSuchUpload" }
+        } throws: { error in
+            if case MultipartError.noSuchUpload = error { return true }
+            return false
+        }
         // A claimed upload is not listed.
         let (listed, _, _, _) = try MultipartFileHandler.listUploads(bucketName: "bucket")
         #expect(listed.isEmpty)

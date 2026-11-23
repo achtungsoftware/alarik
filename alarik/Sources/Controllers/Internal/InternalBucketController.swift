@@ -730,22 +730,17 @@ struct InternalBucketController: RouteCollection {
         return (uploadId, meta)
     }
 
-    /// `MultipartFileHandler` reports part/order problems and a vanished upload as `NSError`
-    /// domains; everything else is a genuine server fault and must not masquerade as the
-    /// client's mistake (the console only retries 5xx).
+    /// `MultipartFileHandler` reports part/order problems and a vanished upload as
+    /// `MultipartError`; everything else is a genuine server fault and must not masquerade as
+    /// the client's mistake (the console only retries 5xx).
     private func abort(forCompletionError error: any Error) -> Abort {
         if let error = error as? S3Error {
             return Abort(error.status, reason: error.message)
         }
-        let nsError = error as NSError
-        switch nsError.domain {
-        case "InvalidPart", "InvalidPartOrder", "InvalidPartNumber":
-            return Abort(.badRequest, reason: nsError.localizedDescription)
-        case "NoSuchUpload":
-            return Abort(.notFound, reason: "The specified upload does not exist.")
-        default:
-            return Abort(.internalServerError, reason: "Completing the upload failed: \(error)")
+        if let error = error as? MultipartError {
+            return Abort(error.status, reason: error.message)
         }
+        return Abort(.internalServerError, reason: "Completing the upload failed: \(error)")
     }
 
     @Sendable

@@ -23,6 +23,10 @@ enum StorageError: Error, CustomStringConvertible {
     case truncatedFile(path: String)
     /// The `.obj` header (length prefix + metadata JSON) is not one this layer wrote.
     case corruptHeader(path: String, reason: String)
+    case flushFailed(path: String, errno: Int32)
+    case moveFailed(from: String, to: String, errno: Int32)
+    case objectNotFound(bucket: String, key: String)
+    case versionNotFound(bucket: String, key: String, versionId: String)
 
     var description: String {
         switch self {
@@ -30,6 +34,11 @@ enum StorageError: Error, CustomStringConvertible {
         case .statFailed(let path, let code): "Could not stat '\(path)' (errno \(code))"
         case .truncatedFile(let path): "File '\(path)' ended early"
         case .corruptHeader(let path, let reason): "Corrupt object header in '\(path)': \(reason)"
+        case .flushFailed(let path, let code): "Could not flush '\(path)' to disk (errno \(code))"
+        case .moveFailed(let from, let to, let code): "Could not move '\(from)' to '\(to)' (errno \(code))"
+        case .objectNotFound(let bucket, let key): "Object '\(key)' does not exist in bucket '\(bucket)'"
+        case .versionNotFound(let bucket, let key, let versionId):
+            "Version '\(versionId)' of '\(key)' does not exist in bucket '\(bucket)'"
         }
     }
 }
