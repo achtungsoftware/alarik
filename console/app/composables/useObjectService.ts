@@ -22,7 +22,6 @@ export interface DeleteResult {
 
 export function useObjectService() {
     const config = useRuntimeConfig();
-    const jwtCookie = useJWTCookie();
     const toast = useToast();
 
     const isDeleting = ref(false);
@@ -32,14 +31,13 @@ export function useObjectService() {
 
     async function deleteObject(bucket: string, key: string): Promise<boolean> {
         try {
-            await $fetch(`${apiBaseUrl}/api/v1/objects`, {
+            await useApi()(`/objects`, {
                 method: "DELETE",
-                headers: { Authorization: `Bearer ${jwtCookie.value}` },
                 params: { bucket, key },
             });
             return true;
         } catch (error) {
-            console.error(`Failed to delete ${key}:`, error);
+            logFailure(`Failed to delete ${key}:`, error);
             return false;
         }
     }
@@ -116,9 +114,8 @@ export function useObjectService() {
         inline?: boolean;
         downloadName?: string;
     }): Promise<string> {
-        const ticket = await $fetch<DownloadTicket>(`${apiBaseUrl}/api/v1/objects/download-ticket`, {
+        const ticket = await useApi()<DownloadTicket>(`/objects/download-ticket`, {
             method: "POST",
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
             body: request,
         });
         return `${apiBaseUrl}/api/v1/objects/download?ticket=${encodeURIComponent(ticket.ticket)}`;

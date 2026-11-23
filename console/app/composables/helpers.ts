@@ -20,12 +20,30 @@ export const MAX_CONCURRENT_UPLOADS = 3;
 /// error's own message. Every catch block used to pick these fields off an `any`.
 export function errorMessage(error: unknown, fallback = "Unknown error"): string {
     if (typeof error === "object" && error !== null) {
-        const data = (error as { data?: { reason?: unknown } }).data;
-        if (data && typeof data.reason === "string" && data.reason.length > 0) return data.reason;
-        const message = (error as { message?: unknown }).message;
-        if (typeof message === "string" && message.length > 0) return message;
+        const candidate = error as { data?: { reason?: unknown }; response?: { _data?: { reason?: unknown } }; message?: unknown };
+        const reason = candidate.data?.reason ?? candidate.response?._data?.reason;
+        if (typeof reason === "string" && reason.length > 0) return reason;
+        if (typeof candidate.message === "string" && candidate.message.length > 0) return candidate.message;
     }
     return fallback;
+}
+
+/// The HTTP status a failed request carried, if any.
+export function errorStatus(error: unknown): number | undefined {
+    if (typeof error !== "object" || error === null) return undefined;
+    const candidate = error as { status?: unknown; statusCode?: unknown; response?: { status?: unknown } };
+    for (const value of [candidate.status, candidate.statusCode, candidate.response?.status]) {
+        if (typeof value === "number") return value;
+    }
+    return undefined;
+}
+
+/// Development-only trace of a failure the UI already reports through a toast or an alert.
+/// Nothing is written in production builds.
+export function logFailure(context: string, error: unknown): void {
+    if (import.meta.dev) {
+        console.warn(`${context} ${errorMessage(error)}`);
+    }
 }
 
 export function formatBytes(bytes: number): string {

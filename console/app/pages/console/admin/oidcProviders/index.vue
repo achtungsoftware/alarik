@@ -29,7 +29,6 @@ useHead({
 const page = ref(1);
 const itemsPerPage = ref(10);
 const UBadge = resolveComponent("UBadge");
-const jwtCookie = useJWTCookie();
 const openCreateModal = ref(false);
 const toast = useToast();
 const UDropdownMenu = resolveComponent("UDropdownMenu");
@@ -43,13 +42,11 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<OIDCProvider>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/oidcProviders`, {
+} = await useFetch<Page<OIDCProvider>>(`/admin/oidcProviders`, {
+    $fetch: useApi(),
     params: {
         page: page,
         per: itemsPerPage,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
@@ -135,11 +132,8 @@ async function deleteProvider(provider: OIDCProvider) {
     if (!confirmed) return;
 
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/oidcProviders/${provider.id}`, {
+        await useApi()(`/admin/oidcProviders/${provider.id}`, {
             method: "DELETE",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
         });
 
         await refresh();
@@ -150,11 +144,11 @@ async function deleteProvider(provider: OIDCProvider) {
             icon: "i-lucide-circle-check",
             color: "success",
         });
-    } catch (error: any) {
-        console.error(`Failed to delete provider ${provider.name}:`, error);
+    } catch (error) {
+        logFailure(`Failed to delete provider ${provider.name}:`, error);
         toast.add({
             title: "Deletion Failed",
-            description: error.response?._data?.reason ?? "Failed to delete provider",
+            description: errorMessage(error, "Failed to delete provider"),
             icon: "i-lucide-circle-x",
             color: "error",
         });

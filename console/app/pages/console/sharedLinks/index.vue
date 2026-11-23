@@ -30,7 +30,6 @@ const page = ref(1);
 const itemsPerPage = ref(10);
 const UCheckbox = resolveComponent("UCheckbox");
 const rowSelection = ref<Record<string, boolean>>({});
-const jwtCookie = useJWTCookie();
 const isDeleting = ref(false);
 const toast = useToast();
 const { confirm } = useConfirmDialog();
@@ -39,13 +38,11 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<SharedLink>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share`, {
+} = await useFetch<Page<SharedLink>>(`/objects/share`, {
+    $fetch: useApi(),
     params: {
         page: page,
         per: itemsPerPage,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
@@ -62,11 +59,8 @@ async function copyLink(url: string) {
 
 async function deleteLink(item: SharedLink) {
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share/${item.id}`, {
+        await useApi()(`/objects/share/${item.id}`, {
             method: "DELETE",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
         });
         await refresh();
         toast.add({
@@ -75,10 +69,10 @@ async function deleteLink(item: SharedLink) {
             icon: "i-lucide-circle-check",
             color: "success",
         });
-    } catch (error: any) {
+    } catch (error) {
         toast.add({
             title: "Failed to Revoke Link",
-            description: error.response?._data?.reason ?? "Unknown error",
+            description: errorMessage(error, "Unknown error"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -178,15 +172,12 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share/${item.id}`, {
+                await useApi()(`/objects/share/${item.id}`, {
                     method: "DELETE",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                    },
                 });
                 successCount++;
             } catch (error) {
-                console.error(`Failed to revoke shared link ${item.id}:`, error);
+                logFailure(`Failed to revoke shared link ${item.id}:`, error);
                 errorCount++;
             }
         }

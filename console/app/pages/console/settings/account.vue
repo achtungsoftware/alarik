@@ -30,7 +30,7 @@ const state = reactive({
 const isRenaming = computed(() => state.username.trim() !== user.value.username);
 const needsCurrentPassword = computed(() => isRenaming.value || state.newPassword !== "");
 
-async function submitForm(event: FormSubmitEvent<any>) {
+async function submitForm(event: FormSubmitEvent<typeof state>) {
     event.preventDefault();
     if (needsCurrentPassword.value && state.currentPassword === "") {
         error.value = "Enter your current password to change your username or password.";
@@ -40,18 +40,17 @@ async function submitForm(event: FormSubmitEvent<any>) {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users`, {
+        const response = await useApi()<{ token: string }>(`/users`, {
             method: "PUT",
             body: JSON.stringify(state),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
         });
 
         window.location.reload();
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
@@ -77,17 +76,14 @@ async function deleteAccount() {
     if (!confirmedAgain) return;
 
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users`, {
+        await useApi()(`/users`, {
             method: "DELETE",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
         });
 
         jwtCookie.value = null;
         window.location.reload();
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Failed to delete account";
+    } catch (err) {
+        error.value = errorMessage(err, "Failed to delete account");
     }
 }
 </script>

@@ -33,7 +33,6 @@ const UBadge = resolveComponent("UBadge");
 const UDropdownMenu = resolveComponent("UDropdownMenu");
 const UButton = resolveComponent("UButton");
 const rowSelection = ref<Record<string, boolean>>({});
-const jwtCookie = useJWTCookie();
 const openBucketCreateModal = ref(false);
 const isDeleting = ref(false);
 const toast = useToast();
@@ -45,13 +44,11 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets`, {
+} = await useFetch<Page<Bucket>>(`/admin/buckets`, {
+    $fetch: useApi(),
     params: {
         page: page,
         per: itemsPerPage,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
@@ -66,8 +63,7 @@ watch(
     (response) => {
         for (const bucket of response?.items ?? []) {
             requestBucketStats(bucket.name, () =>
-                $fetch<StorageStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets/${bucket.name}/stats`, {
-                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
+                useApi()<StorageStats>(`/admin/buckets/${bucket.name}/stats`, {
                 })
             );
         }
@@ -220,18 +216,15 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/buckets/${item.name}`, {
+                await useApi()(`/admin/buckets/${item.name}`, {
                     method: "DELETE",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                    },
                 });
                 successCount++;
-            } catch (error: any) {
-                if (error?.status === 409) {
+            } catch (error) {
+                if (errorStatus(error) === 409) {
                     notEmptyCount++;
                 } else {
-                    console.error(`Failed to delete bucket ${item.name}:`, error);
+                    logFailure(`Failed to delete bucket ${item.name}:`, error);
                     errorCount++;
                 }
             }

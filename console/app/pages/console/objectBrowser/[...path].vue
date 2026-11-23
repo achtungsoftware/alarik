@@ -41,7 +41,6 @@ function resetObjectPaging() {
     objectMarkerHistory.value = [];
 }
 const rowSelection = ref<Record<string, boolean>>({});
-const jwtCookie = useJWTCookie();
 const fileInput = ref<HTMLInputElement | null>(null);
 const folderInput = ref<HTMLInputElement | null>(null);
 const openDetailModal = ref(false);
@@ -108,25 +107,6 @@ watch([currentBucket, currentPrefix], () => {
     searchQuery.value = "";
 });
 
-// Selection is keyed by item key (see `getRowId` on the table), never by row index: a
-// background refresh that inserts an earlier-sorting key must not shift the selection onto
-// different objects before a delete.
-const selectedItems = computed(() => {
-    return displayItems.value.filter((item) => rowSelection.value[item.key]);
-});
-
-// Drop selections for rows that are no longer listed, so counts and bulk actions only ever
-// cover what is on screen.
-watch(displayItems, (items) => {
-    const listed = new Set(items.map((item) => item.key));
-    const kept: Record<string, boolean> = {};
-    for (const [key, selected] of Object.entries(rowSelection.value)) {
-        if (selected && listed.has(key)) kept[key] = true;
-    }
-    if (Object.keys(kept).length !== Object.keys(rowSelection.value).length) {
-        rowSelection.value = kept;
-    }
-});
 
 // Count files, folders, and buckets for deletion dialog
 const deletionCounts = computed(() => {
@@ -162,7 +142,7 @@ const breadcrumbNavItems = computed<BreadcrumbNav[]>(() => {
         });
 
         if (currentPrefix.value) {
-            const folderParts = currentPrefix.value.split("/").filter((p) => p.length > 0);
+            const folderParts = currentPrefix.value.split("/").filter((p: string) => p.length > 0);
             folderParts.forEach((part, index) => {
                 const folders = folderParts.slice(0, index + 1);
                 items.push({
@@ -191,9 +171,9 @@ const {
     data: bucketsResponse,
     status: bucketsStatus,
     refresh: refreshBuckets,
-} = await useFetch<Page<Bucket>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets`, {
+} = await useFetch<Page<Bucket>>(`/buckets`, {
+    $fetch: useApi(),
     params: { page: page, per: itemsPerPage },
-    headers: { Authorization: `Bearer ${jwtCookie.value}` },
     watch: [page],
     default: () => ({ items: [], metadata: { page: 1, per: 100, total: 0 } }),
 });
@@ -203,16 +183,14 @@ const {
     data: objectsResponse,
     status: objectsStatus,
     refresh,
-} = await useFetch<CursorPage<BrowserItem>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
+} = await useFetch<CursorPage<BrowserItem>>(`/objects`, {
+    $fetch: useApi(),
     params: {
         bucket: currentBucket,
         prefix: currentPrefix,
         search: searchQuery,
         per: itemsPerPage,
         marker: objectMarker,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     immediate: false,
     // The explicit watcher below is the single trigger; useFetch's own param watching would
@@ -302,6 +280,26 @@ const displayItems = computed<BrowserItem[]>(() => {
     }
 });
 
+// Selection is keyed by item key (see `getRowId` on the table), never by row index: a
+// background refresh that inserts an earlier-sorting key must not shift the selection onto
+// different objects before a delete.
+const selectedItems = computed(() => {
+    return displayItems.value.filter((item) => rowSelection.value[item.key]);
+});
+
+// Drop selections for rows that are no longer listed, so counts and bulk actions only ever
+// cover what is on screen.
+watch(displayItems, (items) => {
+    const listed = new Set(items.map((item) => item.key));
+    const kept: Record<string, boolean> = {};
+    for (const [key, selected] of Object.entries(rowSelection.value)) {
+        if (selected && listed.has(key)) kept[key] = true;
+    }
+    if (Object.keys(kept).length !== Object.keys(rowSelection.value).length) {
+        rowSelection.value = kept;
+    }
+});
+
 const status = computed(() => {
     return !currentBucket.value ? bucketsStatus.value : objectsStatus.value;
 });
@@ -320,8 +318,7 @@ watch(
             if (!item.isFolder) continue;
             const params = item.isBucket ? { bucket: item.key } : { bucket: currentBucket.value, prefix: item.key };
             requestEntryStats(item.key, () =>
-                $fetch<StorageStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/stats`, {
-                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
+                useApi()<StorageStats>(`/objects/stats`, {
                     params,
                 })
             );
@@ -372,7 +369,7 @@ const columns: TableColumn<BrowserItem>[] = [
             } else if (item.isFolder) {
                 displayName = item.key
                     .split("/")
-                    .filter((p: any) => p)
+                    .filter((p: string) => p.length > 0)
                     .pop();
             } else {
                 displayName = item.key.split("/").pop() || item.key;
@@ -720,13 +717,12 @@ async function handleSingleDelete(item: BrowserItem) {
 
 async function deleteBucket(bucketName: string): Promise<boolean> {
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets/${bucketName}`, {
+        await useApi()(`/buckets/${bucketName}`, {
             method: "DELETE",
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
         });
         return true;
-    } catch (error: any) {
-        const message = error?.data?.reason || error?.message || "Failed to delete bucket";
+    } catch (error) {
+        const message = errorMessage(error, "Failed to delete bucket");
         toast.add({
             title: "Failed to Delete Bucket",
             description: message,

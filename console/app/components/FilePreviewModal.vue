@@ -28,7 +28,6 @@ const props = withDefaults(
 
 const emit = defineEmits(["update:open", "saved"]);
 const open = ref(props.open);
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 const { downloadTicketUrl } = useObjectService();
 
@@ -136,9 +135,8 @@ async function saveChanges() {
         const formData = new FormData();
         formData.append("data", file, file.name);
 
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects`, {
+        await useApi()(`/objects`, {
             method: "POST",
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
             params: {
                 bucket: props.bucket,
                 ...(prefix.length > 0 && { prefix }),
@@ -159,10 +157,10 @@ async function saveChanges() {
         });
 
         emit("saved");
-    } catch (err: any) {
+    } catch (err) {
         toast.add({
             title: "Save Failed",
-            description: err.message || "Failed to save changes",
+            description: errorMessage(err, "Failed to save changes"),
             icon: "i-lucide-circle-x",
             color: "error",
         });

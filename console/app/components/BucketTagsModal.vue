@@ -31,11 +31,10 @@ const isDeleting = ref(false);
 const error = ref("");
 const emit = defineEmits(["update:open", "close", "saved"]);
 const open = ref(props.open);
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 const { confirm } = useConfirmDialog();
 
-const tagsEndpoint = computed(() => `${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets/${props.bucket.name}/tags`);
+const tagsEndpoint = computed(() => `/buckets/${props.bucket.name}/tags`);
 
 const rows = ref<{ key: string; value: string }[]>([]);
 
@@ -59,15 +58,12 @@ async function fetchTags() {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ tags: Record<string, string> }>(tagsEndpoint.value, {
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
+        const response = await useApi()<{ tags: Record<string, string> }>(tagsEndpoint.value, {
         });
 
         rows.value = Object.entries(response.tags).map(([key, value]) => ({ key, value }));
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
@@ -92,12 +88,11 @@ async function save() {
             tags[row.key.trim()] = row.value;
         }
 
-        await $fetch(tagsEndpoint.value, {
+        await useApi()(tagsEndpoint.value, {
             method: "PUT",
             body: JSON.stringify({ tags }),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
         });
 
@@ -110,8 +105,8 @@ async function save() {
 
         emit("saved");
         open.value = false;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isSaving.value = false;
     }
@@ -129,11 +124,8 @@ async function removeAll() {
         isDeleting.value = true;
         error.value = "";
 
-        await $fetch(tagsEndpoint.value, {
+        await useApi()(tagsEndpoint.value, {
             method: "DELETE",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
         });
 
         rows.value = [];
@@ -146,8 +138,8 @@ async function removeAll() {
 
         emit("saved");
         open.value = false;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isDeleting.value = false;
     }

@@ -30,9 +30,7 @@ const isLoading = ref(false);
 const error = ref("");
 const emit = defineEmits(["update:open", "close"]);
 const open = ref(props.open);
-const form = useTemplateRef("form");
-const jwtCookie = useJWTCookie();
-const callbackURL = `${useRuntimeConfig().public.apiBaseUrl}/api/v1/auth/oidc/callback`;
+const callbackURL = `/auth/oidc/callback`;
 
 watch(
     () => props.open,
@@ -53,64 +51,54 @@ const state = reactive({
     enabled: true,
 });
 
-async function submitForm(event: FormSubmitEvent<any>) {
+async function submitForm(event: FormSubmitEvent<typeof state>) {
     event.preventDefault();
     try {
         isLoading.value = true;
         error.value = "";
 
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/oidcProviders`, {
+        await useApi()(`/admin/oidcProviders`, {
             method: "POST",
             body: JSON.stringify(state),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
         });
 
         window.location.reload();
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
 }
 </script>
 <template>
-    <UModal v-model:open="open" title="Create OIDC Provider" :ui="{ footer: 'justify-end' }">
-        <slot />
-
-        <template #body>
-            <UForm ref="form" :state="state" @submit="submitForm" class="space-y-4">
-                <UAlert v-if="error != ''" title="Error" :description="error" color="error" class="" variant="subtle" />
-
-                <UFormField required label="Name" description="Shown on the login page, e.g. 'Google'.">
-                    <UInput placeholder="Name" v-model="state.name" class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-
-                <UFormField required label="Issuer URL" description="e.g. https://accounts.google.com">
-                    <UInput autocomplete="off" :autocorrect="false" placeholder="Issuer URL" v-model="state.issuerURL" class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-
-                <UFormField required label="Client ID">
-                    <UInput autocomplete="off" :autocorrect="false" placeholder="Client ID" v-model="state.clientId" class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-
-                <UFormField required label="Client Secret">
-                    <UInput autocomplete="off" :autocorrect="false" placeholder="Client Secret" type="password" v-model="state.clientSecret" class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-
-                <UFormField label="Redirect URL" description="Register this exact URL with your identity provider.">
-                    <UInput :model-value="callbackURL" readonly class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-
-                <USwitch v-model="state.enabled" size="lg" label="Enabled" description="Show this provider as a sign-in option." />
-            </UForm>
+    <FormModal v-model:open="open" title="Create OIDC Provider" submit-label="Create" :loading="isLoading" :error="error" :state="state" @submit="submitForm">
+        <template #trigger>
+            <slot />
         </template>
 
-        <template #footer="{ close }">
-            <UButton label="Cancel" color="neutral" variant="subtle" @click="close" />
-            <UButton label="Create" :loading="isLoading" color="primary" @click="form?.submit()" />
-        </template>
-    </UModal>
+        <UFormField required label="Name" description="Shown on the login page, e.g. 'Google'.">
+            <UInput placeholder="Name" v-model="state.name" class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+
+        <UFormField required label="Issuer URL" description="e.g. https://accounts.google.com">
+            <UInput autocomplete="off" :autocorrect="false" placeholder="Issuer URL" v-model="state.issuerURL" class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+
+        <UFormField required label="Client ID">
+            <UInput autocomplete="off" :autocorrect="false" placeholder="Client ID" v-model="state.clientId" class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+
+        <UFormField required label="Client Secret">
+            <UInput autocomplete="off" :autocorrect="false" placeholder="Client Secret" type="password" v-model="state.clientSecret" class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+
+        <UFormField label="Redirect URL" description="Register this exact URL with your identity provider.">
+            <UInput :model-value="callbackURL" readonly class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+
+        <USwitch v-model="state.enabled" size="lg" label="Enabled" description="Show this provider as a sign-in option." />
+    </FormModal>
 </template>

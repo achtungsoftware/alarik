@@ -35,7 +35,6 @@ const UButton = resolveComponent("UButton");
 const selectedKeyForEdit = ref<AccessKey | null>(null);
 const openKeyEditModal = ref(false);
 const rowSelection = ref<Record<string, boolean>>({});
-const jwtCookie = useJWTCookie();
 const openAccessKeyCreateModal = ref(false);
 const isDeleting = ref(false);
 const toast = useToast();
@@ -45,13 +44,11 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<AccessKey>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys`, {
+} = await useFetch<Page<AccessKey>>(`/users/accessKeys`, {
+    $fetch: useApi(),
     params: {
         page: page,
         per: itemsPerPage,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
@@ -170,15 +167,12 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys/${item.id}`, {
+                await useApi()(`/users/accessKeys/${item.id}`, {
                     method: "DELETE",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                    },
                 });
                 successCount++;
             } catch (error) {
-                console.error(`Failed to delete access key ${item.accessKey}:`, error);
+                logFailure(`Failed to delete access key ${item.accessKey}:`, error);
                 errorCount++;
             }
         }

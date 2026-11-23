@@ -31,7 +31,6 @@ const itemsPerPage = ref(10);
 const UCheckbox = resolveComponent("UCheckbox");
 const UBadge = resolveComponent("UBadge");
 const rowSelection = ref<Record<string, boolean>>({});
-const jwtCookie = useJWTCookie();
 const openUserCreateModal = ref(false);
 const isDeleting = ref(false);
 const toast = useToast();
@@ -46,13 +45,11 @@ const {
     data: fetchResponse,
     status,
     refresh,
-} = await useFetch<Page<User>>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users`, {
+} = await useFetch<Page<User>>(`/admin/users`, {
+    $fetch: useApi(),
     params: {
         page: page,
         per: itemsPerPage,
-    },
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
     },
     default: () => ({ items: [], metadata: { page: 1, per: 12, total: 0 } }),
 });
@@ -170,15 +167,12 @@ async function deleteMany() {
     try {
         for (const item of items) {
             try {
-                await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users/${item.id}`, {
+                await useApi()(`/admin/users/${item.id}`, {
                     method: "DELETE",
-                    headers: {
-                        Authorization: `Bearer ${jwtCookie.value}`,
-                    },
                 });
                 successCount++;
-            } catch (error: any) {
-                console.error(`Failed to delete user ${item.name}:`, error);
+            } catch (error) {
+                logFailure(`Failed to delete user ${item.name}:`, error);
                 errorCount++;
             }
         }
@@ -229,11 +223,8 @@ async function deleteSingleUser(user: User) {
     isDeleting.value = true;
 
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/users/${user.id}`, {
+        await useApi()(`/admin/users/${user.id}`, {
             method: "DELETE",
-            headers: {
-                Authorization: `Bearer ${jwtCookie.value}`,
-            },
         });
 
         await refresh();
@@ -244,11 +235,11 @@ async function deleteSingleUser(user: User) {
             icon: "i-lucide-circle-check",
             color: "success",
         });
-    } catch (error: any) {
-        console.error(`Failed to delete user ${user.name}:`, error);
+    } catch (error) {
+        logFailure(`Failed to delete user ${user.name}:`, error);
         toast.add({
             title: "Deletion Failed",
-            description: error.response?._data?.reason ?? "Failed to delete user",
+            description: errorMessage(error, "Failed to delete user"),
             icon: "i-lucide-circle-x",
             color: "error",
         });

@@ -30,7 +30,6 @@ const isLoading = ref(false);
 const error = ref("");
 const emit = defineEmits(["update:open", "close"]);
 const open = ref(props.open);
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 
 // null = never expires
@@ -73,7 +72,7 @@ async function generateLink() {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ url: string; expiresAt?: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/share`, {
+        const response = await useApi()<{ url: string; expiresAt?: string }>(`/objects/share`, {
             method: "POST",
             body: JSON.stringify({
                 bucket: props.bucket,
@@ -83,14 +82,13 @@ async function generateLink() {
             }),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
         });
 
         generatedURL.value = response.url;
         expiresAt.value = response.expiresAt ? new Date(response.expiresAt) : null;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }

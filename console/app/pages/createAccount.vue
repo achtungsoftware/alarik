@@ -20,7 +20,6 @@ useHead({
 });
 
 const router = useRouter();
-const jwtCookie = useJWTCookie();
 const createAccountError = ref("");
 const isLoadingCreateAccount = ref(false);
 const createAccountState = reactive({
@@ -36,7 +35,7 @@ async function createAccount(e: Event) {
         isLoadingCreateAccount.value = true;
         createAccountError.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users`, {
+        const response = await useApi()<{ token: string }>(`/users`, {
             method: "POST",
             body: JSON.stringify(createAccountState),
             headers: {
@@ -45,8 +44,8 @@ async function createAccount(e: Event) {
         });
 
         router.push("/");
-    } catch (error: any) {
-        createAccountError.value = error.data?.reason ?? "Unknown error";
+    } catch (error) {
+        createAccountError.value = errorMessage(error, "Unknown error");
     } finally {
         isLoadingCreateAccount.value = false;
     }

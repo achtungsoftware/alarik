@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import type { ButtonProps } from "@nuxt/ui";
+
 import ConfirmDialogModal from "~/components/ConfirmDialogModal.vue";
 
 export interface ConfirmDialogOptions {
     title?: string;
     message: string;
     confirmLabel?: string;
-    confirmColor?: string;
+    confirmColor?: ButtonProps["color"];
 }
 
 export function useConfirmDialog() {

@@ -52,11 +52,8 @@ interface Delivery {
 
 const route = useRoute();
 const router = useRouter();
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 const { confirm } = useConfirmDialog();
-const authHeaders = computed(() => ({ Authorization: `Bearer ${jwtCookie.value}` }));
-const apiBase = computed(() => useRuntimeConfig().public.apiBaseUrl);
 
 // ── Bucket selection - search-as-you-type, server-side ──────────────────────
 // A deployment can have far too many buckets to load into a <select> up front, so this
@@ -93,13 +90,12 @@ const bucketOptions = computed<BucketOption[]>(() => {
 async function searchBuckets(term: string) {
     isSearchingBuckets.value = true;
     try {
-        const response = await $fetch<Page<Bucket>>(`${apiBase.value}/api/v1/buckets`, {
+        const response = await useApi()<Page<Bucket>>(`/buckets`, {
             params: { page: 1, per: 20, search: term || undefined },
-            headers: authHeaders.value,
         });
         bucketSearchResults.value = response.items.map((b: Bucket) => ({ label: b.name, value: b.name }));
     } catch (err) {
-        console.error("Failed to search buckets:", err);
+        logFailure("Failed to search buckets:", err);
     } finally {
         isSearchingBuckets.value = false;
     }
@@ -118,7 +114,7 @@ const isLoading = ref(false);
 const isLoadingDeliveries = ref(false);
 const error = ref("");
 
-const base = computed(() => `${apiBase.value}/api/v1/buckets/${selectedBucketName.value}/notifications`);
+const base = computed(() => `/buckets/${selectedBucketName.value}/notifications`);
 
 const rules = ref<NotificationRule[]>([]);
 const deliveries = ref<Delivery[]>([]);
@@ -142,10 +138,10 @@ async function fetchAll() {
         isLoading.value = true;
         error.value = "";
 
-        const response = await $fetch<{ rules: NotificationRule[] }>(base.value, { headers: authHeaders.value });
+        const response = await useApi()<{ rules: NotificationRule[] }>(base.value);
         rules.value = response.rules;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
@@ -155,12 +151,12 @@ async function fetchAll() {
 async function fetchDeliveries() {
     try {
         isLoadingDeliveries.value = true;
-        const response = await $fetch<{ deliveries: Delivery[] }>(`${base.value}/deliveries`, { headers: authHeaders.value });
+        const response = await useApi()<{ deliveries: Delivery[] }>(`${base.value}/deliveries`);
         deliveries.value = response.deliveries;
     } catch (err) {
         // Non-fatal: the rules table above is the primary content of this page, a failed
         // delivery-history fetch shouldn't block using it.
-        console.error("Failed to fetch deliveries:", err);
+        logFailure("Failed to fetch deliveries:", err);
     } finally {
         isLoadingDeliveries.value = false;
     }
@@ -228,15 +224,15 @@ async function persistRules(next: NotificationRule[]) {
             })),
         };
 
-        const response = await $fetch<{ rules: NotificationRule[] }>(base.value, {
+        const response = await useApi()<{ rules: NotificationRule[] }>(base.value, {
             method: "PUT",
             body: JSON.stringify(payload),
-            headers: { "Content-Type": "application/json", ...authHeaders.value },
+            headers: { "Content-Type": "application/json" },
         });
         rules.value = response.rules;
         return true;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
         toast.add({
             title: "Failed to Save Webhook",
             description: error.value,
@@ -287,9 +283,8 @@ async function sendTest(rule: NotificationRule) {
         testingId.value = rule.id;
         error.value = "";
 
-        await $fetch(`${base.value}/${rule.id}/test`, {
+        await useApi()(`${base.value}/${rule.id}/test`, {
             method: "POST",
-            headers: authHeaders.value,
         });
 
         toast.add({
@@ -300,10 +295,10 @@ async function sendTest(rule: NotificationRule) {
         });
 
         await fetchDeliveries();
-    } catch (err: any) {
+    } catch (err) {
         toast.add({
             title: "Test Failed",
-            description: err.response?._data?.reason ?? "Unknown error",
+            description: errorMessage(err, "Unknown error"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -320,9 +315,8 @@ async function retryDelivery(delivery: Delivery) {
     try {
         retryingId.value = delivery.id;
 
-        await $fetch(`${base.value}/deliveries/${delivery.id}/retry`, {
+        await useApi()(`${base.value}/deliveries/${delivery.id}/retry`, {
             method: "POST",
-            headers: authHeaders.value,
         });
 
         toast.add({
@@ -333,10 +327,10 @@ async function retryDelivery(delivery: Delivery) {
         });
 
         await fetchDeliveries();
-    } catch (err: any) {
+    } catch (err) {
         toast.add({
             title: "Retry Failed",
-            description: err.response?._data?.reason ?? "Unknown error",
+            description: errorMessage(err, "Unknown error"),
             icon: "i-lucide-circle-x",
             color: "error",
         });

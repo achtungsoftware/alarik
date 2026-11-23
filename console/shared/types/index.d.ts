@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 declare global {
-    export interface StorageStats {
+    // Cluster-wide capacity and usage (the admin dashboard's `/admin/storage`).
+    export interface SystemStorageStats {
         totalBytes: number;
         availableBytes: number;
         usedBytes: number;

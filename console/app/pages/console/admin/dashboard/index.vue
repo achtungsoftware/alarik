@@ -24,16 +24,13 @@ useHead({
     title: `Dashboard`,
 });
 
-const jwtCookie = useJWTCookie();
 
 const {
     data: stats,
     status,
     refresh,
-} = await useFetch<StorageStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/storageStats`, {
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
-    },
+} = await useFetch<SystemStorageStats>(`/admin/storageStats`, {
+    $fetch: useApi(),
     default: () => ({
         totalBytes: 0,
         availableBytes: 0,
@@ -44,10 +41,8 @@ const {
     }),
 });
 
-const { data: sys, refresh: refreshSys } = await useFetch<SystemStats>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/admin/systemStats`, {
-    headers: {
-        Authorization: `Bearer ${jwtCookie.value}`,
-    },
+const { data: sys, refresh: refreshSys } = await useFetch<SystemStats>(`/admin/systemStats`, {
+    $fetch: useApi(),
 });
 
 // The system stats endpoint is cheap (no storage walk), so poll it for live charts.

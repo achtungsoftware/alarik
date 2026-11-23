@@ -48,7 +48,7 @@ const oidcErrorMessages: Record<string, string> = {
 
 onMounted(async () => {
     try {
-        ssoProviders.value = await $fetch<{ id: string; name: string }[]>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/auth/oidc/providers`);
+        ssoProviders.value = await useApi()<{ id: string; name: string }[]>(`/auth/oidc/providers`);
     } catch {
         ssoProviders.value = [];
     }
@@ -61,7 +61,7 @@ onMounted(async () => {
 });
 
 function loginWithSSO(providerId: string) {
-    window.location.href = `${useRuntimeConfig().public.apiBaseUrl}/api/v1/auth/oidc/login/${providerId}`;
+    window.location.href = `/auth/oidc/login/${providerId}`;
 }
 
 async function login(e: Event) {
@@ -71,7 +71,7 @@ async function login(e: Event) {
         isLoadingLogin.value = true;
         loginError.value = "";
 
-        const response = await $fetch<{ token: string }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/login`, {
+        const response = await useApi()<{ token: string }>(`/users/login`, {
             method: "POST",
             body: JSON.stringify(loginState),
             headers: {
@@ -83,8 +83,8 @@ async function login(e: Event) {
             jwtCookie.value = response.token;
             window.location.reload();
         }
-    } catch (error: any) {
-        loginError.value = error.data?.reason ?? "Unknown error";
+    } catch (error) {
+        loginError.value = errorMessage(error, "Unknown error");
     } finally {
         isLoadingLogin.value = false;
     }

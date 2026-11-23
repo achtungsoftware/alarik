@@ -31,8 +31,6 @@ const isLoading = ref(false);
 const error = ref("");
 const emit = defineEmits(["update:open", "saved"]);
 const open = ref(props.open);
-const form = useTemplateRef("form");
-const jwtCookie = useJWTCookie();
 
 watch(
     () => props.open,
@@ -49,47 +47,37 @@ const state = reactive({
     description: props.accessKey.description ?? "",
 });
 
-async function submitForm(event: FormSubmitEvent<any>) {
+async function submitForm(event: FormSubmitEvent<typeof state>) {
     event.preventDefault();
     try {
         isLoading.value = true;
         error.value = "";
 
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/users/accessKeys/${props.accessKey.id}`, {
+        await useApi()(`/users/accessKeys/${props.accessKey.id}`, {
             method: "PATCH",
             body: JSON.stringify({ description: state.description.trim() }),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
         });
 
         emit("saved");
         open.value = false;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
 }
 </script>
 <template>
-    <UModal v-model:open="open" title="Edit Description" :description="accessKey.accessKey" :ui="{ footer: 'justify-end' }">
-        <slot />
-
-        <template #body>
-            <UForm ref="form" :state="state" @submit="submitForm" class="space-y-4">
-                <UAlert v-if="error != ''" title="Error" :description="error" color="error" variant="subtle" />
-
-                <UFormField label="Description" name="description" help="Optional note to help identify what this key is used for. Leave empty to remove it.">
-                    <UTextarea placeholder="e.g. Backup server" v-model="state.description" :maxlength="500" class="w-full" size="lg" variant="subtle" />
-                </UFormField>
-            </UForm>
+    <FormModal v-model:open="open" title="Edit Description" :description="accessKey.accessKey" submit-label="Save" :loading="isLoading" :error="error" :state="state" @submit="submitForm">
+        <template #trigger>
+            <slot />
         </template>
 
-        <template #footer="{ close }">
-            <UButton label="Cancel" color="neutral" variant="subtle" @click="close" />
-            <UButton label="Save" :loading="isLoading" color="primary" @click="form?.submit()" />
-        </template>
-    </UModal>
+        <UFormField label="Description" name="description" help="Optional note to help identify what this key is used for. Leave empty to remove it.">
+            <UTextarea placeholder="e.g. Backup server" v-model="state.description" :maxlength="500" class="w-full" size="lg" variant="subtle" />
+        </UFormField>
+    </FormModal>
 </template>

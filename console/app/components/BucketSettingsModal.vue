@@ -31,7 +31,6 @@ const props = withDefaults(
 
 const emit = defineEmits(["update:open", "close", "saved"]);
 const open = ref(props.open);
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 
 const isSaving = ref(false);
@@ -45,7 +44,7 @@ const error = ref("");
 const versioningEnabled = ref(props.bucket.versioningStatus === "Enabled");
 
 const versioningEndpoint = computed(
-    () => `${useRuntimeConfig().public.apiBaseUrl}/api/v1/buckets/${props.bucket.name}/versioning`
+    () => `/buckets/${props.bucket.name}/versioning`
 );
 
 const versioningChanged = computed(() => {
@@ -77,12 +76,11 @@ async function save() {
         error.value = "";
 
         if (versioningChanged.value) {
-            await $fetch(versioningEndpoint.value, {
+            await useApi()(versioningEndpoint.value, {
                 method: "PUT",
                 body: JSON.stringify({ status: versioningEnabled.value ? "Enabled" : "Suspended" }),
                 headers: {
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${jwtCookie.value}`,
                 },
             });
         }
@@ -96,8 +94,8 @@ async function save() {
 
         emit("saved");
         open.value = false;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isSaving.value = false;
     }

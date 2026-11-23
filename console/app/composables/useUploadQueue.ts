@@ -95,7 +95,7 @@ export function useUploadQueue() {
             const newItems: UploadItem[] = batch.map((file) => {
                 let itemPrefix = prefix;
                 if (preserveFolderStructure) {
-                    const relativePath = (file as any).webkitRelativePath || file.name;
+                    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
                     itemPrefix = prefix + relativePath.substring(0, relativePath.lastIndexOf("/") + 1);
                 }
                 return {
@@ -344,7 +344,6 @@ export function useUploadQueue() {
                 // Best effort, never awaited against the user's cancel: clean up the server side.
                 $fetch(multipartUrl("", item, { uploadId }).toString(), {
                     method: "DELETE",
-                    headers: { Authorization: `Bearer ${jwtCookie.value}` },
                 }).catch(() => {});
             }
             if (abortController.signal.aborted) {

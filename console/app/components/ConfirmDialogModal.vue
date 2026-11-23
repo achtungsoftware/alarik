@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { ButtonProps } from "@nuxt/ui";
 /*
 Copyright 2025-present Julian Gerhards
 
@@ -19,7 +20,7 @@ defineProps<{
     title?: string;
     message: string;
     confirmLabel?: string;
-    confirmColor?: string;
+    confirmColor?: ButtonProps["color"];
 }>();
 
 const emit = defineEmits<{
@@ -45,7 +46,7 @@ function handleCancel() {
 
         <template #footer>
             <UButton label="Cancel" color="neutral" variant="subtle" @click="handleCancel" />
-            <UButton @click="handleConfirm" :label="confirmLabel ?? 'Continue'" :color="(confirmColor as any) ?? 'error'" />
+            <UButton @click="handleConfirm" :label="confirmLabel ?? 'Continue'" :color="confirmColor ?? 'error'" />
         </template>
     </UModal>
 </template>

@@ -26,11 +26,8 @@ useHead({
     title: "Cluster",
 });
 
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 const { confirm } = useConfirmDialog();
-const authHeaders = computed(() => ({ Authorization: `Bearer ${jwtCookie.value}` }));
-const apiBase = computed(() => useRuntimeConfig().public.apiBaseUrl);
 
 // Identity palette
 const nodeColorPalette = [
@@ -62,16 +59,16 @@ const {
     data: nodes,
     status: nodesStatus,
     refresh: refreshNodes,
-} = await useFetch<ClusterNode[]>(`${apiBase.value}/api/v1/admin/cluster/nodes`, {
-    headers: authHeaders.value,
+} = await useFetch<ClusterNode[]>(`/admin/cluster/nodes`, {
+    $fetch: useApi(),
     default: () => [],
 });
 
 const {
     data: rebalanceStatus,
     refresh: refreshRebalanceStatus,
-} = await useFetch<ClusterRebalanceStatus>(`${apiBase.value}/api/v1/admin/cluster/rebalance/status`, {
-    headers: authHeaders.value,
+} = await useFetch<ClusterRebalanceStatus>(`/admin/cluster/rebalance/status`, {
+    $fetch: useApi(),
     default: () => ({ pendingCount: 0, failedCount: 0, pendingByReason: {}, replicationFactor: 0 }),
 });
 
@@ -81,8 +78,8 @@ const {
 const {
     data: erasureCodingStatus,
     refresh: refreshErasureCodingStatus,
-} = await useFetch<ClusterErasureCodingStatus>(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/status`, {
-    headers: authHeaders.value,
+} = await useFetch<ClusterErasureCodingStatus>(`/admin/cluster/erasure-coding/status`, {
+    $fetch: useApi(),
     default: () => ({
         enabled: false,
         dataShards: 0,
@@ -103,8 +100,8 @@ const {
     data: nodeStorage,
     status: storageStatus,
     refresh: refreshStorage,
-} = await useFetch<ClusterNodeStorage[]>(`${apiBase.value}/api/v1/admin/cluster/storage`, {
-    headers: authHeaders.value,
+} = await useFetch<ClusterNodeStorage[]>(`/admin/cluster/storage`, {
+    $fetch: useApi(),
     default: () => [],
 });
 
@@ -118,12 +115,11 @@ const hasLoadedTaskDetails = ref(false);
 async function loadTaskDetails() {
     isLoadingTaskDetails.value = true;
     try {
-        taskDetails.value = await $fetch<ClusterReplicationTaskDetail[]>(`${apiBase.value}/api/v1/admin/cluster/rebalance/tasks`, {
-            headers: authHeaders.value,
+        taskDetails.value = await useApi()<ClusterReplicationTaskDetail[]>(`/admin/cluster/rebalance/tasks`, {
         });
         hasLoadedTaskDetails.value = true;
-    } catch (err: any) {
-        toast.add({ title: "Failed to Load", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } catch (err) {
+        toast.add({ title: "Failed to Load", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
     } finally {
         isLoadingTaskDetails.value = false;
     }
@@ -138,12 +134,11 @@ const hasLoadedEcTaskDetails = ref(false);
 async function loadEcTaskDetails() {
     isLoadingEcTaskDetails.value = true;
     try {
-        ecTaskDetails.value = await $fetch<ClusterErasureCodedTaskDetail[]>(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/tasks`, {
-            headers: authHeaders.value,
+        ecTaskDetails.value = await useApi()<ClusterErasureCodedTaskDetail[]>(`/admin/cluster/erasure-coding/tasks`, {
         });
         hasLoadedEcTaskDetails.value = true;
-    } catch (err: any) {
-        toast.add({ title: "Failed to Load", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } catch (err) {
+        toast.add({ title: "Failed to Load", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
     } finally {
         isLoadingEcTaskDetails.value = false;
     }
@@ -256,14 +251,13 @@ async function drainNode(node: ClusterNode) {
 
     nodeActionLoading.value[node.id] = true;
     try {
-        await $fetch(`${apiBase.value}/api/v1/admin/cluster/nodes/${node.id}/drain`, {
+        await useApi()(`/admin/cluster/nodes/${node.id}/drain`, {
             method: "POST",
-            headers: authHeaders.value,
         });
         toast.add({ title: "Node Draining", description: `${node.address} is being drained.`, icon: "i-lucide-circle-check", color: "success" });
         await refreshAll();
-    } catch (err: any) {
-        toast.add({ title: "Drain Failed", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } catch (err) {
+        toast.add({ title: "Drain Failed", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
     } finally {
         nodeActionLoading.value[node.id] = false;
     }
@@ -282,14 +276,13 @@ async function resyncCluster() {
 
     isResyncing.value = true;
     try {
-        await $fetch(`${apiBase.value}/api/v1/admin/cluster/resync`, {
+        await useApi()(`/admin/cluster/resync`, {
             method: "POST",
-            headers: authHeaders.value,
         });
         toast.add({ title: "Resync Started", description: "A full cluster-wide rebalance walk has been triggered.", icon: "i-lucide-circle-check", color: "success" });
         await refreshRebalanceStatus();
-    } catch (err: any) {
-        toast.add({ title: "Resync Failed", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } catch (err) {
+        toast.add({ title: "Resync Failed", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
     } finally {
         isResyncing.value = false;
     }
@@ -308,14 +301,13 @@ async function scrubCluster() {
 
     isScrubbing.value = true;
     try {
-        await $fetch(`${apiBase.value}/api/v1/admin/cluster/erasure-coding/scrub`, {
+        await useApi()(`/admin/cluster/erasure-coding/scrub`, {
             method: "POST",
-            headers: authHeaders.value,
         });
         toast.add({ title: "Scrub Started", description: "A cluster-wide bit-rot scrub has been triggered.", icon: "i-lucide-circle-check", color: "success" });
         await refreshErasureCodingStatus();
-    } catch (err: any) {
-        toast.add({ title: "Scrub Failed", description: err?.data?.reason ?? "Unknown error", icon: "i-lucide-circle-x", color: "error" });
+    } catch (err) {
+        toast.add({ title: "Scrub Failed", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
     } finally {
         isScrubbing.value = false;
     }
@@ -570,7 +562,7 @@ async function loadPlacement() {
     placementError.value = "";
     hasSearchedPlacement.value = true;
     try {
-        const response = await $fetch<Page<ClusterPlacementEntry>>(`${apiBase.value}/api/v1/admin/cluster/placement`, {
+        const response = await useApi()<Page<ClusterPlacementEntry>>(`/admin/cluster/placement`, {
             params: {
                 bucket: placementBucket.value,
                 prefix: placementPrefix.value || undefined,
@@ -578,12 +570,11 @@ async function loadPlacement() {
                 page: placementPage.value,
                 per: placementPer,
             },
-            headers: authHeaders.value,
         });
         placementEntries.value = response.items;
         placementTotal.value = response.metadata.total;
-    } catch (err: any) {
-        placementError.value = err?.data?.reason ?? "Failed to load placement";
+    } catch (err) {
+        placementError.value = errorMessage(err, "Failed to load placement");
         placementEntries.value = [];
     } finally {
         isLoadingPlacement.value = false;

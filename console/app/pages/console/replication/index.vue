@@ -30,11 +30,8 @@ const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 
 const route = useRoute();
 const router = useRouter();
-const jwtCookie = useJWTCookie();
 const toast = useToast();
 const { confirm } = useConfirmDialog();
-const authHeaders = computed(() => ({ Authorization: `Bearer ${jwtCookie.value}` }));
-const apiBase = computed(() => useRuntimeConfig().public.apiBaseUrl);
 
 interface BucketOption {
     label: string;
@@ -64,13 +61,12 @@ const bucketOptions = computed<BucketOption[]>(() => {
 async function searchBuckets(term: string) {
     isSearchingBuckets.value = true;
     try {
-        const response = await $fetch<Page<Bucket>>(`${apiBase.value}/api/v1/buckets`, {
+        const response = await useApi()<Page<Bucket>>(`/buckets`, {
             params: { page: 1, per: 20, search: term || undefined },
-            headers: authHeaders.value,
         });
         bucketSearchResults.value = response.items.map((b: Bucket) => ({ label: b.name, value: b.name }));
     } catch (err) {
-        console.error("Failed to search buckets:", err);
+        logFailure("Failed to search buckets:", err);
     } finally {
         isSearchingBuckets.value = false;
     }
@@ -96,7 +92,7 @@ const isLoading = ref(false);
 const isLoadingTasks = ref(false);
 const error = ref("");
 
-const base = computed(() => `${apiBase.value}/api/v1/buckets/${selectedBucketName.value}/replication`);
+const base = computed(() => `/buckets/${selectedBucketName.value}/replication`);
 
 const targets = ref<ReplicationTarget[]>([]);
 const rules = ref<ReplicationRule[]>([]);
@@ -116,9 +112,8 @@ watch(
 
         isLoadingBucket.value = true;
         try {
-            const response = await $fetch<Page<Bucket>>(`${apiBase.value}/api/v1/buckets`, {
+            const response = await useApi()<Page<Bucket>>(`/buckets`, {
                 params: { page: 1, per: 5, search: name },
-                headers: authHeaders.value,
             });
             selectedBucket.value = response.items.find((b: Bucket) => b.name === name) ?? null;
         } finally {
@@ -143,14 +138,14 @@ async function fetchAll() {
         error.value = "";
 
         const [targetsResponse, rulesResponse] = await Promise.all([
-            $fetch<{ targets: ReplicationTarget[] }>(`${base.value}/targets`, { headers: authHeaders.value }),
-            $fetch<{ rules: ReplicationRule[] }>(`${base.value}/rules`, { headers: authHeaders.value }),
+            useApi()<{ targets: ReplicationTarget[] }>(`${base.value}/targets`),
+            useApi()<{ rules: ReplicationRule[] }>(`${base.value}/rules`),
         ]);
 
         targets.value = targetsResponse.targets;
         rules.value = rulesResponse.rules;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
     } finally {
         isLoading.value = false;
     }
@@ -160,12 +155,12 @@ async function fetchAll() {
 async function fetchTasks() {
     try {
         isLoadingTasks.value = true;
-        const response = await $fetch<{ tasks: ReplicationTask[] }>(`${base.value}/tasks`, { headers: authHeaders.value });
+        const response = await useApi()<{ tasks: ReplicationTask[] }>(`${base.value}/tasks`);
         tasks.value = response.tasks;
     } catch (err) {
         // Non-fatal: the targets/rules tables above are the primary content of this page, a
         // failed task-history fetch shouldn't block using it.
-        console.error("Failed to fetch replication tasks:", err);
+        logFailure("Failed to fetch replication tasks:", err);
     } finally {
         isLoadingTasks.value = false;
     }
@@ -231,20 +226,20 @@ async function persistTargets(next: ReplicationTarget[]) {
             })),
         };
 
-        const response = await $fetch<{ targets: ReplicationTarget[] }>(`${base.value}/targets`, {
+        const response = await useApi()<{ targets: ReplicationTarget[] }>(`${base.value}/targets`, {
             method: "PUT",
             body: JSON.stringify(payload),
-            headers: { "Content-Type": "application/json", ...authHeaders.value },
+            headers: { "Content-Type": "application/json" },
         });
         targets.value = response.targets;
 
         // Removing a target auto-disables any rule that referenced it on the server - re-sync.
-        const rulesResponse = await $fetch<{ rules: ReplicationRule[] }>(`${base.value}/rules`, { headers: authHeaders.value });
+        const rulesResponse = await useApi()<{ rules: ReplicationRule[] }>(`${base.value}/rules`);
         rules.value = rulesResponse.rules;
 
         return true;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
         toast.add({
             title: "Failed to Save Target",
             description: error.value,
@@ -355,15 +350,15 @@ async function persistRules(next: ReplicationRule[]) {
             })),
         };
 
-        const response = await $fetch<{ rules: ReplicationRule[] }>(`${base.value}/rules`, {
+        const response = await useApi()<{ rules: ReplicationRule[] }>(`${base.value}/rules`, {
             method: "PUT",
             body: JSON.stringify(payload),
-            headers: { "Content-Type": "application/json", ...authHeaders.value },
+            headers: { "Content-Type": "application/json" },
         });
         rules.value = response.rules;
         return true;
-    } catch (err: any) {
-        error.value = err.response?._data?.reason ?? "Unknown error";
+    } catch (err) {
+        error.value = errorMessage(err, "Unknown error");
         toast.add({
             title: "Failed to Save Rule",
             description: error.value,
@@ -413,9 +408,8 @@ async function resync(rule: ReplicationRule) {
     try {
         resyncingId.value = rule.id;
 
-        await $fetch(`${base.value}/rules/${rule.id}/resync`, {
+        await useApi()(`${base.value}/rules/${rule.id}/resync`, {
             method: "POST",
-            headers: authHeaders.value,
         });
 
         // The walk runs in the background - it's not done by the time this returns, just
@@ -428,10 +422,10 @@ async function resync(rule: ReplicationRule) {
         });
 
         await fetchTasks();
-    } catch (err: any) {
+    } catch (err) {
         toast.add({
             title: "Resync Failed",
-            description: err.response?._data?.reason ?? "Unknown error",
+            description: errorMessage(err, "Unknown error"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -448,9 +442,8 @@ async function retryTask(task: ReplicationTask) {
     try {
         retryingId.value = task.id;
 
-        await $fetch(`${base.value}/tasks/${task.id}/retry`, {
+        await useApi()(`${base.value}/tasks/${task.id}/retry`, {
             method: "POST",
-            headers: authHeaders.value,
         });
 
         toast.add({
@@ -461,10 +454,10 @@ async function retryTask(task: ReplicationTask) {
         });
 
         await fetchTasks();
-    } catch (err: any) {
+    } catch (err) {
         toast.add({
             title: "Retry Failed",
-            description: err.response?._data?.reason ?? "Unknown error",
+            description: errorMessage(err, "Unknown error"),
             icon: "i-lucide-circle-x",
             color: "error",
         });

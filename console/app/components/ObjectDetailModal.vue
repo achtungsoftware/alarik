@@ -29,7 +29,6 @@ const props = withDefaults(
 
 const emit = defineEmits(["update:open", "close", "versionDeleted", "saved"]);
 const open = ref(props.open);
-const jwtCookie = useJWTCookie();
 const { downloadTicketUrl, triggerBrowserDownload } = useObjectService();
 const toast = useToast();
 const versions = ref<BrowserItem[]>([]);
@@ -72,8 +71,7 @@ async function fetchMetadata() {
 
     loadingMetadata.value = true;
     try {
-        const response = await $fetch<{ contentType: string; metadata: Record<string, string> }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/metadata`, {
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        const response = await useApi()<{ contentType: string; metadata: Record<string, string> }>(`/objects/metadata`, {
             params: {
                 bucket: props.bucketName,
                 key: props.item.key,
@@ -82,7 +80,7 @@ async function fetchMetadata() {
         contentTypeInput.value = response.contentType;
         metadataRows.value = Object.entries(response.metadata).map(([key, value]) => ({ key, value }));
     } catch (error) {
-        console.error("Failed to fetch metadata:", error);
+        logFailure("Failed to fetch metadata:", error);
         contentTypeInput.value = props.item.contentType;
         metadataRows.value = [];
     } finally {
@@ -118,12 +116,11 @@ async function saveMetadata() {
             metadata[row.key.trim()] = row.value;
         }
 
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/metadata`, {
+        await useApi()(`/objects/metadata`, {
             method: "PUT",
             body: JSON.stringify({ contentType: contentTypeInput.value.trim(), metadata }),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
             params: {
                 bucket: props.bucketName,
@@ -139,10 +136,10 @@ async function saveMetadata() {
         });
 
         emit("saved");
-    } catch (error: any) {
+    } catch (error) {
         toast.add({
             title: "Save Failed",
-            description: error.data?.reason ?? "Failed to save metadata",
+            description: errorMessage(error, "Failed to save metadata"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -156,8 +153,7 @@ async function fetchTags() {
 
     loadingTags.value = true;
     try {
-        const response = await $fetch<{ tags: Record<string, string> }>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/tags`, {
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        const response = await useApi()<{ tags: Record<string, string> }>(`/objects/tags`, {
             params: {
                 bucket: props.bucketName,
                 key: props.item.key,
@@ -165,7 +161,7 @@ async function fetchTags() {
         });
         tagRows.value = Object.entries(response.tags).map(([key, value]) => ({ key, value }));
     } catch (error) {
-        console.error("Failed to fetch tags:", error);
+        logFailure("Failed to fetch tags:", error);
         tagRows.value = [];
     } finally {
         loadingTags.value = false;
@@ -191,12 +187,11 @@ async function saveTags() {
             tags[row.key.trim()] = row.value;
         }
 
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/tags`, {
+        await useApi()(`/objects/tags`, {
             method: "PUT",
             body: JSON.stringify({ tags }),
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${jwtCookie.value}`,
             },
             params: {
                 bucket: props.bucketName,
@@ -210,10 +205,10 @@ async function saveTags() {
             icon: "i-lucide-circle-check",
             color: "success",
         });
-    } catch (error: any) {
+    } catch (error) {
         toast.add({
             title: "Save Failed",
-            description: error.data?.reason ?? "Failed to save tags",
+            description: errorMessage(error, "Failed to save tags"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -227,8 +222,7 @@ async function fetchVersions() {
 
     loadingVersions.value = true;
     try {
-        const response = await $fetch<BrowserItem[]>(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/versions`, {
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
+        const response = await useApi()<BrowserItem[]>(`/objects/versions`, {
             params: {
                 bucket: props.bucketName,
                 key: props.item.key,
@@ -236,7 +230,7 @@ async function fetchVersions() {
         });
         versions.value = response || [];
     } catch (error) {
-        console.error("Failed to fetch versions:", error);
+        logFailure("Failed to fetch versions:", error);
         versions.value = [];
     } finally {
         loadingVersions.value = false;
@@ -248,9 +242,8 @@ async function deleteVersion(versionId: string) {
 
     deletingVersionId.value = versionId;
     try {
-        await $fetch(`${useRuntimeConfig().public.apiBaseUrl}/api/v1/objects/version`, {
+        await useApi()(`/objects/version`, {
             method: "DELETE",
-            headers: { Authorization: `Bearer ${jwtCookie.value}` },
             params: {
                 bucket: props.bucketName,
                 key: props.item.key,
@@ -270,10 +263,10 @@ async function deleteVersion(versionId: string) {
 
         // Emit event so parent can refresh if needed
         emit("versionDeleted");
-    } catch (error: any) {
+    } catch (error) {
         toast.add({
             title: "Delete Failed",
-            description: error.data?.reason || "Failed to delete version",
+            description: errorMessage(error, "Failed to delete version"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
@@ -315,10 +308,10 @@ async function downloadVersion(versionId: string) {
             icon: "i-lucide-download",
             color: "success",
         });
-    } catch (error: any) {
+    } catch (error) {
         toast.add({
             title: "Download Failed",
-            description: error.message || "Failed to download version",
+            description: errorMessage(error, "Failed to download version"),
             icon: "i-lucide-circle-x",
             color: "error",
         });
