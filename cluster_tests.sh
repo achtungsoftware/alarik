@@ -673,6 +673,14 @@ else
             pass "Draining a node excludes it from placement and reclaims its local copy once the new owner has one, without losing the object."
         else
             fail "Reclaim did not complete as expected (reclaimed=$RECLAIMED still_listed=$STILL_LISTED content_ok=$CONTENT_STILL_OK)."
+            # Reclaim is gated on the key having no outstanding EC repair rows anywhere, so show
+            # what each node still holds for it - the usual culprit is a row sitting on backoff.
+            for j in $(seq 0 $((NODE_COUNT - 1))); do
+                echo "  node $j shards: $(ls "${STATE_DIRS[$j]}/Storage/buckets/cluster-reclaim-test/reclaim.txt.ecshards" 2>/dev/null | tr '\n' ' ')"
+                find "${STATE_DIRS[$j]}/Storage/outbox/erasure-coded-replication-tasks" -name "*.task" 2>/dev/null | while read -r task_file; do
+                    grep -q "reclaim.txt" "$task_file" && echo "  node $j outbox: $(cat "$task_file")"
+                done
+            done
         fi
 
         # Every write is erasure-coded by default now with k+m == NODE_COUNT (zero slack) - unlike
