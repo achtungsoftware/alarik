@@ -3208,6 +3208,54 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("DeleteObjects - Results stay in request order with parallel deletes")
+    func testDeleteObjectsOrderedWithManyKeys() async throws {
+        let bucketName = "test-delete-objects-ordered"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            // More keys than the delete concurrency, so completion order differs from request order.
+            let keys = (0..<25).map { "obj-\(String(format: "%02d", $0)).txt" }
+            for key in keys {
+                try await putObject(app, bucketName: bucketName, key: key, content: key)
+            }
+            // Request them in reverse, with an invalid empty key in the middle.
+            var requested = Array(keys.reversed())
+            requested.insert("", at: 10)
+            let body = Data(
+                ("<Delete>" + requested.map { "<Object><Key>\($0)</Key></Object>" }.joined() + "</Delete>").utf8)
+            let signed = signedHeaders(
+                for: .POST, path: "/\(bucketName)", query: "delete", body: body,
+                additionalHeaders: ["Content-MD5": Data(Insecure.MD5.hash(data: body)).base64EncodedString()])
+            try await app.test(
+                .POST, "/\(bucketName)?delete",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: body)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    // Pretty-printed XML: match structurally, not on exact whitespace.
+                    let xml = res.body.string.replacingOccurrences(
+                        of: ">\\s+<", with: "><", options: .regularExpression)
+                    let deletedKeys = xml.components(separatedBy: "<Deleted><Key>").dropFirst()
+                        .compactMap { $0.components(separatedBy: "</Key>").first }
+                    #expect(deletedKeys == Array(keys.reversed()))
+                    #expect(xml.contains("<Code>InvalidArgument</Code>"))
+                })
+            for key in keys {
+                let head = signedHeaders(for: .HEAD, path: "/\(bucketName)/\(key)")
+                try await app.test(
+                    .HEAD, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in
+                        req.headers.add(contentsOf: head)
+                    },
+                    afterResponse: { res in
+                        #expect(res.status == .notFound)
+                    })
+            }
+        }
+    }
+
     @Test("DeleteObjects - Multi-object delete removes all listed keys")
     func testDeleteObjectsBasic() async throws {
         let bucketName = "test-delete-objects-basic"

@@ -1436,6 +1436,20 @@ struct S3Controller: RouteCollection {
         // Authenticate access to source bucket
         _ = try await S3Service.authenticateWithCache(req: req, bucketName: copySource.bucketName)
 
+        // Preconditions first, header-only, so a failing `x-amz-copy-source-if-*` never pays for
+        // pulling a remote or erasure-coded source. Re-checked below against the bytes actually
+        // copied, which also covers a source this node cannot describe without fetching it.
+        if req.headers.contains(where: { $0.name.lowercased().hasPrefix("x-amz-copy-source-if-") }) {
+            let (_, _, sourceResponsible) = await ObjectRoutingService.erasureCodedReadPlacement(
+                req: req, bucketName: copySource.bucketName, key: copySource.key)
+            if let headMeta = try? await Self.resolveObjectMetaEitherFormat(
+                req: req, bucketName: copySource.bucketName, key: copySource.key,
+                versionId: copySource.versionId, responsible: sourceResponsible)
+            {
+                try S3Service.validateCopyConditions(req: req, sourceMeta: headMeta)
+            }
+        }
+
         // Resolve the source straight to its on-disk file (fetching it from a peer first if
         // this node doesn't hold it) - the payload is streamed file-to-file in fixed windows,
         // never buffered whole.
@@ -2017,6 +2031,10 @@ struct S3Controller: RouteCollection {
             message: "Invalid POST request", requestId: req.id)
     }
 
+    /// Deletes in a multi-object request that run at once. In a cluster each delete is a
+    /// network round trip, so a 1000-key batch was 1000 serial round trips.
+    static let multiObjectDeleteConcurrency = 8
+
     /// Multi-Object Delete - POST /:bucket?delete
     @Sendable
     private func handleDeleteObjects(req: Request, bucketName: String) async throws -> Response {
@@ -2026,18 +2044,18 @@ struct S3Controller: RouteCollection {
 
         let versioningStatus = await BucketVersioningCache.shared.resolvedStatus(app: req.application, bucket: bucketName)
 
-        var deleted: [DeletedEntry] = []
-        var errors: [DeleteErrorEntry] = []
+        enum Outcome {
+            case deleted(DeletedEntry)
+            case failed(DeleteErrorEntry)
+        }
 
-        for object in objects {
+        let deleteOne: @Sendable (DeleteObjectRequestEntry) async -> Outcome = { object in
             guard !object.key.isEmpty else {
-                errors.append(
+                return .failed(
                     DeleteErrorEntry(
                         key: object.key, code: "InvalidArgument",
                         message: "The Key element of an Object cannot be empty."))
-                continue
             }
-
             do {
                 let outcome = try await ClusterReplicationService.deleteObjectClusterWide(
                     req: req, bucketName: bucketName, key: object.key,
@@ -2046,14 +2064,6 @@ struct S3Controller: RouteCollection {
                     await ClusterReplicationService.pruneEmptyPrefix(
                         app: req.application, bucketName: bucketName, prefix: object.key)
                 }
-
-                deleted.append(
-                    DeletedEntry(
-                        key: object.key,
-                        versionId: outcome.isDeleteMarker ? nil : outcome.versionId,
-                        deleteMarker: outcome.isDeleteMarker ? true : nil,
-                        deleteMarkerVersionId: outcome.isDeleteMarker ? outcome.versionId : nil
-                    ))
 
                 await NotificationService.emit(
                     event: outcome.isDeleteMarker
@@ -2068,11 +2078,44 @@ struct S3Controller: RouteCollection {
                         app: req.application, bucketName: bucketName, key: object.key,
                         versionId: outcome.versionId)
                 }
+                return .deleted(
+                    DeletedEntry(
+                        key: object.key,
+                        versionId: outcome.isDeleteMarker ? nil : outcome.versionId,
+                        deleteMarker: outcome.isDeleteMarker ? true : nil,
+                        deleteMarkerVersionId: outcome.isDeleteMarker ? outcome.versionId : nil
+                    ))
             } catch {
-                errors.append(
+                return .failed(
                     DeleteErrorEntry(
                         key: object.key, code: "InternalError",
                         message: "We encountered an internal error. Please try again."))
+            }
+        }
+
+        // Bounded parallelism, results reported in request order.
+        let limiter = AsyncSemaphore(permits: Self.multiObjectDeleteConcurrency)
+        var outcomes = [Outcome?](repeating: nil, count: objects.count)
+        await withTaskGroup(of: (Int, Outcome).self) { group in
+            for (index, object) in objects.enumerated() {
+                group.addTask {
+                    let outcome = (try? await limiter.withPermit { await deleteOne(object) })
+                        ?? .failed(
+                            DeleteErrorEntry(
+                                key: object.key, code: "InternalError",
+                                message: "We encountered an internal error. Please try again."))
+                    return (index, outcome)
+                }
+            }
+            for await (index, outcome) in group { outcomes[index] = outcome }
+        }
+
+        var deleted: [DeletedEntry] = []
+        var errors: [DeleteErrorEntry] = []
+        for case let outcome? in outcomes {
+            switch outcome {
+            case .deleted(let entry): deleted.append(entry)
+            case .failed(let entry): errors.append(entry)
             }
         }
 
