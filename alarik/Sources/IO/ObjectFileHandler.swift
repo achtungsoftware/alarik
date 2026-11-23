@@ -1201,13 +1201,16 @@ struct ObjectFileHandler {
     /// pay for stat-ing + creating the parent directory on the rare miss (same pattern as
     /// `AtomicObjectWriter.init` and `SpoolSink.spillToDisk`).
     static func updateLatestPointer(bucketName: String, key: String, versionId: String) throws {
-        let pointerPath = latestPointerPath(for: bucketName, key: key)
+        // Through the same writer as the version file: a pointer that survives a crash only in
+        // the page cache leaves the just-acknowledged version unreadable ("No versions found")
+        // or serves the previous one as current.
+        var writer = try AtomicObjectWriter(finalPath: latestPointerPath(for: bucketName, key: key))
         do {
-            try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
+            try writer.write(Data(versionId.utf8))
+            try writer.finish()
         } catch {
-            let dirURL = URL(fileURLWithPath: pointerPath).deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-            try versionId.write(toFile: pointerPath, atomically: true, encoding: .utf8)
+            writer.abort()
+            throw error
         }
     }
 

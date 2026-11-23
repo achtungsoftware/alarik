@@ -106,11 +106,24 @@ struct MultipartFileHandler {
             httpHeaders: httpHeaders
         )
 
-        let metaData = try jsonEncoder.encode(meta)
-        let metaPath = try metadataPath(for: bucketName, uploadId: uploadId)
-        try metaData.write(to: URL(fileURLWithPath: metaPath))
+        try writeAtomically(
+            try jsonEncoder.encode(meta), to: try metadataPath(for: bucketName, uploadId: uploadId))
 
         return uploadId
+    }
+
+    /// Small multipart bookkeeping files (upload meta, part meta, in-memory parts) go through
+    /// `AtomicObjectWriter` like everything else: a torn `meta.json` after a crash made
+    /// CompleteMultipartUpload and every ListMultipartUploads throw a JSON error.
+    private static func writeAtomically(_ data: Data, to path: String) throws {
+        var writer = try AtomicObjectWriter(finalPath: path)
+        do {
+            try writer.write(data)
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
+        }
     }
 
     /// Writes a part and returns its ETag
@@ -139,8 +152,8 @@ struct MultipartFileHandler {
         let etag = S3Service.computeETag(data)
 
         // Write part data
-        let partPath = try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
-        try data.write(to: URL(fileURLWithPath: partPath))
+        try writeAtomically(
+            data, to: try partPath(for: bucketName, uploadId: uploadId, partNumber: partNumber))
 
         try writePartMeta(
             bucketName: bucketName, uploadId: uploadId, partNumber: partNumber,
@@ -290,9 +303,9 @@ struct MultipartFileHandler {
             lastModified: Date(),
             checksum: checksum
         )
-        let partMetaData = try jsonEncoder.encode(partMeta)
-        let partMetaPath = try partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber)
-        try partMetaData.write(to: URL(fileURLWithPath: partMetaPath))
+        try writeAtomically(
+            try jsonEncoder.encode(partMeta),
+            to: try partMetaPath(for: bucketName, uploadId: uploadId, partNumber: partNumber))
     }
 
     /// Everything `completeUpload` does short of the actual write: validates/orders parts,
