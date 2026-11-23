@@ -54,6 +54,10 @@ const openBucketTagsModal = ref(false);
 const selectedBucketForTags = ref<Bucket | null>(null);
 const openBucketSettingsModal = ref(false);
 const selectedBucketForSettings = ref<Bucket | null>(null);
+const openBucketLifecycleModal = ref(false);
+const selectedBucketForLifecycle = ref<Bucket | null>(null);
+const openBucketCORSModal = ref(false);
+const selectedBucketForCORS = ref<Bucket | null>(null);
 const openShareModal = ref(false);
 const shareObject = ref<BrowserItem | null>(null);
 const openCopyModal = ref(false);
@@ -484,6 +488,30 @@ const columns: TableColumn<BrowserItem>[] = [
                         },
                     }),
                     h(resolveComponent("UButton"), {
+                        label: "Lifecycle",
+                        variant: "subtle",
+                        color: "neutral",
+                        size: "sm",
+                        icon: "i-lucide-timer",
+                        onClick: (e: Event) => {
+                            e.stopPropagation();
+                            selectedBucketForLifecycle.value = bucket;
+                            openBucketLifecycleModal.value = true;
+                        },
+                    }),
+                    h(resolveComponent("UButton"), {
+                        label: "CORS",
+                        variant: "subtle",
+                        color: "neutral",
+                        size: "sm",
+                        icon: "i-lucide-globe",
+                        onClick: (e: Event) => {
+                            e.stopPropagation();
+                            selectedBucketForCORS.value = bucket;
+                            openBucketCORSModal.value = true;
+                        },
+                    }),
+                    h(resolveComponent("UButton"), {
                         label: "Webhooks",
                         variant: "subtle",
                         color: "neutral",
@@ -769,6 +797,8 @@ async function deleteBucket(bucketName: string): Promise<boolean> {
     <BucketPolicyModal v-if="selectedBucketForPolicy && openBucketPolicyModal" v-model:open="openBucketPolicyModal" :bucket="selectedBucketForPolicy" @saved="refreshBuckets" />
     <BucketTagsModal v-if="selectedBucketForTags && openBucketTagsModal" v-model:open="openBucketTagsModal" :bucket="selectedBucketForTags" @saved="refreshBuckets" />
     <BucketSettingsModal v-if="selectedBucketForSettings && openBucketSettingsModal" v-model:open="openBucketSettingsModal" :bucket="selectedBucketForSettings" @saved="refreshBuckets" />
+    <BucketLifecycleModal v-if="selectedBucketForLifecycle && openBucketLifecycleModal" v-model:open="openBucketLifecycleModal" :bucket="selectedBucketForLifecycle" />
+    <BucketCORSModal v-if="selectedBucketForCORS && openBucketCORSModal" v-model:open="openBucketCORSModal" :bucket="selectedBucketForCORS" />
     <ShareFileModal v-if="shareObject && openShareModal" v-model:open="openShareModal" :bucket="currentBucket" :item="shareObject" />
     <FilePreviewModal v-model:open="openPreviewModal" :bucket="currentBucket" :item="previewObject" @saved="refresh" />
     <ObjectCopyModal v-if="copyObjectTarget && openCopyModal" v-model:open="openCopyModal" :bucket="currentBucket" :item="copyObjectTarget" :mode="copyMode" @done="refresh" />
