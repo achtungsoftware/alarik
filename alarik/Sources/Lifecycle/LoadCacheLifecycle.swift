@@ -281,14 +281,17 @@ final class LoadCacheLifecycle: LifecycleHandler {
     /// when it was saved, so this is a defensive skip, not an expected case.
     static func parsedPolicy(for bucket: Bucket, logger: Logger) -> BucketPolicy? {
         guard let rawPolicy = bucket.policy else { return nil }
-        guard
-            let policy = try? BucketPolicy.parseAndValidate(
+        do {
+            return try BucketPolicy.parseAndValidate(
                 rawJSON: rawPolicy, bucketName: bucket.name, requestId: "cache-reload")
-        else {
-            logger.error("Failed to load stored policy for bucket '\(bucket.name)' - skipping")
+        } catch {
+            // Fail closed, but loudly: GetBucketPolicy still returns the stored document.
+            let reason = (error as? S3Error)?.message ?? "\(error)"
+            logger.error(
+                "Stored bucket policy for '\(bucket.name)' no longer validates and is NOT enforced, while GetBucketPolicy still returns it - delete or re-put the policy. Reason: \(reason)"
+            )
             return nil
         }
-        return policy
     }
 
     /// nil when every flag is false - a bucket with no restrictions behaves identically to not
