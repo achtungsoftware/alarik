@@ -372,7 +372,13 @@ struct S3Controller: RouteCollection {
         // Validate conditional request headers
         try S3Service.validateConditionalHeaders(req: req, meta: meta)
 
-        let response = S3Service.buildVersionedObjectMetadataResponse(meta: meta)
+        let partSelection = try S3Service.partSelection(req: req, meta: meta)
+        let response = S3Service.buildVersionedObjectMetadataResponse(
+            meta: meta, range: partSelection?.range)
+        if let partSelection {
+            response.headers.replaceOrAdd(
+                name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
+        }
         S3Service.addChecksumHeadersIfRequested(req: req, meta: meta, to: response)
         return response
     }
@@ -1725,18 +1731,18 @@ struct S3Controller: RouteCollection {
                         status: .notFound, code: "NoSuchKey",
                         message: "The specified key does not exist.", requestId: req.id)
                 }
-                do {
-                    try S3Service.validateConditionalHeaders(req: req, meta: meta)
-                } catch {
-                    prepared.discard()
-                    throw error
-                }
-
+                let partSelection: (range: ByteRange?, partsCount: Int)?
                 let byteRange: ByteRange?
                 do {
-                    byteRange =
-                        req.headers.first(name: .range) != nil
-                        ? try S3RangeParser.parseRange(from: req, fileSize: meta.size) : nil
+                    try S3Service.validateConditionalHeaders(req: req, meta: meta)
+                    partSelection = try S3Service.partSelection(req: req, meta: meta)
+                    if let partSelection {
+                        byteRange = partSelection.range
+                    } else {
+                        byteRange =
+                            req.headers.first(name: .range) != nil
+                            ? try S3RangeParser.parseRange(from: req, fileSize: meta.size) : nil
+                    }
                 } catch {
                     prepared.discard()
                     throw error
@@ -1758,6 +1764,10 @@ struct S3Controller: RouteCollection {
                 S3Service.addVersionHeaders(to: response, meta: meta)
                 if let tagCount = meta.tags?.count, tagCount > 0 {
                     response.headers.add(name: "x-amz-tagging-count", value: String(tagCount))
+                }
+                if let partSelection {
+                    response.headers.replaceOrAdd(
+                        name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
                 }
                 response.body = Response.Body(
                     managedAsyncStream: { writer in
@@ -1809,10 +1819,15 @@ struct S3Controller: RouteCollection {
 
         try S3Service.validateConditionalHeaders(req: req, meta: meta)
 
-        let byteRange: ByteRange? =
-            req.headers.first(name: .range) != nil
-            ? try S3RangeParser.parseRange(from: req, fileSize: meta.size)
-            : nil
+        let partSelection = try S3Service.partSelection(req: req, meta: meta)
+        let byteRange: ByteRange?
+        if let partSelection {
+            byteRange = partSelection.range
+        } else {
+            byteRange =
+                req.headers.first(name: .range) != nil
+                ? try S3RangeParser.parseRange(from: req, fileSize: meta.size) : nil
+        }
         let bodyLength = byteRange?.length ?? payloadSize
 
         if bodyLength > Constants.streamingThreshold {
@@ -1822,6 +1837,10 @@ struct S3Controller: RouteCollection {
             // (e.g. aws s3 cp's parallel ranged download) must never validate it against one range.
             if byteRange == nil {
                 S3Service.addChecksumHeadersIfRequested(req: req, meta: meta, to: response)
+            }
+            if let partSelection {
+                response.headers.replaceOrAdd(
+                    name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
             }
             return response
         }
@@ -1845,6 +1864,10 @@ struct S3Controller: RouteCollection {
         // the whole-object checksum, or a ranged download will validate it against partial bytes.
         if byteRange == nil {
             S3Service.addChecksumHeadersIfRequested(req: req, meta: freshMeta, to: response)
+        }
+        if let partSelection {
+            response.headers.replaceOrAdd(
+                name: S3Service.partsCountHeader, value: String(partSelection.partsCount))
         }
         return response
     }

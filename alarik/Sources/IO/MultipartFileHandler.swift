@@ -447,6 +447,10 @@ struct MultipartFileHandler {
             updatedAt: Date()
         )
 
+        // Per-part sizes are kept for every multipart object: `GET ?partNumber` needs them to
+        // serve one part's byte range, checksummed or not.
+        objectMeta.parts = partDetails
+
         // Object checksum: only when the upload pinned an algorithm at Create and every part
         // carried a checksum (a single missing one makes it unverifiable, so we store none rather
         // than a wrong one). The type is constrained by the algorithm - CRC64NVME is full-object,
@@ -465,8 +469,6 @@ struct MultipartFileHandler {
                 objectMeta.checksum = ObjectChecksum.composite(
                     algorithm: algorithm, partChecksumsBase64: partDetails.compactMap { $0.checksum })
             }
-            // Retain per-part detail (for GetObjectAttributes) only for checksummed uploads.
-            objectMeta.parts = partDetails
         }
 
         return CompletionPlan(

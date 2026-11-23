@@ -262,6 +262,41 @@ struct S3Service {
         return response
     }
 
+    /// `partNumber` on GET/HEAD selects one part of a multipart object, served as the byte range
+    /// that part occupies plus `x-amz-mp-parts-count` - what parallel downloaders (AWS CRT,
+    /// Java TransferManager, Mountpoint) use to reassemble an object part by part. A single-part
+    /// object is part 1 of 1. Out of range is `416 InvalidPartNumber`; together with `Range` it
+    /// is `400 InvalidRequest`. A nil range with a non-nil result means "the whole, empty object".
+    static func partSelection(req: Request, meta: ObjectMeta) throws -> (
+        range: ByteRange?, partsCount: Int
+    )? {
+        guard let raw = req.query[String.self, at: "partNumber"] else { return nil }
+        guard let partNumber = Int(raw), partNumber >= 1, partNumber <= 10_000 else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidArgument",
+                message: "Part number must be an integer between 1 and 10000, inclusive",
+                requestId: req.id)
+        }
+        guard req.headers.first(name: .range) == nil else {
+            throw S3Error(
+                status: .badRequest, code: "InvalidRequest",
+                message: "Cannot specify both Range header and partNumber query parameter",
+                requestId: req.id)
+        }
+        let sizes = (meta.parts?.map(\.size)).flatMap { $0.isEmpty ? nil : $0 } ?? [meta.size]
+        guard partNumber <= sizes.count else {
+            throw S3Error(
+                status: .rangeNotSatisfiable, code: "InvalidPartNumber",
+                message: "The requested partnumber is not satisfiable", requestId: req.id)
+        }
+        let start = sizes.prefix(partNumber - 1).reduce(0, +)
+        let length = sizes[partNumber - 1]
+        guard length > 0 else { return (nil, sizes.count) }
+        return (ByteRange(start: start, end: start + length - 1), sizes.count)
+    }
+
+    static let partsCountHeader = "x-amz-mp-parts-count"
+
     /// Client-supplied page limits (`max-keys`, `max-parts`, `max-uploads`). A negative value
     /// is `InvalidArgument`, anything above S3's page maximum is capped to 1000. They feed
     /// `Array.prefix`, which traps on a negative count - unchecked, `?max-keys=-1` took the
