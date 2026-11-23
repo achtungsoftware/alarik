@@ -407,9 +407,13 @@ echo "Creating buckets for UploadPartCopy tests..."
 aws_s3 s3 mb s3://upload-part-copy-source-bucket
 aws_s3 s3 mb s3://upload-part-copy-dest-bucket
 
-# Upload a source object larger than a single part for a meaningful range-copy test
+# The source must be at least 5 MiB: copied parts obey the same minimum as uploaded ones
+# (every part but the last), so the whole-object copy below is part 1 and the small range copy
+# is the final part.
 echo "Uploading source object..."
-echo -n "0123456789ABCDEFGHIJ" | aws_s3 s3 cp - s3://upload-part-copy-source-bucket/source.txt
+UPC_SRC=$(mktemp)
+head -c $((5 * 1024 * 1024 + 20)) /dev/urandom > "$UPC_SRC"
+aws_s3 s3 cp "$UPC_SRC" s3://upload-part-copy-source-bucket/source.txt
 
 # Create a multipart upload on the destination
 echo "Creating multipart upload on destination..."
@@ -467,16 +471,21 @@ else
     echo "  Response: $COMPLETE_RESPONSE"
 fi
 
-# Verify final content: full source (20 bytes) + first 10 bytes of source again
-DEST_CONTENT=$(aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest.txt -)
-EXPECTED_CONTENT="0123456789ABCDEFGHIJ0123456789"
-if [ "$DEST_CONTENT" == "$EXPECTED_CONTENT" ]; then
+# Verify final content: the full source followed by its first 10 bytes again
+UPC_EXPECTED=$(mktemp); UPC_DEST=$(mktemp)
+cat "$UPC_SRC" > "$UPC_EXPECTED"
+head -c 10 "$UPC_SRC" >> "$UPC_EXPECTED"
+aws_s3 s3 cp s3://upload-part-copy-dest-bucket/dest.txt "$UPC_DEST" > /dev/null
+UPC_EXPECTED_MD5=$(md5 -q "$UPC_EXPECTED" 2>/dev/null || md5sum "$UPC_EXPECTED" | cut -d' ' -f1)
+UPC_DEST_MD5=$(md5 -q "$UPC_DEST" 2>/dev/null || md5sum "$UPC_DEST" | cut -d' ' -f1)
+if [ "$UPC_DEST_MD5" == "$UPC_EXPECTED_MD5" ]; then
     pass "Assembled object has the expected content from both copied parts."
 else
     fail "Assembled object content mismatch."
-    echo "  Expected: $EXPECTED_CONTENT"
-    echo "  Got:      $DEST_CONTENT"
+    echo "  Expected md5: $UPC_EXPECTED_MD5 ($(wc -c < "$UPC_EXPECTED") bytes)"
+    echo "  Got md5:      $UPC_DEST_MD5 ($(wc -c < "$UPC_DEST") bytes)"
 fi
+rm -f "$UPC_SRC" "$UPC_EXPECTED" "$UPC_DEST"
 
 # UploadPartCopy from a non-existent source key should fail
 echo "Testing UploadPartCopy with a non-existent source key..."
