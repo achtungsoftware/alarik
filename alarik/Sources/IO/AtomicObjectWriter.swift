@@ -84,7 +84,7 @@ struct AtomicObjectWriter {
         let folderURL = fileURL.deletingLastPathComponent()
 
         self.finalPath = finalPath
-        self.tempPath = folderURL.path + "/.tmp-" + UUID().uuidString
+        self.tempPath = folderURL.path + "/" + Self.tempFilePrefix + UUID().uuidString
 
         // Optimistically open first instead of always stat-ing the parent directory before
         // every write - the directory already exists for the overwhelming majority of writes
@@ -162,5 +162,31 @@ struct AtomicObjectWriter {
         finished = true
         _ = POSIXFile.close(fd)
         _ = POSIXFile.unlink(tempPath)
+    }
+
+    static let tempFilePrefix = ".tmp-"
+
+    /// Removes temp files a crashed writer left behind under `root`. A live write's temp file
+    /// is seconds old, so anything older than `age` is an orphan: it holds space, and a
+    /// directory containing one can never be pruned as empty. One walk; run at boot and
+    /// periodically, not on the request path. Returns how many were removed.
+    @discardableResult
+    static func removeOrphanedTempFiles(under root: String, olderThan age: TimeInterval) -> Int {
+        let fileManager = FileManager.default
+        guard
+            let enumerator = fileManager.enumerator(
+                at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [])
+        else { return 0 }
+        let cutoff = Date().addingTimeInterval(-age)
+        var removed = 0
+        for case let fileURL as URL in enumerator where fileURL.lastPathComponent.hasPrefix(tempFilePrefix) {
+            guard
+                let modified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate, modified < cutoff
+            else { continue }
+            if (try? fileManager.removeItem(at: fileURL)) != nil { removed += 1 }
+        }
+        return removed
     }
 }

@@ -43,4 +43,22 @@ struct AtomicObjectWriterTests {
         #expect(POSIXFile.fsyncDirectory(dir + "does-not-exist") != 0)
     }
 
+    @Test("removeOrphanedTempFiles removes only old temp files, never fresh ones or objects")
+    func orphanSweep() throws {
+        let dir = try tempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: dir + "bucket/prefix", withIntermediateDirectories: true)
+        let old = dir + "bucket/prefix/" + AtomicObjectWriter.tempFilePrefix + "old"
+        let fresh = dir + "bucket/" + AtomicObjectWriter.tempFilePrefix + "fresh"
+        let object = dir + "bucket/prefix/real.obj"
+        for path in [old, fresh, object] { fm.createFile(atPath: path, contents: Data("x".utf8)) }
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: old)
+
+        let removed = AtomicObjectWriter.removeOrphanedTempFiles(under: dir, olderThan: 3600)
+        #expect(removed == 1)
+        #expect(!fm.fileExists(atPath: old))
+        #expect(fm.fileExists(atPath: fresh))
+        #expect(fm.fileExists(atPath: object))
+    }
 }

@@ -91,6 +91,14 @@ public func configure(_ app: Application) async throws {
     // Same for staged EC shards: a stage survives only when its coordinator can no longer
     // commit it here (see `ErasureCodedObjectHandler.cleanupStagingOrphans`).
     ErasureCodedObjectHandler.cleanupStagingOrphans()
+    // Encode scratch is per-write and cleaned by `defer`; whatever is left is from a crash.
+    try? FileManager.default.removeItem(atPath: Constants.erasureCodingScratchDirectory)
+    // Temp files of writers that crashed mid-write sit next to their objects and are never
+    // reclaimed by anything else. The whole-tree walk is too costly for the boot path, so it
+    // runs detached at low priority; a live write's temp file is far younger than the cutoff.
+    Task.detached(priority: .background) {
+        AtomicObjectWriter.removeOrphanedTempFiles(under: BucketHandler.rootPath, olderThan: 3600)
+    }
 
     let cors: CORSMiddleware = CORSMiddleware(
         configuration: .init(
