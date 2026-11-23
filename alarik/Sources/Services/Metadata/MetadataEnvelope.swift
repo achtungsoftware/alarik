@@ -40,6 +40,10 @@ struct MetadataEnvelope: Sendable, Equatable {
     var deleted: Bool
     /// The record's own encoded bytes. `nil` exactly when `deleted` - a tombstone carries no body.
     var payload: Data?
+    /// Set by `putIfAbsent` only: the id of the create that wrote this record. A create whose
+    /// reply was lost is retried by its coordinator; finding the record already there with the
+    /// same id means that retry succeeded, not that the name was taken.
+    var writeId: String?
 
     var updatedAt: Date { Date(timeIntervalSince1970: Double(updatedAtMillis) / 1000) }
 
@@ -52,11 +56,11 @@ extension MetadataEnvelope {
     static func nowMillis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
     static func live(
-        payload: Data, schemaVersion: Int, updatedAtMillis: Int64 = nowMillis()
+        payload: Data, schemaVersion: Int, updatedAtMillis: Int64 = nowMillis(), writeId: String? = nil
     ) -> MetadataEnvelope {
         MetadataEnvelope(
             format: currentFormat, schemaVersion: schemaVersion,
-            updatedAtMillis: updatedAtMillis, deleted: false, payload: payload)
+            updatedAtMillis: updatedAtMillis, deleted: false, payload: payload, writeId: writeId)
     }
 
     static func tombstone(
@@ -99,6 +103,7 @@ extension MetadataEnvelope {
         static let updatedAtMillis = "updatedAtMillis"
         static let deleted = "deleted"
         static let payload = "payload"
+        static let writeId = "writeId"
     }
 
     func encoded() throws -> Data {
@@ -109,6 +114,7 @@ extension MetadataEnvelope {
             Key.deleted: deleted,
         ]
         if let payload { object[Key.payload] = payload.base64EncodedString() }
+        if let writeId { object[Key.writeId] = writeId }
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
@@ -131,7 +137,8 @@ extension MetadataEnvelope {
             schemaVersion: object[Key.schemaVersion] as? Int ?? 1,
             updatedAtMillis: (object[Key.updatedAtMillis] as? NSNumber)?.int64Value ?? 0,
             deleted: deleted,
-            payload: deleted ? nil : payload)
+            payload: deleted ? nil : payload,
+            writeId: object[Key.writeId] as? String)
     }
 
     /// True when `data` was written before envelopes existed - used only to decide whether a

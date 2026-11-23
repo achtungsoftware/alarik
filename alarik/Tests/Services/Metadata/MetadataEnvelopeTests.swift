@@ -42,6 +42,16 @@ struct MetadataEnvelopeTests {
         #expect(decoded.format == MetadataEnvelope.currentFormat)
     }
 
+    @Test("the create's write id rides inside the envelope and is absent for plain writes")
+    func writeIdRoundTrips() throws {
+        let created = MetadataEnvelope.live(payload: payload("x"), schemaVersion: 1, writeId: "create-1")
+        let decoded = MetadataEnvelope.decode(try created.encoded())
+        #expect(decoded.writeId == "create-1")
+        #expect(decoded.payload == payload("x"))
+        let plain = MetadataEnvelope.decode(try MetadataEnvelope.live(payload: payload("y"), schemaVersion: 1).encoded())
+        #expect(plain.writeId == nil)
+    }
+
     @Test("a tombstone round-trips and carries no payload")
     func tombstoneRoundTrip() throws {
         let envelope = MetadataEnvelope.tombstone(schemaVersion: 1)

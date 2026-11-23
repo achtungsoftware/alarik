@@ -207,7 +207,8 @@ struct InternalClusterMetadataController: RouteCollection {
         let (collection, id) = try collectionAndId(req: req)
         guard
             let value = try await MetadataStore.executeLocalConsumeIfPresent(
-                app: req.application, collection: collection, id: id)
+                app: req.application, collection: collection, id: id,
+                token: req.query[String.self, at: "token"])
         else {
             throw Abort(.notFound, reason: "No metadata record for this collection/id")
         }

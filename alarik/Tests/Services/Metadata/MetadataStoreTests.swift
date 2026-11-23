@@ -74,6 +74,45 @@ struct MetadataStoreTests {
         }
     }
 
+    // MARK: - Retried forwards
+
+    @Test("the same create arriving twice is a success both times; another create of the name is not")
+    func repeatedCreateIsIdempotent() async throws {
+        try await withApp { app in
+            let collection = "idempotent-create-\(UUID().uuidString)"
+            let first = try MetadataEnvelope.live(
+                payload: Data("one".utf8), schemaVersion: 1, writeId: UUID().uuidString).encoded()
+            #expect(try await MetadataStore.executeLocalPutIfAbsent(app: app, collection: collection, id: "n", value: first))
+            // A coordinator retrying after a lost reply sends the identical bytes.
+            #expect(try await MetadataStore.executeLocalPutIfAbsent(app: app, collection: collection, id: "n", value: first))
+            let other = try MetadataEnvelope.live(
+                payload: Data("two".utf8), schemaVersion: 1, writeId: UUID().uuidString).encoded()
+            #expect(try await MetadataStore.executeLocalPutIfAbsent(app: app, collection: collection, id: "n", value: other) == false)
+            // The record is the first create's, untouched.
+            let stored = try #require(try await MetadataStore.get(app: app, collection: collection, id: "n"))
+            #expect(stored == Data("one".utf8))
+        }
+    }
+
+    @Test("a consume retried under its token replays the consumed record instead of finding nothing")
+    func repeatedConsumeReplays() async throws {
+        try await withApp { app in
+            let collection = "replay-consume-\(UUID().uuidString)"
+            try await MetadataStore.put(app: app, collection: collection, id: "s", value: Data("state".utf8))
+            let token = UUID().uuidString
+            let first = try await MetadataStore.executeLocalConsumeIfPresent(
+                app: app, collection: collection, id: "s", token: token)
+            #expect(first.map { MetadataEnvelope.decode($0).payload } == Data("state".utf8))
+            let again = try await MetadataStore.executeLocalConsumeIfPresent(
+                app: app, collection: collection, id: "s", token: token)
+            #expect(again == first)
+            // Any other request finds it gone, as a single-use record must be.
+            #expect(try await MetadataStore.executeLocalConsumeIfPresent(
+                app: app, collection: collection, id: "s", token: UUID().uuidString) == nil)
+            #expect(try await MetadataStore.get(app: app, collection: collection, id: "s") == nil)
+        }
+    }
+
     // MARK: - Round trip
 
     @Test("get returns nil for a record that was never written")

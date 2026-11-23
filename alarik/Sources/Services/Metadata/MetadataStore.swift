@@ -188,8 +188,10 @@ enum MetadataStore {
     ) async throws -> Bool {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
+        // One id for this create, however many owners end up asked: see `MetadataEnvelope.writeId`.
         let envelope = MetadataEnvelope.live(
-            payload: value, schemaVersion: MetadataMigrations.currentVersion(for: collection))
+            payload: value, schemaVersion: MetadataMigrations.currentVersion(for: collection),
+            writeId: UUID().uuidString)
         let wrapped = try envelope.encoded()
         return try await withCoordinator(
             app: app, routing: routing, collection: collection, id: id,
@@ -254,12 +256,18 @@ enum MetadataStore {
     ) async throws -> Data? {
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
+        // One token for this consume: an owner that already consumed under it replays the
+        // result instead of reporting the record gone (`MetadataConsumeLedger`).
+        let token = UUID().uuidString
         let stored: Data? = try await withCoordinator(
             app: app, routing: routing, collection: collection, id: id,
-            local: { try await executeLocalConsumeIfPresent(app: app, collection: collection, id: id) },
+            local: {
+                try await executeLocalConsumeIfPresent(
+                    app: app, collection: collection, id: id, token: token)
+            },
             forward: { node in
                 try await forwardConsumeIfPresent(
-                    app: app, node: node, collection: collection, id: id)
+                    app: app, node: node, collection: collection, id: id, token: token)
             })
         guard let stored else { return nil }
         let envelope = MetadataEnvelope.decode(stored)
@@ -408,6 +416,20 @@ enum MetadataStore {
             if candidate.id == routing.selfNodeId { return try await local() }
             do {
                 return try await forward(candidate)
+            } catch let error where replyMayHaveBeenLost(error) {
+                // The owner may well have done the work and only the reply was lost. Every
+                // forwarded operation is safe to repeat against the same owner (an idempotent
+                // put/delete, a create carrying its `writeId`, a consume with its ledger token),
+                // and asking the NEXT owner instead would turn a completed create into "already
+                // exists" and a completed consume into "nothing there". One more try, then move on.
+                do {
+                    return try await forward(candidate)
+                } catch {
+                    lastError = error
+                    app.logger.warning(
+                        "Coordinator \(candidate.id) timed out twice for '\(collection)/\(id)' - trying the next owner: \(error)"
+                    )
+                }
             } catch {
                 lastError = error
                 app.logger.warning(
@@ -425,6 +447,13 @@ enum MetadataStore {
             )
         }
         return try await local()
+    }
+
+    /// A timeout after the request was sent: the owner may have executed it. A refused or
+    /// dropped connection means it never arrived.
+    private static func replyMayHaveBeenLost(_ error: any Error) -> Bool {
+        guard let clientError = error as? HTTPClientError else { return false }
+        return clientError == .readTimeout || clientError == .deadlineExceeded
     }
 
     // MARK: - Distributed claim (unique-name safety across coordinators)
@@ -582,9 +611,14 @@ enum MetadataStore {
                 // be reusable). A read failure PROPAGATES rather than becoming `false`, which
                 // callers read as "already taken" and would turn a legitimate create into a
                 // silent no-op that still looks like success.
-                let existing = try await localGet(app: app, key: key, routing: routing)
-                if let existing, !MetadataEnvelope.decode(existing).isTombstone {
-                    return false
+                if let existing = try await localGet(app: app, key: key, routing: routing) {
+                    let stored = MetadataEnvelope.decode(existing)
+                    if !stored.isTombstone {
+                        // This very create arriving again (a forward whose reply was lost) is
+                        // still a success; anybody else's record means the name is taken.
+                        return stored.writeId != nil
+                            && stored.writeId == MetadataEnvelope.decode(value).writeId
+                    }
                 }
                 try await localWrite(app: app, key: key, value: value, routing: routing)
                 return true
@@ -603,8 +637,13 @@ enum MetadataStore {
     }
 
     static func executeLocalConsumeIfPresent(
-        app: Application, collection: String, id: String
+        app: Application, collection: String, id: String, token: String? = nil
     ) async throws -> Data? {
+        if let token,
+            let replayed = await MetadataConsumeLedger.shared.replay(collection: collection, id: id, token: token)
+        {
+            return replayed
+        }
         let key = MetadataNamespace.key(collection: collection, id: id)
         let routing = await resolveRouting(app: app, key: key)
         // Same majority claim as `putIfAbsent`, and the same lock-outside-claim ordering: local
@@ -632,6 +671,10 @@ enum MetadataStore {
         }
         guard let consumed else {
             throw MetadataStoreError.claimNotAcquired(collection: collection, id: id)
+        }
+        if let token, let consumed {
+            await MetadataConsumeLedger.shared.remember(
+                collection: collection, id: id, token: token, value: consumed)
         }
         return consumed
     }
@@ -958,14 +1001,14 @@ enum MetadataStore {
     }
 
     private static func forwardConsumeIfPresent(
-        app: Application, node: ClusterNodeInfo?, collection: String, id: String
+        app: Application, node: ClusterNodeInfo?, collection: String, id: String, token: String
     ) async throws -> Data? {
         guard let node, let config = app.storage[ClusterConfigurationKey.self] else {
             throw MetadataStoreError.coordinatorUnreachable(collection: collection, id: id)
         }
         var outbound = HTTPClientRequest(
             url: node.address + "/internal/cluster/metadata/consume-if-present"
-                + querySuffix(collection: collection, id: id))
+                + querySuffix(collection: collection, id: id) + "&token=\(token)")
         outbound.method = .POST
         outbound.headers.replaceOrAdd(
             name: ClusterForwardAuthenticator.secretHeaderName, value: config.secret)
