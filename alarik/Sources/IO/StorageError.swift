@@ -21,12 +21,15 @@ enum StorageError: Error, CustomStringConvertible {
     case statFailed(path: String, errno: Int32)
     /// The file ended before the bytes its header or caller promised.
     case truncatedFile(path: String)
+    /// The `.obj` header (length prefix + metadata JSON) is not one this layer wrote.
+    case corruptHeader(path: String, reason: String)
 
     var description: String {
         switch self {
         case .openFailed(let path, let code): "Could not open '\(path)' (errno \(code))"
         case .statFailed(let path, let code): "Could not stat '\(path)' (errno \(code))"
         case .truncatedFile(let path): "File '\(path)' ended early"
+        case .corruptHeader(let path, let reason): "Corrupt object header in '\(path)': \(reason)"
         }
     }
 }

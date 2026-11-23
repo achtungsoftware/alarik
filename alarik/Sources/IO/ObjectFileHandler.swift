@@ -204,54 +204,10 @@ struct ObjectFileHandler {
     static func openPayloadSnapshot(path: String) throws -> (
         fd: Int32, meta: ObjectMeta, payloadOffset: Int, payloadSize: Int
     ) {
-        let fd = POSIXFile.open(path, O_RDONLY)
-        guard fd >= 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
-        }
-
+        let fd = try openForReading(path)
         do {
-            var lengthBytes = [UInt8](repeating: 0, count: 4)
-            guard POSIXFile.read(fd, &lengthBytes, 4) == 4 else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Missing length prefix"])
-            }
-            let metadataLength = UInt32(
-                bigEndian: lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self) })
-            guard metadataLength > 0, Int(metadataLength) <= maxMetadataHeaderLength else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Corrupt metadata length prefix"])
-            }
-
-            var jsonBytes = [UInt8](repeating: 0, count: Int(metadataLength))
-            guard POSIXFile.read(fd, &jsonBytes, Int(metadataLength)) == Int(metadataLength)
-            else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Incomplete metadata"])
-            }
-            let meta = try jsonBytes.withUnsafeBufferPointer { buffer in
-                try jsonDecoder.decode(ObjectMeta.self, from: Data(buffer))
-            }
-
-            var statInfo = stat()
-            guard POSIXFile.fstat(fd, &statInfo) == 0 else {
-                throw NSError(
-                    domain: "FileError", code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "Could not stat file"])
-            }
-
-            let payloadOffset = 4 + Int(metadataLength)
-            let payloadSize = Swift.max(0, Int(statInfo.st_size) - payloadOffset)
-            // A truncated or over-long payload must never be served under a header that
-            // promises another length.
-            guard payloadSize == meta.size else {
-                throw IntegrityError.sizeMismatch(path: path, expected: meta.size, actual: payloadSize)
-            }
-            return (fd, meta, payloadOffset, payloadSize)
+            let header = try readHeader(fd: fd, path: path)
+            return (fd, header.meta, header.payloadOffset, header.payloadSize)
         } catch {
             _ = POSIXFile.close(fd)
             throw error
@@ -263,97 +219,80 @@ struct ObjectFileHandler {
     static func read(from path: String, loadData: Bool = true, range: (start: Int, end: Int)? = nil)
         throws -> (ObjectMeta, Data?)
     {
-        // Use low-level file descriptor to avoid URL parsing overhead
-        let fd = POSIXFile.open(path, O_RDONLY)
-        guard fd >= 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not open file"])
-        }
+        let fd = try openForReading(path)
         defer { _ = POSIXFile.close(fd) }
+        let (metadata, dataOffset, dataSize) = try readHeader(fd: fd, path: path)
 
-        // Read 4-byte length prefix
-        var lengthBytes = [UInt8](repeating: 0, count: 4)
-        let lengthRead = POSIXFile.read(fd, &lengthBytes, 4)
-        guard lengthRead == 4 else {
-            throw NSError(
-                domain: "InvalidFile", code: 0,
-                userInfo: [NSLocalizedDescriptionKey: "Missing length prefix"])
-        }
-
-        let metadataLength = UInt32(
-            bigEndian: lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self) })
-        guard metadataLength > 0, Int(metadataLength) <= maxMetadataHeaderLength else {
-            throw NSError(
-                domain: "InvalidFile", code: 0,
-                userInfo: [NSLocalizedDescriptionKey: "Corrupt metadata length prefix"])
-        }
-
-        // Read metadata JSON
-        var jsonBytes = [UInt8](repeating: 0, count: Int(metadataLength))
-        let jsonRead = POSIXFile.read(fd, &jsonBytes, Int(metadataLength))
-        guard jsonRead == Int(metadataLength) else {
-            throw NSError(
-                domain: "InvalidFile", code: 0,
-                userInfo: [NSLocalizedDescriptionKey: "Incomplete metadata"])
-        }
-
-        let metadata = try jsonBytes.withUnsafeBufferPointer { buffer in
-            try jsonDecoder.decode(ObjectMeta.self, from: Data(buffer))
-        }
-
-        let dataOffset = 4 + Int(metadataLength)
-
-        // The header's size against the file's: a truncated object is damaged, not short.
-        var statInfo = stat()
-        guard POSIXFile.fstat(fd, &statInfo) == 0 else {
-            throw NSError(
-                domain: "FileError", code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Could not stat file"])
-        }
-        let dataSize = Swift.max(0, Int(statInfo.st_size) - dataOffset)
-        guard dataSize == metadata.size else {
-            throw IntegrityError.sizeMismatch(path: path, expected: metadata.size, actual: dataSize)
-        }
-
-        // For metadata-only reads, we're done
         if !loadData {
             return (metadata, nil)
         }
 
-        // For range reads
         if let range = range {
-            // Seek to the start of the range (relative to object data)
             _ = POSIXFile.lseek(fd, off_t(dataOffset + range.start), SEEK_SET)
-
             let bytesToRead = range.end - range.start + 1
             var rangeBytes = [UInt8](repeating: 0, count: bytesToRead)
             let rangeRead = POSIXFile.read(fd, &rangeBytes, bytesToRead)
-            guard rangeRead > 0 else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Could not read range"])
-            }
-
+            guard rangeRead > 0 else { throw StorageError.truncatedFile(path: path) }
             return (metadata, Data(rangeBytes[0..<rangeRead]))
         }
 
         // Full read: the whole payload, verified against the header's checksum.
         var dataBytes = [UInt8](repeating: 0, count: dataSize)
         if dataSize > 0 {
-            let dataRead = POSIXFile.read(fd, &dataBytes, dataSize)
-            guard dataRead == dataSize else {
-                throw NSError(
-                    domain: "InvalidFile", code: 0,
-                    userInfo: [NSLocalizedDescriptionKey: "Incomplete data"])
+            guard POSIXFile.read(fd, &dataBytes, dataSize) == dataSize else {
+                throw StorageError.truncatedFile(path: path)
             }
         }
         if var verifier = PayloadVerifier(meta: metadata, path: path) {
             dataBytes.withUnsafeBytes { verifier.update($0) }
             try verifier.verify()
         }
-
         return (metadata, Data(dataBytes))
+    }
+
+    private static func openForReading(_ path: String) throws -> Int32 {
+        let fd = POSIXFile.open(path, O_RDONLY)
+        guard fd >= 0 else { throw StorageError.openFailed(path: path, errno: errno) }
+        return fd
+    }
+
+    /// Parses the `.obj` header at the start of `fd` - 4-byte big-endian length, then the
+    /// `ObjectMeta` JSON - and checks the payload that follows is exactly the length the header
+    /// promises: a truncated or over-long payload must never be served under a header that says
+    /// otherwise. Leaves `fd` positioned at the payload.
+    private static func readHeader(fd: Int32, path: String) throws -> (
+        meta: ObjectMeta, payloadOffset: Int, payloadSize: Int
+    ) {
+        var lengthBytes = [UInt8](repeating: 0, count: 4)
+        guard POSIXFile.read(fd, &lengthBytes, 4) == 4 else {
+            throw StorageError.corruptHeader(path: path, reason: "missing length prefix")
+        }
+        let metadataLength = Int(UInt32(bigEndian: lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self) }))
+        guard metadataLength > 0, metadataLength <= maxMetadataHeaderLength else {
+            throw StorageError.corruptHeader(path: path, reason: "metadata length \(metadataLength)")
+        }
+
+        var jsonBytes = [UInt8](repeating: 0, count: metadataLength)
+        guard POSIXFile.read(fd, &jsonBytes, metadataLength) == metadataLength else {
+            throw StorageError.corruptHeader(path: path, reason: "incomplete metadata")
+        }
+        let meta: ObjectMeta
+        do {
+            meta = try jsonBytes.withUnsafeBufferPointer { try jsonDecoder.decode(ObjectMeta.self, from: Data($0)) }
+        } catch {
+            throw StorageError.corruptHeader(path: path, reason: "metadata does not decode: \(error)")
+        }
+
+        var statInfo = stat()
+        guard POSIXFile.fstat(fd, &statInfo) == 0 else {
+            throw StorageError.statFailed(path: path, errno: errno)
+        }
+        let payloadOffset = 4 + metadataLength
+        let payloadSize = Swift.max(0, Int(statInfo.st_size) - payloadOffset)
+        guard payloadSize == meta.size else {
+            throw IntegrityError.sizeMismatch(path: path, expected: meta.size, actual: payloadSize)
+        }
+        return (meta, payloadOffset, payloadSize)
     }
 
     /// `Storage/buckets/<bucket>/<key>` - the stem every on-disk form of a key hangs off:
