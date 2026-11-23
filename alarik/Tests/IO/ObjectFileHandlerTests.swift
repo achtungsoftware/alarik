@@ -291,7 +291,8 @@ struct ObjectFileHandlerTests {
         let path = ObjectFileHandler.storagePath(for: "bucket", key: "../../../etc/passwd")
 
         #expect(!path.contains(".."))
-        #expect(path.contains("///etc/passwd.obj"))
+        // The emptied components are escaped rather than left to collapse in the filesystem.
+        #expect(path.hasSuffix("/bucket/~/~/~/etc/passwd.obj"))
     }
 
     @Test("Storage path encodes special characters in bucket name")
@@ -1425,6 +1426,40 @@ struct ObjectFileHandlerPaginationTests {
         let (versions, markers, _, _, _, _) = try ObjectFileHandler.listAllVersions(bucketName: bucket)
         #expect(versions.map(\.key) == ["a", "b", "c", "d", "d"])
         #expect(markers.map(\.key) == ["b", "d"])
+    }
+
+    @Test("keys named like Alarik's own files and folders coexist with the keys they would collide with")
+    func reservedLookingKeysDoNotCollide() throws {
+        try reset()
+        defer { try? FileManager.default.removeItem(atPath: "\(BucketHandler.rootPath)\(bucket)") }
+        let keys = [
+            "x", "x.obj", "x.obj/y", "backup", "backup.versions/1", "data.ecshards/z", "data",
+            "a/b", "a//b", "notes.txt~", "docs/", "docs/~", "dot/./x",
+        ]
+        for key in keys.shuffled() { try put(key) }
+        _ = try putVersioned("x.obj")
+        _ = try putVersioned("backup")
+
+        // Every key is stored, readable under its own name, and listed exactly once.
+        for key in keys {
+            let stored = try #require(
+                try ObjectFileHandler.readCurrentObject(bucketName: bucket, key: key, loadData: false), "\(key)")
+            #expect(stored.meta.key == key)
+        }
+        #expect(try pageThrough(prefix: "", delimiter: nil, maxKeys: 4) == keys.sorted())
+        #expect(try pageThrough(prefix: "x.obj/", delimiter: "/", maxKeys: 10) == ["x.obj/y"])
+        #expect(try pageThrough(prefix: "", delimiter: "/", maxKeys: 10)
+            == ["a/", "backup", "backup.versions/", "data", "data.ecshards/", "docs/", "dot/", "notes.txt~", "x", "x.obj", "x.obj/"])
+        #expect(try ObjectFileHandler.listVersions(bucketName: bucket, key: "x.obj").count == 2)
+        #expect(try ObjectFileHandler.listVersions(bucketName: bucket, key: "x").count == 1)
+
+        // Removing a folder-like key prunes only its own directory.
+        try ObjectFileHandler.delete(bucketName: bucket, key: "x.obj/y")
+        #expect(try ObjectFileHandler.readCurrentObject(bucketName: bucket, key: "x", loadData: false) != nil)
+        #expect(try ObjectFileHandler.readCurrentObject(bucketName: bucket, key: "x.obj", loadData: false) != nil)
+        #expect(!FileManager.default.fileExists(atPath: "\(BucketHandler.rootPath)\(bucket)/x.obj~"))
+        let (stats, count) = BucketHandler.calculateStats(bucketName: bucket, prefix: "a//")
+        #expect(count == 1 && stats > 0)
     }
 
     @Test("a versions listing counts folders toward the page and resumes after them")

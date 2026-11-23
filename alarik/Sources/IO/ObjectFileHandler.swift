@@ -298,9 +298,11 @@ struct ObjectFileHandler {
     }
 
     /// `Storage/buckets/<bucket>/<key>` - the stem every on-disk form of a key hangs off:
-    /// `.obj`, `.versions/`, `.ecshards/`. Bucket and key are made path-safe here, once.
+    /// `.obj`, `.versions/`, `.ecshards/`. Bucket and key are made path-safe here, once, and
+    /// components that would collide with those forms are escaped (`KeyPathEncoding`).
     static func keyBasePath(bucketName: String, key: String) -> String {
-        "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))/\(PathSafety.strippingDotDot(key))"
+        "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))/"
+            + KeyPathEncoding.encodedPath(forKey: PathSafety.strippingDotDot(key))
     }
 
     /// The non-versioned object file for a key.
@@ -401,7 +403,7 @@ struct ObjectFileHandler {
     static func removeEmptyPrefixDirectory(bucketName: String, prefix: String) -> Bool {
         guard prefix.hasSuffix("/"), !prefix.contains("..") else { return false }
         let bucketRoot = "\(BucketHandler.rootPath)\(BucketHandler.encodedBucketName(bucketName))"
-        let dir = bucketRoot + "/" + String(prefix.dropLast())
+        let dir = bucketRoot + "/" + KeyPathEncoding.encodedDirectoryPath(forPrefix: prefix)
         guard dir.hasPrefix(bucketRoot + "/"), removeDirectoryIfNoObjectData(dir) else {
             return false
         }
@@ -519,7 +521,8 @@ struct ObjectFileHandler {
         var startPrefix = ""
         if let lastSlash = prefix.lastIndex(of: "/") {
             startPrefix = String(prefix[...lastSlash])
-            startURL = bucketURL.appendingPathComponent(String(startPrefix.dropLast()))
+            startURL = bucketURL.appendingPathComponent(
+                KeyPathEncoding.encodedDirectoryPath(forPrefix: startPrefix))
         }
 
         var walker = OrderedKeyWalker(
@@ -552,21 +555,25 @@ struct ObjectFileHandler {
         }
 
         /// What a directory entry lists as: `x.obj` / `x.versions` / `x.ecshards` are forms of
-        /// key `x`, any other directory is the folder `x/`, anything else is not an object.
+        /// key `x`, any other directory is the folder `x/`, anything else is not an object. Stems
+        /// and folder names are decoded back from their on-disk escaping (`KeyPathEncoding`).
         private static func classify(
             _ name: String, isDirectory: Bool, under listedPrefix: String
         ) -> (Kind, String)? {
+            func key(stem: Substring) -> String {
+                listedPrefix + KeyPathEncoding.decodeComponent(String(stem), asDirectory: false)
+            }
             if !isDirectory {
                 guard name.hasSuffix(".obj") else { return nil }
-                return (.plain, listedPrefix + name.dropLast(".obj".count))
+                return (.plain, key(stem: name.dropLast(".obj".count)))
             }
             if name.hasSuffix(".versions") {
-                return (.versions, listedPrefix + name.dropLast(".versions".count))
+                return (.versions, key(stem: name.dropLast(".versions".count)))
             }
             if name.hasSuffix(".ecshards") {
-                return (.shards, listedPrefix + name.dropLast(".ecshards".count))
+                return (.shards, key(stem: name.dropLast(".ecshards".count)))
             }
-            return (.directory, listedPrefix + name + "/")
+            return (.directory, listedPrefix + KeyPathEncoding.decodeComponent(name, asDirectory: true) + "/")
         }
 
         /// Returns false once `visit` asked to stop.

@@ -130,7 +130,8 @@ struct BucketHandler {
         let url =
             sanitizedPrefix.isEmpty
             ? bucketURL(for: bucketName)
-            : bucketURL(for: bucketName).appendingPathComponent(sanitizedPrefix)
+            : bucketURL(for: bucketName).appendingPathComponent(
+                KeyPathEncoding.encodedDirectoryPath(forPrefix: sanitizedPrefix))
 
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: url.path) else {

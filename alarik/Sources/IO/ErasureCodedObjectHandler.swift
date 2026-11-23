@@ -425,7 +425,10 @@ enum ErasureCodedObjectHandler {
         // record - purely to throw away the ones whose key didn't match.
         let searchRoot: String
         if let lastSlash = keyPrefix.lastIndex(of: "/") {
-            searchRoot = "\(bucketPath)/\(PathSafety.strippingDotDot(String(keyPrefix[..<lastSlash])))"
+            searchRoot =
+                "\(bucketPath)/"
+                + KeyPathEncoding.encodedDirectoryPath(
+                    forPrefix: PathSafety.strippingDotDot(String(keyPrefix[..<lastSlash])))
         } else {
             searchRoot = bucketPath
         }

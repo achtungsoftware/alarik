@@ -4181,4 +4181,55 @@ struct S3ControllerTests {
                 })
         }
     }
+
+    @Test("Object keys that look like storage artifacts round-trip through PUT, LIST, GET and DELETE")
+    func testReservedLookingKeys() async throws {
+        let bucketName = "reserved-keys-bucket"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+            let keys = ["notes.obj", "notes", "backup.versions/1.txt", "backup", "a//b"]
+            for key in keys { try await putObject(app, bucketName: bucketName, key: key, content: key) }
+
+            for key in keys {
+                let signed = signedHeaders(for: .GET, path: "/\(bucketName)/\(key)")
+                try await app.test(
+                    .GET, "/\(bucketName)/\(key)",
+                    beforeRequest: { req in req.headers.add(contentsOf: signed) },
+                    afterResponse: { res in
+                        #expect(res.status == .ok, "\(key)")
+                        #expect(res.body.string == key, "\(key)")
+                    })
+            }
+
+            let listSigned = signedHeaders(for: .GET, path: "/\(bucketName)", query: "list-type=2&delimiter=/")
+            try await app.test(
+                .GET, "/\(bucketName)?list-type=2&delimiter=/",
+                beforeRequest: { req in req.headers.add(contentsOf: listSigned) },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    let body = res.body.string
+                    for expected in ["<Key>notes.obj</Key>", "<Key>notes</Key>", "<Key>backup</Key>",
+                        "<Prefix>backup.versions/</Prefix>", "<Prefix>a/</Prefix>"] {
+                        #expect(body.contains(expected), "\(expected)")
+                    }
+                    #expect(!body.contains("<Key>backup.versions/1.txt</Key>"))
+                })
+
+            let deleteSigned = signedHeaders(for: .DELETE, path: "/\(bucketName)/notes.obj")
+            try await app.test(
+                .DELETE, "/\(bucketName)/notes.obj",
+                beforeRequest: { req in req.headers.add(contentsOf: deleteSigned) },
+                afterResponse: { res in #expect(res.status == .noContent) })
+            let gone = signedHeaders(for: .GET, path: "/\(bucketName)/notes.obj")
+            try await app.test(
+                .GET, "/\(bucketName)/notes.obj",
+                beforeRequest: { req in req.headers.add(contentsOf: gone) },
+                afterResponse: { res in #expect(res.status == .notFound) })
+            let stillThere = signedHeaders(for: .GET, path: "/\(bucketName)/notes")
+            try await app.test(
+                .GET, "/\(bucketName)/notes",
+                beforeRequest: { req in req.headers.add(contentsOf: stillThere) },
+                afterResponse: { res in #expect(res.status == .ok) })
+        }
+    }
 }
