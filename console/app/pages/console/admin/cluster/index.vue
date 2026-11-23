@@ -263,6 +263,30 @@ async function drainNode(node: ClusterNode) {
     }
 }
 
+/// The last step after a drain: marks the node removed so listings stop waiting on it. The
+/// server refuses it for anything but a draining node.
+async function decommissionNode(node: ClusterNode) {
+    const confirmed = await confirm({
+        title: "Decommission Node",
+        message: `Remove ${node.address} from the cluster? Do this only once its drain has finished and the process is about to be stopped for good - the other nodes stop asking it for data immediately.`,
+        confirmLabel: "Decommission",
+    });
+    if (!confirmed) return;
+
+    nodeActionLoading.value[node.id] = true;
+    try {
+        await useApi()(`/admin/cluster/nodes/${node.id}/decommission`, {
+            method: "POST",
+        });
+        toast.add({ title: "Node Decommissioned", description: `${node.address} was removed from the cluster.`, icon: "i-lucide-circle-check", color: "success" });
+        await refreshAll();
+    } catch (err) {
+        toast.add({ title: "Decommission Failed", description: errorMessage(err, "Unknown error"), icon: "i-lucide-circle-x", color: "error" });
+    } finally {
+        nodeActionLoading.value[node.id] = false;
+    }
+}
+
 // Deliberately cluster-wide, not per-node - ClusterRebalanceService always walks every bucket
 // under current membership regardless of which node is asked, so this lives as a single
 // page-level action rather than a per-row button implying a narrower scope than it has.
@@ -388,17 +412,31 @@ const nodeColumns: TableColumn<ClusterNode>[] = [
         header: "",
         cell: ({ row }) => {
             const node = row.original;
-            if (node.status !== "active") return null;
-            return h("div", { class: "flex justify-end" }, [
-                h(resolveComponent("UButton"), {
-                    label: "Drain",
-                    size: "xs",
-                    color: "warning",
-                    variant: "subtle",
-                    loading: nodeActionLoading.value[node.id] ?? false,
-                    onClick: () => drainNode(node),
-                }),
-            ]);
+            if (node.status === "active") {
+                return h("div", { class: "flex justify-end" }, [
+                    h(resolveComponent("UButton"), {
+                        label: "Drain",
+                        size: "xs",
+                        color: "warning",
+                        variant: "subtle",
+                        loading: nodeActionLoading.value[node.id] ?? false,
+                        onClick: () => drainNode(node),
+                    }),
+                ]);
+            }
+            if (node.status === "draining") {
+                return h("div", { class: "flex justify-end" }, [
+                    h(resolveComponent("UButton"), {
+                        label: "Decommission",
+                        size: "xs",
+                        color: "error",
+                        variant: "subtle",
+                        loading: nodeActionLoading.value[node.id] ?? false,
+                        onClick: () => decommissionNode(node),
+                    }),
+                ]);
+            }
+            return null;
         },
     },
 ];
@@ -762,6 +800,17 @@ const placementColumns = computed<TableColumn<ClusterPlacementEntry>[]>(() => [
                                     block
                                     :loading="nodeActionLoading[selectedNode.id] ?? false"
                                     @click="drainNode(selectedNode)"
+                                />
+                                <UButton
+                                    v-else-if="selectedNode.status === 'draining'"
+                                    label="Decommission Node"
+                                    icon="i-lucide-server-off"
+                                    color="error"
+                                    variant="subtle"
+                                    size="sm"
+                                    block
+                                    :loading="nodeActionLoading[selectedNode.id] ?? false"
+                                    @click="decommissionNode(selectedNode)"
                                 />
                             </div>
                         </div>

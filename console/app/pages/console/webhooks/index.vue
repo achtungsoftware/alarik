@@ -559,7 +559,7 @@ const deliveryColumns: TableColumn<Delivery>[] = [
                     <template #header>
                         <CardHeader title="Recent Deliveries" size="sm" :badge="deliveries.length > 0 ? deliveries.length + '' : undefined">
                             <template #rightContent>
-                                <UButton icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" :loading="isLoadingDeliveries" @click="fetchDeliveries" />
+                                <UButton icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" aria-label="Reload deliveries" :loading="isLoadingDeliveries" @click="fetchDeliveries" />
                             </template>
                         </CardHeader>
                     </template>

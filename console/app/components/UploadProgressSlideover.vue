@@ -149,9 +149,9 @@ function canRemove(status: UploadStatus): boolean {
 
                                 <!-- Actions -->
                                 <div class="flex items-center gap-1 shrink-0">
-                                    <UButton v-if="canCancel(item.status)" icon="i-lucide-x" color="neutral" variant="ghost" size="xs" title="Cancel upload" @click="cancelItem(item.id)" />
-                                    <UButton v-if="canRetry(item.status)" icon="i-lucide-refresh-ccw" color="warning" variant="ghost" size="xs" title="Retry upload" @click="retryItem(item.id)" />
-                                    <UButton v-if="canRemove(item.status)" icon="i-lucide-trash-2" color="neutral" variant="ghost" size="xs" title="Remove from list" @click="removeItem(item.id)" />
+                                    <UButton v-if="canCancel(item.status)" icon="i-lucide-x" color="neutral" variant="ghost" size="xs" title="Cancel upload" aria-label="Cancel upload" @click="cancelItem(item.id)" />
+                                    <UButton v-if="canRetry(item.status)" icon="i-lucide-refresh-ccw" color="warning" variant="ghost" size="xs" title="Retry upload" aria-label="Retry upload" @click="retryItem(item.id)" />
+                                    <UButton v-if="canRemove(item.status)" icon="i-lucide-trash-2" color="neutral" variant="ghost" size="xs" title="Remove from list" aria-label="Remove from list" @click="removeItem(item.id)" />
                                 </div>
                             </div>
                         </div>

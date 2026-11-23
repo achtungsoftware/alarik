@@ -44,6 +44,24 @@ const policyEndpoint = computed(
 
 const policyText = ref(props.bucket.policy ?? "");
 
+/// Caught here so a typo is explained inline, not as a server rejection after a round trip.
+const jsonError = computed(() => {
+    if (policyText.value.trim() === "") return "";
+    try {
+        const parsed: unknown = JSON.parse(policyText.value);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "A policy must be a JSON object.";
+        if (!("Statement" in parsed)) return "A policy needs a Statement array.";
+        return "";
+    } catch (err) {
+        return `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
+    }
+});
+
+function formatPolicy() {
+    if (jsonError.value) return;
+    policyText.value = JSON.stringify(JSON.parse(policyText.value), null, 4);
+}
+
 watch(
     () => props.open,
     (val) => {
@@ -80,6 +98,10 @@ function fillPublicReadTemplate() {
 }
 
 async function save() {
+    if (jsonError.value) {
+        error.value = jsonError.value;
+        return;
+    }
     try {
         isLoading.value = true;
         error.value = "";
@@ -157,7 +179,8 @@ async function removePolicy() {
                     icon="i-lucide-info"
                 />
 
-                <div class="flex justify-end">
+                <div class="flex justify-end gap-2">
+                    <UButton label="Format JSON" variant="subtle" color="neutral" size="sm" icon="i-lucide-braces" :disabled="!!jsonError || policyText.trim() === ''" @click="formatPolicy" />
                     <UButton label="Make bucket public (read-only)" variant="subtle" color="neutral" size="sm" icon="i-lucide-globe" @click="fillPublicReadTemplate" />
                 </div>
 
@@ -169,6 +192,7 @@ async function removePolicy() {
                     :ui="{ base: 'font-mono text-xs' }"
                     class="w-full"
                 />
+                <p v-if="jsonError" class="text-xs text-error">{{ jsonError }}</p>
             </div>
         </template>
 
@@ -176,7 +200,7 @@ async function removePolicy() {
             <UButton label="Remove Policy" color="error" variant="subtle" :loading="isDeleting" :disabled="!bucket.policy" @click="removePolicy" />
             <div class="flex gap-2">
                 <UButton label="Cancel" color="neutral" variant="subtle" @click="close" />
-                <UButton label="Save" :loading="isLoading" color="primary" @click="save" />
+                <UButton label="Save" :loading="isLoading" color="primary" :disabled="!!jsonError || policyText.trim() === ''" @click="save" />
             </div>
         </template>
     </UModal>

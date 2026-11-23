@@ -766,7 +766,7 @@ const taskColumns: TableColumn<ReplicationTask>[] = [
                         <template #header>
                             <CardHeader title="Recent Tasks" size="sm" :badge="tasks.length > 0 ? tasks.length + '' : undefined">
                                 <template #rightContent>
-                                    <UButton icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" :loading="isLoadingTasks" @click="fetchTasks" />
+                                    <UButton icon="i-lucide-refresh-ccw" color="neutral" variant="ghost" size="sm" aria-label="Reload tasks" :loading="isLoadingTasks" @click="fetchTasks" />
                                 </template>
                             </CardHeader>
                         </template>
