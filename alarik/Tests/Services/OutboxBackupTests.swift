@@ -55,8 +55,23 @@ struct OutboxBackupTests {
     @Test("a mirrored row is adopted once its owner has dropped out of the cluster, and only then")
     func adoptsRowsOfDepartedOwners() async throws {
         try await withClusterApp { app, selfId in
-            let liveOwner = UUID()
             let deadOwner = UUID()
+            let collection = OutboxCollections.notificationDeliveries
+            let (deadRow, deadData) = try backupRow(owner: deadOwner)
+            // Adoption is elected by HRW among the live placement members; pick a live peer id
+            // for which this node wins, so the assertions are deterministic.
+            var liveOwner = UUID()
+            for _ in 0..<200 {
+                let winner = PlacementService.responsibleNodes(
+                    bucketName: OutboxMailbox.outboxPlacementBucket,
+                    key: "\(collection)/\(deadOwner)/\(deadRow.id)",
+                    activeNodes: [selfId, liveOwner].map {
+                        ClusterNodeInfo(id: $0, address: "http://\($0).internal", status: .active, lastHeartbeatAt: Date())
+                    }, count: 1
+                ).first?.id
+                if winner == selfId { break }
+                liveOwner = UUID()
+            }
             let now = Date()
             await ClusterNodeCache.shared.load(initialData: [
                 ClusterNodeInfo(id: selfId, address: "http://self.internal", status: .active, lastHeartbeatAt: now),
@@ -66,9 +81,7 @@ struct OutboxBackupTests {
                     id: deadOwner, address: "http://dead.internal", status: .active,
                     lastHeartbeatAt: now.addingTimeInterval(-3600)),
             ])
-            let collection = OutboxCollections.notificationDeliveries
             let (liveRow, liveData) = try backupRow(owner: liveOwner)
-            let (deadRow, deadData) = try backupRow(owner: deadOwner)
             try OutboxMailbox.receiveBackup(data: liveData, collection: collection, ownerNodeId: liveOwner, taskId: liveRow.id)
             try OutboxMailbox.receiveBackup(data: deadData, collection: collection, ownerNodeId: deadOwner, taskId: deadRow.id)
 

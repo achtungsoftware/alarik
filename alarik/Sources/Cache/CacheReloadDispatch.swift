@@ -218,6 +218,12 @@ enum CacheReloadDispatch {
                 await ClusterRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
                 await ErasureCodedRebalanceService.scheduleRebalance(app: app, reason: .membershipChange)
             }
+        case (CacheInvalidationService.clusterNodeOfflineCache, .upsert):
+            // A node stopping gracefully. Liveness only - its standing is unchanged, so no
+            // rebalance: a restart must not shuffle data.
+            if let uuid = UUID(uuidString: message.key) {
+                await ClusterNodeCache.shared.markOffline(id: uuid)
+            }
 
         case ("clusterRebalance", _):
             // Operator-triggered resync: unlike a genuine membership change (whose NOTIFY carries

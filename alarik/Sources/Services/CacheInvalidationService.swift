@@ -62,6 +62,28 @@ struct CacheInvalidationMessage: Codable, Sendable {
 /// own in-process cache mutation, already done immediately before this is called, is the whole
 /// story.
 enum CacheInvalidationService {
+    /// `cache` name of the goodbye a stopping node sends; `key` is its id.
+    static let clusterNodeOfflineCache = "clusterNodeOffline"
+
+    /// Tells every live peer this node is stopping, so they stop forwarding to it now rather
+    /// than after `ClusterNodeCache.heartbeatStaleness`. One attempt per peer with a short
+    /// timeout: the process is on its way out, and a peer that misses it only falls back to the
+    /// staleness window it had anyway.
+    static func announceOffline(app: Application) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let peers = await ClusterNodeCache.shared.activeNodes().filter { $0.id != config.nodeId }
+        guard !peers.isEmpty else { return }
+        let message = CacheInvalidationMessage(
+            cache: clusterNodeOfflineCache, op: .upsert, key: config.nodeId.uuidString)
+        await withTaskGroup(of: Void.self) { group in
+            for peer in peers {
+                group.addTask {
+                    try? await send(app: app, node: peer, secret: config.secret, message: message, timeout: .seconds(1))
+                }
+            }
+        }
+    }
+
     /// Fire-and-forget: never throws to the caller. A dropped broadcast only costs the rest of
     /// the cluster staleness until the next periodic full reload - it must never fail the write
     /// path that triggered it. `nodeInfo` (`clusterNode` only) is passed directly rather than
@@ -147,7 +169,8 @@ enum CacheInvalidationService {
     }
 
     private static func send(
-        app: Application, node: ClusterNodeInfo, secret: String, message: CacheInvalidationMessage
+        app: Application, node: ClusterNodeInfo, secret: String, message: CacheInvalidationMessage,
+        timeout: TimeAmount = .seconds(2)
     ) async throws {
         var outbound = HTTPClientRequest(url: node.address + "/internal/cluster/cache-invalidate")
         outbound.method = .POST
@@ -158,6 +181,6 @@ enum CacheInvalidationService {
         // `LightweightClusterControlClient.shared`, not `app.http.client.shared` - see its own
         // doc comment for why cluster control-plane traffic gets a dedicated client.
         _ = try await LightweightClusterControlClient.shared.execute(
-            outbound, timeout: .seconds(2), logger: app.logger)
+            outbound, timeout: timeout, logger: app.logger)
     }
 }

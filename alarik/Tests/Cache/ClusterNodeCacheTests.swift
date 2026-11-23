@@ -36,6 +36,32 @@ struct ClusterNodeCacheTests {
         #expect(fetched?.status == .active)
     }
 
+    @Test("a node that announced its shutdown leaves the live set at once but keeps its placement")
+    func markOfflineDropsLivenessOnly() async {
+        let cache = ClusterNodeCache()
+        let id = UUID()
+        let heartbeat = Date()
+        let node = ClusterNodeInfo(id: id, address: "http://a:8080", status: .active, lastHeartbeatAt: heartbeat)
+        await cache.upsert(node)
+        await cache.markOffline(id: id)
+
+        #expect(await cache.activeNodes().isEmpty)
+        #expect(await cache.placementNodes().map(\.id) == [id])
+        #expect(await cache.reachablePeers().map(\.id) == [id])
+
+        // The periodic reload's snapshot carries the same last heartbeat: the goodbye stands.
+        await cache.reconcile(snapshot: [node])
+        #expect(await cache.activeNodes().isEmpty)
+        // A fresher heartbeat means the node is back.
+        await cache.reconcile(snapshot: [
+            ClusterNodeInfo(id: id, address: "http://a:8080", status: .active, lastHeartbeatAt: heartbeat.addingTimeInterval(1))
+        ])
+        #expect(await cache.activeNodes().map(\.id) == [id])
+        // Marking an unknown node is a no-op.
+        await cache.markOffline(id: UUID())
+        #expect(await cache.all().count == 1)
+    }
+
     @Test("remove drops the node")
     func removeDropsNode() async {
         let cache = ClusterNodeCache()

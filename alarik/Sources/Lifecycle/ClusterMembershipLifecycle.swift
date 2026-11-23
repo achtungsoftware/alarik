@@ -115,6 +115,12 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
     }
 
     func shutdownAsync(_ app: Application) async {
+        stopHeartbeat()
+    }
+
+    /// Idempotent; also called by `ClusterLeaveAnnouncer` before it says goodbye, so no later
+    /// tick can announce this node as live again.
+    func stopHeartbeat() {
         heartbeatTask?.cancel()
         heartbeatTask = nil
         refreshTask?.cancel()
@@ -450,5 +456,18 @@ final actor ClusterMembershipLifecycle: LifecycleHandler {
             guard !Task.isCancelled else { return }
             await gossipMembership(app: app, config: config)
         }
+    }
+}
+
+/// Says goodbye to the cluster at shutdown. Without it, peers keep forwarding requests and
+/// coordinating writes through this node for up to `ClusterNodeCache.heartbeatStaleness` after
+/// it stopped answering, each attempt paying a connection failure or timeout. Registered after
+/// the control-plane HTTP client's shutdown handler so that, with Vapor running handlers in
+/// reverse order, the announcement still has a client to go out on. The heartbeat is stopped
+/// first, so a late tick cannot revive what this just reported.
+struct ClusterLeaveAnnouncer: LifecycleHandler {
+    func shutdownAsync(_ app: Application) async {
+        await ClusterMembershipLifecycle.shared.stopHeartbeat()
+        await CacheInvalidationService.announceOffline(app: app)
     }
 }

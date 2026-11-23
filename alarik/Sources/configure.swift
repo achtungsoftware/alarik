@@ -197,6 +197,9 @@ public func configure(_ app: Application) async throws {
     // (cache-invalidation broadcasts, membership seed queries) - see its own doc comment for why
     // that traffic gets a separate client from `app.http.client.shared`.
     app.lifecycle.use(LightweightClusterControlClient.ShutdownHandler())
+    // After the client's handler on purpose: shutdown runs handlers in reverse, and the goodbye
+    // needs the client (`ClusterLeaveAnnouncer`).
+    app.lifecycle.use(ClusterLeaveAnnouncer())
     app.storage[WebhookHTTPClient.Key.self] = WebhookHTTPClient.make()
     app.lifecycle.use(WebhookHTTPClient.ShutdownHandler())
 

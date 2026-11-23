@@ -31,10 +31,14 @@ struct ClusterNodeInfo: Sendable, Equatable {
     /// doesn't carry it, test fixtures, etc.) doesn't need to opt in explicitly.
     let totalBytes: Int64?
     let availableBytes: Int64?
+    /// The node said goodbye (`ClusterLeaveAnnouncer`): treated as unreachable at once instead
+    /// of after `heartbeatStaleness`, while its standing - and so placement - is untouched. A
+    /// fresher heartbeat clears it; the node is back.
+    let reportedOffline: Bool
 
     init(
         id: UUID, address: String, status: ClusterNode.Status, lastHeartbeatAt: Date,
-        totalBytes: Int64? = nil, availableBytes: Int64? = nil
+        totalBytes: Int64? = nil, availableBytes: Int64? = nil, reportedOffline: Bool = false
     ) {
         self.id = id
         self.address = address
@@ -42,6 +46,13 @@ struct ClusterNodeInfo: Sendable, Equatable {
         self.lastHeartbeatAt = lastHeartbeatAt
         self.totalBytes = totalBytes
         self.availableBytes = availableBytes
+        self.reportedOffline = reportedOffline
+    }
+
+    func markedOffline() -> ClusterNodeInfo {
+        ClusterNodeInfo(
+            id: id, address: address, status: status, lastHeartbeatAt: lastHeartbeatAt,
+            totalBytes: totalBytes, availableBytes: availableBytes, reportedOffline: true)
     }
 }
 
@@ -112,6 +123,8 @@ final actor ClusterNodeCache {
         if existing.lastHeartbeatAt != snapshot.lastHeartbeatAt {
             return existing.lastHeartbeatAt > snapshot.lastHeartbeatAt
         }
+        // A goodbye is newer information than a snapshot carrying the same last heartbeat.
+        if existing.reportedOffline && !snapshot.reportedOffline { return true }
         // Same heartbeat, so no newer information about the node itself - only a deliberate
         // operator action should change its standing, never a lagging snapshot:
         //
@@ -127,6 +140,12 @@ final actor ClusterNodeCache {
 
     func upsert(_ node: ClusterNodeInfo) {
         nodes[node.id] = node
+    }
+
+    /// The node announced it is stopping: drop it from the live set now, keep its standing.
+    func markOffline(id: UUID) {
+        guard let existing = nodes[id] else { return }
+        nodes[id] = existing.markedOffline()
     }
 
     func remove(id: UUID) {
@@ -162,12 +181,14 @@ final actor ClusterNodeCache {
     }
 
     /// Who is *reachable* right now - for admission checks, broadcast targets and liveness
-    /// reporting. Never for deciding where a key lives; use `placementNodes()` for that.
+    /// reporting. Never for deciding where a key lives; use `placementNodes()` for that. A node
+    /// that announced its shutdown drops out immediately rather than after `staleness`.
     func activeNodes(now: Date = Date(), staleness: TimeInterval = ClusterNodeCache.heartbeatStaleness)
         -> [ClusterNodeInfo]
     {
         nodes.values.filter {
-            $0.status == .active && now.timeIntervalSince($0.lastHeartbeatAt) <= staleness
+            $0.status == .active && !$0.reportedOffline
+                && now.timeIntervalSince($0.lastHeartbeatAt) <= staleness
         }
     }
 }

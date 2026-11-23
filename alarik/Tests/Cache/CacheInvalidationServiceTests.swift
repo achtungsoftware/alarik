@@ -81,6 +81,24 @@ struct CacheInvalidationServiceTests {
         }
     }
 
+    @Test("a clusterNodeOffline message marks the node unreachable without touching its standing")
+    func offlineMessageMarksNode() async throws {
+        try await withApp { app in
+            let id = UUID()
+            await ClusterNodeCache.shared.load(initialData: [
+                ClusterNodeInfo(id: id, address: "http://peer.internal", status: .active, lastHeartbeatAt: Date())
+            ])
+            defer { Task { await ClusterNodeCache.shared.load(initialData: []) } }
+            try await CacheReloadDispatch.apply(
+                message: CacheInvalidationMessage(
+                    cache: CacheInvalidationService.clusterNodeOfflineCache, op: .upsert, key: id.uuidString),
+                app: app)
+            #expect(await ClusterNodeCache.shared.activeNodes().isEmpty)
+            #expect(await ClusterNodeCache.shared.placementNodes().map(\.id) == [id])
+            await ClusterNodeCache.shared.load(initialData: [])
+        }
+    }
+
     // MARK: - CacheInvalidationMessage JSON round-trip
 
     @Test("CacheInvalidationMessage round-trips through JSON for every op")
