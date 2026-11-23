@@ -435,6 +435,11 @@ struct S3Controller: RouteCollection {
             return try await handleLifecyclePut(req: req, bucketName: bucketName)
         }
 
+        // Handle PUT ?cors
+        if queryNames.contains("cors") {
+            return try await handleCORSPut(req: req, bucketName: bucketName)
+        }
+
         // PUT ?notification - Alarik's webhook rules target http(s) URLs, not the SNS/SQS/Lambda
         // ARNs the S3 XML format carries, so there's nothing meaningful an S3 client could PUT
         // here. Managed via the console / internal API instead (GET ?notification still works).
@@ -695,6 +700,46 @@ struct S3Controller: RouteCollection {
         return .noContent
     }
 
+    /// Handles PUT /:bucketName?cors - replaces the bucket's CORS configuration. S3 returns
+    /// 200 OK with an empty body (verified against the PutBucketCors API reference).
+    @Sendable
+    private func handleCORSPut(req: Request, bucketName: String) async throws -> Response {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
+
+        let xml = try await S3Service.collectBodyString(req: req)
+        let configuration = try CORSConfiguration.parse(xml: xml, requestId: req.id)
+
+        try await Self.storeCORS(configuration.rules, on: bucket, req: req)
+
+        return S3Service.buildStandardResponse(status: .ok, requestId: req.id)
+    }
+
+    /// Handles DELETE /:bucketName?cors - removes the bucket's CORS configuration (204).
+    @Sendable
+    private func handleCORSDelete(req: Request, bucketName: String) async throws -> HTTPStatus {
+        _ = try await S3Service.authenticateWithCache(req: req, bucketName: bucketName)
+
+        let bucket = try await fetchBucket(req: req, bucketName: bucketName)
+
+        try await Self.storeCORS(nil, on: bucket, req: req)
+
+        return .noContent
+    }
+
+    /// Saves the rules and brings every node's `BucketCORSCache` up to date - shared with the
+    /// console endpoint so the two write paths can never diverge.
+    static func storeCORS(_ rules: [CORSRule]?, on bucket: Bucket, req: Request) async throws {
+        bucket.corsRules = rules
+        try await bucket.save(app: req.application)
+
+        await BucketCORSCache.shared.setConfig(
+            for: bucket.name, config: CORSConfiguration(rules: rules ?? []))
+        CacheInvalidationService.notify(
+            app: req.application, cache: "bucketCORS", op: .upsert, key: bucket.name)
+    }
+
     /// Handles DELETE /:bucketName?replication - clears the bucket's whole replication
     /// configuration (targets and rules). Unlike PUT ?replication, this needs no target
     /// credentials, so - matching S3's DeleteBucketReplication - it's fully supported, not
@@ -736,6 +781,11 @@ struct S3Controller: RouteCollection {
         // Handle DELETE ?lifecycle
         if queryNames.contains("lifecycle") {
             return try await handleLifecycleDelete(req: req, bucketName: bucketName)
+        }
+
+        // Handle DELETE ?cors
+        if queryNames.contains("cors") {
+            return try await handleCORSDelete(req: req, bucketName: bucketName)
         }
 
         // Handle DELETE ?policy

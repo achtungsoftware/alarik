@@ -179,6 +179,15 @@ enum CacheReloadDispatch {
         case ("replicationConfig", .remove):
             await ReplicationConfigCache.shared.removeBucket(bucketName)
 
+        case ("bucketCORS", .upsert):
+            // A found bucket is always a definitive answer here, rules or none.
+            if let bucket = try await Bucket.find(app: app, name: bucketName) {
+                await BucketCORSCache.shared.setConfig(
+                    for: bucketName, config: LoadCacheLifecycle.corsConfig(for: bucket))
+            }
+        case ("bucketCORS", .remove):
+            await BucketCORSCache.shared.removeBucket(bucketName)
+
         case ("clusterNode", .upsert):
             let nodeId = message.key
             guard let uuid = UUID(uuidString: nodeId) else { break }

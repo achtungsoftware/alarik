@@ -56,7 +56,7 @@ struct S3ErrorMiddleware: Middleware {
         }
     }
 
-    private static func isS3Route(_ request: Request) -> Bool {
+    static func isS3Route(_ request: Request) -> Bool {
         let path = request.url.path
         return !(path.hasPrefix("/api/") || path.hasPrefix("/internal/") || path == "/livez"
             || path == "/readyz")
@@ -120,7 +120,7 @@ struct S3ErrorMiddleware: Middleware {
         }
     }
 
-    private static func xmlResponse(
+    static func xmlResponse(
         status: HTTPStatus, code: String, message: String, resource: String?, requestId: String
     ) -> Response {
         let payload = S3ErrorResponse(

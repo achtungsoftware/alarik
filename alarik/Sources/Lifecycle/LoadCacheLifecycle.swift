@@ -245,6 +245,7 @@ final class LoadCacheLifecycle: LifecycleHandler {
         await BucketPolicyCache.shared.removePublicAccessBlock(for: bucketName)
         await NotificationConfigCache.shared.removeBucket(bucketName)
         await ReplicationConfigCache.shared.removeBucket(bucketName)
+        await BucketCORSCache.shared.removeBucket(bucketName)
         await AccessKeyBucketMapCache.shared.removeAll(for: bucketName)
     }
 
@@ -280,6 +281,7 @@ final class LoadCacheLifecycle: LifecycleHandler {
         if let config = replicationConfig(for: bucket) {
             await ReplicationConfigCache.shared.setConfig(for: bucket.name, config: config)
         }
+        await BucketCORSCache.shared.setConfig(for: bucket.name, config: corsConfig(for: bucket))
     }
 
     /// Shared by the bulk load above and `CacheReloadDispatch`'s single-item reload, so the two
@@ -314,6 +316,12 @@ final class LoadCacheLifecycle: LifecycleHandler {
 
     /// nil when there are no rules - an empty rule set behaves identically to not being in the
     /// cache (`NotificationConfigCache.config(for:)`'s nil fast path).
+    /// Empty rules when none are set: "known to have none" is itself cached (see
+    /// `BucketCORSCache`), since browsers hit buckets without CORS far more often than with.
+    static func corsConfig(for bucket: Bucket) -> CORSConfiguration {
+        CORSConfiguration(rules: bucket.corsRules ?? [])
+    }
+
     static func notificationConfig(for bucket: Bucket) -> NotificationConfiguration? {
         guard let config = bucket.notificationConfig, !config.rules.isEmpty else { return nil }
         return config

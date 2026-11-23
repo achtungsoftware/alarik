@@ -770,6 +770,7 @@ struct S3Service {
             || names.contains("publicaccessblock")
             || names.contains("tagging")
             || names.contains("lifecycle")
+            || names.contains("cors")
             || names.contains("notification")
             || names.contains("replication")
     }
@@ -793,6 +794,10 @@ struct S3Service {
 
         if names.contains("lifecycle") {
             return try handleLifecycleGet(bucket: bucket, requestId: req.id)
+        }
+
+        if names.contains("cors") {
+            return try handleCORSGet(bucket: bucket, requestId: req.id)
         }
 
         if names.contains("notification") {
@@ -848,6 +853,17 @@ struct S3Service {
         }
         return buildXMLResponse(
             data: Data(LifecycleConfiguration(rules: rules).toXML().utf8))
+    }
+
+    /// Handles GET ?cors. Matches S3: a 404 NoSuchCORSConfiguration when none has been set
+    /// (verified against the GetBucketCors API reference).
+    static func handleCORSGet(bucket: Bucket?, requestId: String) throws -> Response {
+        guard let rules = bucket?.corsRules else {
+            throw S3Error(
+                status: .notFound, code: "NoSuchCORSConfiguration",
+                message: "The CORS configuration does not exist", requestId: requestId)
+        }
+        return buildXMLResponse(data: Data(CORSConfiguration(rules: rules).toXML().utf8))
     }
 
     /// Handles GET ?tagging on a bucket. Matches S3: a 404 NoSuchTagSet if no tag set has

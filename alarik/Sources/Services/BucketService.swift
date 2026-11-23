@@ -128,6 +128,9 @@ struct BucketService {
         await ReplicationConfigCache.shared.removeBucket(bucketName)
         CacheInvalidationService.notify(
             app: req.application, cache: "replicationConfig", op: .remove, key: bucketName)
+        await BucketCORSCache.shared.removeBucket(bucketName)
+        CacheInvalidationService.notify(
+            app: req.application, cache: "bucketCORS", op: .remove, key: bucketName)
 
         // Drop any queued webhook deliveries / replication tasks for the deleted bucket -
         // retrying them would announce or push objects for a bucket that no longer exists.

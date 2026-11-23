@@ -103,8 +103,7 @@ public func configure(_ app: Application) async throws {
         AtomicObjectWriter.removeOrphanedTempFiles(under: BucketHandler.rootPath, olderThan: 3600)
     }
 
-    let cors: CORSMiddleware = CORSMiddleware(
-        configuration: .init(
+    let consoleCORS = CORSMiddleware.Configuration(
             allowedOrigin: .any(
                 [consoleBaseUrl] + additionalCorsOrigins(consoleBaseUrl: consoleBaseUrl)),
             allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
@@ -117,12 +116,11 @@ public func configure(_ app: Application) async throws {
                 .init(stringLiteral: "amz-sdk-invocation-id"),
             ]
         )
-    )
 
     // Outermost, so it sees final responses (including errors already converted by
     // S3ErrorMiddleware) and counts their status and size correctly.
     app.middleware.use(MetricsMiddleware())
-    app.middleware.use(cors)
+    app.middleware.use(AlarikCORSMiddleware(console: consoleCORS))
     app.middleware.use(S3ErrorMiddleware())
 
     if let jwt = Environment.sanitizedGet("JWT") {

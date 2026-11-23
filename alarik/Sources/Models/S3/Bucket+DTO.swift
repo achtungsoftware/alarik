@@ -52,6 +52,8 @@ final class Bucket: Content, @unchecked Sendable, MetadataRecord {
     /// `LifecycleConfiguration`.
     var lifecycleRules: [LifecycleRule]?
 
+    var corsRules: [CORSRule]?
+
     /// Webhook notification rules, or nil if none configured.
     var notificationConfig: NotificationConfiguration?
 

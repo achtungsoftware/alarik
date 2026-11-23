@@ -36,6 +36,10 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
         let rules: [LifecycleRule]
     }
 
+    struct CORSDTO: Content {
+        let rules: [CORSRule]
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
@@ -62,6 +66,11 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
             .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setLifecycle)
         routes.grouped("buckets").grouped(":bucketName").grouped("lifecycle").delete(
             use: self.deleteLifecycle)
+        routes.grouped("buckets").grouped(":bucketName").grouped("cors").get(use: self.getCORS)
+        routes.grouped("buckets").grouped(":bucketName").grouped("cors")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setCORS)
+        routes.grouped("buckets").grouped(":bucketName").grouped("cors").delete(
+            use: self.deleteCORS)
     }
 
     /// Lists the caller's own buckets. An optional `?search=` narrows to names containing that
@@ -395,6 +404,78 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
 
         bucket.lifecycleRules = nil
         try await bucket.save(app: req.application)
+
+        return .noContent
+    }
+
+    // MARK: - CORS
+
+    @Sendable
+    func getCORS(req: Request) async throws -> CORSDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        return CORSDTO(rules: bucket.corsRules ?? [])
+    }
+
+    /// Replaces the whole configuration, like PutBucketCors. Methods are normalised to upper
+    /// case and blank entries dropped before the shared validation runs.
+    @Sendable
+    func setCORS(req: Request) async throws -> CORSDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(CORSDTO.self)
+        let rules = input.rules.map { rule -> CORSRule in
+            var rule = rule
+            let trimmed = { (values: [String]) in
+                values.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            }
+            rule.id = rule.id.flatMap { id -> String? in
+                let trimmed = id.trimmingCharacters(in: .whitespaces)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            rule.allowedOrigins = trimmed(rule.allowedOrigins)
+            rule.allowedMethods = trimmed(rule.allowedMethods).map { $0.uppercased() }
+            rule.allowedHeaders = trimmed(rule.allowedHeaders)
+            rule.exposeHeaders = trimmed(rule.exposeHeaders)
+            return rule
+        }
+        do {
+            try CORSConfiguration.validate(rules)
+        } catch let error as CORSConfiguration.ValidationError {
+            throw Abort(.badRequest, reason: error.message)
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        try await S3Controller.storeCORS(rules, on: bucket, req: req)
+
+        return CORSDTO(rules: rules)
+    }
+
+    @Sendable
+    func deleteCORS(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        try await S3Controller.storeCORS(nil, on: bucket, req: req)
 
         return .noContent
     }
