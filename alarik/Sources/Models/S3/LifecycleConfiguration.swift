@@ -33,6 +33,47 @@ struct LifecycleRule: Codable, Equatable {
 struct LifecycleConfiguration: Equatable {
     var rules: [LifecycleRule]
 
+    /// S3's own ceiling (verified against the PutBucketLifecycleConfiguration API reference).
+    static let maxRuleCount = 1000
+
+    struct ValidationError: Error {
+        let message: String
+    }
+
+    /// The checks every rule set must pass, whichever API delivers it: the S3 XML parser and
+    /// the console endpoint share this so the two can never accept different configurations.
+    static func validate(_ rules: [LifecycleRule]) throws {
+        guard !rules.isEmpty else {
+            throw ValidationError(message: "LifecycleConfiguration must contain at least one Rule.")
+        }
+        guard rules.count <= maxRuleCount else {
+            throw ValidationError(
+                message: "LifecycleConfiguration may contain at most \(maxRuleCount) Rules.")
+        }
+        var seenIds: Set<String> = []
+        for rule in rules {
+            guard !rule.id.isEmpty, rule.id.utf8.count <= 255 else {
+                throw ValidationError(message: "Each Rule ID must be 1 to 255 characters long.")
+            }
+            guard seenIds.insert(rule.id).inserted else {
+                throw ValidationError(message: "Rule ID \"\(rule.id)\" is used more than once.")
+            }
+            let actions = [
+                rule.expirationDays, rule.noncurrentVersionExpirationDays,
+                rule.abortIncompleteMultipartUploadDays,
+            ].compactMap { $0 }
+            guard !actions.isEmpty else {
+                throw ValidationError(
+                    message:
+                        "Each Rule must specify at least one supported action (Expiration, NoncurrentVersionExpiration, or AbortIncompleteMultipartUpload)."
+                )
+            }
+            guard actions.allSatisfy({ $0 > 0 }) else {
+                throw ValidationError(message: "Every Days value must be a positive integer.")
+            }
+        }
+    }
+
     /// S3 elements this system doesn't support - rejected explicitly at parse time rather
     /// than silently accepted and ignored, mirroring `BucketPolicy.parseAndValidate`'s philosophy.
     private static let unsupportedElementNames = [
@@ -83,14 +124,6 @@ struct LifecycleConfiguration: Equatable {
                 outer: "AbortIncompleteMultipartUpload", inner: "DaysAfterInitiation",
                 from: content)
 
-            guard expirationDays != nil || noncurrentDays != nil || abortDays != nil else {
-                throw S3Error(
-                    status: .badRequest, code: "MalformedXML",
-                    message:
-                        "Each Rule must specify at least one supported action (Expiration, NoncurrentVersionExpiration, or AbortIncompleteMultipartUpload).",
-                    requestId: requestId)
-            }
-
             rules.append(
                 LifecycleRule(
                     id: id, enabled: status == "Enabled", prefix: prefix,
@@ -99,10 +132,11 @@ struct LifecycleConfiguration: Equatable {
                     abortIncompleteMultipartUploadDays: abortDays))
         }
 
-        guard !rules.isEmpty else {
+        do {
+            try validate(rules)
+        } catch let error as ValidationError {
             throw S3Error(
-                status: .badRequest, code: "MalformedXML",
-                message: "LifecycleConfiguration must contain at least one Rule.",
+                status: .badRequest, code: "MalformedXML", message: error.message,
                 requestId: requestId)
         }
 

@@ -32,6 +32,10 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
         let tags: [String: String]
     }
 
+    struct LifecycleDTO: Content {
+        let rules: [LifecycleRule]
+    }
+
     func boot(routes: any RoutesBuilder) throws {
         routes.grouped("buckets").get(use: self.listBuckets)
         routes.grouped("buckets").post(use: self.createBucket)
@@ -52,6 +56,12 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
             .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setBucketTags)
         routes.grouped("buckets").grouped(":bucketName").grouped("tags").delete(
             use: self.deleteBucketTags)
+        routes.grouped("buckets").grouped(":bucketName").grouped("lifecycle").get(
+            use: self.getLifecycle)
+        routes.grouped("buckets").grouped(":bucketName").grouped("lifecycle")
+            .on(.PUT, body: .collect(maxSize: Self.subresourceBodySizeLimit), use: self.setLifecycle)
+        routes.grouped("buckets").grouped(":bucketName").grouped("lifecycle").delete(
+            use: self.deleteLifecycle)
     }
 
     /// Lists the caller's own buckets. An optional `?search=` narrows to names containing that
@@ -323,5 +333,69 @@ struct InternalBucketController: RouteCollection, ConsoleBucketRoutes {
         return .noContent
     }
 
-    // MARK: - Bucket notifications (webhooks)
+    // MARK: - Lifecycle
+
+    /// No configuration reads as an empty rule set: the console shows an editor either way.
+    @Sendable
+    func getLifecycle(req: Request) async throws -> LifecycleDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        return LifecycleDTO(rules: bucket.lifecycleRules ?? [])
+    }
+
+    /// Replaces the whole configuration, like PutBucketLifecycleConfiguration. Rules sent
+    /// without an id get one, as the XML path does.
+    @Sendable
+    func setLifecycle(req: Request) async throws -> LifecycleDTO {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let input = try req.content.decode(LifecycleDTO.self)
+        let rules = input.rules.map { rule -> LifecycleRule in
+            var rule = rule
+            rule.id = rule.id.trimmingCharacters(in: .whitespaces)
+            if rule.id.isEmpty { rule.id = UUID().uuidString }
+            return rule
+        }
+        do {
+            try LifecycleConfiguration.validate(rules)
+        } catch let error as LifecycleConfiguration.ValidationError {
+            throw Abort(.badRequest, reason: error.message)
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        bucket.lifecycleRules = rules
+        try await bucket.save(app: req.application)
+
+        return LifecycleDTO(rules: rules)
+    }
+
+    @Sendable
+    func deleteLifecycle(req: Request) async throws -> HTTPStatus {
+        let auth = try req.auth.require(AuthenticatedUser.self)
+
+        guard let bucketName = req.parameters.get("bucketName") else {
+            throw Abort(.badRequest, reason: "Missing bucket name")
+        }
+
+        let bucket = try await requireOwnedBucket(
+            req: req, bucketName: bucketName, userId: auth.userId)
+
+        bucket.lifecycleRules = nil
+        try await bucket.save(app: req.application)
+
+        return .noContent
+    }
 }

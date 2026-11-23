@@ -349,4 +349,58 @@ struct LifecycleConfigurationTests {
             [LifecycleRule].self, from: try JSONEncoder().encode(original))
         #expect(restored == original)
     }
+
+    // MARK: - validate(_:)
+
+    @Test("validate - rejects non-positive Days")
+    func testValidateRejectsZeroDays() {
+        let rule = LifecycleRule(
+            id: "r", enabled: true, prefix: "", expirationDays: 0,
+            noncurrentVersionExpirationDays: nil, abortIncompleteMultipartUploadDays: nil)
+        #expect(throws: LifecycleConfiguration.ValidationError.self) {
+            try LifecycleConfiguration.validate([rule])
+        }
+    }
+
+    @Test("validate - rejects duplicate rule IDs")
+    func testValidateRejectsDuplicateIds() {
+        let rule = LifecycleRule(
+            id: "same", enabled: true, prefix: "", expirationDays: 1,
+            noncurrentVersionExpirationDays: nil, abortIncompleteMultipartUploadDays: nil)
+        #expect(throws: LifecycleConfiguration.ValidationError.self) {
+            try LifecycleConfiguration.validate([rule, rule])
+        }
+        var other = rule
+        other.id = "other"
+        #expect(throws: Never.self) { try LifecycleConfiguration.validate([rule, other]) }
+    }
+
+    @Test("validate - rejects an empty id and an empty rule set")
+    func testValidateRejectsEmpty() {
+        #expect(throws: LifecycleConfiguration.ValidationError.self) {
+            try LifecycleConfiguration.validate([])
+        }
+        let rule = LifecycleRule(
+            id: "", enabled: true, prefix: "", expirationDays: 1,
+            noncurrentVersionExpirationDays: nil, abortIncompleteMultipartUploadDays: nil)
+        #expect(throws: LifecycleConfiguration.ValidationError.self) {
+            try LifecycleConfiguration.validate([rule])
+        }
+    }
+
+    @Test("parse - a zero Days value is MalformedXML")
+    func testParseRejectsZeroDays() {
+        let xml = """
+            <LifecycleConfiguration>
+              <Rule>
+                <ID>rule1</ID>
+                <Status>Enabled</Status>
+                <Expiration><Days>0</Days></Expiration>
+              </Rule>
+            </LifecycleConfiguration>
+            """
+        #expect(throws: S3Error.self) {
+            try LifecycleConfiguration.parse(xml: xml, requestId: "test")
+        }
+    }
 }
