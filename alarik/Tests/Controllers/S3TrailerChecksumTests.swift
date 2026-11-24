@@ -206,6 +206,8 @@ struct S3TrailerChecksumTests {
                     #expect(res.status == .ok)
                     #expect(res.headers.first(name: "Content-Length") == String(payload.count))
                     #expect(Data(res.body.readableBytesView) == payload)
+                    // `aws-chunked` was the upload's framing, not the object's encoding.
+                    #expect(res.headers.first(name: "Content-Encoding") == nil)
                 })
         }
     }

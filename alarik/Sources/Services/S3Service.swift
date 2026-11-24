@@ -309,9 +309,25 @@ struct S3Service {
     static func storedObjectHeaders(from headers: HTTPHeaders) -> [String: String]? {
         var stored: [String: String] = [:]
         for name in storedObjectHeaderNames {
-            if let value = headers.first(name: name) { stored[name] = value }
+            guard var value = headers.first(name: name) else { continue }
+            if name == "content-encoding" {
+                // `aws-chunked` is the transfer framing of a trailer-checksum upload, not a
+                // property of the object: S3 stores the remaining encodings and omits the header
+                // when that is all there was. Replaying it makes browsers fail to decode GETs.
+                guard let remaining = contentEncodingWithoutChunking(value) else { continue }
+                value = remaining
+            }
+            stored[name] = value
         }
         return stored.isEmpty ? nil : stored
+    }
+
+    /// `Content-Encoding` minus the `aws-chunked` token; nil when nothing else was named.
+    static func contentEncodingWithoutChunking(_ value: String) -> String? {
+        let encodings = value.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && $0.lowercased() != "aws-chunked" }
+        return encodings.isEmpty ? nil : encodings.joined(separator: ", ")
     }
 
     /// GET's `response-*` query overrides (`response-content-disposition` on a presigned
