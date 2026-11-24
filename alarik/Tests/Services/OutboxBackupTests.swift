@@ -101,6 +101,71 @@ struct OutboxBackupTests {
         }
     }
 
+    @Test("a restarting or draining owner keeps its rows - only a vanished or long-silent one is adopted")
+    func onlyGoneOwnersAreAdopted() async throws {
+        try await withClusterApp { app, selfId in
+            let collection = OutboxCollections.notificationDeliveries
+            let now = Date()
+            let restarting = UUID()
+            let draining = UUID()
+            let silentButRecent = UUID()
+            await ClusterNodeCache.shared.load(initialData: [
+                ClusterNodeInfo(id: selfId, address: "http://self.internal", status: .active, lastHeartbeatAt: now),
+                // Said goodbye a moment ago: a routine restart, not a departure.
+                ClusterNodeInfo(
+                    id: restarting, address: "http://restarting.internal", status: .active,
+                    lastHeartbeatAt: now, reportedOffline: true),
+                // Draining nodes hand their rows over themselves.
+                ClusterNodeInfo(id: draining, address: "http://draining.internal", status: .draining, lastHeartbeatAt: now),
+                // Past heartbeat staleness, but well inside the adoption grace.
+                ClusterNodeInfo(
+                    id: silentButRecent, address: "http://quiet.internal", status: .active,
+                    lastHeartbeatAt: now.addingTimeInterval(-2 * ClusterNodeCache.heartbeatStaleness)),
+            ])
+            for owner in [restarting, draining, silentButRecent] {
+                let (row, data) = try backupRow(owner: owner)
+                try OutboxMailbox.receiveBackup(data: data, collection: collection, ownerNodeId: owner, taskId: row.id)
+            }
+
+            let promoted = await OutboxMailbox.promoteOrphanedBackups(
+                NotificationDelivery.self, app: app, collection: collection)
+            #expect(promoted == 0)
+            #expect(OutboxMailbox.allOwnedTasks(NotificationDelivery.self, app: app, collection: collection).isEmpty)
+            let remaining = OutboxMailboxFileHandler.listAllOwnerTaskIds(
+                root: OutboxMailboxFileHandler.backupRootPath, collection: collection)
+            #expect(remaining.count == 3)
+
+            // The rule itself, at the boundaries.
+            #expect(OutboxMailbox.ownerIsGone(nil))
+            let node = ClusterNodeInfo(
+                id: UUID(), address: "http://n.internal", status: .active,
+                lastHeartbeatAt: now.addingTimeInterval(-OutboxMailbox.adoptionGrace - 1))
+            #expect(OutboxMailbox.ownerIsGone(node, now: now))
+            #expect(!OutboxMailbox.ownerIsGone(node, now: now.addingTimeInterval(-2)))
+        }
+    }
+
+    @Test("mirrors of rows their owner no longer has are pruned, live ones kept")
+    func prunesDeliveredMirrors() async throws {
+        try await withClusterApp { app, _ in
+            let collection = OutboxCollections.notificationDeliveries
+            let owner = UUID()
+            let (live, liveData) = try backupRow(owner: owner)
+            let (delivered, deliveredData) = try backupRow(owner: owner)
+            try OutboxMailbox.receiveBackup(data: liveData, collection: collection, ownerNodeId: owner, taskId: live.id)
+            try OutboxMailbox.receiveBackup(
+                data: deliveredData, collection: collection, ownerNodeId: owner, taskId: delivered.id)
+
+            let removed = OutboxMailbox.pruneBackups(collection: collection, ownerNodeId: owner, keeping: [live.id])
+            #expect(removed == 1)
+            let remaining = OutboxMailboxFileHandler.listTaskIds(
+                root: OutboxMailboxFileHandler.backupRootPath, collection: collection, ownerNodeId: owner)
+            #expect(remaining == [live.id])
+            // Nothing held for an unknown owner, nothing to prune.
+            #expect(OutboxMailbox.pruneBackups(collection: collection, ownerNodeId: UUID(), keeping: []) == 0)
+        }
+    }
+
     @Test("the replica count honours the new variable and falls back to the historical name")
     func replicaCountFallsBack() async throws {
         try await withClusterApp { app, _ in

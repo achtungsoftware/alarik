@@ -255,7 +255,7 @@ final actor GenericOutboxDispatcher<Row: OutboxRow> {
                 // log storm when a peer is down for the whole backoff ladder.
                 if row.attempts == 1 {
                     app.logger.info(
-                        "\(logContext) delivery failed (attempt 1/\(maxAttempts), retrying in \(Int(backoff))s): \(describeFailure(row)): \(error)"
+                        "\(logContext) attempt 1/\(maxAttempts) failed, retrying in \(Int(backoff))s: \(describeFailure(row)): \(error)"
                     )
                 }
             }

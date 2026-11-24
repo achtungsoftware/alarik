@@ -82,6 +82,9 @@ enum OutboxMailbox {
         await mirrorBackups(
             NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
         await mirrorBackups(ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
+        await pruneDeliveredBackups(
+            NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
+        await pruneDeliveredBackups(ReplicationTask.self, app: app, collection: OutboxCollections.replicationTasks)
         let adoptedDeliveries = await promoteOrphanedBackups(
             NotificationDelivery.self, app: app, collection: OutboxCollections.notificationDeliveries)
         let adoptedReplications = await promoteOrphanedBackups(
@@ -442,6 +445,60 @@ enum OutboxMailbox {
 
     // MARK: - Promotion on ungraceful owner loss
 
+    /// Drops this node's mirrors of rows their owner no longer has - delivered or purged ones.
+    /// `remove` only reaches the owner's own disk, so without this every mirror lived forever and
+    /// was adopted wholesale the moment its owner looked gone (every webhook ever queued, again).
+    /// An owner that cannot be asked right now is left alone; the next sweep asks again.
+    static func pruneDeliveredBackups<Row: OutboxMailboxRow>(
+        _ type: Row.Type, app: Application, collection: String
+    ) async {
+        guard let config = app.storage[ClusterConfigurationKey.self] else { return }
+        let owners = Set(
+            OutboxMailboxFileHandler.listAllOwnerTaskIds(
+                root: OutboxMailboxFileHandler.backupRootPath, collection: collection
+            ).map(\.ownerNodeId)
+        ).subtracting([config.nodeId])
+        guard !owners.isEmpty else { return }
+        let reachable = await ClusterNodeCache.shared.activeNodes()
+        for owner in reachable where owners.contains(owner.id) {
+            guard
+                let live = await fetchRemoteRows(
+                    Row.self, app: app, node: owner, secret: config.secret, collection: collection)
+            else { continue }
+            pruneBackups(collection: collection, ownerNodeId: owner.id, keeping: Set(live.map(\.id)))
+        }
+    }
+
+    /// The local half of `pruneDeliveredBackups`: every mirror held for `ownerNodeId` whose id
+    /// is not in `live` goes. Returns how many were removed.
+    @discardableResult
+    static func pruneBackups(collection: String, ownerNodeId: UUID, keeping live: Set<UUID>) -> Int {
+        var removed = 0
+        let held = OutboxMailboxFileHandler.listTaskIds(
+            root: OutboxMailboxFileHandler.backupRootPath, collection: collection, ownerNodeId: ownerNodeId)
+        for taskId in held where !live.contains(taskId) {
+            OutboxMailboxFileHandler.remove(
+                path: OutboxMailboxFileHandler.taskPath(
+                    root: OutboxMailboxFileHandler.backupRootPath, collection: collection,
+                    ownerNodeId: ownerNodeId, taskId: taskId))
+            removed += 1
+        }
+        return removed
+    }
+
+    /// How long an owner may be silent before its mirrors are adopted. Far longer than
+    /// `heartbeatStaleness`: a restart or a goodbye is routine, and the owner still holds its
+    /// rows and delivers them itself once back - adopting them then runs each twice.
+    static let adoptionGrace: TimeInterval = 10 * 60
+
+    /// Whether `owner`'s mirrors should be adopted: it left membership altogether, or has been
+    /// silent past `adoptionGrace`. Status never decides - a draining node is alive and hands
+    /// its rows over itself (`reassignOwnedTasks`).
+    static func ownerIsGone(_ owner: ClusterNodeInfo?, now: Date = Date()) -> Bool {
+        guard let owner else { return true }
+        return now.timeIntervalSince(owner.lastHeartbeatAt) > adoptionGrace
+    }
+
     /// Walks this node's own held backup entries in `collection` and self-promotes any whose
     /// owner has dropped out of active membership - moves the file from `outbox-backup/` into
     /// this node's own `outbox/<collection>/<selfId>/`, re-owning it. A deterministic HRW
@@ -453,7 +510,7 @@ enum OutboxMailbox {
     ) async -> Int {
         guard let config = app.storage[ClusterConfigurationKey.self] else { return 0 }
         let selfId = config.nodeId
-        // Liveness decides WHETHER to promote (is the owner gone?); stable placement decides WHO
+        // `ownerIsGone` decides WHETHER to promote; stable placement decides WHO
         // promotes. Electing from the live set would let two nodes with slightly different
         // heartbeat views each elect themselves and both promote the same task - a webhook
         // delivered twice, a replication task run twice. `placementNodes()` is the same on every
@@ -467,7 +524,7 @@ enum OutboxMailbox {
 
         var promoted = 0
         for (ownerNodeId, taskId) in backupEntries {
-            guard !activeIds.contains(ownerNodeId) else { continue }
+            guard ownerIsGone(await ClusterNodeCache.shared.get(id: ownerNodeId)) else { continue }
 
             // Elect among nodes that are both placement members AND currently reachable, so a
             // task isn't handed to a node that is itself down; every node computes this from the
@@ -582,17 +639,25 @@ enum OutboxMailbox {
     private static func fetchRemoteList<Row: OutboxMailboxRow>(
         _ type: Row.Type, app: Application, node: ClusterNodeInfo, secret: String, collection: String
     ) async -> [Row] {
+        await fetchRemoteRows(Row.self, app: app, node: node, secret: secret, collection: collection) ?? []
+    }
+
+    /// `node`'s own owned rows; nil when it could not be asked, which callers that act on an
+    /// absence (pruning) must tell apart from "owns nothing".
+    private static func fetchRemoteRows<Row: OutboxMailboxRow>(
+        _ type: Row.Type, app: Application, node: ClusterNodeInfo, secret: String, collection: String
+    ) async -> [Row]? {
         do {
             var outbound = HTTPClientRequest.internalCluster(
                 url: node.address + "/internal/cluster/outbox/list" + querySuffix(collection: collection),
                 method: .GET, secret: secret)
             let response = try await LightweightClusterControlClient.shared.execute(
                 outbound, timeout: ClusterReplicationClient.probeTimeout, logger: app.logger)
-            guard response.status == .ok else { return [] }
+            guard response.status == .ok else { return nil }
             let body = try await response.body.collect(upTo: 64 * 1024 * 1024)
             return try decoder.decode([Row].self, from: Data(buffer: body))
         } catch {
-            return []
+            return nil
         }
     }
 
