@@ -59,6 +59,8 @@ export function useUploadQueue() {
     const config = useRuntimeConfig();
     const jwtCookie = useJWTCookie();
     const toast = useToast();
+    // Resolved at setup: a composable can't be called from inside an upload's catch block.
+    const api = useApi();
 
     const apiBaseUrl = config.public.apiBaseUrl;
 
@@ -342,9 +344,8 @@ export function useUploadQueue() {
         } catch (error) {
             if (uploadId) {
                 // Best effort, never awaited against the user's cancel: clean up the server side.
-                $fetch(multipartUrl("", item, { uploadId }).toString(), {
-                    method: "DELETE",
-                }).catch(() => {});
+                // Through useApi so the bearer token goes along - a bare $fetch is a silent 401.
+                api(multipartUrl("", item, { uploadId }).toString(), { method: "DELETE" }).catch(() => {});
             }
             if (abortController.signal.aborted) {
                 updateItem(item.id, { status: "cancelled", error: "Cancelled" });
