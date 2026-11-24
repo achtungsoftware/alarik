@@ -49,16 +49,36 @@ struct AtomicObjectWriterTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let fm = FileManager.default
         try fm.createDirectory(atPath: dir + "bucket/prefix", withIntermediateDirectories: true)
-        let old = dir + "bucket/prefix/" + AtomicObjectWriter.tempFilePrefix + "old"
-        let fresh = dir + "bucket/" + AtomicObjectWriter.tempFilePrefix + "fresh"
+        let old = dir + "bucket/prefix/" + AtomicObjectWriter.tempFilePrefix + UUID().uuidString
+        let fresh = dir + "bucket/" + AtomicObjectWriter.tempFilePrefix + UUID().uuidString
         let object = dir + "bucket/prefix/real.obj"
-        for path in [old, fresh, object] { fm.createFile(atPath: path, contents: Data("x".utf8)) }
-        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: old)
+        // Objects and folders whose keys merely start with the temp prefix are not temp files.
+        let lookalikeObject = dir + "bucket/" + AtomicObjectWriter.tempFilePrefix + "report.obj"
+        let lookalikeFolder = dir + "bucket/" + AtomicObjectWriter.tempFilePrefix + "cache"
+        try fm.createDirectory(atPath: lookalikeFolder, withIntermediateDirectories: true)
+        for path in [old, fresh, object, lookalikeObject, lookalikeFolder + "/inner.obj"] {
+            fm.createFile(atPath: path, contents: Data("x".utf8))
+        }
+        let ancient = Date().addingTimeInterval(-7200)
+        for path in [old, lookalikeObject, lookalikeFolder] {
+            try fm.setAttributes([.modificationDate: ancient], ofItemAtPath: path)
+        }
 
         let removed = AtomicObjectWriter.removeOrphanedTempFiles(under: dir, olderThan: 3600)
         #expect(removed == 1)
         #expect(!fm.fileExists(atPath: old))
         #expect(fm.fileExists(atPath: fresh))
         #expect(fm.fileExists(atPath: object))
+        #expect(fm.fileExists(atPath: lookalikeObject))
+        #expect(fm.fileExists(atPath: lookalikeFolder + "/inner.obj"))
+    }
+
+    @Test("only the exact .tmp-<UUID> shape counts as a temp file")
+    func tempFileNameShape() {
+        #expect(AtomicObjectWriter.isTempFileName(".tmp-" + UUID().uuidString))
+        #expect(!AtomicObjectWriter.isTempFileName(".tmp-report.obj"))
+        #expect(!AtomicObjectWriter.isTempFileName(".tmp-cache"))
+        #expect(!AtomicObjectWriter.isTempFileName(".tmp-"))
+        #expect(!AtomicObjectWriter.isTempFileName("tmp-" + UUID().uuidString))
     }
 }

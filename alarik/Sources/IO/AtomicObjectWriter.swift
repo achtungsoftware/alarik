@@ -175,18 +175,30 @@ struct AtomicObjectWriter {
         let fileManager = FileManager.default
         guard
             let enumerator = fileManager.enumerator(
-                at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.contentModificationDateKey],
+                at: URL(fileURLWithPath: root),
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
                 options: [])
         else { return 0 }
         let cutoff = Date().addingTimeInterval(-age)
         var removed = 0
-        for case let fileURL as URL in enumerator where fileURL.lastPathComponent.hasPrefix(tempFilePrefix) {
+        for case let fileURL as URL in enumerator where isTempFileName(fileURL.lastPathComponent) {
+            // Regular files only: an object keyed `.tmp-report` is `.tmp-report.obj` and a
+            // folder `.tmp-cache/` is a directory - neither is ours, whatever their age.
             guard
-                let modified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate, modified < cutoff
+                let values = try? fileURL.resourceValues(forKeys: [
+                    .contentModificationDateKey, .isRegularFileKey,
+                ]),
+                values.isRegularFile == true,
+                let modified = values.contentModificationDate, modified < cutoff
             else { continue }
             if (try? fileManager.removeItem(at: fileURL)) != nil { removed += 1 }
         }
         return removed
+    }
+
+    /// Exactly the shape `init` produces: the prefix followed by one UUID, nothing else.
+    static func isTempFileName(_ name: String) -> Bool {
+        guard name.hasPrefix(tempFilePrefix) else { return false }
+        return UUID(uuidString: String(name.dropFirst(tempFilePrefix.count))) != nil
     }
 }
