@@ -33,9 +33,9 @@ enum KeyPathMigration {
         var conflicts: [String] = []
     }
 
-    static func runIfNeeded(logger: Logger) {
+    static func runIfNeeded(logger: Logger, root: String = BucketHandler.rootPath, markerPath: String = markerPath) {
         guard !FileManager.default.fileExists(atPath: markerPath) else { return }
-        let report = migrate(root: BucketHandler.rootPath)
+        let report = migrate(root: root)
         if report.renamed > 0 {
             logger.notice("Renamed \(report.renamed) pre-beta-17 object path(s) into their escaped form.")
         }
@@ -44,7 +44,13 @@ enum KeyPathMigration {
                 "Left pre-beta-17 path '\(path)' in place: its escaped name already exists and holds the newer object. Remove the old path by hand once the newer object is confirmed."
             )
         }
-        FileManager.default.createFile(atPath: markerPath, contents: Data())
+        // A fresh single-node store has no `Storage/` yet at this point in boot; without the
+        // directory the marker silently fails to write and every boot repeats the walk.
+        try? FileManager.default.createDirectory(
+            atPath: (markerPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        if !FileManager.default.createFile(atPath: markerPath, contents: Data()) {
+            logger.warning("Could not write '\(markerPath)'; the key-escaping walk will run again next boot.")
+        }
     }
 
     /// Walks every bucket directory under `root`. Idempotent: a second pass renames nothing.
@@ -62,14 +68,14 @@ enum KeyPathMigration {
 
     private static func migrateDirectory(_ directory: String, report: inout Report) {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
-        for name in names where !name.hasPrefix(AtomicObjectWriter.tempFilePrefix) {
+        for name in names where !AtomicObjectWriter.isTempFileName(name) {
             let path = directory + "/" + name
             let directoryEntry = isDirectory(path)
             let (form, stem) = split(name)
 
             if !directoryEntry {
                 guard form == ".obj" else { continue }
-                let recorded = (try? ObjectFileHandler.read(from: path, loadData: false))?.0.key
+                let recorded = needsRecordedKey(stem) ? (try? ObjectFileHandler.read(from: path, loadData: false))?.0.key : nil
                 let escaped = escapedStem(stem, recordedKey: recorded)
                 if escaped != stem { rename(path, to: directory + "/" + escaped + ".obj", report: &report) }
                 continue
@@ -77,7 +83,7 @@ enum KeyPathMigration {
 
             // A directory named `<stem>.versions` / `<stem>.ecshards` is a sidecar of key `stem`
             // unless its contents say otherwise; `<stem>.obj` can only be a folder.
-            if let form, form != ".obj", let recorded = sidecarKey(path, form: form) {
+            if let form, form != ".obj", let recorded = sidecarKey(path, form: form, stem: stem) {
                 let escaped = escapedStem(stem, recordedKey: recorded)
                 if escaped != stem { rename(path, to: directory + "/" + escaped + form, report: &report) }
                 continue
@@ -90,6 +96,13 @@ enum KeyPathMigration {
             }
             migrateDirectory(current, report: &report)
         }
+    }
+
+    /// Only a stem ending in the marker is ambiguous (legacy `x.obj~` vs escaped `x.obj`); any
+    /// other name encodes the same with or without its header, so the one-time walk stays a
+    /// directory scan and does not open every object on a large store.
+    static func needsRecordedKey(_ stem: Substring) -> Bool {
+        stem.last == KeyPathEncoding.marker
     }
 
     /// The name `stem` should have on disk. A legacy name IS the key component; a current name
@@ -118,11 +131,12 @@ enum KeyPathMigration {
     /// keys and version ids; a sidecar's entries are named by the version id their header records,
     /// and a shard directory holds nothing but `<index>.ecshard`. Undecidable (empty, or a header
     /// that cannot be read) counts as a sidecar with no recorded key, which leaves the name alone.
-    private static func sidecarKey(_ directory: String, form: String) -> String?? {
+    private static func sidecarKey(_ directory: String, form: String, stem: Substring) -> String?? {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return .some(nil) }
         if form == ".ecshards" {
             guard names.allSatisfy({ $0.hasSuffix(".ecshard") && Int($0.dropLast(".ecshard".count)) != nil })
             else { return nil }
+            guard needsRecordedKey(stem) else { return .some(nil) }
             return .some(ErasureCodedObjectHandler.anyLocalShardHeader(inShardDirectory: directory)?.objectMeta.key)
         }
         for name in names where name != ".latest" {

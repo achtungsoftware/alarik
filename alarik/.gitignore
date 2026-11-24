@@ -24,3 +24,4 @@ Storage/outbox/*
 !Storage/outbox/.gitkeep
 
 Storage/cluster_node_id
+Storage/key-escaping-migrated

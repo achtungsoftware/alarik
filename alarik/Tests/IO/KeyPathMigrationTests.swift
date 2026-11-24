@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 import Foundation
+import Logging
 import Testing
 
 @testable import Alarik
@@ -69,10 +70,18 @@ struct KeyPathMigrationTests {
         // A sidecar known only by its pointer file is left where it is.
         try fm.createDirectory(atPath: b + "ptr.versions", withIntermediateDirectories: true)
         fm.createFile(atPath: b + "ptr.versions/.latest", contents: Data("v".utf8))
+        // Only a `.tmp-<UUID>` is a writer's temp file; an object keyed `.tmp-foo.obj` migrates.
+        try writeObject(b + ".tmp-foo.obj.obj", key: ".tmp-foo.obj")
+        // An unambiguous name is renamed from its name alone; its header is never consulted.
+        fm.createFile(atPath: b + "junk.obj.obj", contents: Data("not an object header".utf8))
 
         let report = KeyPathMigration.migrate(root: root)
 
-        #expect(report.renamed == 6)
+        #expect(report.renamed == 8)
+        #expect(exists(b + ".tmp-foo.obj~.obj") && !exists(b + ".tmp-foo.obj.obj"))
+        #expect(exists(b + "junk.obj~.obj") && !exists(b + "junk.obj.obj"))
+        #expect(!KeyPathMigration.needsRecordedKey("model.obj"))
+        #expect(KeyPathMigration.needsRecordedKey("model.obj~"))
         #expect(exists(b + "tilde.obj~~.obj") && !exists(b + "tilde.obj~.obj"))
         #expect(exists(b + "other.obj~.obj"))
         #expect(exists(b + "ptr.versions/.latest"))
@@ -93,6 +102,23 @@ struct KeyPathMigrationTests {
 
         // Idempotent.
         #expect(KeyPathMigration.migrate(root: root) == KeyPathMigration.Report())
+    }
+
+    @Test("the done-marker is written even when its directory does not exist yet")
+    func writesMarkerIntoMissingDirectory() throws {
+        let root = try tempRoot()
+        defer { try? fm.removeItem(atPath: root) }
+        try writeObject(root + "buckets/b/model.obj.obj", key: "model.obj")
+        let marker = root + "state/key-escaping-migrated"
+
+        KeyPathMigration.runIfNeeded(logger: Logger(label: "test"), root: root + "buckets/", markerPath: marker)
+
+        #expect(exists(marker))
+        #expect(exists(root + "buckets/b/model.obj~.obj"))
+        // With the marker in place a fresh legacy name is left alone: the walk no longer runs.
+        try writeObject(root + "buckets/b/later.obj.obj", key: "later.obj")
+        KeyPathMigration.runIfNeeded(logger: Logger(label: "test"), root: root + "buckets/", markerPath: marker)
+        #expect(exists(root + "buckets/b/later.obj.obj"))
     }
 
     @Test("an object rewritten after the upgrade is never replaced by its legacy copy")
