@@ -94,6 +94,9 @@ public func configure(_ app: Application) async throws {
     // Same for staged EC shards: a stage survives only when its coordinator can no longer
     // commit it here (see `ErasureCodedObjectHandler.cleanupStagingOrphans`).
     ErasureCodedObjectHandler.cleanupStagingOrphans()
+    // Before anything is served: reads resolve escaped paths, so a pre-beta-17 name is
+    // invisible to them until renamed (see `KeyPathMigration`).
+    KeyPathMigration.runIfNeeded(logger: app.logger)
     // Encode scratch is per-write and cleaned by `defer`; whatever is left is from a crash.
     try? FileManager.default.removeItem(atPath: Constants.erasureCodingScratchDirectory)
     // Temp files of writers that crashed mid-write sit next to their objects and are never
