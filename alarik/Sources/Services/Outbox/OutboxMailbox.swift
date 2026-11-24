@@ -391,9 +391,8 @@ enum OutboxMailbox {
         let replicas = replicaCount(app: app)
         guard replicas > 1 else { return }
 
-        let active = await ClusterNodeCache.shared.activeNodes().filter { $0.id != selfId }
-        guard !active.isEmpty else { return }
-        let targets = Array(active.prefix(replicas - 1))
+        let candidates = await adoptionElectorate()
+        guard candidates.contains(where: { $0.id != selfId }) else { return }
 
         let ids = OutboxMailboxFileHandler.listTaskIds(
             root: OutboxMailboxFileHandler.rootPath, collection: collection, ownerNodeId: selfId)
@@ -404,6 +403,9 @@ enum OutboxMailbox {
                 root: OutboxMailboxFileHandler.rootPath, collection: collection, ownerNodeId: selfId,
                 taskId: id)
             guard let data = OutboxMailboxFileHandler.read(path: path) else { continue }
+            let targets = mirrorTargets(
+                collection: collection, ownerNodeId: selfId, taskId: id, candidates: candidates,
+                replicas: replicas)
             await withTaskGroup(of: Void.self) { group in
                 for node in targets {
                     group.addTask {
@@ -431,6 +433,44 @@ enum OutboxMailbox {
         } catch {
             // Best-effort - the next sweep re-tries automatically.
         }
+    }
+
+    /// The peers that hold `taskId`'s mirrors: the top `replicas - 1` of the same HRW ranking
+    /// `electAdopter` uses, so whoever wins the adoption election is one of them. Any other
+    /// choice (e.g. "the first few active peers") elects a non-holder in a cluster of three or
+    /// more, and the row then sits on its mirrors forever.
+    static func mirrorTargets(
+        collection: String, ownerNodeId: UUID, taskId: UUID, candidates: [ClusterNodeInfo], replicas: Int
+    ) -> [ClusterNodeInfo] {
+        PlacementService.responsibleNodes(
+            bucketName: outboxPlacementBucket,
+            key: adoptionKey(collection: collection, ownerNodeId: ownerNodeId, taskId: taskId),
+            activeNodes: candidates.filter { $0.id != ownerNodeId }, count: replicas - 1)
+    }
+
+    /// The one node that adopts `taskId` once its owner is gone. The owner is never a candidate:
+    /// it is gone at election time, and ranking as if it were present would shift the winner away
+    /// from the mirror holders chosen when it was still alive.
+    static func electAdopter(
+        collection: String, ownerNodeId: UUID, taskId: UUID, eligible: [ClusterNodeInfo]
+    ) -> ClusterNodeInfo? {
+        PlacementService.responsibleNodes(
+            bucketName: outboxPlacementBucket,
+            key: adoptionKey(collection: collection, ownerNodeId: ownerNodeId, taskId: taskId),
+            activeNodes: eligible.filter { $0.id != ownerNodeId }, count: 1
+        ).first
+    }
+
+    private static func adoptionKey(collection: String, ownerNodeId: UUID, taskId: UUID) -> String {
+        "\(collection)/\(ownerNodeId)/\(taskId)"
+    }
+
+    /// Nodes that are both placement members and reachable right now - the set both the mirror
+    /// targets and the adoption election are ranked over. Every node computes it from the same
+    /// two views, so the ranking is unanimous.
+    static func adoptionElectorate() async -> [ClusterNodeInfo] {
+        let activeIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
+        return await ClusterNodeCache.shared.placementNodes().filter { activeIds.contains($0.id) }
     }
 
     /// The receiving side of `sendBackupRPC` - stores a mirror copy under `outbox-backup/`, never
@@ -514,9 +554,9 @@ enum OutboxMailbox {
         // promotes. Electing from the live set would let two nodes with slightly different
         // heartbeat views each elect themselves and both promote the same task - a webhook
         // delivered twice, a replication task run twice. `placementNodes()` is the same on every
-        // node, so the election is unanimous; self must still be in it to be eligible.
-        let activeIds = Set(await ClusterNodeCache.shared.activeNodes().map(\.id))
-        let electorate = await ClusterNodeCache.shared.placementNodes()
+        // node, so the election is unanimous; self must still be in it to be eligible, and the
+        // eligible set is also what `mirrorTargets` ranked over, so the winner holds a mirror.
+        let eligible = await adoptionElectorate()
 
         let backupEntries = OutboxMailboxFileHandler.listAllOwnerTaskIds(
             root: OutboxMailboxFileHandler.backupRootPath, collection: collection)
@@ -526,15 +566,8 @@ enum OutboxMailbox {
         for (ownerNodeId, taskId) in backupEntries {
             guard ownerIsGone(await ClusterNodeCache.shared.get(id: ownerNodeId)) else { continue }
 
-            // Elect among nodes that are both placement members AND currently reachable, so a
-            // task isn't handed to a node that is itself down; every node computes this from the
-            // same two sets.
-            let eligible = electorate.filter { activeIds.contains($0.id) }
-            let winner = PlacementService.responsibleNodes(
-                bucketName: outboxPlacementBucket,
-                key: "\(collection)/\(ownerNodeId)/\(taskId)",
-                activeNodes: eligible, count: 1
-            ).first
+            let winner = electAdopter(
+                collection: collection, ownerNodeId: ownerNodeId, taskId: taskId, eligible: eligible)
             guard winner?.id == selfId else { continue }
 
             let backupPath = OutboxMailboxFileHandler.taskPath(

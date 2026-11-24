@@ -166,6 +166,41 @@ struct OutboxBackupTests {
         }
     }
 
+    @Test("the elected adopter always holds a mirror, whatever the cluster size")
+    func adopterIsAMirrorHolder() throws {
+        let collection = OutboxCollections.notificationDeliveries
+        let nodes = (0..<5).map { _ -> ClusterNodeInfo in
+            let id = UUID()
+            return ClusterNodeInfo(id: id, address: "http://\(id).internal", status: .active, lastHeartbeatAt: Date())
+        }
+        let owner = nodes[0]
+        for replicas in [2, 3] {
+            for _ in 0..<100 {
+                let task = UUID()
+                let holders = OutboxMailbox.mirrorTargets(
+                    collection: collection, ownerNodeId: owner.id, taskId: task, candidates: nodes, replicas: replicas)
+                #expect(holders.count == replicas - 1)
+                #expect(!holders.contains { $0.id == owner.id })
+                // Owner gone: the winner is the first holder.
+                let survivors = nodes.filter { $0.id != owner.id }
+                let winner = OutboxMailbox.electAdopter(
+                    collection: collection, ownerNodeId: owner.id, taskId: task, eligible: survivors)
+                #expect(winner?.id == holders.first?.id)
+                // A stale view that still lists the owner must not move the winner.
+                let staleWinner = OutboxMailbox.electAdopter(
+                    collection: collection, ownerNodeId: owner.id, taskId: task, eligible: nodes)
+                #expect(staleWinner?.id == winner?.id)
+                // First holder down as well: the next holder wins, not a stranger.
+                if replicas == 3 {
+                    let remaining = survivors.filter { $0.id != holders[0].id }
+                    let fallback = OutboxMailbox.electAdopter(
+                        collection: collection, ownerNodeId: owner.id, taskId: task, eligible: remaining)
+                    #expect(fallback?.id == holders[1].id)
+                }
+            }
+        }
+    }
+
     @Test("the replica count honours the new variable and falls back to the historical name")
     func replicaCountFallsBack() async throws {
         try await withClusterApp { app, _ in
