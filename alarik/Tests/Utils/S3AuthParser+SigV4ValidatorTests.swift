@@ -502,6 +502,55 @@ struct AdditionalS3AuthTests {
         }
     }
 
+    @Test("Validate PUT with a percent-encoded semicolon in the key using Soto")
+    func testValidatePutWithEncodedSemicolonUsingSoto() async throws {
+        try await withApp { app in
+            let eventLoop = app.eventLoopGroup.next()
+
+            let accessKey = "AKIAIOSFODNN7EXAMPLE"
+            let secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            let region = "us-east-1"
+            let bodyContent = "test content"
+            let bodyData = Data(bodyContent.utf8)
+            let host = "examplebucket.s3.us-east-1.amazonaws.com"
+
+            // AWS CLI, Soto and Veeam all percent-encode `;` as `%3B` in the request line and
+            // sign `%3B` in the canonical URI. Vapor's `URI.path` rewrites that escape back to
+            // `;`, so without the canonical-URI variants this request fails with
+            // SignatureDoesNotMatch even though the client signed correctly.
+            let url = URL(string: "https://\(host)/a%3Bb.txt")!
+
+            let signer = AWSSigner(
+                credentials: StaticCredential(accessKeyId: accessKey, secretAccessKey: secretKey),
+                name: "s3",
+                region: region
+            )
+            let signedHeaders = signer.signHeaders(
+                url: url,
+                method: .PUT,
+                headers: ["host": host],
+                body: .data(bodyData)
+            )
+
+            var buffer = ByteBufferAllocator().buffer(capacity: bodyData.count)
+            buffer.writeBytes(bodyData)
+            let req = Request(
+                application: app,
+                method: .PUT,
+                url: URI(string: url.absoluteString),
+                collectedBody: buffer,
+                on: eventLoop
+            )
+            for (key, value) in signedHeaders {
+                req.headers.add(name: key, value: value)
+            }
+
+            let authInfo = try S3AuthParser.parse(request: req)
+            let validator = SigV4Validator(secretKey: secretKey)
+            #expect(try validator.validate(request: req, authInfo: authInfo) == true)
+        }
+    }
+
     @Test("Validate GET request with query parameters using Soto")
     func testValidateGetWithQueryParamsUsingSoto() async throws {
         try await withApp { app in
