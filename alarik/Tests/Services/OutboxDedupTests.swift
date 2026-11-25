@@ -56,6 +56,35 @@ struct OutboxDedupTests {
         #expect(otherVersion.id != a.id)
     }
 
+    @Test("a failed attempt is not written back once the row was purged underneath it")
+    func failedAttemptDoesNotResurrectPurgedRow() async throws {
+        try await withApp { app in
+            let collection = OutboxCollections.replicationTasks
+            let selfId = OutboxMailbox.selfNodeId(app: app)
+            let target = ReplicationTarget(
+                id: UUID(), endpoint: "http://127.0.0.1:1", targetBucket: "never", accessKeyId: "a",
+                secretAccessKey: "s", region: "us-east-1", enabled: true)
+            let row = ReplicationTask(
+                bucketName: "doomed", ruleId: UUID(), target: target, key: "a.txt", versionId: nil,
+                operation: .put, ownerNodeId: selfId)
+            try OutboxMailbox.store(row, collection: collection)
+            #expect(OutboxMailbox.allOwnedTasks(ReplicationTask.self, app: app, collection: collection).count == 1)
+
+            // The dispatcher is mid-attempt while the bucket delete purges the row...
+            OutboxMailbox.removeOwned(ReplicationTask.self, app: app, collection: collection) { $0.bucketName == "doomed" }
+            // ...and then records the failure.
+            row.attempts = 1
+            try OutboxMailbox.updateIfQueued(row, collection: collection)
+            #expect(OutboxMailbox.allOwnedTasks(ReplicationTask.self, app: app, collection: collection).isEmpty)
+
+            // A row that is still queued takes the update as before.
+            try OutboxMailbox.store(row, collection: collection)
+            row.attempts = 2
+            try OutboxMailbox.updateIfQueued(row, collection: collection)
+            #expect(OutboxMailbox.allOwnedTasks(ReplicationTask.self, app: app, collection: collection).first?.attempts == 2)
+        }
+    }
+
     @Test("storing the same task again keeps the pending row and revives a dead-lettered one")
     func storeDeduplicates() async throws {
         try await withApp { app in

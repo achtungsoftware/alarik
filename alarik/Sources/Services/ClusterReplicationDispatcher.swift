@@ -71,7 +71,7 @@ enum ClusterReplicationDispatcher {
             }
         },
         persist: { row, _ in
-            try OutboxMailbox.update(row, collection: OutboxCollections.clusterReplicationTasks)
+            try OutboxMailbox.updateIfQueued(row, collection: OutboxCollections.clusterReplicationTasks)
         },
         remove: { row, _ in
             OutboxMailbox.remove(row, collection: OutboxCollections.clusterReplicationTasks)

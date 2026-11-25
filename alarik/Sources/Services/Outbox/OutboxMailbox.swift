@@ -164,6 +164,17 @@ enum OutboxMailbox {
             path: path, data: try JSONEncoder().encode(row), dueAt: row.nextAttemptAt)
     }
 
+    /// `update` for a row the dispatcher has just attempted: written back only while it is still
+    /// queued. A purge racing with the attempt (bucket deleted, node drained) removed the file,
+    /// and rewriting it would resurrect work for a bucket or node that is gone.
+    static func updateIfQueued<Row: OutboxMailboxRow>(_ row: Row, collection: String) throws {
+        let path = OutboxMailboxFileHandler.taskPath(
+            root: OutboxMailboxFileHandler.rootPath, collection: collection,
+            ownerNodeId: row.ownerNodeId, taskId: row.id)
+        guard OutboxMailboxFileHandler.exists(path: path) else { return }
+        try update(row, collection: collection)
+    }
+
     /// Deletes a completed task - both the owner's copy and any backup mirror, since a done task
     /// needs no further protecting.
     static func remove<Row: OutboxMailboxRow>(_ row: Row, collection: String) {

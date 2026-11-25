@@ -66,7 +66,7 @@ enum ErasureCodedDispatcher {
             }
         },
         persist: { row, _ in
-            try OutboxMailbox.update(row, collection: OutboxCollections.erasureCodedReplicationTasks)
+            try OutboxMailbox.updateIfQueued(row, collection: OutboxCollections.erasureCodedReplicationTasks)
         },
         remove: { row, _ in
             OutboxMailbox.remove(row, collection: OutboxCollections.erasureCodedReplicationTasks)

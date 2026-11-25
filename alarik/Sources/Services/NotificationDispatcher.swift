@@ -58,7 +58,7 @@ enum NotificationDispatcher {
                 return .failure(error)
             }
         },
-        persist: { row, _ in try OutboxMailbox.update(row, collection: OutboxCollections.notificationDeliveries) },
+        persist: { row, _ in try OutboxMailbox.updateIfQueued(row, collection: OutboxCollections.notificationDeliveries) },
         remove: { row, _ in OutboxMailbox.remove(row, collection: OutboxCollections.notificationDeliveries) },
         describeFailure: { row in "\(row.url) (bucket: \(row.bucketName))" },
         purgeExpired: { app in

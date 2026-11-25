@@ -53,7 +53,7 @@ enum ReplicationDispatcher {
                 return .failure(error)
             }
         },
-        persist: { row, _ in try OutboxMailbox.update(row, collection: OutboxCollections.replicationTasks) },
+        persist: { row, _ in try OutboxMailbox.updateIfQueued(row, collection: OutboxCollections.replicationTasks) },
         remove: { row, _ in OutboxMailbox.remove(row, collection: OutboxCollections.replicationTasks) },
         describeFailure: { row in "\(row.key) to \(row.endpoint) (bucket: \(row.bucketName))" },
         purgeExpired: { app in
