@@ -1310,6 +1310,8 @@ SPECIAL_KEYS=(
     "equals=and&ampersand.txt"
     "deep/nested/path/file.txt"
     "dots..in..key.txt"
+    "semicolon;key.txt"
+    "Veeam-style[0;499999].vbk"
 )
 
 for key in "${SPECIAL_KEYS[@]}"; do

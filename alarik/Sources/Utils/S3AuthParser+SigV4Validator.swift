@@ -403,19 +403,34 @@ struct SigV4Validator {
         let payloadHash = try resolveAndVerifyPayloadHash(
             request: request, isQueryAuth: authInfo.expires != nil)
 
+        // Canonical URI variants. Vapor's `URI.path` rewrites every `%3B` to `;` (its
+        // URLComponents workaround for Linux, where `;` isn't treated as a valid path
+        // character), so the parsed path no longer says which spelling the client signed.
+        // AWS CLI and Soto sign `%3B`; a client that puts a bare `;` on the request line
+        // (legal in an RFC 3986 path) signs `;`. Try both - and only a path that actually
+        // contains a semicolon pays for the second attempt.
+        let decodedPath = request.url.path.isEmpty ? "/" : request.url.path
+        let canonicalURIPaths =
+            decodedPath.contains(";")
+            ? [decodedPath, decodedPath.replacingOccurrences(of: ";", with: "%3B")]
+            : [decodedPath]
+
         // Try multiple combinations to handle different client implementations:
+        // - canonicalURIPath: `;` vs `%3B` in the path (see above)
         // - sorted=true: AWS spec compliant query param sorting
         // - sorted=false: Soto-AWS compatibility (preserves original order)
         // - emptyValueEquals=true: AWS CLI style (?versioning=)
         // - emptyValueEquals=false: Soto style (?versioning)
-        for sorted in [true, false] {
-            for emptyValueEquals in [true, false] {
-                if try validateWithQuerySort(
-                    request: request, authInfo: authInfo, sorted: sorted,
-                    emptyValueEquals: emptyValueEquals, signingKey: kSigning,
-                    payloadHash: payloadHash
-                ) {
-                    return true
+        for canonicalURIPath in canonicalURIPaths {
+            for sorted in [true, false] {
+                for emptyValueEquals in [true, false] {
+                    if try validateWithQuerySort(
+                        request: request, authInfo: authInfo, canonicalURIPath: canonicalURIPath,
+                        sorted: sorted, emptyValueEquals: emptyValueEquals, signingKey: kSigning,
+                        payloadHash: payloadHash
+                    ) {
+                        return true
+                    }
                 }
             }
         }
@@ -438,6 +453,7 @@ struct SigV4Validator {
     private func validateWithQuerySort(
         request: Request,
         authInfo: S3AuthInfo,
+        canonicalURIPath: String,
         sorted: Bool,
         emptyValueEquals: Bool,
         signingKey: Data,
@@ -446,6 +462,7 @@ struct SigV4Validator {
         // Create canonical request
         let canonicalRequest = try createCanonicalRequest(
             request: request,
+            canonicalURIPath: canonicalURIPath,
             signedHeaders: authInfo.signedHeaders,
             isQueryAuth: authInfo.expires != nil,
             sortQueryParams: sorted,
@@ -524,6 +541,7 @@ struct SigV4Validator {
 
     private func createCanonicalRequest(
         request: Request,
+        canonicalURIPath: String,
         signedHeaders: [String],
         isQueryAuth: Bool,
         sortQueryParams: Bool,
@@ -531,8 +549,8 @@ struct SigV4Validator {
         payloadHash: String
     ) throws -> String {
         let method = request.method.rawValue
-        // Canonical URI
-        let path = request.url.path.isEmpty ? "/" : request.url.path
+        // Canonical URI - supplied by the caller, which tries the semicolon spellings
+        // `request.url.path` can no longer distinguish (see `validate`).
 
         // Canonical query string
         var queryString = ""
@@ -638,8 +656,8 @@ struct SigV4Validator {
         // Signed headers - cache the result
         let signedHeadersString = sortedHeaders.joined(separator: ";")
 
-        return method + "\n" + path + "\n" + queryString + "\n" + canonicalHeaders + "\n"
-            + signedHeadersString + "\n" + payloadHash
+        return method + "\n" + canonicalURIPath + "\n" + queryString + "\n" + canonicalHeaders
+            + "\n" + signedHeadersString + "\n" + payloadHash
     }
 
     private func createStringToSign(
