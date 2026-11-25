@@ -409,6 +409,43 @@ struct S3ControllerTests {
         }
     }
 
+    @Test("a literal percent escape in an object key is decoded exactly once")
+    func testLiteralPercentEscapeInKeyListedVerbatim() async throws {
+        let bucketName = "test-percent-escape-key"
+        try await withApp { app in
+            try await createBucket(app, bucketName: bucketName)
+
+            // The client key is `a%20b.txt` - a literal percent sign, not a space. A correct
+            // S3 client sends the path component as `a%2520b.txt`; decoding that once yields
+            // the key, decoding twice yields `a b.txt`.
+            let encodedPath = "/\(bucketName)/a%2520b.txt"
+            let data = Data("literal percent".utf8)
+            let signed = signedHeaders(for: .PUT, path: encodedPath, body: data)
+
+            try await app.test(
+                .PUT, encodedPath,
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: signed)
+                    req.body = ByteBuffer(data: data)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                })
+
+            let listSigned = signedHeaders(for: .GET, path: "/\(bucketName)")
+            try await app.test(
+                .GET, "/\(bucketName)",
+                beforeRequest: { req in
+                    req.headers.add(contentsOf: listSigned)
+                },
+                afterResponse: { res in
+                    #expect(res.status == .ok)
+                    #expect(res.body.string.contains("<Key>a%20b.txt</Key>"))
+                    #expect(!res.body.string.contains("<Key>a b.txt</Key>"))
+                })
+        }
+    }
+
     @Test("List Objects V1 - With prefix")
     func testListObjectsV1WithPrefix() async throws {
         let bucketName = "test-list-prefix"

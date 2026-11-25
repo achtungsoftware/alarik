@@ -1330,6 +1330,17 @@ else
     fail "Expected ${#SPECIAL_KEYS[@]} keys in listing, got: $LISTED_COUNT"
 fi
 
+# A key containing a literal `%20` travels on the wire as `%2520`; the server must decode the
+# path exactly once. Decoding twice stores and lists `literal percent.txt` instead.
+PERCENT_KEY="literal%20percent.txt"
+echo "content of $PERCENT_KEY" | aws_s3 s3 cp - "s3://$SPECIAL_BUCKET/$PERCENT_KEY" > /dev/null 2>&1
+LISTED_PERCENT_KEY=$(aws_s3 s3api list-objects-v2 --bucket "$SPECIAL_BUCKET" --prefix "$PERCENT_KEY" --no-paginate --query 'Contents[0].Key' --output text 2>/dev/null)
+if [ "$LISTED_PERCENT_KEY" == "$PERCENT_KEY" ]; then
+    pass "Literal percent escape in key is preserved: '$PERCENT_KEY'"
+else
+    fail "Literal percent escape in key was mangled (listed as: '$LISTED_PERCENT_KEY')"
+fi
+
 aws_s3 s3 rm "s3://$SPECIAL_BUCKET" --recursive > /dev/null 2>&1
 aws_s3 s3api delete-bucket --bucket "$SPECIAL_BUCKET" > /dev/null 2>&1
 
